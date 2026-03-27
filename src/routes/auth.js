@@ -3,7 +3,7 @@
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { getDb } from '../db/schema.js';
-import { generateToken } from '../middleware/auth.js';
+import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 
 const router = Router();
@@ -130,22 +130,12 @@ router.post('/verify', (req, res) => {
 });
 
 // ─── POST /app/onboarding ─────────────────────────────────────────────────────
-router.post('/onboarding', (req, res) => {
-  const auth = req.headers.authorization?.slice(7);
+router.post('/onboarding', authMiddleware, (req, res) => {
   const { name, language } = req.body || {};
-
-  if (!auth) return res.status(401).json({ status: false, message: 'Auth required' });
-
-  try {
-    const payload = jwt.verify(auth, process.env.JWT_SECRET);
-    const db = getDb();
-    db.prepare(`
-      UPDATE users SET name = ?, language = ?, updated_at = unixepoch() WHERE id = ?
-    `).run(name?.trim() || '', language || 'English', payload.userId);
-    res.json({ status: true, message: 'Profile saved successfully' });
-  } catch {
-    res.json({ status: true, message: 'Profile saved' });
-  }
+  const db = getDb();
+  db.prepare('UPDATE users SET name=?, language=?, updated_at=unixepoch() WHERE id=?')
+    .run(name?.trim() || '', language || 'English', req.user.userId);
+  res.json({ status: true, message: 'Profile saved successfully' });
 });
 
 export default router;

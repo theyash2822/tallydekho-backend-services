@@ -2,9 +2,9 @@
 // Works for both India (+91) and Dubai (+971) and any country code
 import axios from 'axios';
 
-const WABA_URL = 'https://crmapi.cronberry.com/api/v1/messages';
-const WABA_TOKEN = 'Bearer Pskq6moUauaczstu5pFem2VU5ERVJTQ09SRQm3lg4mqDURnYRitEQj45NRP3xBNpo558iH7tTPwREFTSAAnS5OCSvrrfa8ycySIwQWd3eDbGOREFTSAZUq1yV39PEW7XS575Pi9qPt8FDq1tmo';
-const TEMPLATE_NAME = 'otp_international';
+const WABA_URL = process.env.CRONBERRY_URL || 'https://crmapi.cronberry.com/api/v1/messages';
+const WABA_TOKEN = `Bearer ${process.env.CRONBERRY_TOKEN || ''}`;
+const TEMPLATE_NAME = process.env.CRONBERRY_TEMPLATE || 'otp_international';
 
 /**
  * Send OTP via WhatsApp (Cronberry WABA)

@@ -61,6 +61,10 @@ app.use('/', ingestRoutes);
 // ── Notify on ingest complete (wire sync → WebSocket) ──────────────────────
 // Override ingest complete to emit synced event
 app.post('/ingest/complete-notify', express.json(), (req, res) => {
+  const secret = req.headers['x-internal-secret'];
+  if (secret !== process.env.INTERNAL_SECRET) {
+    return res.status(403).json({ status: false, message: 'Forbidden' });
+  }
   const { userId, companyGuid } = req.body;
   if (userId) socketService.notifySynced(userId, companyGuid);
   res.json({ status: true });
