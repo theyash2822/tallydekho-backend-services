@@ -24,8 +24,9 @@ router.post('/ledgers', authMiddleware, (req, res) => {
 
   const ledgers = db.prepare(query).all(...params);
   const total = db.prepare('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=?').get(companyGuid)?.c || 0;
+  const withBalance = db.prepare('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=? AND closing_balance != 0').get(companyGuid)?.c || 0;
 
-  res.json({ status: true, data: { ledgers, total, page, pageSize } });
+  res.json({ status: true, data: { ledgers, total, withBalance, page, pageSize } });
 });
 
 // POST /app/ledger — single ledger detail
@@ -134,18 +135,29 @@ router.post('/dashboard', authMiddleware, (req, res) => {
   const totalPayments = db.prepare("SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=? AND voucher_type LIKE '%Payment%' AND date BETWEEN ? AND ? AND is_cancelled=0").get(companyGuid, from, to)?.v || 0;
   const totalReceipts = db.prepare("SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=? AND voucher_type LIKE '%Receipt%' AND date BETWEEN ? AND ? AND is_cancelled=0").get(companyGuid, from, to)?.v || 0;
 
-  const cashLedger = db.prepare("SELECT closing_balance FROM ledgers WHERE company_guid=? AND (name LIKE '%Cash%' OR parent LIKE '%Cash%') LIMIT 1").get(companyGuid);
-  const bankLedgers = db.prepare("SELECT SUM(closing_balance) as v FROM ledgers WHERE company_guid=? AND parent LIKE '%Bank%'").get(companyGuid);
-  const receivables = db.prepare("SELECT SUM(closing_balance) as v FROM ledgers WHERE company_guid=? AND parent LIKE '%Sundry Debtor%'").get(companyGuid);
-  const payables = db.prepare("SELECT SUM(closing_balance) as v FROM ledgers WHERE company_guid=? AND parent LIKE '%Sundry Creditor%'").get(companyGuid);
+  const cashLedger = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Cash%' OR name LIKE '%Cash in Hand%')").get(companyGuid);
+  const bankLedgers = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Bank%' OR parent LIKE '%Bank Account%')").get(companyGuid);
+  const receivables = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Sundry Debtor%' OR parent = 'Sundry Debtors') AND closing_balance != 0").get(companyGuid);
+  const payables = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Sundry Creditor%' OR parent = 'Sundry Creditors') AND closing_balance != 0").get(companyGuid);
+  
+  // Sales from Direct Income ledgers
+  const salesLedger = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Direct Income%' OR parent LIKE '%Sales%' OR name LIKE '%Sales%')").get(companyGuid);
+  // Purchase from Direct Expense ledgers  
+  const purchaseLedger = db.prepare("SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=? AND (parent LIKE '%Direct Expense%' OR parent LIKE '%Purchase%' OR name LIKE '%Purchase%')").get(companyGuid);
+
+  const totalSalesReal = salesLedger?.v || totalSales;
+  const totalPurchaseReal = purchaseLedger?.v || totalPurchase;
 
   res.json({ status: true, data: {
-    totalSales, totalPurchase, totalPayments, totalReceipts,
-    cashBalance: cashLedger?.closing_balance || 0,
+    totalSales: totalSalesReal,
+    totalPurchase: totalPurchaseReal,
+    totalPayments,
+    totalReceipts,
+    cashBalance: cashLedger?.v || 0,
     bankBalance: bankLedgers?.v || 0,
     receivables: receivables?.v || 0,
     payables: payables?.v || 0,
-    netProfit: totalSales - totalPurchase,
+    netProfit: totalSalesReal - totalPurchaseReal,
   }});
 });
 
