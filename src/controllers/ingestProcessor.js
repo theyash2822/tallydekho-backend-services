@@ -77,7 +77,7 @@ function processMasters(db, data, companyGuid) {
           r.ADDRESS || null,
           parseFloat(String(r.OPENINGBALANCE || '0').replace(/[^0-9.-]/g, '')) || 0,
           Math.abs(balNum), balType,
-          parseInt(r.ALTERID || r.AlterId || 0),
+          parseInt(r.AlterId || r.ALTERID || 0),
         );
         saved++;
       } catch {}
@@ -125,7 +125,7 @@ function processStocks(db, data, companyGuid) {
           parseFloat(r.CLOSINGRATE || r.RATE || 0),
           parseFloat(r.CLOSINGVALUE || r.VALUE || 0),
           parseFloat(r.REORDERLEVEL || 0),
-          parseInt(r.ALTERID || r.AlterId || 0),
+          parseInt(r.AlterId || r.ALTERID || 0),
         );
         saved++;
       } catch {}
@@ -163,19 +163,19 @@ function processVouchers(db, data, companyGuid) {
       // F02 = VoucherNumber (can be number or string)
       const voucherNumber = r.F02 !== undefined ? String(r.F02) : (r.VOUCHERNUMBER || r.voucherNumber || null);
 
-      const voucherType = r.VOUCHERTYPENAME || r.voucherType || 'Voucher';
+      const voucherType = r.VoucherTypeName || r.VOUCHERTYPENAME || r.voucherType || 'Voucher';
 
       try {
         insert.run(
           guid, companyGuid,
-          voucherNumber,
+          r.VoucherNumber || r.VOUCHERNUMBER || voucherNumber || null,
           voucherType,
-          r.DATE || r.date || null,
-          r.PARTYNAME || r.partyName || null,
-          parseFloat(r.AMOUNT || r.amount || 0),
-          r.NARRATION || r.narration || null,
-          r.REFERENCE || r.reference || null,
-          parseInt(r.ALTERID || r.AlterId || 0),
+          (r.Date && !r.Date.includes('\xf1') && r.Date.trim() !== '' ? r.Date : null) || (r.DATE && !r.DATE.includes('\xf1') ? r.DATE : null) || r.date || null,
+          r.PartyLedgerName || r.PARTYNAME || r.partyName || null,
+          parseFloat(r.Amount || r.AMOUNT || r.amount || 0),
+          r.Narration || r.NARRATION || r.narration || null,
+          r.Reference || r.REFERENCE || r.reference || null,
+          parseInt(r.AlterId || r.ALTERID || 0),
           JSON.stringify(r).slice(0, 2000),
         );
         saved++;
@@ -209,7 +209,7 @@ function processStockTransactions(db, data, companyGuid) {
           companyGuid,
           r.VCHGUID || r.voucherGuid || null,
           r.VOUCHERTYPENAME || null,
-          r.DATE || r.date || null,
+          (r.Date && !r.Date.includes('\xf1') && r.Date.trim() !== '' ? r.Date : null) || (r.DATE && !r.DATE.includes('\xf1') ? r.DATE : null) || r.date || null,
           parseFloat(r.ACTUALQTY || r.qty || 0),
           parseFloat(r.RATE || r.rate || 0),
           parseFloat(r.AMOUNT || r.value || 0),
