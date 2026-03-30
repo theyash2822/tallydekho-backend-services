@@ -156,16 +156,14 @@ function processVouchers(db, data, companyGuid) {
   const insertMany = db.transaction((records) => {
     let saved = 0;
     for (const r of records) {
-      // Voucher GUID can come as Guid, GUID, or guid
-      const guid = r.Guid || r.GUID || r.guid || '';
+      // GUID is all caps from Tally
+      const guid = r.GUID || r.Guid || r.guid || '';
       if (!guid) continue;
 
-      // Voucher number: F02 (from SimplifiedVoucher) or VOUCHERNUMBER
-      const voucherNumber = r.F02 || r.VOUCHERNUMBER || r.voucherNumber || null;
+      // F02 = VoucherNumber (can be number or string)
+      const voucherNumber = r.F02 !== undefined ? String(r.F02) : (r.VOUCHERNUMBER || r.voucherNumber || null);
 
-      // Get voucher type from COLLECTION_NAME or direct field
-      const voucherType = r.VOUCHERTYPENAME || r.voucherType ||
-        (r.COLLECTION_NAME === 'Voucher' ? 'Voucher' : 'Unknown');
+      const voucherType = r.VOUCHERTYPENAME || r.voucherType || 'Voucher';
 
       try {
         insert.run(
@@ -178,10 +176,12 @@ function processVouchers(db, data, companyGuid) {
           r.NARRATION || r.narration || null,
           r.REFERENCE || r.reference || null,
           parseInt(r.ALTERID || r.AlterId || 0),
-          JSON.stringify(r).slice(0, 2000), // Store raw data (truncated)
+          JSON.stringify(r).slice(0, 2000),
         );
         saved++;
-      } catch {}
+      } catch(e) {
+        console.warn('[DB] Voucher insert failed:', e.message, '| guid:', guid);
+      }
     }
     return saved;
   });
