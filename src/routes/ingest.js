@@ -33,6 +33,28 @@ router.post('/desktop/init-sync', (req, res) => {
         master: latestLedger?.max || 0,
         voucher: {},
       };
+
+      // Save company to DB
+      try {
+        db.prepare(`
+          INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+          ON CONFLICT(guid) DO UPDATE SET
+            name=excluded.name, formal_name=excluded.formal_name,
+            gstin=excluded.gstin, fy_start=excluded.fy_start,
+            fy_end=excluded.fy_end, synced_at=unixepoch()
+        `).run(
+          c.guid, userId, deviceId,
+          c.name || c.NAME || 'Unknown Company',
+          c.formalName || c.FORMALNAME || c.name || '',
+          c.gstin || c.GSTIN || null,
+          c.startingFrom || c.STARTINGFROM || null,
+          c.endingAt || c.ENDINGAT || null
+        );
+        console.log(`[DB] Company saved: ${c.name || c.guid}`);
+      } catch(e) {
+        console.warn('[DB] Company save failed:', e.message);
+      }
     });
   }
 
