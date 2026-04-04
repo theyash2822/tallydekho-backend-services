@@ -205,48 +205,63 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Ledger Vouchers (vouchers linked to a specific ledger via line items) ──────
+// ─── Ledger Vouchers (vouchers linked to a specific ledger via line items or party name) ───
 router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
   const { companyGuid, ledgerName, page = 1, pageSize = 25 } = req.body || {};
   if (!companyGuid || !ledgerName) return res.status(400).json({ status: false, message: 'companyGuid and ledgerName required' });
 
   const offset = (page - 1) * pageSize;
   try {
-    // Get voucher GUIDs that have this ledger as a line item
-    const { rows: items } = await query(
+    // Strategy 1: exact ledger_name match in voucher_items
+    const { rows: exactItems } = await query(
       `SELECT DISTINCT vi.voucher_guid FROM voucher_items vi
-       WHERE vi.company_guid = $1 AND vi.ledger_name ILIKE $2
-       LIMIT $3 OFFSET $4`,
+       WHERE vi.company_guid = $1 AND vi.ledger_name = $2`,
+      [companyGuid, ledgerName]
+    );
+
+    // Strategy 2: party_name exact match in vouchers
+    const { rows: partyVouchers } = await query(
+      `SELECT * FROM vouchers WHERE company_guid = $1
+       AND party_name = $2 AND is_cancelled = FALSE
+       ORDER BY date DESC LIMIT $3 OFFSET $4`,
       [companyGuid, ledgerName, pageSize, offset]
     );
 
-    if (items.length === 0) {
-      // Fallback: search by party_name in vouchers
-      const { rows: vouchers } = await query(
-        `SELECT * FROM vouchers WHERE company_guid = $1
-         AND (party_name ILIKE $2 OR voucher_number ILIKE $2)
-         AND is_cancelled = FALSE
-         ORDER BY date DESC LIMIT $3 OFFSET $4`,
-        [companyGuid, `%${ledgerName}%`, pageSize, offset]
+    // Strategy 3: ILIKE match in voucher_items if exact returns nothing
+    let itemGuids = exactItems.map(i => i.voucher_guid);
+    if (itemGuids.length === 0) {
+      const { rows: likeItems } = await query(
+        `SELECT DISTINCT vi.voucher_guid FROM voucher_items vi
+         WHERE vi.company_guid = $1 AND vi.ledger_name ILIKE $2
+         LIMIT $3`,
+        [companyGuid, `%${ledgerName}%`, pageSize]
       );
-      const { rows: countRows } = await query(
-        `SELECT COUNT(*) as c FROM vouchers WHERE company_guid = $1
-         AND (party_name ILIKE $2 OR voucher_number ILIKE $2) AND is_cancelled = FALSE`,
-        [companyGuid, `%${ledgerName}%`]
-      );
-      return res.json({ status: true, data: { vouchers, total: parseInt(countRows[0].c), page, source: 'party_name' } });
+      itemGuids = likeItems.map(i => i.voucher_guid);
     }
 
-    const guids = items.map(i => i.voucher_guid);
-    const placeholders = guids.map((_, i) => `$${i + 2}`).join(',');
-    const { rows: vouchers } = await query(
-      `SELECT * FROM vouchers WHERE company_guid = $1
-       AND guid IN (${placeholders})
-       ORDER BY date DESC`,
-      [companyGuid, ...guids]
-    );
+    // Fetch vouchers from item GUIDs
+    let itemVouchers = [];
+    if (itemGuids.length > 0) {
+      const ph = itemGuids.map((_, i) => `$${i + 2}`).join(',');
+      const { rows } = await query(
+        `SELECT * FROM vouchers WHERE company_guid = $1
+         AND guid IN (${ph}) AND is_cancelled = FALSE
+         ORDER BY date DESC LIMIT $${itemGuids.length + 2}`,
+        [companyGuid, ...itemGuids, pageSize]
+      );
+      itemVouchers = rows;
+    }
 
-    res.json({ status: true, data: { vouchers, total: vouchers.length, page, source: 'ledger_items' } });
+    // Merge: party vouchers + item vouchers, deduplicate by id
+    const seen = new Set();
+    const all = [...partyVouchers, ...itemVouchers].filter(v => {
+      if (seen.has(v.id)) return false;
+      seen.add(v.id);
+      return true;
+    }).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+    const source = partyVouchers.length > 0 ? 'party_name' : itemGuids.length > 0 ? 'ledger_items' : 'none';
+    res.json({ status: true, data: { vouchers: all.slice(0, pageSize), total: all.length, page, source } });
   } catch (err) {
     console.error('[ledger-vouchers] Error:', err.message);
     res.status(500).json({ status: false, message: 'Failed to fetch ledger vouchers' });
