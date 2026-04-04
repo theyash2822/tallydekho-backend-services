@@ -170,7 +170,19 @@ async function processVouchers(data, companyGuid) {
       const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
       const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes');
-      const partyGuid     = r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
+      const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
+
+      // Calculate amount from ledger entries (positive = debit side)
+      const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || [];
+      let amount = parseFloat(r.Amount || r.AMOUNT || r.amount || 0);
+      if (amount === 0 && Array.isArray(ledgerEntries) && ledgerEntries.length > 0) {
+        // Sum positive (Dr) entries as the voucher amount
+        const drSum = ledgerEntries
+          .filter(e => e.ISDEEMEDPOSITIVE === 'Yes' || e.IsDeemedPositive === 'Yes')
+          .reduce((s, e) => s + Math.abs(parseFloat(e.AMOUNT || e.Amount || 0)), 0);
+        amount = drSum || ledgerEntries
+          .reduce((s, e) => s + Math.abs(parseFloat(e.AMOUNT || e.Amount || 0)), 0) / 2;
+      }
 
       try {
         await client.query(`
@@ -184,9 +196,9 @@ async function processVouchers(data, companyGuid) {
             raw_data=EXCLUDED.raw_data, synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, date,
-          r.PartyLedgerName || r.PARTYNAME || r.partyName || null,
+          r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
           partyGuid,
-          parseFloat(r.Amount || r.AMOUNT || r.amount || 0),
+          amount,
           r.Narration || r.NARRATION || r.narration || null,
           r.Reference || r.REFERENCE || r.reference || null,
           isCancelled,
@@ -291,14 +303,35 @@ async function processStockTransactions(data, companyGuid) {
 }
 
 async function processRecords(data, companyGuid, userId, deviceId) {
-  const sample = data[0];
-  if (sample?.COLLECTION_NAME === 'Voucher' || sample?.Guid || sample?.F02) {
-    await processVouchers(data, companyGuid);
-  } else if (sample?.COLLECTION_NAME === 'StockItem' || sample?.BASEUNITS) {
-    await processStocks(data, companyGuid);
-  } else if (sample?.GUID && (sample?.PARENT !== undefined || sample?.NAME)) {
-    await processMasters(data, companyGuid);
-  } else {
-    await processMasters(data, companyGuid);
+  // Records stream is a mixed bag from desktop — group by XML type and process each
+  const byXml = {};
+  for (const r of data) {
+    const xml = r.XML || r.xml || 'unknown';
+    if (!byXml[xml]) byXml[xml] = [];
+    byXml[xml].push(r);
+  }
+
+  for (const [xml, records] of Object.entries(byXml)) {
+    if (records.length === 0) continue;
+    const sample = records[0];
+
+    if (xml === 'Voucher.xml') {
+      // Full voucher data — has VoucherTypeName, Date, PartyLedgerName etc.
+      await processVouchers(records, companyGuid);
+    } else if (xml === 'SimplifiedVoucher.xml') {
+      // GUID-only voucher stubs — skip, full data comes from Voucher.xml
+      console.log(`[INGEST] Skipping ${records.length} SimplifiedVoucher stubs`);
+    } else if (xml === 'StockItem.xml' || sample?.BASEUNITS) {
+      await processStocks(records, companyGuid);
+    } else if (xml === 'StockTransaction.xml') {
+      await processStockTransactions(records, companyGuid);
+    } else if (xml === 'LedgerTransaction.xml' || xml === 'LedgerOpeningBalance.xml') {
+      // Ledger transaction detail — can be stored later; skip for now
+      console.log(`[INGEST] Skipping ${records.length} ${xml} records (not yet implemented)`);
+    } else if (sample?.GUID && (sample?.PARENT !== undefined || sample?.NAME)) {
+      await processMasters(records, companyGuid);
+    } else {
+      console.log(`[INGEST] Unknown XML type: ${xml}, ${records.length} records — skipping`);
+    }
   }
 }
