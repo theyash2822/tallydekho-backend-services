@@ -252,16 +252,33 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
       itemVouchers = rows;
     }
 
-    // Merge: party vouchers + item vouchers, deduplicate by id
-    const seen = new Set();
-    const all = [...partyVouchers, ...itemVouchers].filter(v => {
-      if (seen.has(v.id)) return false;
-      seen.add(v.id);
-      return true;
-    }).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    // Priority: party_name results first (they have full data)
+    // Only use item vouchers if party_name returns nothing
+    // Filter out SimplifiedVoucher stubs (type='Voucher', amount=0)
+    const realItemVouchers = itemVouchers.filter(v =>
+      v.voucher_type !== 'Voucher' || parseFloat(v.amount) > 0
+    );
+
+    let finalVouchers;
+    if (partyVouchers.length > 0) {
+      // Merge party + real item vouchers, party first
+      const seen = new Set();
+      finalVouchers = [...partyVouchers, ...realItemVouchers].filter(v => {
+        if (seen.has(v.id)) return false;
+        seen.add(v.id);
+        return true;
+      });
+    } else if (realItemVouchers.length > 0) {
+      finalVouchers = realItemVouchers;
+    } else {
+      // Last resort: return item vouchers even if stubs
+      finalVouchers = itemVouchers;
+    }
+
+    finalVouchers.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
     const source = partyVouchers.length > 0 ? 'party_name' : itemGuids.length > 0 ? 'ledger_items' : 'none';
-    res.json({ status: true, data: { vouchers: all.slice(0, pageSize), total: all.length, page, source } });
+    res.json({ status: true, data: { vouchers: finalVouchers.slice(0, pageSize), total: finalVouchers.length, page, source } });
   } catch (err) {
     console.error('[ledger-vouchers] Error:', err.message);
     res.status(500).json({ status: false, message: 'Failed to fetch ledger vouchers' });
