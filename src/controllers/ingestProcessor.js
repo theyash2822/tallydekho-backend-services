@@ -392,10 +392,28 @@ async function processStockOpeningBalance(data, companyGuid) {
       WHERE s.name = sub.stock_guid AND s.company_guid = sub.company_guid AND s.company_guid = $1
     `, [companyGuid]);
 
-    // Also update stocks with no transactions (closing = opening)
+    // Stocks with opening but no transactions: closing = opening
     await dbQuery(
-      `UPDATE stocks SET closing_qty = opening_qty, closing_value = opening_qty * NULLIF(opening_rate, 0)
+      `UPDATE stocks SET closing_qty = opening_qty
        WHERE company_guid = $1 AND closing_qty = 0 AND opening_qty > 0`,
+      [companyGuid]
+    );
+
+    // Stocks with transactions but no opening: closing = net transactions only
+    await dbQuery(
+      `UPDATE stocks s
+       SET closing_qty = sub.net_qty
+       FROM (
+         SELECT stock_guid, company_guid,
+                SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
+         FROM stock_transactions
+         WHERE company_guid = $1 AND qty IS NOT NULL AND qty::text != 'NaN'
+         GROUP BY stock_guid, company_guid
+       ) sub
+       WHERE s.name = sub.stock_guid
+         AND s.company_guid = sub.company_guid
+         AND s.opening_qty = 0
+         AND sub.net_qty > 0`,
       [companyGuid]
     );
 
