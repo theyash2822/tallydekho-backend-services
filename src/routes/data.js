@@ -239,17 +239,28 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
       itemGuids = likeItems.map(i => i.voucher_guid);
     }
 
-    // Fetch vouchers from item GUIDs
+    // Fetch vouchers from item GUIDs with enriched line item data
     let itemVouchers = [];
     if (itemGuids.length > 0) {
       const ph = itemGuids.map((_, i) => `$${i + 2}`).join(',');
       const { rows } = await query(
-        `SELECT * FROM vouchers WHERE company_guid = $1
-         AND guid IN (${ph}) AND is_cancelled = FALSE
-         ORDER BY date DESC LIMIT $${itemGuids.length + 2}`,
+        `SELECT v.*,
+           -- Sum Cr items as the voucher amount if voucher amount is 0
+           CASE WHEN v.amount = 0 THEN
+             (SELECT SUM(vi2.amount) FROM voucher_items vi2
+              WHERE vi2.voucher_guid = v.guid AND vi2.company_guid = v.company_guid AND vi2.type = 'Cr')
+           ELSE v.amount END as computed_amount
+         FROM vouchers v
+         WHERE v.company_guid = $1
+         AND v.guid IN (${ph})
+         ORDER BY v.date DESC LIMIT $${itemGuids.length + 2}`,
         [companyGuid, ...itemGuids, pageSize]
       );
-      itemVouchers = rows;
+      // Use computed_amount if present
+      itemVouchers = rows.map(v => ({
+        ...v,
+        amount: v.computed_amount || v.amount,
+      }));
     }
 
     // Priority: party_name results first (they have full data)
