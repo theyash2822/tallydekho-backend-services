@@ -205,6 +205,54 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Ledger Vouchers (vouchers linked to a specific ledger via line items) ──────
+router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
+  const { companyGuid, ledgerName, page = 1, pageSize = 25 } = req.body || {};
+  if (!companyGuid || !ledgerName) return res.status(400).json({ status: false, message: 'companyGuid and ledgerName required' });
+
+  const offset = (page - 1) * pageSize;
+  try {
+    // Get voucher GUIDs that have this ledger as a line item
+    const { rows: items } = await query(
+      `SELECT DISTINCT vi.voucher_guid FROM voucher_items vi
+       WHERE vi.company_guid = $1 AND vi.ledger_name ILIKE $2
+       LIMIT $3 OFFSET $4`,
+      [companyGuid, ledgerName, pageSize, offset]
+    );
+
+    if (items.length === 0) {
+      // Fallback: search by party_name in vouchers
+      const { rows: vouchers } = await query(
+        `SELECT * FROM vouchers WHERE company_guid = $1
+         AND (party_name ILIKE $2 OR voucher_number ILIKE $2)
+         AND is_cancelled = FALSE
+         ORDER BY date DESC LIMIT $3 OFFSET $4`,
+        [companyGuid, `%${ledgerName}%`, pageSize, offset]
+      );
+      const { rows: countRows } = await query(
+        `SELECT COUNT(*) as c FROM vouchers WHERE company_guid = $1
+         AND (party_name ILIKE $2 OR voucher_number ILIKE $2) AND is_cancelled = FALSE`,
+        [companyGuid, `%${ledgerName}%`]
+      );
+      return res.json({ status: true, data: { vouchers, total: parseInt(countRows[0].c), page, source: 'party_name' } });
+    }
+
+    const guids = items.map(i => i.voucher_guid);
+    const placeholders = guids.map((_, i) => `$${i + 2}`).join(',');
+    const { rows: vouchers } = await query(
+      `SELECT * FROM vouchers WHERE company_guid = $1
+       AND guid IN (${placeholders})
+       ORDER BY date DESC`,
+      [companyGuid, ...guids]
+    );
+
+    res.json({ status: true, data: { vouchers, total: vouchers.length, page, source: 'ledger_items' } });
+  } catch (err) {
+    console.error('[ledger-vouchers] Error:', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch ledger vouchers' });
+  }
+});
+
 // ─── Reports ──────────────────────────────────────────────────────────────────
 router.post('/reports/pl', authMiddleware, async (req, res) => {
   const { companyGuid } = req.body || {};
