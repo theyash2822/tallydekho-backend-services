@@ -302,6 +302,78 @@ async function processStockTransactions(data, companyGuid) {
   }
 }
 
+async function processLedgerTransactions(data, companyGuid) {
+  // LedgerTransaction.xml: each record is a ledger line item for a voucher
+  // Fields: Guid (voucher GUID), LedgerName, LedgerGuid, Amount, Date, AlterId
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Group by voucher GUID to compute totals
+    const voucherAmounts = {}; // guid → total amount
+    let itemsSaved = 0;
+
+    for (const r of data) {
+      const voucherGuid = r.Guid || r.GUID || '';
+      if (!voucherGuid) continue;
+
+      const rawAmt = parseFloat(r.Amount || r.AMOUNT || 0);
+      const amount = isNaN(rawAmt) ? 0 : rawAmt;
+      const ledgerName = r.LedgerName || r.LEDGERNAME || null;
+
+      // Insert into voucher_items
+      try {
+        await client.query(`
+          INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, ledger_guid, amount, type)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [
+          voucherGuid, companyGuid,
+          ledgerName,
+          r.LedgerGuid || r.LEDGERGUID || null,
+          Math.abs(amount),
+          amount >= 0 ? 'Cr' : 'Dr',
+        ]);
+        itemsSaved++;
+      } catch {}
+
+      // Accumulate Cr (positive/credit) amounts per voucher for total
+      const absAmount = isNaN(amount) ? 0 : Math.abs(parseFloat(r.Amount || 0));
+      if (absAmount > 0) {
+        if (!voucherAmounts[voucherGuid]) voucherAmounts[voucherGuid] = { cr: 0, dr: 0 };
+        if (amount >= 0) voucherAmounts[voucherGuid].cr += absAmount;
+        else voucherAmounts[voucherGuid].dr += absAmount;
+      }
+    }
+
+    // Update voucher amounts via JOIN on voucher_items (most reliable)
+    await client.query(`
+      UPDATE vouchers v
+      SET amount = sub.total
+      FROM (
+        SELECT voucher_guid, company_guid,
+               SUM(CASE WHEN type = 'Cr' THEN amount ELSE 0 END) as total
+        FROM voucher_items
+        WHERE company_guid = $1
+          AND amount IS NOT NULL
+          AND amount::text != 'NaN'
+          AND amount > 0
+        GROUP BY voucher_guid, company_guid
+      ) sub
+      WHERE v.guid = sub.voucher_guid
+        AND v.company_guid = sub.company_guid
+        AND sub.total > 0
+    `, [companyGuid]);
+
+    await client.query('COMMIT');
+    console.log(`[DB] LedgerTx: ${itemsSaved} items, updated ${Object.keys(voucherAmounts).length} voucher amounts for ${companyGuid}`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[DB] LedgerTx transaction failed:', e.message);
+  } finally {
+    client.release();
+  }
+}
+
 async function processRecords(data, companyGuid, userId, deviceId) {
   // Records stream is a mixed bag from desktop — group by XML type and process each
   const byXml = {};
@@ -325,9 +397,11 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processStocks(records, companyGuid);
     } else if (xml === 'StockTransaction.xml') {
       await processStockTransactions(records, companyGuid);
-    } else if (xml === 'LedgerTransaction.xml' || xml === 'LedgerOpeningBalance.xml') {
-      // Ledger transaction detail — can be stored later; skip for now
-      console.log(`[INGEST] Skipping ${records.length} ${xml} records (not yet implemented)`);
+    } else if (xml === 'LedgerTransaction.xml') {
+      await processLedgerTransactions(records, companyGuid);
+    } else if (xml === 'LedgerOpeningBalance.xml') {
+      // Opening balances already captured in ledger master sync — skip
+      console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);
     } else if (sample?.GUID && (sample?.PARENT !== undefined || sample?.NAME)) {
       await processMasters(records, companyGuid);
     } else {
