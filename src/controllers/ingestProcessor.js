@@ -344,6 +344,206 @@ async function processStockTransactions(data, companyGuid) {
   }
 }
 
+async function processGroupMasters(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      const guid = r.Guid || r.GUID || name + '_' + companyGuid;
+      if (!name) continue;
+      try {
+        await client.query(`
+          INSERT INTO groups (guid, company_guid, name, parent, nature, is_revenue, is_debit_positive, is_primary, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          ON CONFLICT (guid, company_guid) DO UPDATE SET
+            name=EXCLUDED.name, parent=EXCLUDED.parent, nature=EXCLUDED.nature,
+            is_revenue=EXCLUDED.is_revenue, is_debit_positive=EXCLUDED.is_debit_positive,
+            is_primary=EXCLUDED.is_primary, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          guid, companyGuid, name,
+          r.Parent || r.PARENT || null,
+          r.NatureOfGroup || r.NATUREOFGROUP || null,
+          !!(r.IsRevenue === 1 || r.IsRevenue === '1'),
+          !!(r.IsDebitPositive === 1 || r.IsDebitPositive === '1'),
+          !!(r.IsPrimary === 1 || r.IsPrimary === '1'),
+          parseInt(r.AlterId || r.ALTERID || 0), now(),
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] Group insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] Groups: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Groups failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processFullLedger(data, companyGuid) {
+  // Same as processMasters but with extended fields
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      const guid = r.Guid || r.GUID || name + '_' + companyGuid;
+      if (!name) continue;
+      if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
+      if (r.LedgerName && !r.Name) continue;
+
+      const bal = r.ClosingBalance || r.CLOSINGBALANCE || '0';
+      const balStr = String(bal).replace('(-)', '-');
+      const balNum = parseFloat(balStr.replace(/[^0-9.-]/g, '')) || 0;
+      const balType = balStr.includes('-') ? 'Cr' : 'Dr';
+
+      try {
+        await client.query(`
+          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
+            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+          ON CONFLICT (guid, company_guid) DO UPDATE SET
+            name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
+            gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
+            email=EXCLUDED.email, address=EXCLUDED.address,
+            opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
+            balance_type=EXCLUDED.balance_type, is_revenue=EXCLUDED.is_revenue,
+            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          guid, companyGuid, name,
+          r.Parent || r.PARENT || null,
+          r.Alias || r.OnlyAlias || null,
+          r.GSTIN || r.PartyGSTIN || null,
+          r.PAN || r.IncomeTaxNumber || null,
+          r.Phone || r.LedPhone || r.LedgerPhone || null,
+          r.Email || null,
+          r.Address || null,
+          parseFloat(String(r.OpeningBalance || '0').replace(/[^0-9.-]/g, '')) || 0,
+          Math.abs(balNum), balType,
+          !!(r.IsRevenue === 1 || r.IsRevenue === '1'),
+          parseInt(r.AlterId || r.ALTERID || 0), now(),
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] FullLedger insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] FullLedger: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processVoucherInventoryItems(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const voucherGuid = r.VoucherGuid || r.Guid || r.GUID || '';
+      const itemName = r.StockItemName || r.STOCKITEMNAME || '';
+      if (!voucherGuid || !itemName) continue;
+
+      const qtyRaw = String(r.ActualQty || r.ACTUALQTY || '0');
+      const qtyMatch = qtyRaw.match(/^-?[\d.]+/);
+      const qty = qtyMatch ? parseFloat(qtyMatch[0]) : 0;
+
+      const billedRaw = String(r.BilledQty || r.BILLEDQTY || '0');
+      const billedMatch = billedRaw.match(/^-?[\d.]+/);
+      const billedQty = billedMatch ? parseFloat(billedMatch[0]) : 0;
+
+      const rawAmt = parseFloat(r.Amount || r.AMOUNT || 0);
+      const amount = isNaN(rawAmt) ? 0 : rawAmt;
+
+      try {
+        await client.query(`
+          INSERT INTO voucher_inventory_items
+            (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        `, [
+          voucherGuid, companyGuid, itemName,
+          r.StockItemGuid || null,
+          Math.abs(qty), Math.abs(billedQty),
+          parseFloat(r.Rate || 0), Math.abs(amount),
+          parseFloat(r.Discount || 0),
+          r.GodownName || null, r.BatchName || null,
+          r.Unit || null, r.HSN || null,
+          parseInt(r.AlterId || 0),
+        ]);
+        saved++;
+      } catch {}
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] VoucherInventoryItems failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processGSTDetails(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const voucherGuid = r.VoucherGuid || r.Guid || r.GUID || '';
+      if (!voucherGuid) continue;
+      const rawAmt = (f) => { const v = parseFloat(f || 0); return isNaN(v) ? 0 : v; };
+      try {
+        await client.query(`
+          INSERT INTO gst_voucher_details
+            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
+            taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
+            sgst_amount=EXCLUDED.sgst_amount, igst_amount=EXCLUDED.igst_amount,
+            irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          voucherGuid, companyGuid,
+          r.VoucherNumber || null, r.VoucherTypeName || null,
+          normalizeDate(r.Date || r.DATE),
+          r.PartyLedgerName || null, r.GSTRegType || null,
+          r.PlaceOfSupply || null,
+          rawAmt(r.TaxableAmount), rawAmt(r.CGSTAmount),
+          rawAmt(r.SGSTAmount), rawAmt(r.IGSTAmount),
+          r.IRN || null,
+          parseInt(r.AlterId || 0), now(),
+        ]);
+        saved++;
+      } catch {}
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processBillOutstanding(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const ledgerName = r.LedgerName || r.LEDGERNAME || '';
+      const billName = r.BillName || r.BILLNAME || '';
+      if (!ledgerName) continue;
+      try {
+        await client.query(`
+          INSERT INTO bill_outstanding
+            (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        `, [
+          r.VoucherGuid || null, companyGuid, ledgerName, billName,
+          normalizeDate(r.BillDate), normalizeDate(r.DueDate),
+          parseFloat(r.Amount || 0), parseFloat(r.PendingAmount || 0),
+          r.BillType || null, parseInt(r.AlterId || 0), now(),
+        ]);
+        saved++;
+      } catch {}
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BillOutstanding failed:', e.message); }
+  finally { client.release(); }
+}
+
 async function processStockOpeningBalance(data, companyGuid) {
   // StockOpeningBalance.xml: Name, OpeningBalance (numeric), OpeningRate, OpeningValue
   const client = await getClient();
@@ -531,6 +731,16 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processLedgerTransactions(records, companyGuid);
     } else if (xml === 'StockOpeningBalance.xml') {
       await processStockOpeningBalance(records, companyGuid);
+    } else if (xml === 'VoucherInventoryDetail.xml') {
+      await processVoucherInventoryItems(records, companyGuid);
+    } else if (xml === 'GSTDetails.xml') {
+      await processGSTDetails(records, companyGuid);
+    } else if (xml === 'GroupMaster.xml') {
+      await processGroupMasters(records, companyGuid);
+    } else if (xml === 'FullLedger.xml') {
+      await processFullLedger(records, companyGuid);
+    } else if (xml === 'BillOutstanding.xml') {
+      await processBillOutstanding(records, companyGuid);
     } else if (xml === 'LedgerOpeningBalance.xml') {
       // Opening balances captured in ledger master sync
       console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);

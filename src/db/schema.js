@@ -211,6 +211,86 @@ export async function initSchema() {
         completed_at  BIGINT
       );
 
+      -- Group masters
+      CREATE TABLE IF NOT EXISTS groups (
+        id            SERIAL PRIMARY KEY,
+        guid          TEXT NOT NULL,
+        company_guid  TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        parent        TEXT,
+        nature        TEXT,
+        is_revenue    BOOLEAN DEFAULT FALSE,
+        is_debit_positive BOOLEAN DEFAULT FALSE,
+        is_primary    BOOLEAN DEFAULT FALSE,
+        alter_id      INTEGER DEFAULT 0,
+        synced_at     BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(guid, company_guid)
+      );
+
+      -- Voucher inventory items (line items with qty, rate, item)
+      CREATE TABLE IF NOT EXISTS voucher_inventory_items (
+        id              SERIAL PRIMARY KEY,
+        voucher_guid    TEXT NOT NULL,
+        company_guid    TEXT NOT NULL,
+        stock_item_name TEXT,
+        stock_item_guid TEXT,
+        actual_qty      DECIMAL(15,4) DEFAULT 0,
+        billed_qty      DECIMAL(15,4) DEFAULT 0,
+        rate            DECIMAL(15,4) DEFAULT 0,
+        amount          DECIMAL(15,4) DEFAULT 0,
+        discount        DECIMAL(8,4)  DEFAULT 0,
+        godown_name     TEXT,
+        batch_name      TEXT,
+        unit            TEXT,
+        hsn             TEXT,
+        alter_id        INTEGER DEFAULT 0
+      );
+
+      -- GST voucher details
+      CREATE TABLE IF NOT EXISTS gst_voucher_details (
+        id              SERIAL PRIMARY KEY,
+        voucher_guid    TEXT NOT NULL,
+        company_guid    TEXT NOT NULL,
+        voucher_number  TEXT,
+        voucher_type    TEXT,
+        date            TEXT,
+        party_name      TEXT,
+        gst_reg_type    TEXT,
+        place_of_supply TEXT,
+        taxable_amount  DECIMAL(15,4) DEFAULT 0,
+        cgst_amount     DECIMAL(15,4) DEFAULT 0,
+        sgst_amount     DECIMAL(15,4) DEFAULT 0,
+        igst_amount     DECIMAL(15,4) DEFAULT 0,
+        irn             TEXT,
+        alter_id        INTEGER DEFAULT 0,
+        synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(voucher_guid, company_guid)
+      );
+
+      -- Bill-wise outstanding
+      CREATE TABLE IF NOT EXISTS bill_outstanding (
+        id              SERIAL PRIMARY KEY,
+        voucher_guid    TEXT,
+        company_guid    TEXT NOT NULL,
+        ledger_name     TEXT,
+        bill_name       TEXT,
+        bill_date       TEXT,
+        due_date        TEXT,
+        amount          DECIMAL(15,4) DEFAULT 0,
+        pending_amount  DECIMAL(15,4) DEFAULT 0,
+        bill_type       TEXT,
+        alter_id        INTEGER DEFAULT 0,
+        synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+
+      -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_vii_voucher        ON voucher_inventory_items(voucher_guid);
+      CREATE INDEX IF NOT EXISTS idx_vii_company        ON voucher_inventory_items(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_gst_company        ON gst_voucher_details(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_bill_company       ON bill_outstanding(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_bill_ledger        ON bill_outstanding(ledger_name);
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_ledgers_company   ON ledgers(company_guid);
       CREATE INDEX IF NOT EXISTS idx_vouchers_company  ON vouchers(company_guid);
