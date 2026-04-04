@@ -57,6 +57,10 @@ async function processMasters(data, companyGuid) {
       const parent = r.PARENT || r.parent || '';
       if (!name || name.length === 0) continue;
       if (r.BASEUNITS || r.UNIT || r.COLLECTION_NAME === 'StockItem') continue;
+      // Skip LedgerTransaction records — they have LedgerName not NAME
+      if (r.LedgerName && !r.NAME) continue;
+      // Skip records that look like voucher line items (have Amount but no parent group)
+      if (r.Amount !== undefined && !r.PARENT && !r.parent && r.LedgerName) continue;
 
       const bal = r.CLOSINGBALANCE || r.OPENINGBALANCE || '0';
       const balStr = String(bal);
@@ -530,10 +534,13 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'LedgerOpeningBalance.xml') {
       // Opening balances captured in ledger master sync
       console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);
-    } else if (sample?.GUID && (sample?.PARENT !== undefined || sample?.NAME)) {
+    } else if (xml === 'Ledger.xml' || xml === 'Master.xml' || (sample?.GUID && sample?.NAME && !sample?.LedgerName)) {
+      // Only process as masters if it's a proper ledger master record (has NAME, not LedgerName)
       await processMasters(records, companyGuid);
     } else {
-      console.log(`[INGEST] Unknown XML type: ${xml}, ${records.length} records — skipping`);
+      // LedgerTransaction.xml records have LedgerName field — already handled above
+      // Unknown XML types — skip to prevent data pollution
+      console.log(`[INGEST] Skipping ${records.length} records from unknown XML: ${xml}`);
     }
   }
 }
