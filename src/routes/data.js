@@ -205,6 +205,38 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Single Voucher Detail (with line items) ────────────────────────────────
+router.post('/voucher-detail', authMiddleware, async (req, res) => {
+  const { companyGuid, voucherId } = req.body || {};
+  if (!companyGuid || !voucherId) return res.status(400).json({ status: false, message: 'companyGuid and voucherId required' });
+
+  try {
+    const { rows: vouchers } = await query(
+      'SELECT * FROM vouchers WHERE company_guid = $1 AND id = $2',
+      [companyGuid, voucherId]
+    );
+    if (!vouchers[0]) return res.status(404).json({ status: false, message: 'Voucher not found' });
+
+    const voucher = vouchers[0];
+
+    // Get line items
+    const { rows: items } = await query(
+      `SELECT * FROM voucher_items WHERE company_guid = $1 AND voucher_guid = $2
+       ORDER BY CASE WHEN type = 'Dr' THEN 0 ELSE 1 END, amount DESC`,
+      [companyGuid, voucher.guid]
+    );
+
+    // Get company info
+    const { rows: companies } = await query('SELECT * FROM companies WHERE guid = $1', [companyGuid]);
+    const company = companies[0];
+
+    res.json({ status: true, data: { voucher, items, company } });
+  } catch (err) {
+    console.error('[voucher-detail] Error:', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch voucher' });
+  }
+});
+
 // ─── Ledger Vouchers (vouchers linked to a specific ledger via line items or party name) ───
 router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
   const { companyGuid, ledgerName, page = 1, pageSize = 25 } = req.body || {};
