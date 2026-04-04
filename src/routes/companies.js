@@ -1,28 +1,98 @@
 import { Router } from 'express';
-import { getDb } from '../db/schema.js';
+import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 
 const router = Router();
+const now = () => Math.floor(Date.now() / 1000);
 
-// GET /app/companies — list companies for logged-in user
-router.get('/companies', authMiddleware, (req, res) => {
-  const db = getDb();
-  const companies = db.prepare('SELECT * FROM companies WHERE user_id = ? ORDER BY name').all(req.user.userId);
-  res.json({ status: true, data: { companies } });
+// GET /app/companies
+router.get('/companies', authMiddleware, async (req, res) => {
+  try {
+    const { rows: companies } = await query(
+      'SELECT * FROM companies WHERE user_id = $1 ORDER BY name',
+      [req.user.userId]
+    );
+
+    const companiesWithYears = companies.map(c => {
+      const years = [];
+      const fyStart = c.fy_start;
+      const fyEnd   = c.fy_end;
+
+      if (fyStart && fyEnd) {
+        const startYear = String(fyStart).replace(/-/g, '').slice(0, 4);
+        const endYear   = String(fyEnd).replace(/-/g, '').slice(0, 4);
+        const name = `${startYear}-${String(endYear).slice(2)}`;
+        years.push({ uniqueId: `${c.guid}_${startYear}`, name, startDate: fyStart, endDate: fyEnd });
+      } else {
+        const now = new Date();
+        const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+        years.push({
+          uniqueId: `${c.guid}_${fyYear}`,
+          name: `${fyYear}-${String(fyYear + 1).slice(2)}`,
+          startDate: `${fyYear}-04-01`,
+          endDate: `${fyYear + 1}-03-31`,
+        });
+      }
+      return { ...c, years };
+    });
+
+    res.json({ status: true, data: { companies: companiesWithYears } });
+  } catch (err) {
+    console.error('[companies] Error:', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch companies' });
+  }
 });
 
-// Internal: upsert company (called from ingest pipeline)
-export function upsertCompany(companyData, userId, deviceId) {
-  const db = getDb();
-  db.prepare(`
+// GET /app/pairing-device
+router.get('/pairing-device', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [req.user.userId]
+    );
+    const device = rows[0];
+    if (!device) return res.json({ status: true, data: { device: null, isPaired: false } });
+    res.json({ status: true, data: { device: { id: device.device_id, name: device.name, os: device.os, lastSeen: device.last_seen }, isPaired: true } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to fetch device' });
+  }
+});
+
+// GET /app/paired-device — alias
+router.get('/paired-device', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [req.user.userId]
+    );
+    const device = rows[0];
+    if (!device) return res.json({ status: true, data: { device: null, isPaired: false } });
+    res.json({ status: true, data: { device: { id: device.device_id, name: device.name, os: device.os, lastSeen: device.last_seen }, isPaired: true } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to fetch device' });
+  }
+});
+
+// Internal upsert (called from ingest)
+export async function upsertCompany(companyData, userId, deviceId) {
+  await query(`
     INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, address, state, fy_start, fy_end, synced_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-    ON CONFLICT(guid) DO UPDATE SET
-      name=excluded.name, formal_name=excluded.formal_name, gstin=excluded.gstin,
-      address=excluded.address, state=excluded.state, synced_at=unixepoch()
-  `).run(companyData.guid, userId, deviceId, companyData.name, companyData.formalName || companyData.name,
-    companyData.gstin || null, companyData.address || null, companyData.state || null,
-    companyData.fyStart || null, companyData.fyEnd || null);
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (guid) DO UPDATE SET
+      name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
+      gstin = EXCLUDED.gstin, address = EXCLUDED.address,
+      state = EXCLUDED.state, synced_at = EXCLUDED.synced_at
+  `, [
+    companyData.guid, userId, deviceId,
+    companyData.name || companyData.NAME || 'Unknown',
+    companyData.formalName || companyData.name || '',
+    companyData.gstin || null,
+    companyData.address || null,
+    companyData.state || null,
+    companyData.fyStart || null,
+    companyData.fyEnd || null,
+    now(),
+  ]);
 }
 
 export default router;

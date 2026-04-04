@@ -32,6 +32,15 @@ export function setupSocket(io) {
       console.log(`[WS] registered desktop: ${deviceId}`);
     });
 
+    // Mobile emits this on manual logout so server cleans up immediately
+    socket.on('client-disconnect', () => {
+      console.log(`[WS] client-disconnect from ${socket.id} (manual logout)`);
+      for (const [key, s] of connectedClients.entries()) {
+        if (s.id === socket.id) connectedClients.delete(key);
+      }
+      socket.disconnect(true);
+    });
+
     socket.on('disconnect', () => {
       console.log(`[WS] disconnected: ${socket.id}`);
       for (const [key, s] of connectedClients.entries()) {

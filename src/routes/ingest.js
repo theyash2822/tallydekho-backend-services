@@ -1,199 +1,171 @@
-// Ingest pipeline — receives chunked data from Desktop app
-// Matches Desktop's xml.js upload protocol exactly
+// Ingest pipeline — receives chunked data from Desktop
 import { Router } from 'express';
-import { getDb } from '../db/schema.js';
+import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
 import { processIngestedData } from '../controllers/ingestProcessor.js';
-// socketService injected at runtime to avoid circular import
+
 let _socketService = null;
 export function setSocketService(s) { _socketService = s; }
 const socketService = { notifySynced: (...args) => _socketService?.notifySynced(...args) };
 
 const router = Router();
+const now = () => Math.floor(Date.now() / 1000);
 
-// POST /desktop/init-sync — Desktop calls before sync
-router.post('/desktop/init-sync', (req, res) => {
+// POST /desktop/init-sync
+router.post('/desktop/init-sync', async (req, res) => {
   const deviceId = req.headers['device-id'];
   const { companies } = req.body || {};
   console.log(`[SYNC] init-sync from device ${deviceId}, companies: ${companies?.length}`);
 
-  const db = getDb();
-  const device = db.prepare('SELECT * FROM devices WHERE device_id=?').get(deviceId);
-  const userId = device?.user_id;
+  try {
+    const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
+    const device = devices[0];
+    const userId = device?.user_id;
 
-  if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
+    if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
 
-  // Build alter IDs response (tells desktop what data is already synced)
-  const alterIds = {};
-  if (companies) {
-    companies.forEach(c => {
-      const latestLedger = db.prepare('SELECT MAX(alter_id) as max FROM ledgers WHERE company_guid=?').get(c.guid);
-      const latestVoucher = db.prepare('SELECT MAX(alter_id) as max FROM vouchers WHERE company_guid=?').get(c.guid);
-      alterIds[c.guid] = {
-        master: latestLedger?.max || 0,
-        voucher: {},
-      };
+    const alterIds = {};
+    if (companies) {
+      for (const c of companies) {
+        const { rows: lRows } = await query('SELECT MAX(alter_id) as max FROM ledgers WHERE company_guid = $1', [c.guid]);
+        alterIds[c.guid] = { master: lRows[0]?.max || 0, voucher: {} };
 
-      // Save company to DB
-      try {
-        db.prepare(`
-          INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-          ON CONFLICT(guid) DO UPDATE SET
-            name=excluded.name, formal_name=excluded.formal_name,
-            gstin=excluded.gstin, fy_start=excluded.fy_start,
-            fy_end=excluded.fy_end, synced_at=unixepoch()
-        `).run(
-          c.guid, userId, deviceId,
-          c.name || c.NAME || 'Unknown Company',
-          c.formalName || c.FORMALNAME || c.name || '',
-          c.gstin || c.GSTIN || null,
-          c.startingFrom || c.STARTINGFROM || null,
-          c.endingAt || c.ENDINGAT || null
-        );
-        console.log(`[DB] Company saved: ${c.name || c.guid}`);
-      } catch(e) {
-        console.warn('[DB] Company save failed:', e.message);
+        try {
+          await query(`
+            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (guid) DO UPDATE SET
+              name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
+              gstin = EXCLUDED.gstin, fy_start = EXCLUDED.fy_start,
+              fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at
+          `, [c.guid, userId, deviceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
+              c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now()]);
+          console.log(`[DB] Company saved: ${c.name || c.guid}`);
+        } catch (e) {
+          console.warn('[DB] Company save failed:', e.message);
+        }
       }
-    });
-  }
+    }
 
-  // Year IDs mapping
-  const yearIds = {};
-  if (companies) {
-    companies.forEach(c => {
-      yearIds[c.id || c.guid] = {};
-      (c.allYears || c.years || []).forEach(y => {
-        yearIds[c.id || c.guid][y.finYear || y] = `${c.guid}_${y.finYear || y}`;
+    const yearIds = {};
+    if (companies) {
+      companies.forEach(c => {
+        yearIds[c.id || c.guid] = {};
+        (c.allYears || c.years || []).forEach(y => {
+          yearIds[c.id || c.guid][y.finYear || y] = `${c.guid}_${y.finYear || y}`;
+        });
       });
-    });
-  }
+    }
 
-  res.json({ status: true, data: { alterIds, yearIds, uploadId: uuid() } });
+    res.json({ status: true, data: { alterIds, yearIds, uploadId: uuid() } });
+  } catch (err) {
+    console.error('[SYNC] init-sync error:', err.message);
+    res.status(500).json({ status: false, message: 'Sync init failed' });
+  }
 });
 
-// POST /ingest/init — Start a chunked upload
-router.post('/ingest/init', (req, res) => {
+// POST /ingest/init
+router.post('/ingest/init', async (req, res) => {
   const deviceId = req.headers['device-id'];
   const uploadId = uuid();
-  const db = getDb();
-  const device = db.prepare('SELECT * FROM devices WHERE device_id=?').get(deviceId);
-  db.prepare('INSERT INTO ingest_uploads (id, device_id) VALUES (?, ?)').run(uploadId, deviceId);
-  console.log(`[INGEST] init upload ${uploadId} from device ${deviceId}`);
-  res.json({ status: true, data: { uploadId } });
+  try {
+    await query('INSERT INTO ingest_uploads (id, device_id) VALUES ($1, $2)', [uploadId, deviceId]);
+    console.log(`[INGEST] init upload ${uploadId} from device ${deviceId}`);
+    res.json({ status: true, data: { uploadId } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Init failed' });
+  }
 });
 
-// POST /ingest/chunk — Receive data chunk
+// POST /ingest/chunk
 router.post('/ingest/chunk', async (req, res) => {
-  const uploadId = req.headers['upload-id'];
+  const uploadId  = req.headers['upload-id'];
   const streamName = req.headers['stream-name'];
   const chunkIndex = parseInt(req.headers['chunk-index'] || '0');
-  const deviceId = req.headers['device-id'];
+  const deviceId  = req.headers['device-id'];
 
   if (!uploadId || !streamName) return res.status(400).json({ status: false, message: 'Missing headers' });
 
-  const db = getDb();
-  const device = db.prepare('SELECT * FROM devices WHERE device_id=?').get(deviceId);
-  const userId = device?.user_id;
-
-  // Parse the incoming data — desktop sends ndjson or json
-  let data;
   try {
+    const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
+    const device = devices[0];
+    const userId = device?.user_id;
+
+    let data;
     const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body;
     if (typeof raw === 'string') {
-      // Try NDJSON first (one JSON object per line)
       const lines = raw.trim().split('\n').filter(Boolean);
-      if (lines.length > 1) {
-        data = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-      } else {
-        data = JSON.parse(raw);
-      }
+      data = lines.length > 1
+        ? lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+        : JSON.parse(raw);
     } else {
       data = raw;
     }
-  } catch {
-    data = req.body;
-  }
+    if (!Array.isArray(data)) data = data ? [data] : [];
 
-  if (!Array.isArray(data)) data = data ? [data] : [];
-
-  // Extract companyGuid from data items (desktop embeds COMPANY_GUID in each record)
-  let companyGuid = req.headers['company-guid'];
-  if (!companyGuid && data.length > 0) {
-    companyGuid = data[0]?.COMPANY_GUID || data[0]?.company_guid || null;
-  }
-
-  // Also try to get from upload record
-  if (!companyGuid) {
-    const upload = db.prepare('SELECT company_guid FROM ingest_uploads WHERE id=?').get(uploadId);
-    companyGuid = upload?.company_guid;
-  }
-
-  // Save companyGuid to upload record if we found it
-  if (companyGuid) {
-    db.prepare('UPDATE ingest_uploads SET company_guid=? WHERE id=?').run(companyGuid, uploadId);
-  }
-
-  console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${companyGuid || 'unknown'} | records: ${data.length}`);
-
-  // Process chunk immediately
-  if (data.length > 0) {
-    try {
-      await processIngestedData(db, streamName, data, companyGuid, userId, deviceId);
-    } catch (err) {
-      console.error('[INGEST] Processing error:', err.message);
+    let companyGuid = req.headers['company-guid'];
+    if (!companyGuid && data.length > 0) {
+      companyGuid = data[0]?.COMPANY_GUID || data[0]?.company_guid || null;
     }
+    if (!companyGuid) {
+      const { rows } = await query('SELECT company_guid FROM ingest_uploads WHERE id = $1', [uploadId]);
+      companyGuid = rows[0]?.company_guid;
+    }
+    if (companyGuid) {
+      await query('UPDATE ingest_uploads SET company_guid = $1 WHERE id = $2', [companyGuid, uploadId]);
+    }
+
+    console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${companyGuid || 'unknown'} | records: ${data.length}`);
+
+    if (data.length > 0) {
+      await processIngestedData(streamName, data, companyGuid, userId, deviceId);
+    }
+
+    await query('UPDATE ingest_uploads SET chunks = chunks + 1 WHERE id = $1', [uploadId]);
+    res.json({ status: true, data: { received: true, chunkIndex } });
+  } catch (err) {
+    console.error('[INGEST] chunk error:', err.message);
+    res.status(500).json({ status: false, message: 'Chunk processing failed' });
   }
-
-  // Update chunk count
-  db.prepare('UPDATE ingest_uploads SET chunks=chunks+1 WHERE id=?').run(uploadId);
-
-  res.json({ status: true, data: { received: true, chunkIndex } });
 });
 
-// POST /ingest/complete — Finalize upload + notify mobile/web via WebSocket
+// POST /ingest/complete
 router.post('/ingest/complete', async (req, res) => {
   let body = req.body;
-  if (Buffer.isBuffer(body)) {
-    try { body = JSON.parse(body.toString()); } catch { body = {}; }
-  }
+  if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
   const { uploadId } = body || {};
   let { companyGuid } = body || {};
   const deviceId = req.headers['device-id'];
 
-  const db = getDb();
-
-  // Get companyGuid from upload record if not in body
-  if (!companyGuid && uploadId) {
-    const upload = db.prepare('SELECT company_guid FROM ingest_uploads WHERE id=?').get(uploadId);
-    companyGuid = upload?.company_guid;
-  }
-
-  db.prepare('UPDATE ingest_uploads SET status=?, completed_at=unixepoch() WHERE id=?').run('complete', uploadId || '');
-  db.prepare('UPDATE devices SET last_seen=unixepoch() WHERE device_id=?').run(deviceId);
-
-  const device = db.prepare('SELECT * FROM devices WHERE device_id=?').get(deviceId);
-  const userId = device?.user_id;
-
-  if (companyGuid) {
-    db.prepare('UPDATE companies SET synced_at=unixepoch() WHERE guid=?').run(companyGuid);
-    db.prepare(`INSERT INTO sync_log (company_guid, device_id, stream, status, completed_at)
-      VALUES (?, ?, 'complete', 'success', unixepoch())`).run(companyGuid, deviceId);
-  }
-
-  console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
-
-  // 🔔 Notify mobile + web portal via WebSocket
-  if (userId) {
-    try {
-      socketService.notifySynced(userId, companyGuid);
-      console.log(`[WS] Emitted 'synced' to user ${userId}`);
-    } catch (e) {
-      console.warn('[WS] Could not emit synced:', e.message);
+  try {
+    if (!companyGuid && uploadId) {
+      const { rows } = await query('SELECT company_guid FROM ingest_uploads WHERE id = $1', [uploadId]);
+      companyGuid = rows[0]?.company_guid;
     }
-  }
 
-  res.json({ status: true, message: 'Sync complete' });
+    await query('UPDATE ingest_uploads SET status = $1, completed_at = $2 WHERE id = $3', ['complete', now(), uploadId || '']);
+    await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
+
+    const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
+    const userId = devices[0]?.user_id;
+
+    if (companyGuid) {
+      await query('UPDATE companies SET synced_at = $1 WHERE guid = $2', [now(), companyGuid]);
+      await query(`INSERT INTO sync_log (company_guid, device_id, stream, status, completed_at) VALUES ($1, $2, 'complete', 'success', $3)`,
+        [companyGuid, deviceId, now()]);
+    }
+
+    console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
+
+    if (userId) {
+      try { socketService.notifySynced(userId, companyGuid); } catch (e) { console.warn('[WS] emit failed:', e.message); }
+    }
+
+    res.json({ status: true, message: 'Sync complete' });
+  } catch (err) {
+    console.error('[INGEST] complete error:', err.message);
+    res.status(500).json({ status: false, message: 'Complete failed' });
+  }
 });
 
 export default router;
