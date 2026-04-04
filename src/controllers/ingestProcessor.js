@@ -1,6 +1,6 @@
 // Ingest processor — PostgreSQL version
 // Handles: masters (ledgers, stocks), vouchers, stock transactions
-import { getClient } from '../db/schema.js';
+import { getClient, query as dbQuery } from '../db/schema.js';
 
 // Normalize Tally date: '20240401' → '2024-04-01'
 function normalizeDate(val) {
@@ -110,8 +110,8 @@ async function processStocks(data, companyGuid) {
     let saved = 0;
 
     for (const r of data) {
-      const name = r.NAME || r.name || '';
-      const guid = r.GUID || r.guid || name + '_' + companyGuid;
+      const name = r.Name || r.NAME || r.name || '';
+      const guid = r.Guid || r.GUID || r.guid || name + '_' + companyGuid;
       if (!name) continue;
 
       try {
@@ -127,15 +127,17 @@ async function processStocks(data, companyGuid) {
             synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, name,
-          r.ALIAS || null,
-          r.CATEGORY || r.STOCKCATEGORY || null,
-          r.PARENT || r.GROUP || null,
-          r.BASEUNITS || r.UNIT || r.unit || 'Pcs',
-          r.HSNDETAILS?.[0]?.HSNCODE || r.HSN || null,
-          parseFloat(r.GSTRATE || r.TAXRATE || 18),
-          parseFloat(r.CLOSINGBALANCE || r.CLOSINGQTY || 0),
-          parseFloat(r.CLOSINGRATE || r.RATE || 0),
-          parseFloat(r.CLOSINGVALUE || r.VALUE || 0),
+          r.OnlyAlias || r.ALIAS || null,
+          r.Category || r.CATEGORY || r.STOCKCATEGORY || null,
+          r.Parent || r.PARENT || r.GROUP || null,
+          r.BaseUnits || r.BASEUNITS || r.UNIT || r.unit || 'Pcs',
+          r.Hsncode || r.HSNDETAILS?.[0]?.HSNCODE || r.HSN || null,
+          parseFloat(r.IGSTRate || r.GSTRATE || r.TAXRATE || 18),
+          // StockItem.xml has OpeningBalance not ClosingBalance
+          // closing_qty will be computed from StockTransaction stream
+          parseFloat(r.CLOSINGBALANCE || r.CLOSINGQTY || r.OpeningBalance || 0),
+          parseFloat(r.OpeningRate || r.CLOSINGRATE || r.RATE || 0),
+          parseFloat(r.OpeningValue || r.CLOSINGVALUE || r.VALUE || 0),
           parseFloat(r.REORDERLEVEL || 0),
           parseInt(r.AlterId || r.ALTERID || 0),
           now(),
@@ -271,21 +273,33 @@ async function processStockTransactions(data, companyGuid) {
     let saved = 0;
 
     for (const r of data) {
+      // StockTransaction.xml fields: StockItemName, StockItemGuid, ActualQty, Amount, GodownName
+      const stockName = r.StockItemName || r.STOCKITEMNAME || r.stockGuid || '';
+      const stockGuid = r.StockItemGuid || r.STOCKITEMGUID || stockName;
+      // ActualQty can come as '21 Nos' or '-21' or 21 — extract numeric part
+      const qtyRaw = String(r.ActualQty || r.ACTUALQTY || r.qty || '0');
+      const qtyMatch = qtyRaw.match(/^-?[\d.]+/);
+      const rawQty = qtyMatch ? parseFloat(qtyMatch[0]) : 0;
+      const qty = isNaN(rawQty) ? 0 : rawQty;
+      const rawAmt    = parseFloat(r.Amount || r.AMOUNT || r.value || 0);
+      const amount    = isNaN(rawAmt) ? 0 : rawAmt;
+      const type      = qty >= 0 ? 'inward' : 'outward';
+
       try {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         `, [
-          r.STOCKITEMNAME || r.stockGuid || '',
+          stockName,  // use name as key (StockItem.xml stores name as guid too)
           companyGuid,
-          r.VCHGUID || r.voucherGuid || null,
+          r.Guid || r.GUID || null,
           r.VOUCHERTYPENAME || null,
           normalizeDate(r.Date || r.DATE || r.date),
-          parseFloat(r.ACTUALQTY || r.qty || 0),
-          parseFloat(r.RATE || r.rate || 0),
-          parseFloat(r.AMOUNT || r.value || 0),
-          r.ISDEEMEDPOSITIVE === 'Yes' ? 'inward' : 'outward',
-          r.GODOWNNAME || r.warehouse || null,
+          Math.abs(qty),
+          0,
+          Math.abs(amount),
+          type,
+          r.GodownName || r.GODOWNNAME || null,
           now(),
         ]);
         saved++;
@@ -299,6 +313,95 @@ async function processStockTransactions(data, companyGuid) {
     console.error('[DB] StockTx transaction failed:', e.message);
   } finally {
     client.release();
+  }
+
+  // Compute closing qty from transactions and update stocks
+  try {
+    const result = await dbQuery(`
+      UPDATE stocks s
+      SET closing_qty = sub.net_qty,
+          closing_value = sub.net_value
+      FROM (
+        SELECT stock_guid, company_guid,
+               SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty,
+               SUM(CASE WHEN type = 'inward' THEN value ELSE -value END) as net_value
+        FROM stock_transactions
+        WHERE company_guid = $1
+          AND qty IS NOT NULL
+          AND qty::text != 'NaN'
+        GROUP BY stock_guid, company_guid
+      ) sub
+      WHERE s.name = sub.stock_guid
+        AND s.company_guid = sub.company_guid
+    `, [companyGuid]);
+    console.log(`[DB] StockTx: updated ${result.rowCount} stock closing_qty for ${companyGuid}`);
+  } catch (e) {
+    console.error('[DB] Stock closing_qty update failed:', e.message);
+  }
+}
+
+async function processStockOpeningBalance(data, companyGuid) {
+  // StockOpeningBalance.xml: Name, OpeningBalance (numeric), OpeningRate, OpeningValue
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let updated = 0;
+
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+
+      const openQty  = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
+      const openRate = parseFloat(r.OpeningRate    || r.OPENINGRATE    || 0);
+      const openVal  = parseFloat(r.OpeningValue   || r.OPENINGVALUE   || 0);
+
+      if (isNaN(openQty)) continue;
+
+      try {
+        const result = await client.query(
+          `UPDATE stocks SET opening_qty = $1, opening_rate = $2
+           WHERE name = $3 AND company_guid = $4`,
+          [openQty, openRate, name, companyGuid]
+        );
+        if (result.rowCount > 0) updated++;
+      } catch {}
+    }
+
+    await client.query('COMMIT');
+    console.log(`[DB] StockOpening: updated ${updated}/${data.length} for ${companyGuid}`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[DB] StockOpening failed:', e.message);
+  } finally {
+    client.release();
+  }
+
+  // Recompute closing_qty = opening_qty + net transactions
+  try {
+    await dbQuery(`
+      UPDATE stocks s
+      SET closing_qty = s.opening_qty + COALESCE(sub.net_qty, 0),
+          closing_value = (s.opening_qty + COALESCE(sub.net_qty, 0)) * NULLIF(s.opening_rate, 0)
+      FROM (
+        SELECT stock_guid, company_guid,
+               SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
+        FROM stock_transactions
+        WHERE company_guid = $1 AND qty IS NOT NULL AND qty::text != 'NaN'
+        GROUP BY stock_guid, company_guid
+      ) sub
+      WHERE s.name = sub.stock_guid AND s.company_guid = sub.company_guid AND s.company_guid = $1
+    `, [companyGuid]);
+
+    // Also update stocks with no transactions (closing = opening)
+    await dbQuery(
+      `UPDATE stocks SET closing_qty = opening_qty, closing_value = opening_qty * NULLIF(opening_rate, 0)
+       WHERE company_guid = $1 AND closing_qty = 0 AND opening_qty > 0`,
+      [companyGuid]
+    );
+
+    console.log(`[DB] StockOpening: closing_qty recomputed for ${companyGuid}`);
+  } catch (e) {
+    console.error('[DB] Stock closing_qty recompute failed:', e.message);
   }
 }
 
@@ -345,8 +448,18 @@ async function processLedgerTransactions(data, companyGuid) {
       }
     }
 
-    // Update voucher amounts via JOIN on voucher_items (most reliable)
-    await client.query(`
+    await client.query('COMMIT');
+    console.log(`[DB] LedgerTx: ${itemsSaved} items saved for ${companyGuid}`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[DB] LedgerTx transaction failed:', e.message);
+  } finally {
+    client.release();
+  }
+
+  // Update voucher amounts AFTER items are committed — separate query
+  try {
+    const result = await dbQuery(`
       UPDATE vouchers v
       SET amount = sub.total
       FROM (
@@ -363,14 +476,9 @@ async function processLedgerTransactions(data, companyGuid) {
         AND v.company_guid = sub.company_guid
         AND sub.total > 0
     `, [companyGuid]);
-
-    await client.query('COMMIT');
-    console.log(`[DB] LedgerTx: ${itemsSaved} items, updated ${Object.keys(voucherAmounts).length} voucher amounts for ${companyGuid}`);
+    console.log(`[DB] LedgerTx: updated ${result.rowCount} voucher amounts for ${companyGuid}`);
   } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('[DB] LedgerTx transaction failed:', e.message);
-  } finally {
-    client.release();
+    console.error('[DB] Voucher amount update failed:', e.message);
   }
 }
 
@@ -399,8 +507,10 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processStockTransactions(records, companyGuid);
     } else if (xml === 'LedgerTransaction.xml') {
       await processLedgerTransactions(records, companyGuid);
+    } else if (xml === 'StockOpeningBalance.xml') {
+      await processStockOpeningBalance(records, companyGuid);
     } else if (xml === 'LedgerOpeningBalance.xml') {
-      // Opening balances already captured in ledger master sync — skip
+      // Opening balances captured in ledger master sync
       console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);
     } else if (sample?.GUID && (sample?.PARENT !== undefined || sample?.NAME)) {
       await processMasters(records, companyGuid);

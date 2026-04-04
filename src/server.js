@@ -79,6 +79,14 @@ setSocketService(socketService);
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()
   .then(() => {
+    httpServer.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[FATAL] Port ${PORT} is already in use. Kill the process and restart.`);
+      } else {
+        console.error('[FATAL] Server error:', err.message);
+      }
+      process.exit(1);
+    });
     httpServer.listen(PORT, '0.0.0.0', () => {
       console.log(`
 ╔═══════════════════════════════════════════════╗
