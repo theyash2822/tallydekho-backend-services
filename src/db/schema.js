@@ -211,6 +211,68 @@ export async function initSchema() {
         completed_at  BIGINT
       );
 
+      -- Warehouses / Godowns
+      CREATE TABLE IF NOT EXISTS warehouses (
+        id            SERIAL PRIMARY KEY,
+        guid          TEXT,
+        company_guid  TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        parent        TEXT,
+        parent_guid   TEXT,
+        address       TEXT,
+        alter_id      INTEGER DEFAULT 0,
+        synced_at     BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(name, company_guid)
+      );
+
+      -- Currency masters
+      CREATE TABLE IF NOT EXISTS currencies (
+        id            SERIAL PRIMARY KEY,
+        guid          TEXT,
+        company_guid  TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        alter_id      INTEGER DEFAULT 0,
+        synced_at     BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(name, company_guid)
+      );
+
+      -- Units of measure
+      CREATE TABLE IF NOT EXISTS units (
+        id              SERIAL PRIMARY KEY,
+        guid            TEXT,
+        company_guid    TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        formal_name     TEXT,
+        is_simple_unit  BOOLEAN DEFAULT TRUE,
+        base_units      TEXT,
+        additional_units TEXT,
+        conversion      TEXT,
+        alter_id        INTEGER DEFAULT 0,
+        synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(name, company_guid)
+      );
+
+      -- Voucher types
+      CREATE TABLE IF NOT EXISTS voucher_types (
+        id              SERIAL PRIMARY KEY,
+        guid            TEXT,
+        company_guid    TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        parent          TEXT,
+        parent_guid     TEXT,
+        numbering_method TEXT,
+        is_deemed_positive BOOLEAN DEFAULT FALSE,
+        affects_stock   BOOLEAN DEFAULT FALSE,
+        alter_id        INTEGER DEFAULT 0,
+        synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE(name, company_guid)
+      );
+
+      -- Indexes for new tables
+      CREATE INDEX IF NOT EXISTS idx_warehouses_company  ON warehouses(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_units_company       ON units(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_vtype_company       ON voucher_types(company_guid);
+
       -- Group masters
       CREATE TABLE IF NOT EXISTS groups (
         id            SERIAL PRIMARY KEY,

@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 
 import { initSchema } from './db/schema.js';
 import { setupSocket } from './socket/socketHandler.js';
+import tallyWriteRoutes from './routes/tally-write.js';
 import authRoutes from './routes/auth.js';
 import pairingRoutes from './routes/pairing.js';
 import companiesRoutes from './routes/companies.js';
@@ -51,6 +52,7 @@ app.use('/app', companiesRoutes);
 app.use('/app', dataRoutes);
 app.use('/app', pairingRoutes);
 app.use('/desktop', pairingRoutes);
+app.use('/tally', tallyWriteRoutes);
 app.use('/', ingestRoutes);
 
 // ── Internal notify ────────────────────────────────────────────────────────
