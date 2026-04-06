@@ -217,6 +217,8 @@ async function processVouchers(data, companyGuid) {
         // Ledger line items
         const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || [];
         if (Array.isArray(ledgerEntries)) {
+          // Clear existing items before re-inserting to prevent duplicates on re-sync
+          await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_guid = $2 AND item_name IS NULL', [guid, companyGuid]);
           for (const entry of ledgerEntries) {
             try {
               await client.query(`
@@ -236,6 +238,8 @@ async function processVouchers(data, companyGuid) {
         // Inventory line items
         const inventoryEntries = r.ALLINVENTORYENTRIES || r.AllInventoryEntries || [];
         if (Array.isArray(inventoryEntries)) {
+          // Clear existing inventory items before re-inserting
+          await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_guid = $2 AND item_name IS NOT NULL', [guid, companyGuid]);
           for (const entry of inventoryEntries) {
             try {
               await client.query(`

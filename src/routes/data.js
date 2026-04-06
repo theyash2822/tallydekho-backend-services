@@ -221,10 +221,11 @@ router.post('/voucher-detail', authMiddleware, async (req, res) => {
 
     const voucher = vouchers[0];
 
-    // Get line items
+    // Get line items - use DISTINCT to prevent duplicates even if sync created them
     const { rows: items } = await query(
-      `SELECT * FROM voucher_items WHERE company_guid = $1 AND voucher_guid = $2
-       ORDER BY CASE WHEN type = 'Dr' THEN 0 ELSE 1 END, amount DESC`,
+      `SELECT DISTINCT ON (ledger_name, type, amount, item_name) *
+       FROM voucher_items WHERE company_guid = $1 AND voucher_guid = $2
+       ORDER BY ledger_name, type, amount, item_name, id`,
       [companyGuid, voucher.guid]
     );
 
