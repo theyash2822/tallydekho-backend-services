@@ -5,7 +5,12 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
-import { v4 as uuidv4 } from 'uuid';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+
+// Socket service reference - injected from server.js after startup
+let _socketService = null;
+export function setTallyWriteSocket(s) { _socketService = s; }
 
 const router = Router();
 
@@ -26,21 +31,32 @@ const buildXML = (template, vars) => {
 
 // ── Helper: forward to Tally via device ──────────────────────────────────────
 const forwardToTally = async (companyGuid, userId, xmlBody) => {
-  // Find the paired device for this user+company
   const { rows } = await query(
     'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
     [userId]
   );
   const device = rows[0];
-  if (!device) throw new Error('No paired device found');
+  if (!device) throw new Error('No paired device found. Please pair your desktop app first.');
 
-  // Return the XML payload — desktop will pick it up and forward to Tally
-  // In Phase 3, we'll add real-time forwarding via WebSocket
-  return {
-    deviceId: device.device_id,
-    xml: xmlBody,
-    status: 'pending', // Will be 'success' once desktop confirms
-  };
+  const jobId = require('crypto').randomUUID();
+
+  if (_socketService && _socketService.connectedClients) {
+    const desktopSocket = _socketService.connectedClients.get('desktop_' + device.device_id);
+    if (desktopSocket && desktopSocket.connected) {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Tally write timeout - is Tally Prime running?'));
+        }, 20000);
+        desktopSocket.emit('tally:write', { jobId, xml: xmlBody }, (result) => {
+          clearTimeout(timeout);
+          if (result && result.status) resolve(result);
+          else reject(new Error((result && result.message) || 'Tally write failed'));
+        });
+      });
+    }
+  }
+
+  return { deviceId: device.device_id, jobId, status: 'pending', message: 'Desktop not connected. Start the desktop app.' };
 };
 
 // ── POST /tally/voucher/sales ─────────────────────────────────────────────────
