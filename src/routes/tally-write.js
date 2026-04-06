@@ -169,7 +169,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional entry saved' : 'Sales invoice created', data: result });
+    res.json({ status: true, message: isOptional ? 'Optional entry saved' : 'Sales invoice created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -224,7 +224,7 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional payment saved' : 'Payment created', data: result });
+    res.json({ status: true, message: isOptional ? 'Optional payment saved' : 'Payment created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -279,7 +279,7 @@ router.post('/voucher/receipt', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional receipt saved' : 'Receipt created', data: result });
+    res.json({ status: true, message: isOptional ? 'Optional receipt saved' : 'Receipt created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -334,7 +334,7 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional journal saved' : 'Journal entry created', data: result });
+    res.json({ status: true, message: isOptional ? 'Optional journal saved' : 'Journal entry created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -388,7 +388,7 @@ router.post('/voucher/contra', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional contra saved' : 'Contra entry created', data: result });
+    res.json({ status: true, message: isOptional ? 'Optional contra saved' : 'Contra entry created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -474,7 +474,7 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: 'Sales order created', data: result });
+    res.json({ status: true, message: 'Sales order created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -523,7 +523,7 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: 'Party/Ledger created in Tally', data: result });
+    res.json({ status: true, message: 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -585,7 +585,7 @@ router.post('/master/warehouse', authMiddleware, async (req, res) => {
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><GODOWN ACTION="Create"><NAME>${name}</NAME>${parentXml}${addressXml}</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: 'Warehouse created in Tally', data: result });
+    res.json({ status: true, message: 'Warehouse created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
   }
@@ -606,7 +606,7 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Purchase order created', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Purchase order created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 // POST /tally/voucher/purchase
@@ -623,7 +623,7 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: isOptional ? 'Optional purchase saved' : 'Purchase invoice created', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: isOptional ? 'Optional purchase saved' : 'Purchase invoice created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 
@@ -640,7 +640,7 @@ router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Credit note created', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Credit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
@@ -656,7 +656,7 @@ router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Debit note created', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Debit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
@@ -670,14 +670,14 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
     xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><LEDGERNAME>${item.salesLedger||'Sales Account'}</LEDGERNAME><AMOUNT>${ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><TRACKINGNUMBER>${item.trackingNumber||''}</TRACKINGNUMBER><AMOUNT>${ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
   }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Delivery note created', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Delivery note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/cancel', authMiddleware, async (req, res) => {
   const { companyGuid, companyName, voucherGuid, voucherType, voucherNumber, date } = req.body;
   if (!companyGuid || !voucherGuid) return res.status(400).json({ status: false, message: 'voucherGuid required' });
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${voucherType}" ACTION="Cancel"><DATE>${tallyDate(date)}</DATE><VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><GUID>${voucherGuid}</GUID></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/master/stock-item', authMiddleware, async (req, res) => {
@@ -688,7 +688,7 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
   const openXml = openingQty > 0 ? `<OPENINGBALANCE>${openingQty} ${unit}</OPENINGBALANCE><OPENINGRATE>${openingRate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '';
   const gstXml = hsnCode ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><HSNCODE>${hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME><PARENT>${groupName}</PARENT>${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Stock item created in Tally', data: r }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 export default router;
