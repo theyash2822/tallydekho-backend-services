@@ -28,6 +28,35 @@ router.get('/desktop/me', async (req, res) => {
   }
 });
 
+// GET /desktop/pairing-device — Desktop checks if it has a paired mobile app
+router.get('/desktop/pairing-device', async (req, res) => {
+  const deviceId = req.headers['device-id'];
+  if (!deviceId) return res.status(400).json({ status: false });
+  try {
+    // Check if THIS desktop device is paired to a user
+    const { rows } = await query(
+      'SELECT d.device_id, d.name, d.user_id, d.last_seen, u.mobile, u.name as user_name FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
+      [deviceId]
+    );
+    if (!rows[0]) return res.json({ status: true, data: { pairing: null } });
+    const d = rows[0];
+    res.json({
+      status: true,
+      data: {
+        pairing: {
+          NAME: d.name || d.device_id.slice(0,8),
+          MOBILE: d.mobile || '',
+          USER_NAME: d.user_name || '',
+          LAST_SYNC_AT: d.last_seen,
+          IS_PAIRED: true,
+        }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: false });
+  }
+});
+
 // GET /desktop/pairing-code — Desktop generates pairing code
 router.get('/pairing-code', async (req, res) => {
   const deviceId = req.headers['device-id'];
