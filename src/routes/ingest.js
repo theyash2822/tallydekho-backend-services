@@ -41,6 +41,20 @@ router.post('/desktop/init-sync', async (req, res) => {
           `, [c.guid, userId, deviceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
               c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now()]);
           console.log(`[DB] Company saved: ${c.name || c.guid}`);
+
+          // Store all financial years for this company
+          const allYears = c.allYears || c.years || [];
+          for (const y of allYears) {
+            if (!y.finYear || !y.begin || !y.end) continue;
+            try {
+              await query(`
+                INSERT INTO company_years (company_guid, fin_year, begin_date, end_date)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (company_guid, fin_year) DO UPDATE SET
+                  begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date
+              `, [c.guid, y.finYear, y.begin, y.end]);
+            } catch {}
+          }
         } catch (e) {
           console.warn('[DB] Company save failed:', e.message);
         }

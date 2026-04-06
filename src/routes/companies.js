@@ -13,26 +13,44 @@ router.get('/companies', authMiddleware, async (req, res) => {
       [req.user.userId]
     );
 
-    const companiesWithYears = companies.map(c => {
-      const years = [];
-      const fyStart = c.fy_start;
-      const fyEnd   = c.fy_end;
+    // Fetch all financial years for all companies in one query
+    const guids = companies.map(c => c.guid);
+    let allYearsRows = [];
+    if (guids.length > 0) {
+      const ph = guids.map((_, i) => `$${i + 1}`).join(',');
+      const { rows } = await query(`SELECT * FROM company_years WHERE company_guid IN (${ph}) ORDER BY begin_date ASC`, guids);
+      allYearsRows = rows;
+    }
 
-      if (fyStart && fyEnd) {
-        const startYear = String(fyStart).replace(/-/g, '').slice(0, 4);
-        const endYear   = String(fyEnd).replace(/-/g, '').slice(0, 4);
-        const name = `${startYear}-${String(endYear).slice(2)}`;
-        years.push({ uniqueId: `${c.guid}_${startYear}`, name, startDate: fyStart, endDate: fyEnd });
-      } else {
-        const now = new Date();
-        const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
-        years.push({
-          uniqueId: `${c.guid}_${fyYear}`,
-          name: `${fyYear}-${String(fyYear + 1).slice(2)}`,
-          startDate: `${fyYear}-04-01`,
-          endDate: `${fyYear + 1}-03-31`,
-        });
+    const yearsByCompany = {};
+    for (const y of allYearsRows) {
+      if (!yearsByCompany[y.company_guid]) yearsByCompany[y.company_guid] = [];
+      yearsByCompany[y.company_guid].push({
+        uniqueId: `${y.company_guid}_${y.fin_year}`,
+        name: y.fin_year,
+        startDate: y.begin_date,
+        endDate: y.end_date,
+      });
+    }
+
+    const companiesWithYears = companies.map(c => {
+      let years = yearsByCompany[c.guid] || [];
+
+      // Fallback: derive from fy_start/fy_end if no years in DB yet
+      if (years.length === 0) {
+        const fyStart = c.fy_start;
+        const fyEnd   = c.fy_end;
+        if (fyStart && fyEnd) {
+          const startYear = String(fyStart).replace(/-/g, '').slice(0, 4);
+          const endYear   = String(fyEnd).replace(/-/g, '').slice(0, 4);
+          years = [{ uniqueId: `${c.guid}_${startYear}`, name: `${startYear}-${String(endYear).slice(2)}`, startDate: fyStart, endDate: fyEnd }];
+        } else {
+          const now = new Date();
+          const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+          years = [{ uniqueId: `${c.guid}_${fyYear}`, name: `${fyYear}-${String(fyYear + 1).slice(2)}`, startDate: `${fyYear}-04-01`, endDate: `${fyYear + 1}-03-31` }];
+        }
       }
+
       return { ...c, years };
     });
 

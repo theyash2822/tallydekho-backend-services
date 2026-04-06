@@ -211,6 +211,18 @@ export async function initSchema() {
         completed_at  BIGINT
       );
 
+      -- Company financial years (multi-year support)
+      CREATE TABLE IF NOT EXISTS company_years (
+        id            SERIAL PRIMARY KEY,
+        company_guid  TEXT NOT NULL,
+        fin_year      TEXT NOT NULL,  -- e.g. '2023-2024'
+        begin_date    TEXT NOT NULL,  -- e.g. '2023-04-01'
+        end_date      TEXT NOT NULL,  -- e.g. '2024-03-31'
+        UNIQUE(company_guid, fin_year)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_company_years ON company_years(company_guid);
+
       -- Warehouses / Godowns
       CREATE TABLE IF NOT EXISTS warehouses (
         id            SERIAL PRIMARY KEY,
