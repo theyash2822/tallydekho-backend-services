@@ -744,13 +744,231 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'LedgerOpeningBalance.xml') {
       // Opening balances captured in ledger master sync
       console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);
+    } else if (xml === 'AllVoucher.xml') {
+      // AllVoucher has header + inventory + ledger entries + bill allocations
+      await processAllVoucher(records, companyGuid);
+    } else if (xml === 'StockItemFull.xml') {
+      await processStocks(records, companyGuid);
+    } else if (xml === 'UnitFull.xml') {
+      await processUnits(records, companyGuid);
+    } else if (xml === 'VoucherTypeFull.xml') {
+      await processVoucherTypes(records, companyGuid);
+    } else if (xml === 'StockGroupFull.xml') {
+      await processStockGroups(records, companyGuid);
+    } else if (xml === 'LedgerFull.xml') {
+      await processFullLedger(records, companyGuid);
+    } else if (xml === 'CurrencyMaster.xml') {
+      await processCurrencies(records, companyGuid);
+    } else if (xml === 'Godown.xml') {
+      await processWarehouses(records, companyGuid);
+    } else if (xml === 'GroupMaster.xml') {
+      await processGroupMasters(records, companyGuid);
     } else if (xml === 'Ledger.xml' || xml === 'Master.xml' || (sample?.GUID && sample?.NAME && !sample?.LedgerName)) {
-      // Only process as masters if it's a proper ledger master record (has NAME, not LedgerName)
       await processMasters(records, companyGuid);
     } else {
-      // LedgerTransaction.xml records have LedgerName field — already handled above
-      // Unknown XML types — skip to prevent data pollution
       console.log(`[INGEST] Skipping ${records.length} records from unknown XML: ${xml}`);
     }
   }
+}
+
+
+async function processAllVoucher(data, companyGuid) {
+  // AllVoucher.xml — full voucher with inventory entries, ledger entries, bill allocations
+  // Each record has: guid, Date, VoucherType, VoucherNumber, PartyName, AllInventoryentries, AllLedgerEntries, Billallocations
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const guid = r.guid || r.GUID || r.Guid || '';
+      if (!guid) continue;
+      const voucherType = r.VoucherType || r.VOUCHERTYPENAME || r.VoucherTypeName || 'Voucher';
+      const date = normalizeDate(r.Date || r.DATE || r.date);
+      const isCancelled = false;
+      const partyGuid = r._PartyName || r.PartyGuid || null;
+      let amount = parseFloat(r.Amount || 0);
+      // Compute amount from ledger entries if not set
+      const ledgerEntries = r.AllLedgerEntries || [];
+      if ((!amount || amount === 0) && Array.isArray(ledgerEntries)) {
+        amount = ledgerEntries.filter(e => parseFloat(e.Amount || 0) > 0).reduce((s, e) => s + parseFloat(e.Amount || 0), 0);
+      }
+      try {
+        await client.query(`
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          ON CONFLICT (guid, company_guid) DO UPDATE SET
+            voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
+            date=EXCLUDED.date, party_name=EXCLUDED.party_name, party_guid=EXCLUDED.party_guid,
+            amount=EXCLUDED.amount, narration=EXCLUDED.narration, reference=EXCLUDED.reference,
+            is_cancelled=EXCLUDED.is_cancelled, alter_id=EXCLUDED.alter_id,
+            raw_data=EXCLUDED.raw_data, synced_at=EXCLUDED.synced_at
+        `, [
+          guid, companyGuid,
+          r.VoucherNumber || r.VoucherNumber || null,
+          voucherType, date,
+          r.PartyName || r.PARTYLEDGERNAME || null,
+          partyGuid,
+          amount,
+          r.Narration || null, r.Reference || null,
+          isCancelled,
+          parseInt(r.AlterId || 0),
+          JSON.stringify(r).slice(0, 5000),
+          now(),
+        ]);
+        saved++;
+        // Insert ledger entries
+        if (Array.isArray(ledgerEntries)) {
+          for (const e of ledgerEntries) {
+            const amt = parseFloat(e.Amount || 0);
+            if (isNaN(amt)) continue;
+            try {
+              await client.query(`INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, amount, type) VALUES ($1,$2,$3,$4,$5)`,
+                [guid, companyGuid, e.Ledgername || e.LedgerName || null, Math.abs(amt), amt >= 0 ? 'Cr' : 'Dr']);
+            } catch {}
+          }
+        }
+        // Insert inventory entries
+        const invEntries = r.AllInventoryentries || [];
+        if (Array.isArray(invEntries)) {
+          for (const e of invEntries) {
+            const qty = parseFloat(e.BilledQty || e.ActualQty || 0);
+            const iamt = parseFloat(e.Amount || 0);
+            try {
+              await client.query(`INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, actual_qty, billed_qty, rate, amount) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+                [guid, companyGuid, e.Stockitemname || null, Math.abs(qty), Math.abs(qty), parseFloat(e.Rate || 0), Math.abs(iamt)]);
+            } catch {}
+          }
+        }
+      } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] AllVoucher failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processWarehouses(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+      try {
+        await client.query(`
+          INSERT INTO warehouses (guid, company_guid, name, parent, parent_guid, address, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          ON CONFLICT (name, company_guid) DO UPDATE SET
+            guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
+            address=EXCLUDED.address, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          r.Guid || r.GUID || null, companyGuid, name,
+          r.Parent || r.PARENT || null,
+          r.ParentGuid || null,
+          r.Address || null,
+          parseInt(r.AlterId || r.ALTERID || 0), now(),
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] Warehouse insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] Warehouses: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Warehouses failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processUnits(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+      try {
+        await client.query(`
+          INSERT INTO units (guid, company_guid, name, formal_name, is_simple_unit, base_units, additional_units, conversion, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          ON CONFLICT (name, company_guid) DO UPDATE SET
+            formal_name=EXCLUDED.formal_name, is_simple_unit=EXCLUDED.is_simple_unit,
+            base_units=EXCLUDED.base_units, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          r.Guid || null, companyGuid, name,
+          r.FORMAL_NAME || r.FormalName || name,
+          !!(r.IS_SIMPLE_UNIT === '1' || r.IS_SIMPLE_UNIT === true),
+          r.BASE_UNITS || r.BaseUnits || null,
+          r.ADDITIONAL_UNITS || null,
+          r.CONVERSION || null,
+          parseInt(r.ALTERID || r.AlterId || 0), now(),
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] Unit insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] Units: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Units failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processVoucherTypes(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+      try {
+        await client.query(`
+          INSERT INTO voucher_types (guid, company_guid, name, parent, parent_guid, numbering_method, is_deemed_positive, affects_stock, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          ON CONFLICT (name, company_guid) DO UPDATE SET
+            guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
+            numbering_method=EXCLUDED.numbering_method, is_deemed_positive=EXCLUDED.is_deemed_positive,
+            affects_stock=EXCLUDED.affects_stock, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+        `, [
+          r.Guid || null, companyGuid, name,
+          r.PARENT || r.Parent || null,
+          r.PARENTGuid || null,
+          r.NUMBERINGMETHOD || null,
+          !!(r.ISDEEMEDPOSITIVE === 'Yes' || r.ISDEEMEDPOSITIVE === '1'),
+          !!(r.AFFECTSSTOCK === 'Yes' || r.AFFECTSSTOCK === '1'),
+          parseInt(r.ALTERID || r.AlterId || 0), now(),
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] VoucherType insert failed:', e.message); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] VoucherTypes: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] VoucherTypes failed:', e.message); }
+  finally { client.release(); }
+}
+
+async function processStockGroups(data, companyGuid) {
+  // Uses the groups table (same as group masters)
+  await processGroupMasters(data, companyGuid);
+}
+
+async function processCurrencies(data, companyGuid) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+      try {
+        await client.query(`
+          INSERT INTO currencies (guid, company_guid, name, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5)
+          ON CONFLICT (name, company_guid) DO UPDATE SET guid=EXCLUDED.guid, synced_at=EXCLUDED.synced_at
+        `, [r.Guid || null, companyGuid, name, parseInt(r.ALTERID || 0), now()]);
+        saved++;
+      } catch {}
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] Currencies: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Currencies failed:', e.message); }
+  finally { client.release(); }
 }
