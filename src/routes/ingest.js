@@ -44,16 +44,26 @@ router.post('/desktop/init-sync', async (req, res) => {
 
           // Store all financial years for this company
           const allYears = c.allYears || c.years || [];
+          console.log(`[DB] Years for ${c.name}:`, allYears.length, allYears[0]);
           for (const y of allYears) {
-            if (!y.finYear || !y.begin || !y.end) continue;
+            // finYear can be '2017-2018' or '2017-18' or just a string
+            const finYear = y.finYear || y.fin_year || y.name || null;
+            const beginDate = y.begin || y.beginDate || y.startDate || null;
+            const endDate = y.end || y.endDate || null;
+            if (!finYear || !beginDate || !endDate) {
+              console.log('[DB] Skipping year (missing fields):', y);
+              continue;
+            }
+            // Normalize: '20170401' -> '2017-04-01'
+            const norm = d => d && d.length === 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
             try {
               await query(`
                 INSERT INTO company_years (company_guid, fin_year, begin_date, end_date)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (company_guid, fin_year) DO UPDATE SET
                   begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date
-              `, [c.guid, y.finYear, y.begin, y.end]);
-            } catch {}
+              `, [c.guid, finYear, norm(beginDate), norm(endDate)]);
+            } catch (ye) { console.warn('[DB] Year insert failed:', ye.message, y); }
           }
         } catch (e) {
           console.warn('[DB] Company save failed:', e.message);
