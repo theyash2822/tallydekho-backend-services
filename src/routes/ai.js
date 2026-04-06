@@ -104,27 +104,34 @@ router.post('/chat', authMiddleware, async (req, res) => {
     return res.status(400).json({ status: false, message: 'messages array required' });
   }
 
-  const OPENAI_KEY = process.env.OPENAI_API_KEY;
+  // Priority: Groq > OpenAI > rule-based fallback
+  const GROQ_KEY    = process.env.GROQ_API_KEY;
+  const OPENAI_KEY  = process.env.OPENAI_API_KEY;
 
-  // If no OpenAI key configured, use smart rule-based fallback
-  if (!OPENAI_KEY) {
+  const apiKey  = GROQ_KEY || OPENAI_KEY;
+  const apiUrl  = GROQ_KEY
+    ? 'https://api.groq.com/openai/v1/chat/completions'
+    : 'https://api.openai.com/v1/chat/completions';
+  const model   = GROQ_KEY ? 'llama-3.1-8b-instant' : 'gpt-4o-mini';
+
+  if (!apiKey) {
     const lastMsg = messages[messages.length - 1]?.content?.toLowerCase() || '';
     const reply = getRuleBasedReply(lastMsg, context);
     return res.json({ status: true, data: { reply, source: 'local' } });
   }
 
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(apiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_KEY}`,
+        'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model,
         messages: [
           { role: 'system', content: TALLYDEKHO_SYSTEM_PROMPT },
-          ...messages.slice(-10), // last 10 messages for context
+          ...messages.slice(-10),
         ],
         max_tokens: 600,
         temperature: 0.4,
@@ -132,16 +139,12 @@ router.post('/chat', authMiddleware, async (req, res) => {
     });
 
     const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data?.error?.message || `OpenAI error ${response.status}`);
-    }
+    if (!response.ok) throw new Error(data?.error?.message || `API error ${response.status}`);
 
     const reply = data.choices?.[0]?.message?.content || 'No response from AI.';
-    res.json({ status: true, data: { reply, source: 'openai' } });
+    res.json({ status: true, data: { reply, source: GROQ_KEY ? 'groq' : 'openai' } });
   } catch (err) {
-    console.error('[AI] OpenAI error:', err.message);
-    // Fallback to rule-based on error
+    console.error('[AI] LLM error:', err.message);
     const lastMsg = messages[messages.length - 1]?.content?.toLowerCase() || '';
     const reply = getRuleBasedReply(lastMsg);
     res.json({ status: true, data: { reply, source: 'fallback' } });
@@ -179,5 +182,58 @@ function getRuleBasedReply(msg, context) {
   }
   return `I'm here to help with TallyDekho! You can ask me about:\n• Device pairing and connection issues\n• Creating invoices, vouchers, orders\n• Sync problems\n• Backup and restore\n• Tally Prime configuration\n• Understanding any feature\n\nWhat's your question?`;
 }
+
+// POST /app/ai/attachment — email attachment to project@tallydekho.com
+router.post('/attachment', authMiddleware, async (req, res) => {
+  const { fileName, fileData, fileType, userMessage, userName, userMobile } = req.body || {};
+  if (!fileName || !fileData) {
+    return res.status(400).json({ status: false, message: 'fileName and fileData required' });
+  }
+
+  const SMTP_HOST  = process.env.SMTP_HOST;
+  const SMTP_PORT  = parseInt(process.env.SMTP_PORT || '587');
+  const SMTP_USER  = process.env.SMTP_USER;
+  const SMTP_PASS  = process.env.SMTP_PASS;
+  const SUPPORT_TO = 'project@tallydekho.com';
+
+  // If no SMTP configured, log and acknowledge
+  if (!SMTP_HOST || !SMTP_USER) {
+    console.warn('[AI] Attachment received but SMTP not configured:', fileName);
+    return res.json({
+      status: true,
+      message: 'Attachment received. Add SMTP config to .env to enable email forwarding.',
+    });
+  }
+
+  try {
+    const nodemailer = await import('nodemailer');
+    const transporter = nodemailer.default.createTransporter({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
+
+    const base64Data = fileData.replace(/^data:[^;]+;base64,/, '');
+
+    await transporter.sendMail({
+      from: `"TallyDekho Support" <${SMTP_USER}>`,
+      to: SUPPORT_TO,
+      subject: `[TallyDekho Help] Attachment from ${userName || userMobile || 'User'}`,
+      text: `User: ${userName || 'Unknown'} (${userMobile || 'no mobile'})\n\nMessage: ${userMessage || '(none)'}\n\nFile: ${fileName}`,
+      attachments: [{
+        filename: fileName,
+        content: base64Data,
+        encoding: 'base64',
+        contentType: fileType || 'application/octet-stream',
+      }],
+    });
+
+    res.json({ status: true, message: `Attachment sent to ${SUPPORT_TO}` });
+  } catch (err) {
+    console.error('[AI] Email error:', err.message);
+    res.status(500).json({ status: false, message: 'Failed to send attachment email' });
+  }
+});
 
 export default router;
