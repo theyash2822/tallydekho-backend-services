@@ -120,7 +120,8 @@ router.post('/vouchers', authMiddleware, async (req, res) => {
   const search = `%${searchText}%`;
 
   try {
-    let q = `SELECT * FROM vouchers WHERE company_guid = $1 AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    // Exclude stub vouchers (SimplifiedVoucher stubs have type='Voucher' and amount=0)
+    let q = `SELECT * FROM vouchers WHERE company_guid = $1 AND is_cancelled = FALSE AND NOT (voucher_type = 'Voucher' AND (amount = 0 OR amount IS NULL)) AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
     const params = [companyGuid, search];
     let idx = 3;
 
