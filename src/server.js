@@ -16,6 +16,7 @@ import aiRoutes from './routes/ai.js';
 import pairingRoutes from './routes/pairing.js';
 import companiesRoutes from './routes/companies.js';
 import ingestRoutes, { setSocketService } from './routes/ingest.js';
+import { setPairingSocket } from './routes/pairing.js';
 import dataRoutes from './routes/data.js';
 
 const app = express();
@@ -80,6 +81,7 @@ app.use((err, req, res, next) => {
 // ── Wire socket into ingest routes ─────────────────────────────────────────
 setSocketService(socketService);
 setTallyWriteSocket(socketService);
+setPairingSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()

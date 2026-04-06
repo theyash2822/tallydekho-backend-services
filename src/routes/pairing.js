@@ -4,6 +4,10 @@ import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
 
+// Socket service injected after startup
+let _socket = null;
+export function setPairingSocket(s) { _socket = s; }
+
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -119,15 +123,38 @@ router.put('/pairing', authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE /desktop/paired-device — Unpair
+// Shared unpair logic - notifies all platforms via WebSocket
+async function performUnpair(deviceId, userId) {
+  await query('UPDATE devices SET paired = FALSE, user_id = NULL WHERE device_id = $1', [deviceId]);
+  // Notify mobile/web clients this user is now unpaired
+  if (_socket && userId) _socket.notifyUnpaired(userId);
+}
+
+// DELETE /desktop/paired-device — Unpair from Desktop
 router.delete('/paired-device', async (req, res) => {
   const deviceId = req.headers['device-id'];
   if (!deviceId) return res.status(400).json({ status: false });
   try {
-    await query('UPDATE devices SET paired = FALSE, user_id = NULL WHERE device_id = $1', [deviceId]);
-    res.json({ status: true, message: 'Unpaired' });
+    const { rows } = await query('SELECT user_id FROM devices WHERE device_id = $1', [deviceId]);
+    await performUnpair(deviceId, rows[0]?.user_id);
+    res.json({ status: true, message: 'Unpaired from all platforms' });
   } catch (err) {
     res.status(500).json({ status: false });
+  }
+});
+
+// DELETE /app/pairing — Unpair from Mobile/Web
+router.delete('/pairing', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [req.user.userId]
+    );
+    if (!rows[0]) return res.json({ status: true, message: 'No paired device found' });
+    await performUnpair(rows[0].device_id, req.user.userId);
+    res.json({ status: true, message: 'Unpaired from all platforms' });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Unpair failed' });
   }
 });
 
