@@ -10,7 +10,7 @@ import rateLimit from 'express-rate-limit';
 
 import { initSchema } from './db/schema.js';
 import { setupSocket } from './socket/socketHandler.js';
-import tallyWriteRoutes from './routes/tally-write.js';
+import tallyWriteRoutes, { setTallyWriteSocket } from './routes/tally-write.js';
 import authRoutes from './routes/auth.js';
 import pairingRoutes from './routes/pairing.js';
 import companiesRoutes from './routes/companies.js';
@@ -77,6 +77,7 @@ app.use((err, req, res, next) => {
 
 // ── Wire socket into ingest routes ─────────────────────────────────────────
 setSocketService(socketService);
+setTallyWriteSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()

@@ -5,7 +5,7 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
-import { getDb } from '../db/schema.js';
+import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
