@@ -7,6 +7,23 @@ import { v4 as uuid } from 'uuid';
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
+// GET /desktop/me — Desktop fetches user profile via device-id (no token needed)
+router.get('/desktop/me', async (req, res) => {
+  const deviceId = req.headers['device-id'];
+  if (!deviceId) return res.status(400).json({ status: false, message: 'device-id required' });
+  try {
+    const { rows } = await query(
+      'SELECT u.id, u.mobile, u.name, u.email, u.language FROM devices d JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
+      [deviceId]
+    );
+    if (!rows[0]) return res.json({ status: false, message: 'Device not paired' });
+    const u = rows[0];
+    res.json({ status: true, data: { id: u.id, mobile: u.mobile, name: u.name || '', email: u.email || '', language: u.language || 'English' } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to fetch profile' });
+  }
+});
+
 // GET /desktop/pairing-code — Desktop generates pairing code
 router.get('/pairing-code', async (req, res) => {
   const deviceId = req.headers['device-id'];

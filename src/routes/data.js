@@ -19,7 +19,8 @@ router.post('/ledgers', authMiddleware, async (req, res) => {
     let idx = 3;
 
     if (parent) { q += ` AND parent = $${idx++}`; params.push(parent); }
-    q += ` ORDER BY name LIMIT $${idx++} OFFSET $${idx}`;
+    // Sort by balance descending so ledgers with real balances appear first
+    q += ` ORDER BY ABS(closing_balance) DESC, name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(pageSize, offset);
 
     const { rows: ledgers } = await query(q, params);
@@ -211,9 +212,10 @@ router.post('/voucher-detail', authMiddleware, async (req, res) => {
   if (!companyGuid || !voucherId) return res.status(400).json({ status: false, message: 'companyGuid and voucherId required' });
 
   try {
+    // Try by integer id first, then by guid
     const { rows: vouchers } = await query(
-      'SELECT * FROM vouchers WHERE company_guid = $1 AND id = $2',
-      [companyGuid, voucherId]
+      'SELECT * FROM vouchers WHERE company_guid = $1 AND (id = $2 OR guid = $3)',
+      [companyGuid, parseInt(voucherId) || 0, String(voucherId)]
     );
     if (!vouchers[0]) return res.status(404).json({ status: false, message: 'Voucher not found' });
 
