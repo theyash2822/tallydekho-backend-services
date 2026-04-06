@@ -11,8 +11,8 @@ export function setPairingSocket(s) { _socket = s; }
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
-// GET /desktop/me — Desktop fetches user profile via device-id (no token needed)
-router.get('/desktop/me', async (req, res) => {
+// GET /me (mounted at /desktop/me) — Desktop fetches user profile via device-id
+router.get('/me', async (req, res) => {
   const deviceId = req.headers['device-id'];
   if (!deviceId) return res.status(400).json({ status: false, message: 'device-id required' });
   try {
@@ -28,8 +28,8 @@ router.get('/desktop/me', async (req, res) => {
   }
 });
 
-// GET /desktop/pairing-device — Desktop checks if it has a paired mobile app
-router.get('/desktop/pairing-device', async (req, res) => {
+// GET /pairing-device (mounted at /desktop/pairing-device)
+router.get('/pairing-device', async (req, res) => {
   const deviceId = req.headers['device-id'];
   if (!deviceId) return res.status(400).json({ status: false });
   try {
