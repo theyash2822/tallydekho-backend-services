@@ -47,6 +47,7 @@ export async function initSchema() {
         id          SERIAL PRIMARY KEY,
         mobile      TEXT UNIQUE NOT NULL,
         name        TEXT,
+        email       TEXT,
         language    TEXT DEFAULT 'English',
         otp         TEXT,
         otp_expires BIGINT,
@@ -372,6 +373,9 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vouchers_date     ON vouchers(date);
       CREATE INDEX IF NOT EXISTS idx_stocks_company    ON stocks(company_guid);
       CREATE INDEX IF NOT EXISTS idx_companies_user    ON companies(user_id);
+
+      -- Migrations for existing installs
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

@@ -114,6 +114,30 @@ router.post('/verify', async (req, res) => {
   }
 });
 
+// ─── GET /app/me ─────────────────────────────────────────────────────────────
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT id, mobile, name, email, language FROM users WHERE id = $1', [req.user.userId]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ status: false, message: 'User not found' });
+    res.json({ status: true, data: { id: user.id, mobile: user.mobile, name: user.name || '', email: user.email || '', language: user.language || 'English' } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to fetch profile' });
+  }
+});
+
+// ─── POST /app/me ─────────────────────────────────────────────────────────────
+router.post('/me', authMiddleware, async (req, res) => {
+  const { name, email, language } = req.body || {};
+  try {
+    await query('UPDATE users SET name = $1, email = $2, language = $3, updated_at = $4 WHERE id = $5',
+      [name?.trim() || '', email?.trim() || '', language || 'English', now(), req.user.userId]);
+    res.json({ status: true, message: 'Profile updated successfully' });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to update profile' });
+  }
+});
+
 // ─── POST /app/onboarding ─────────────────────────────────────────────────────
 router.post('/onboarding', authMiddleware, async (req, res) => {
   const { name, language } = req.body || {};
