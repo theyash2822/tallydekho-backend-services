@@ -162,17 +162,31 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
     let to = toDate;
 
     if (!from || !to) {
-      const { rows: companyRows } = await query('SELECT fy_start, fy_end FROM companies WHERE guid = $1', [companyGuid]);
-      const company = companyRows[0];
-      if (company?.fy_start && company?.fy_end) {
-        const normalize = d => { const s = String(d).replace(/-/g, ''); return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`; };
-        from = normalize(company.fy_start);
-        to   = normalize(company.fy_end);
+      // Try company_years first (most accurate)
+      const { rows: yearRows } = await query(
+        'SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1',
+        [companyGuid]
+      );
+      if (yearRows[0]?.begin_date && yearRows[0]?.end_date) {
+        from = yearRows[0].begin_date;
+        to   = yearRows[0].end_date;
       } else {
-        const now = new Date();
-        const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
-        from = `${fyYear}-04-01`;
-        to   = `${fyYear + 1}-03-31`;
+        // Fallback: use actual voucher date range from the company
+        const { rows: dateRows } = await query(
+          'SELECT MIN(date) as min_d, MAX(date) as max_d FROM vouchers WHERE company_guid=$1 AND date IS NOT NULL',
+          [companyGuid]
+        );
+        if (dateRows[0]?.min_d) {
+          const maxDate = new Date(dateRows[0].max_d);
+          const fyYear = maxDate.getMonth() >= 3 ? maxDate.getFullYear() : maxDate.getFullYear() - 1;
+          from = `${fyYear}-04-01`;
+          to   = `${fyYear + 1}-03-31`;
+        } else {
+          const now = new Date();
+          const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+          from = `${fyYear}-04-01`;
+          to   = `${fyYear + 1}-03-31`;
+        }
       }
     }
 
@@ -190,6 +204,30 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
     const totalSales    = parseFloat(sales.rows[0].v || 0);
     const totalPurchase = parseFloat(purchase.rows[0].v || 0);
 
+    // Monthly sales/purchase chart data (last 6 months of the FY)
+    const { rows: monthlyRows } = await query(`
+      SELECT 
+        TO_CHAR(date, 'Mon') as month,
+        EXTRACT(MONTH FROM date) as month_num,
+        EXTRACT(YEAR FROM date) as year,
+        SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as sales,
+        SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchase
+      FROM vouchers
+      WHERE company_guid=$1 AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE
+      GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date), EXTRACT(YEAR FROM date)
+      ORDER BY year, month_num
+      LIMIT 12
+    `, [companyGuid, from, to]);
+
+    // Top customers by sales amount
+    const { rows: topCustRows } = await query(`
+      SELECT party_name as name, SUM(amount) as revenue, COUNT(*) as invoices
+      FROM vouchers
+      WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND party_name IS NOT NULL
+        AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE
+      GROUP BY party_name ORDER BY revenue DESC LIMIT 5
+    `, [companyGuid, from, to]);
+
     res.json({ status: true, data: {
       totalSales,
       totalPurchase,
@@ -200,6 +238,10 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
       receivables:    parseFloat(receivables.rows[0].v || 0),
       payables:       parseFloat(payables.rows[0].v || 0),
       netProfit:      totalSales - totalPurchase,
+      fromDate: from,
+      toDate: to,
+      monthlySales: monthlyRows.map(r => ({ month: r.month, sales: parseFloat(r.sales||0), purchase: parseFloat(r.purchase||0) })),
+      topCustomers: topCustRows.map(r => ({ name: r.name, revenue: parseFloat(r.revenue||0), invoices: parseInt(r.invoices||0) })),
     }});
   } catch (err) {
     console.error('[dashboard] Error:', err.message);
