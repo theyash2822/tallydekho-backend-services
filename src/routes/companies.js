@@ -9,7 +9,7 @@ const now = () => Math.floor(Date.now() / 1000);
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
     const { rows: companies } = await query(
-      'SELECT * FROM companies WHERE user_id = $1 ORDER BY name',
+      'SELECT * FROM companies WHERE user_id = $1 AND (is_active = TRUE OR is_active IS NULL) ORDER BY name',
       [req.user.userId]
     );
 

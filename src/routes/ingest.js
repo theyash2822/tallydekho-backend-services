@@ -26,12 +26,18 @@ router.post('/desktop/init-sync', async (req, res) => {
 
     const alterIds = {};
     if (companies && companies.length > 0) {
-      // Remove companies no longer in desktop's list (user removed them)
+      // Mark companies not in current sync as inactive (universal approach - never delete)
       const activeGuids = companies.map(c => c.guid).filter(Boolean);
       const ph = activeGuids.map((_, i) => `$${i + 3}`).join(',');
+      // Deactivate removed companies
       await query(
-        `DELETE FROM companies WHERE user_id = $1 AND device_id = $2 AND guid NOT IN (${ph})`,
+        `UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2 AND guid NOT IN (${ph})`,
         [userId, deviceId, ...activeGuids]
+      ).catch(() => {});
+      // Activate current companies
+      await query(
+        `UPDATE companies SET is_active = TRUE WHERE user_id = $1 AND guid IN (${ph})`,
+        [userId, ...activeGuids]
       ).catch(() => {});
     }
     if (companies) {
@@ -41,12 +47,13 @@ router.post('/desktop/init-sync', async (req, res) => {
 
         try {
           await query(`
-            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
             ON CONFLICT (guid) DO UPDATE SET
               name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
               gstin = EXCLUDED.gstin, fy_start = EXCLUDED.fy_start,
-              fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at
+              fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at,
+              is_active = TRUE
           `, [c.guid, userId, deviceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
               c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now()]);
           console.log(`[DB] Company saved: ${c.name || c.guid}`);
