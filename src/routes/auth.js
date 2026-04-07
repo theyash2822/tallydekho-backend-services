@@ -75,7 +75,10 @@ router.post('/verify-otp', async (req, res) => {
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
     const isPaired = devices.length > 0;
 
-    console.log(`[AUTH] Login: ${countryCode}${cleanMobile} | User: ${user.id} | Paired: ${isPaired}`);
+    // isNewUser = true if name is not set (never completed onboarding)
+    const isNewUser = !user.name;
+
+    console.log(`[AUTH] Login: ${countryCode}${cleanMobile} | User: ${user.id} | Paired: ${isPaired} | New: ${isNewUser}`);
 
     res.json({
       status: true,
@@ -83,6 +86,7 @@ router.post('/verify-otp', async (req, res) => {
       data: {
         token,
         isPaired,
+        isNewUser,
         user: { id: user.id, mobile: cleanMobile, name: user.name || null, language: user.language || 'English' },
       },
     });
