@@ -25,6 +25,15 @@ router.post('/desktop/init-sync', async (req, res) => {
     if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
 
     const alterIds = {};
+    if (companies && companies.length > 0) {
+      // Remove companies no longer in desktop's list (user removed them)
+      const activeGuids = companies.map(c => c.guid).filter(Boolean);
+      const ph = activeGuids.map((_, i) => `$${i + 3}`).join(',');
+      await query(
+        `DELETE FROM companies WHERE user_id = $1 AND device_id = $2 AND guid NOT IN (${ph})`,
+        [userId, deviceId, ...activeGuids]
+      ).catch(() => {});
+    }
     if (companies) {
       for (const c of companies) {
         const { rows: lRows } = await query('SELECT MAX(alter_id) as max FROM ledgers WHERE company_guid = $1', [c.guid]);
