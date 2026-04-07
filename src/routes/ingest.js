@@ -43,7 +43,24 @@ router.post('/desktop/init-sync', async (req, res) => {
     if (companies) {
       for (const c of companies) {
         const { rows: lRows } = await query('SELECT MAX(alter_id) as max FROM ledgers WHERE company_guid = $1', [c.guid]);
-        alterIds[c.guid] = { master: lRows[0]?.max || 0, voucher: {} };
+        const { rows: vRows } = await query('SELECT MAX(alter_id) as max FROM vouchers WHERE company_guid = $1', [c.guid]);
+        const masterAlterId = lRows[0]?.max || 0;
+        const voucherAlterIdMax = vRows[0]?.max || 0;
+
+        // Build per-year voucher alter_ids
+        const voucherByYear = {};
+        const allYears = c.allYears || c.years || [];
+        for (const y of allYears) {
+          const finYear = y.finYear || y.fin_year || y.name;
+          if (!finYear) continue;
+          const { rows: yvRows } = await query(
+            `SELECT MAX(alter_id) as max FROM vouchers WHERE company_guid = $1 AND date >= $2 AND date <= $3`,
+            [c.guid, y.begin || y.beginDate || '2000-01-01', y.end || y.endDate || '2099-12-31']
+          ).catch(() => ({ rows: [{ max: 0 }] }));
+          voucherByYear[finYear] = yvRows[0]?.max || 0;
+        }
+
+        alterIds[c.guid] = { master: masterAlterId, voucher: voucherByYear };
 
         try {
           await query(`
