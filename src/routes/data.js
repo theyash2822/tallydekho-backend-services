@@ -6,6 +6,26 @@ import { authMiddleware } from '../middleware/auth.js';
 const router = Router();
 
 // ─── Ledgers ──────────────────────────────────────────────────────────────────
+// POST /parties — unique party names from vouchers (customers/vendors)
+router.post('/parties', authMiddleware, async (req, res) => {
+  const { companyGuid, searchText = '', pageSize = 30 } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const search = `%${searchText}%`;
+    const { rows } = await query(
+      `SELECT DISTINCT party_name as name,
+        MAX(CASE WHEN voucher_type ILIKE '%Sales%' THEN 'Sundry Debtors' WHEN voucher_type ILIKE '%Purchase%' THEN 'Sundry Creditors' ELSE '' END) as parent
+       FROM vouchers
+       WHERE company_guid=$1 AND party_name IS NOT NULL AND party_name ILIKE $2
+       GROUP BY party_name ORDER BY party_name LIMIT $3`,
+      [companyGuid, search, pageSize]
+    );
+    res.json({ status: true, data: { parties: rows } });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 router.post('/ledgers', authMiddleware, async (req, res) => {
   const { companyGuid, page = 1, pageSize = 50, searchText = '', parent } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
