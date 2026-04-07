@@ -17,12 +17,30 @@ export function setupSocket(io) {
     console.log(`[WS] client connected: ${socket.id}`);
 
     // Mobile/Web registers with token
-    socket.on('register', ({ token, type }) => {
+    socket.on('register', ({ token, type, deviceId }) => {
+      // Desktop sends: { type: 'desktop', deviceId } (no token)
+      if (type === 'desktop' && deviceId) {
+        socket.deviceId = deviceId;
+        socket.clientType = 'desktop';
+        connectedClients.set(`desktop_${deviceId}`, socket);
+        console.log(`[WS] registered desktop via register event: ${deviceId}`);
+        socket.emit('registered', { status: true });
+        // Auto-retry offline entries
+        query('SELECT user_id, company_guid FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+          .then(({ rows }) => {
+            if (rows[0] && _retryOfflineEntries) {
+              console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
+              _retryOfflineEntries(rows[0].user_id, rows[0].company_guid);
+            }
+          }).catch(() => {});
+        return;
+      }
+      // Web/mobile: token-based
       try {
         const payload = jwt.verify(token, process.env.JWT_SECRET);
         const userId = payload.userId;
         socket.userId = userId;
-        socket.clientType = type || 'mobile'; // 'mobile' | 'web' | 'desktop'
+        socket.clientType = type || 'mobile';
         connectedClients.set(`${type}_${userId}`, socket);
         console.log(`[WS] registered ${type} client for user ${userId}`);
         socket.emit('registered', { status: true });
