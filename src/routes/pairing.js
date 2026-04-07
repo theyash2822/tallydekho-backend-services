@@ -99,6 +99,12 @@ router.post('/pairing', authMiddleware, async (req, res) => {
       [req.user.userId, device.device_id]
     );
 
+    // Transfer all company data from old user to new user for this device
+    await query(
+      'UPDATE companies SET user_id = $1 WHERE device_id = $2',
+      [req.user.userId, device.device_id]
+    ).catch(() => {});
+
     res.json({ status: true, message: 'Paired successfully', data: { deviceId: device.device_id } });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Pairing failed' });
