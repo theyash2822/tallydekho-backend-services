@@ -204,17 +204,18 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
     const totalSales    = parseFloat(sales.rows[0].v || 0);
     const totalPurchase = parseFloat(purchase.rows[0].v || 0);
 
-    // Monthly sales/purchase chart data (last 6 months of the FY)
+    // Monthly sales/purchase chart data - cast text date to date type
     const { rows: monthlyRows } = await query(`
       SELECT 
-        TO_CHAR(date, 'Mon') as month,
-        EXTRACT(MONTH FROM date) as month_num,
-        EXTRACT(YEAR FROM date) as year,
+        TO_CHAR(date::date, 'Mon') as month,
+        EXTRACT(MONTH FROM date::date) as month_num,
+        EXTRACT(YEAR FROM date::date) as year,
         SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as sales,
         SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchase
       FROM vouchers
       WHERE company_guid=$1 AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE
-      GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date), EXTRACT(YEAR FROM date)
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY TO_CHAR(date::date, 'Mon'), EXTRACT(MONTH FROM date::date), EXTRACT(YEAR FROM date::date)
       ORDER BY year, month_num
       LIMIT 12
     `, [companyGuid, from, to]);
