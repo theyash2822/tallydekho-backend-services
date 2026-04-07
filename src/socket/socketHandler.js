@@ -62,6 +62,23 @@ export function setupSocket(io) {
       });
     },
 
+    // Called when device is successfully paired - refresh all clients
+    notifyPaired: (userId, deviceName) => {
+      ['mobile', 'web'].forEach(type => {
+        const client = connectedClients.get(`${type}_${userId}`);
+        if (client?.connected) {
+          client.emit('paired', { deviceName, pairedAt: new Date().toISOString() });
+          console.log(`[WS] notified ${type} client: paired for user ${userId}`);
+        }
+      });
+      // Also notify the desktop so it refreshes its state
+      for (const [key, s] of connectedClients.entries()) {
+        if (key.startsWith('desktop_') && s?.connected) {
+          s.emit('pairing_confirmed', { userId, pairedAt: new Date().toISOString() });
+        }
+      }
+    },
+
     // Called when device is unpaired
     notifyUnpaired: (userId) => {
       ['mobile', 'web'].forEach(type => {

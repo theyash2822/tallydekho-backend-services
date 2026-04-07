@@ -105,6 +105,9 @@ router.post('/pairing', authMiddleware, async (req, res) => {
       [req.user.userId, device.device_id]
     ).catch(() => {});
 
+    // Notify all connected clients to refresh (web, mobile, desktop)
+    if (_socket) _socket.notifyPaired(req.user.userId, device.name || 'Desktop');
+
     res.json({ status: true, message: 'Paired successfully', data: { deviceId: device.device_id } });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Pairing failed' });
