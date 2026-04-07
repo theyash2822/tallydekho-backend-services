@@ -56,7 +56,42 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
     }
   }
 
-  return { deviceId: device.device_id, jobId, status: 'pending', message: 'Desktop not connected. Start the desktop app.' };
+  return { deviceId: device.device_id, jobId, status: 'desktop_offline', message: 'Desktop not connected. Entry saved — will push when desktop comes online.' };
+};
+
+// ── Helper: log entry to write_queue ─────────────────────────────────────────
+const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml) => {
+  const { rows } = await query(
+    `INSERT INTO write_queue (user_id, company_guid, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT)
+     RETURNING id`,
+    [userId, companyGuid, entryType, entryLabel, amount || null, JSON.stringify(payload), xml]
+  );
+  return rows[0]?.id;
+};
+
+// ── Helper: update write_queue after Tally response ───────────────────────────
+const updateWriteQueue = async (id, result, error) => {
+  if (!id) return;
+  if (error) {
+    await query(
+      `UPDATE write_queue SET status = CASE WHEN error_message ILIKE '%Desktop not connected%' OR error_message ILIKE '%desktop_offline%' THEN 'desktop_offline' ELSE 'failed' END,
+       error_message = $2, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, error]
+    );
+  } else if (result?.status === 'desktop_offline' || (result?.message || '').includes('not connected')) {
+    await query(
+      `UPDATE write_queue SET status = 'desktop_offline', error_message = $2,
+       attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, result?.message || 'Desktop offline']
+    );
+  } else {
+    await query(
+      `UPDATE write_queue SET status = 'success', tally_voucher_number = $2, tally_id = $3,
+       error_message = NULL, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, result?.voucherNumber || null, result?.tallyId || null]
+    );
+  }
 };
 
 // ── POST /tally/voucher/sales ─────────────────────────────────────────────────
@@ -169,10 +204,15 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional entry saved' : 'Sales invoice created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(queueId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -224,10 +264,14 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'payment', `${partyLedger} -> ${bankLedger}`, amt, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional payment saved' : 'Payment created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional payment saved' : 'Payment created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -279,10 +323,14 @@ router.post('/voucher/receipt', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'receipt', `${partyLedger} -> ${bankLedger}`, parseFloat(amount)||0, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional receipt saved' : 'Receipt created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional receipt saved' : 'Receipt created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -334,10 +382,14 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'journal', narration || `${drLedger} / ${crLedger}`, amt, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional journal saved' : 'Journal entry created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional journal saved' : 'Journal entry created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -388,10 +440,14 @@ router.post('/voucher/contra', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'contra', `${fromLedger} -> ${toLedger}`, parseFloat(amount)||0, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: isOptional ? 'Optional contra saved' : 'Contra entry created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional contra saved' : 'Contra entry created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -474,10 +530,14 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
 
   xml += `\n</VOUCHER>\n</TALLYMESSAGE>\n</REQUESTDATA>\n</IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'sales_order', partyLedger, amt, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: 'Sales order created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Sales order created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -523,10 +583,14 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'party', name, null, req.body, xml).catch(() => null);
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
-    res.json({ status: true, message: 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -608,7 +672,8 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Purchase order created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase_order', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Purchase order created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
 // POST /tally/voucher/purchase
@@ -626,7 +691,8 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: isOptional ? 'Optional purchase saved' : 'Purchase invoice created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional purchase saved' : 'Purchase invoice created'), data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
 
@@ -643,7 +709,8 @@ router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Credit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Credit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
@@ -659,7 +726,8 @@ router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Debit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'debit_note', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Debit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
@@ -673,7 +741,8 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
     xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><LEDGERNAME>${item.salesLedger||'Sales Account'}</LEDGERNAME><AMOUNT>${ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><TRACKINGNUMBER>${item.trackingNumber||''}</TRACKINGNUMBER><AMOUNT>${ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
   }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Delivery note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'delivery_note', partyLedger, null, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Delivery note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/voucher/cancel', authMiddleware, async (req, res) => {
@@ -691,7 +760,91 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
   const openXml = openingQty > 0 ? `<OPENINGBALANCE>${openingQty} ${unit}</OPENINGBALANCE><OPENINGRATE>${openingRate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '';
   const gstXml = hsnCode ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><HSNCODE>${hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME><PARENT>${groupName}</PARENT>${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml).catch(() => null);
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
+
+// ── GET /tally/audit-trail — fetch write queue for a company ─────────────────
+router.get('/audit-trail', authMiddleware, async (req, res) => {
+  const { companyGuid, status, limit = 50, offset = 0 } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const conditions = ['company_guid = $1', 'user_id = $2'];
+    const params = [companyGuid, req.user.userId];
+    if (status) { conditions.push(`status = $${params.length + 1}`); params.push(status); }
+    const { rows } = await query(
+      `SELECT id, entry_type, entry_label, amount, status, tally_voucher_number, tally_id, error_message, attempt_count, created_at, updated_at, source
+       FROM write_queue WHERE ${conditions.join(' AND ')}
+       ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, parseInt(limit), parseInt(offset)]
+    );
+    const { rows: countRows } = await query(
+      `SELECT COUNT(*) as total, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count,
+       SUM(CASE WHEN status='desktop_offline' THEN 1 ELSE 0 END) as offline_count,
+       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_count,
+       SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending_count
+       FROM write_queue WHERE company_guid = $1 AND user_id = $2`,
+      [companyGuid, req.user.userId]
+    );
+    res.json({ status: true, data: { entries: rows, stats: countRows[0] } });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── POST /tally/audit-trail/:id/retry — manually retry one entry ──────────────
+router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await query(
+      'SELECT * FROM write_queue WHERE id = $1 AND user_id = $2',
+      [id, req.user.userId]
+    );
+    const entry = rows[0];
+    if (!entry) return res.status(404).json({ status: false, message: 'Entry not found' });
+    if (entry.status === 'success') return res.json({ status: true, message: 'Already pushed to Tally', alreadySuccess: true });
+    if (!entry.xml) return res.status(400).json({ status: false, message: 'No XML stored for retry' });
+
+    await query(`UPDATE write_queue SET status='pending', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [id]);
+    const result = await forwardToTally(entry.company_guid, req.user.userId, entry.xml);
+    await updateWriteQueue(id, result, null);
+    const offline = result?.status === 'desktop_offline';
+    res.json({
+      status: true,
+      queued: offline,
+      message: offline ? 'Desktop still offline. Entry is queued.' : 'Successfully pushed to Tally',
+      voucherNumber: result?.voucherNumber || null,
+    });
+  } catch (e) {
+    await updateWriteQueue(id, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── Auto-retry: called when desktop comes online ───────────────────────────────
+export async function retryOfflineEntries(userId, companyGuid) {
+  try {
+    const { rows } = await query(
+      `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+      [userId, companyGuid]
+    );
+    if (!rows.length) return;
+    console.log(`[write_queue] auto-retry: ${rows.length} entries for user ${userId}`);
+    for (const entry of rows) {
+      if (!entry.xml) continue;
+      try {
+        await query(`UPDATE write_queue SET status='pending', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
+        const result = await forwardToTally(companyGuid, userId, entry.xml);
+        await updateWriteQueue(entry.id, result, null);
+        console.log(`[write_queue] entry ${entry.id} (${entry.entry_type}: ${entry.entry_label}) → ${result?.status || 'done'}`);
+      } catch (err) {
+        await updateWriteQueue(entry.id, null, err.message);
+        console.error(`[write_queue] entry ${entry.id} retry failed: ${err.message}`);
+      }
+    }
+  } catch (e) {
+    console.error('[write_queue] retryOfflineEntries error:', e.message);
+  }
+}
 
 export default router;

@@ -358,6 +358,30 @@ export async function initSchema() {
         synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
 
+      -- Write queue: every entry from app/web, tracks Tally push status
+      CREATE TABLE IF NOT EXISTS write_queue (
+        id              SERIAL PRIMARY KEY,
+        user_id         INTEGER REFERENCES users(id),
+        company_guid    TEXT NOT NULL,
+        entry_type      TEXT NOT NULL,  -- 'sales', 'purchase', 'payment', 'receipt', 'journal', 'contra', 'party', 'item', 'warehouse', 'sales_order', 'purchase_order', 'credit_note', 'debit_note', 'delivery_note'
+        entry_label     TEXT,           -- human-readable: party name, voucher number, item name
+        amount          DECIMAL(15,4),
+        payload         JSONB,          -- full request payload for retry
+        xml             TEXT,           -- generated XML for retry
+        status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'sent', 'success', 'failed', 'desktop_offline'
+        tally_voucher_number TEXT,
+        tally_id        TEXT,
+        error_message   TEXT,
+        attempt_count   INTEGER DEFAULT 0,
+        created_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        updated_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        source          TEXT DEFAULT 'web'  -- 'web', 'mobile'
+      );
+      CREATE INDEX IF NOT EXISTS idx_wq_company   ON write_queue(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_wq_user      ON write_queue(user_id);
+      CREATE INDEX IF NOT EXISTS idx_wq_status    ON write_queue(status);
+      CREATE INDEX IF NOT EXISTS idx_wq_created   ON write_queue(created_at DESC);
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
       CREATE INDEX IF NOT EXISTS idx_vii_voucher        ON voucher_inventory_items(voucher_guid);

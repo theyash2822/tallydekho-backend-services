@@ -2,6 +2,13 @@
 // Events: synced, unpaired, logout, register
 
 import jwt from 'jsonwebtoken';
+import { query } from '../db/schema.js';
+// Lazy import to avoid circular dep at startup
+let _retryOfflineEntries = null;
+setTimeout(async () => {
+  const mod = await import('../routes/tally-write.js');
+  _retryOfflineEntries = mod.retryOfflineEntries;
+}, 1000);
 
 const connectedClients = new Map(); // token/deviceId → socket
 
@@ -30,6 +37,14 @@ export function setupSocket(io) {
       socket.clientType = 'desktop';
       connectedClients.set(`desktop_${deviceId}`, socket);
       console.log(`[WS] registered desktop: ${deviceId}`);
+      // Auto-retry offline entries for this device
+      query('SELECT user_id, company_guid FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+        .then(({ rows }) => {
+          if (rows[0] && _retryOfflineEntries) {
+            console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
+            _retryOfflineEntries(rows[0].user_id, rows[0].company_guid);
+          }
+        }).catch(() => {});
     });
 
     // Mobile emits this on manual logout so server cleans up immediately
