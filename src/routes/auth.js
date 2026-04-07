@@ -140,10 +140,10 @@ router.post('/me', authMiddleware, async (req, res) => {
 
 // ─── POST /app/onboarding ─────────────────────────────────────────────────────
 router.post('/onboarding', authMiddleware, async (req, res) => {
-  const { name, language } = req.body || {};
+  const { name, email, language } = req.body || {};
   try {
-    await query('UPDATE users SET name = $1, language = $2, updated_at = $3 WHERE id = $4',
-      [name?.trim() || '', language || 'English', now(), req.user.userId]);
+    await query('UPDATE users SET name = $1, email = $2, language = $3, updated_at = $4 WHERE id = $5',
+      [name?.trim() || '', email?.trim() || '', language || 'English', now(), req.user.userId]);
     res.json({ status: true, message: 'Profile saved successfully' });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed to save profile' });
