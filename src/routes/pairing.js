@@ -99,9 +99,10 @@ router.post('/pairing', authMiddleware, async (req, res) => {
       [req.user.userId, device.device_id]
     );
 
-    // Transfer all company data from old user to new user for this device
+    // Transfer company data: only move companies that belong to this specific device
+    // This prevents taking companies from other users who happened to use the same device
     await query(
-      'UPDATE companies SET user_id = $1 WHERE device_id = $2',
+      'UPDATE companies SET user_id = $1, is_active = TRUE WHERE device_id = $2',
       [req.user.userId, device.device_id]
     ).catch(() => {});
 
