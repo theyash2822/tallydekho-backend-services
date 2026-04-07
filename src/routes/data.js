@@ -406,4 +406,237 @@ router.post('/reports/balance-sheet', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── POST /cash-bank ─────────────────────────────────────────────────────────
+router.post('/cash-bank', authMiddleware, async (req, res) => {
+  const { companyGuid, fromDate, toDate } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const from = fromDate || '2024-04-01';
+    const to   = toDate   || '2025-03-31';
+
+    // Cash vouchers (Contra + Payment to cash)
+    const { rows: cashRows } = await query(`
+      SELECT v.voucher_number as ref, v.party_name as description, v.amount, v.date,
+             v.voucher_type,
+             CASE WHEN v.voucher_type='Receipt' THEN v.amount ELSE 0 END as dr,
+             CASE WHEN v.voucher_type IN ('Payment','Contra') THEN v.amount ELSE 0 END as cr
+      FROM vouchers v
+      WHERE v.company_guid=$1
+        AND v.voucher_type IN ('Payment','Receipt','Contra')
+        AND v.date BETWEEN $2 AND $3
+        AND v.is_cancelled = FALSE
+        AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      ORDER BY v.date DESC
+      LIMIT 200
+    `, [companyGuid, from, to]);
+
+    // Bank ledger balances
+    const { rows: bankLedgers } = await query(`
+      SELECT name, closing_balance, balance_type
+      FROM ledgers
+      WHERE company_guid=$1
+        AND (name ILIKE '%bank%' OR name ILIKE '%hdfc%' OR name ILIKE '%sbi%'
+             OR name ILIKE '%icici%' OR name ILIKE '%axis%' OR name ILIKE '%kotak%'
+             OR name ILIKE '%pnb%' OR name ILIKE '%boi%' OR parent ILIKE '%bank%')
+      ORDER BY ABS(closing_balance) DESC
+      LIMIT 20
+    `, [companyGuid]);
+
+    const totalCash   = cashRows.filter(r => r.voucher_type === 'Receipt').reduce((s, r) => s + parseFloat(r.amount || 0), 0);
+    const totalPaid   = cashRows.filter(r => r.voucher_type === 'Payment').reduce((s, r) => s + parseFloat(r.amount || 0), 0);
+    const bankBalance = bankLedgers.reduce((s, l) => s + parseFloat(l.closing_balance || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        transactions: cashRows.map(r => ({ ...r, amount: parseFloat(r.amount), dr: parseFloat(r.dr), cr: parseFloat(r.cr) })),
+        bankAccounts: bankLedgers.map(l => ({ name: l.name, balance: parseFloat(l.closing_balance || 0), type: l.balance_type })),
+        summary: { totalReceipts: totalCash, totalPayments: totalPaid, bankBalance, netCash: totalCash - totalPaid },
+      },
+    });
+  } catch (err) {
+    console.error('[cash-bank]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch cash & bank data' });
+  }
+});
+
+// ─── POST /receivables-payables ───────────────────────────────────────────────
+router.post('/receivables-payables', authMiddleware, async (req, res) => {
+  const { companyGuid, fromDate, toDate } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const from = fromDate || '2024-04-01';
+    const to   = toDate   || '2025-03-31';
+
+    // Receivables: Sales parties with outstanding amounts
+    const { rows: receivableRows } = await query(`
+      SELECT party_name as name,
+             SUM(amount) as total_amount,
+             COUNT(*) as invoice_count,
+             MAX(date) as last_date
+      FROM vouchers
+      WHERE company_guid=$1
+        AND voucher_type ILIKE '%Sales%'
+        AND party_name IS NOT NULL
+        AND is_cancelled = FALSE
+        AND date BETWEEN $2 AND $3
+      GROUP BY party_name
+      ORDER BY total_amount DESC
+      LIMIT 50
+    `, [companyGuid, from, to]);
+
+    // Payables: Purchase parties with outstanding amounts
+    const { rows: payableRows } = await query(`
+      SELECT party_name as name,
+             SUM(amount) as total_amount,
+             COUNT(*) as invoice_count,
+             MAX(date) as last_date
+      FROM vouchers
+      WHERE company_guid=$1
+        AND voucher_type ILIKE '%Purchase%'
+        AND party_name IS NOT NULL
+        AND is_cancelled = FALSE
+        AND date BETWEEN $2 AND $3
+      GROUP BY party_name
+      ORDER BY total_amount DESC
+      LIMIT 50
+    `, [companyGuid, from, to]);
+
+    const totalReceivables = receivableRows.reduce((s, r) => s + parseFloat(r.total_amount || 0), 0);
+    const totalPayables    = payableRows.reduce((s, r)    => s + parseFloat(r.total_amount || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        receivables: receivableRows.map(r => ({ ...r, total_amount: parseFloat(r.total_amount), invoice_count: parseInt(r.invoice_count) })),
+        payables:    payableRows.map(r =>    ({ ...r, total_amount: parseFloat(r.total_amount), invoice_count: parseInt(r.invoice_count) })),
+        summary: { totalReceivables, totalPayables, net: totalReceivables - totalPayables },
+      },
+    });
+  } catch (err) {
+    console.error('[receivables-payables]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch receivables/payables' });
+  }
+});
+
+// ─── POST /expenses ───────────────────────────────────────────────────────────
+router.post('/expenses', authMiddleware, async (req, res) => {
+  const { companyGuid, fromDate, toDate } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const from = fromDate || '2024-04-01';
+    const to   = toDate   || '2025-03-31';
+
+    // Expense vouchers: Journal + Payment entries
+    const { rows: expenseRows } = await query(`
+      SELECT v.voucher_number as ref, v.party_name as vendor,
+             v.amount, v.date, v.voucher_type,
+             vi.ledger_name as category
+      FROM vouchers v
+      LEFT JOIN voucher_items vi ON vi.voucher_guid = v.guid
+        AND vi.company_guid = v.company_guid
+        AND vi.amount_type = 'Dr'
+      WHERE v.company_guid=$1
+        AND v.voucher_type IN ('Journal','Payment')
+        AND v.is_cancelled = FALSE
+        AND v.date BETWEEN $2 AND $3
+        AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      ORDER BY v.date::date DESC
+      LIMIT 200
+    `, [companyGuid, from, to]);
+
+    // Category totals
+    const categoryMap = {};
+    expenseRows.forEach(r => {
+      const cat = r.category || r.voucher_type || 'Other';
+      if (!categoryMap[cat]) categoryMap[cat] = 0;
+      categoryMap[cat] += parseFloat(r.amount || 0);
+    });
+    const categories = Object.entries(categoryMap)
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 10);
+
+    const totalExpenses = expenseRows.reduce((s, r) => s + parseFloat(r.amount || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        expenses: expenseRows.map(r => ({ ...r, amount: parseFloat(r.amount || 0) })),
+        categories,
+        summary: { totalExpenses, count: expenseRows.length },
+      },
+    });
+  } catch (err) {
+    console.error('[expenses]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch expenses' });
+  }
+});
+
+// ─── POST /gst-summary ────────────────────────────────────────────────────────
+router.post('/gst-summary', authMiddleware, async (req, res) => {
+  const { companyGuid, fromDate, toDate } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const from = fromDate || '2024-04-01';
+    const to   = toDate   || '2025-03-31';
+
+    // GST from voucher items — CGST/SGST/IGST ledger entries
+    const { rows: gstRows } = await query(`
+      SELECT
+        SUM(CASE WHEN vi.ledger_name ILIKE '%cgst%' THEN vi.amount ELSE 0 END) as cgst,
+        SUM(CASE WHEN vi.ledger_name ILIKE '%sgst%' THEN vi.amount ELSE 0 END) as sgst,
+        SUM(CASE WHEN vi.ledger_name ILIKE '%igst%' THEN vi.amount ELSE 0 END) as igst,
+        SUM(vi.amount) as total_tax
+      FROM voucher_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid AND v.company_guid = vi.company_guid
+      WHERE vi.company_guid=$1
+        AND (vi.ledger_name ILIKE '%cgst%' OR vi.ledger_name ILIKE '%sgst%' OR vi.ledger_name ILIKE '%igst%')
+        AND v.is_cancelled = FALSE
+        AND v.date BETWEEN $2 AND $3
+    `, [companyGuid, from, to]);
+
+    // Monthly GST trend
+    const { rows: monthlyGst } = await query(`
+      SELECT
+        TO_CHAR(v.date::date, 'Mon') as month,
+        EXTRACT(MONTH FROM v.date::date) as month_num,
+        SUM(CASE WHEN vi.ledger_name ILIKE '%cgst%' THEN vi.amount ELSE 0 END) as cgst,
+        SUM(CASE WHEN vi.ledger_name ILIKE '%sgst%' THEN vi.amount ELSE 0 END) as sgst,
+        SUM(CASE WHEN vi.ledger_name ILIKE '%igst%' THEN vi.amount ELSE 0 END) as igst
+      FROM voucher_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid AND v.company_guid = vi.company_guid
+      WHERE vi.company_guid=$1
+        AND (vi.ledger_name ILIKE '%cgst%' OR vi.ledger_name ILIKE '%sgst%' OR vi.ledger_name ILIKE '%igst%')
+        AND v.is_cancelled = FALSE
+        AND v.date BETWEEN $2 AND $3
+        AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY TO_CHAR(v.date::date, 'Mon'), EXTRACT(MONTH FROM v.date::date)
+      ORDER BY month_num
+    `, [companyGuid, from, to]);
+
+    const g = gstRows[0] || {};
+    res.json({
+      status: true,
+      data: {
+        summary: {
+          cgst:  parseFloat(g.cgst  || 0),
+          sgst:  parseFloat(g.sgst  || 0),
+          igst:  parseFloat(g.igst  || 0),
+          total: parseFloat(g.total_tax || 0),
+        },
+        monthly: monthlyGst.map(r => ({
+          month: r.month,
+          cgst:  parseFloat(r.cgst || 0),
+          sgst:  parseFloat(r.sgst || 0),
+          igst:  parseFloat(r.igst || 0),
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('[gst-summary]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch GST data' });
+  }
+});
+
 export default router;
