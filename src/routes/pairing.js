@@ -216,8 +216,9 @@ router.post('/register', async (req, res) => {
     const { rows } = await query('SELECT * FROM devices WHERE device_id = $1', [resolvedId]);
     const device = rows[0];
     const lastSync = device?.last_seen ? new Date(device.last_seen * 1000).toISOString() : null;
+    const isPaired = device?.paired === true;
 
-    res.json({ status: true, message: 'Registered', data: { lastSync, forceUpdate: false } });
+    res.json({ status: true, message: 'Registered', data: { lastSync, forceUpdate: false, isPaired } });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Registration failed' });
   }
