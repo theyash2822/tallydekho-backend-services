@@ -18,6 +18,7 @@ import companiesRoutes from './routes/companies.js';
 import ingestRoutes, { setSocketService } from './routes/ingest.js';
 import { setPairingSocket } from './routes/pairing.js';
 import dataRoutes from './routes/data.js';
+import integrationRoutes from './routes/integrations.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -53,6 +54,7 @@ app.use('/app', authRoutes);
 app.use('/app', companiesRoutes);
 app.use('/app', dataRoutes);
 app.use('/app', pairingRoutes);
+app.use('/app/integrations', integrationRoutes);
 app.use('/app/ai', aiRoutes);
 app.use('/desktop', pairingRoutes);
 app.use('/tally', tallyWriteRoutes);
