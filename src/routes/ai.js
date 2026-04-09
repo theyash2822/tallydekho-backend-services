@@ -1,238 +1,226 @@
-// TallyDekho AI Assistant
-// Route: POST /app/ai/chat
-// Uses OpenAI GPT with a system prompt containing full TallyDekho product knowledge
+/**
+ * AI Routes — Real data-driven analytics
+ * Uses statistical models on actual historical data
+ * No external AI API needed
+ */
 
 import { Router } from 'express';
-import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
+import { authMiddleware } from '../middleware/auth.js';
+import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
 
 const router = Router();
 
-const TALLYDEKHO_SYSTEM_PROMPT = `You are the TallyDekho AI Assistant — an expert helper embedded inside the TallyDekho product suite.
-
-TallyDekho is a multi-platform system that syncs Tally Prime accounting data and allows data entry from anywhere:
-- Mobile App (React Native): iOS and Android. Real-time sync with Tally Prime.
-- Web Portal (React): Browser-based dashboard, reports, and data entry.
-- Desktop App (Electron): Runs on the same Windows PC as Tally Prime. Acts as a bridge.
-- Backend (Node.js + PostgreSQL): Handles auth, data storage, WebSocket sync.
-
-== HOW IT WORKS ==
-1. The Desktop App runs on the same machine as Tally Prime (Windows).
-2. It connects to the TallyDekho backend via WebSocket.
-3. When a user creates an entry (Sales Invoice, Payment, etc.) from the Mobile App or Web Portal:
-   - The entry is sent to the backend
-   - Backend emits a WebSocket event to the paired Desktop App
-   - Desktop App POSTs the XML to Tally Prime's HTTP port (9000)
-   - Tally Prime processes it and returns a response
-   - The voucher number is auto-assigned by Tally and returned to the user
-
-== PAIRING ==
-- Each user must pair their mobile/web account with the Desktop App.
-- Go to Desktop App → Devices → copy the 6-digit pairing code.
-- In Mobile App → Settings → Account Pairing → enter the 6-digit code.
-- Or in Web Portal → Settings → Tally ERP Sync → enter the 6-digit code.
-
-== DATA ENTRY ==
-- Sales Invoice: Mobile → Create → Sales Invoice or Web → Data Entry → Sales Invoice
-- Purchase Invoice: Mobile → Create → Purchase Invoice or Web → Data Entry
-- Payment Voucher: Mobile → Vouchers → Payment
-- Receipt Voucher: Mobile → Vouchers → Receipt
-- Journal Voucher: Mobile → Vouchers → Journal
-- Contra Voucher: Mobile → Vouchers → Contra
-- Credit Note / Debit Note / Delivery Note: Mobile → Notes
-- Sales Order / Purchase Order: Mobile → Orders
-- Create Party / Ledger / Warehouse / Stock Item: Mobile → Masters
-
-== OPTIONAL ENTRIES ==
-- Every data entry form has an "Optional" toggle or "Save as Optional" button.
-- Optional entries are saved to Tally as optional vouchers — they do NOT affect books until approved.
-- Approve them inside Tally Prime under Optional Vouchers.
-
-== SYNC ==
-- Data syncs automatically when the Desktop App is connected and Tally is open.
-- Manual sync: Desktop App → Sync Now button.
-- Sync includes: Ledgers, Vouchers, Stocks, Bills Outstanding, Balance Sheet, P&L.
-- Multi-year support: the app syncs data for all financial years in the company.
-
-== BACKUP & RESTORE ==
-- Desktop App → Backup & Restore section.
-- Local backup: saved to a folder on the PC (default: C:/ProgramData/TallyDekho/Backups).
-- Auto-backup schedule: 1 day / 7 days / 1 month / OFF.
-- Restore: click Restore on any backup. If Tally is open, the app will close it first.
-- Cloud backups: shown in the backup table (last 2 shown, full list on Web Portal).
-
-== DASHBOARD & REPORTS ==
-- Dashboard: shows Sales, Purchases, Outstanding Bills, Cash Balance.
-- Sales Register: all sales vouchers with party, amount, date.
-- Purchase Register: all purchase vouchers.
-- Ledger Book: drill into any ledger to see all vouchers.
-- Reports: Profit & Loss, Balance Sheet — pulled from Tally in real-time.
-- Inventory: stock summary, godown-wise, item-wise.
-
-== SETTINGS ==
-- Profile: name, email, mobile (mobile is read-only, set at registration).
-- Company Info: pulled from Tally Prime company data.
-- Tally ERP Sync: configure Tally host and port (default port: 9000).
-- Language & Region: change display language.
-
-== COMMON ISSUES & FIXES ==
-1. "No paired device found" — Desktop App is not running or not connected. Start it and check the connection status.
-2. "Tally write timeout" — Tally Prime is not open, or the port is wrong. Open Tally and check Desktop App settings (port 9000).
-3. "OTP not received" — Check WhatsApp for the OTP message. OTP expires in 5 minutes.
-4. Sync not happening — Check that Desktop App shows "Connected" status. Check Tally is open.
-5. Wrong data showing — Do a manual sync from Desktop App.
-6. Voucher number not showing — The number is auto-assigned by Tally. If it shows blank, the entry is pending (desktop not connected).
-7. Optional entry not affecting books — That's expected behavior. Approve it inside Tally Prime.
-
-== TALLY PRIME REQUIREMENTS ==
-- Tally Prime must be running on the same PC as the TallyDekho Desktop App.
-- Tally's HTTP port must be enabled: Tally Prime → F12 → Advanced → ODBC/HTTP port = 9000.
-- Company must be open in Tally.
-
-== YOUR ROLE ==
-- Answer questions about TallyDekho features, troubleshoot issues, guide users step-by-step.
-- If asked about accounting concepts (GST, TDS, ledger groups, etc.) — explain them in simple terms.
-- Be concise and helpful. Use numbered steps for troubleshooting.
-- Never make up features that don't exist in TallyDekho.
-- Always refer to the correct platform (Mobile/Web/Desktop) when giving instructions.`;
-
-// POST /app/ai/chat
-router.post('/chat', authMiddleware, async (req, res) => {
-  const { messages, context } = req.body || {};
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ status: false, message: 'messages array required' });
-  }
-
-  // Priority: Groq > OpenAI > rule-based fallback
-  const GROQ_KEY    = process.env.GROQ_API_KEY;
-  const OPENAI_KEY  = process.env.OPENAI_API_KEY;
-
-  const apiKey  = GROQ_KEY || OPENAI_KEY;
-  const apiUrl  = GROQ_KEY
-    ? 'https://api.groq.com/openai/v1/chat/completions'
-    : 'https://api.openai.com/v1/chat/completions';
-  const model   = GROQ_KEY ? 'llama-3.1-8b-instant' : 'gpt-4o-mini';
-
-  if (!apiKey) {
-    const lastMsg = messages[messages.length - 1]?.content?.toLowerCase() || '';
-    const reply = getRuleBasedReply(lastMsg, context);
-    return res.json({ status: true, data: { reply, source: 'local' } });
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ai-insights — Full AI dashboard with forecast + insights + growth
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/ai-insights', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 
   try {
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: TALLYDEKHO_SYSTEM_PROMPT },
-          ...messages.slice(-10),
-        ],
-        max_tokens: 600,
-        temperature: 0.4,
-      }),
+    const now = new Date();
+    const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+    const fyStart = `${fyYear}-04-01`;
+    const fyEnd   = `${fyYear + 1}-03-31`;
+
+    // ── 1. Weekly sales — last 16 weeks (8 actual + 8 for comparison) ──────
+    const { rows: weeklyRows } = await query(`
+      SELECT
+        DATE_TRUNC('week', date::date) as week_start,
+        SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as sales,
+        SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchases,
+        COUNT(CASE WHEN voucher_type ILIKE '%Sales%' THEN 1 END) as invoice_count
+      FROM vouchers
+      WHERE company_guid=$1
+        AND is_cancelled=FALSE
+        AND date::date >= NOW() - INTERVAL '16 weeks'
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY DATE_TRUNC('week', date::date)
+      ORDER BY week_start
+    `, [companyGuid]).catch(() => ({ rows: [] }));
+
+    // Split into prev 8 weeks (forecast base) and last 8 weeks (actual)
+    const allWeeks = weeklyRows;
+    const prevWeeks = allWeeks.slice(0, Math.max(0, allWeeks.length - 8));
+    const lastWeeks = allWeeks.slice(-8);
+
+    const actualSales = lastWeeks.map(r => parseFloat(r.sales || 0));
+    const prevSales   = prevWeeks.map(r => parseFloat(r.sales || 0));
+
+    // Linear regression on prev weeks to forecast last 8
+    const reg = linearRegression(prevSales.length >= 3 ? prevSales : actualSales);
+    const forecastSales = Array.from({ length: 8 }, (_, i) =>
+      Math.round(reg.predict(prevSales.length + i))
+    );
+
+    // Smooth actuals with 3-week moving average for cleaner chart
+    const smoothedActual = movingAverage(actualSales, 3).map(v => Math.round(v));
+
+    // Week labels
+    const weekLabels = lastWeeks.length > 0
+      ? lastWeeks.map((r, i) => `Wk${i + 1}`)
+      : ['Wk1','Wk2','Wk3','Wk4','Wk5','Wk6','Wk7','Wk8'];
+
+    // Pad to 8 if less data
+    while (smoothedActual.length < 8) smoothedActual.unshift(0);
+    while (forecastSales.length < 8) forecastSales.unshift(0);
+
+    // ── 2. Monthly sales — FY ───────────────────────────────────────────────
+    const { rows: monthlyRows } = await query(`
+      SELECT
+        TO_CHAR(date::date, 'Mon') as month,
+        EXTRACT(MONTH FROM date::date) as month_num,
+        SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as sales,
+        SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchases
+      FROM vouchers
+      WHERE company_guid=$1 AND is_cancelled=FALSE
+        AND date BETWEEN $2 AND $3
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY TO_CHAR(date::date, 'Mon'), EXTRACT(MONTH FROM date::date)
+      ORDER BY month_num
+    `, [companyGuid, fyStart, fyEnd]).catch(() => ({ rows: [] }));
+
+    const monthlySales = monthlyRows.map(r => parseFloat(r.sales || 0));
+    const monthlyPurchases = monthlyRows.map(r => parseFloat(r.purchases || 0));
+
+    // ── 3. Growth metrics ───────────────────────────────────────────────────
+    const totalSalesFY = monthlySales.reduce((a, b) => a + b, 0);
+    const totalPurchFY = monthlyPurchases.reduce((a, b) => a + b, 0);
+
+    // Last month vs prev month
+    const lastMonthSales = monthlySales[monthlySales.length - 1] || 0;
+    const prevMonthSales = monthlySales[monthlySales.length - 2] || 0;
+    const momGrowth = pctChange(lastMonthSales, prevMonthSales);
+
+    // Last 4 weeks vs prev 4 weeks
+    const last4 = actualSales.slice(-4).reduce((a, b) => a + b, 0);
+    const prev4 = (prevSales.slice(-4).reduce((a, b) => a + b, 0)) || last4;
+    const weeklyGrowth = pctChange(last4, prev4);
+
+    // Gross margin
+    const grossMargin = totalSalesFY > 0
+      ? ((totalSalesFY - totalPurchFY) / totalSalesFY * 100)
+      : 0;
+
+    // Average ticket size (FY)
+    const totalInvoices = weeklyRows.reduce((s, r) => s + parseInt(r.invoice_count || 0), 0);
+    const avgTicket = totalInvoices > 0 ? Math.round(totalSalesFY / totalInvoices) : 0;
+
+    // ── 4. Customer analytics ───────────────────────────────────────────────
+    const { rows: custRows } = await query(`
+      SELECT party_name as name,
+        SUM(amount) as revenue,
+        COUNT(*) as invoice_count
+      FROM vouchers
+      WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+        AND is_cancelled=FALSE AND date BETWEEN $2 AND $3
+        AND party_name IS NOT NULL AND party_name != ''
+      GROUP BY party_name ORDER BY revenue DESC LIMIT 5
+    `, [companyGuid, fyStart, fyEnd]).catch(() => ({ rows: [] }));
+
+    const topCustomers = custRows.map(r => ({
+      name: r.name,
+      revenue: parseFloat(r.revenue || 0),
+      invoices: parseInt(r.invoice_count || 0),
+      pct: totalSalesFY > 0
+        ? parseFloat((parseFloat(r.revenue || 0) / totalSalesFY * 100).toFixed(1))
+        : 0,
+    }));
+
+    // ── 5. Inventory analytics ──────────────────────────────────────────────
+    const { rows: stockRows } = await query(`
+      SELECT name, current_stock, unit_price,
+        COALESCE(current_stock * unit_price, 0) as total_value
+      FROM stock_items
+      WHERE company_guid=$1
+      ORDER BY total_value DESC LIMIT 20
+    `, [companyGuid]).catch(() => ({ rows: [] }));
+
+    const totalInventoryValue = stockRows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
+    const inventoryTurnover = totalInventoryValue > 0
+      ? parseFloat((totalPurchFY / totalInventoryValue).toFixed(2))
+      : 0;
+    const dsi = inventoryTurnover > 0
+      ? Math.round(365 / inventoryTurnover)
+      : 0;
+
+    // Fast/slow moving (approx by stock level vs purchase frequency)
+    const fastMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 0 && parseFloat(r.unit_price || 0) > 0).length;
+    const slowMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 100).length; // high stock = slow moving
+
+    // ── 6. Outstanding receivables ratio ───────────────────────────────────
+    const { rows: recRows } = await query(`
+      SELECT COALESCE(SUM(ABS(closing_balance)),0) as v
+      FROM ledgers
+      WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')
+        AND closing_balance > 0
+    `, [companyGuid]).catch(() => ({ rows: [{ v: 0 }] }));
+
+    const outstanding = parseFloat(recRows[0]?.v || 0);
+    const outstandingRatio = totalSalesFY > 0 ? outstanding / totalSalesFY : 0;
+
+    // ── 7. Next month forecast ──────────────────────────────────────────────
+    const nextMonthForecast = Math.round(reg.predict(prevSales.length + 8));
+    const forecastConfidence = reg.r2 ? Math.round(reg.r2 * 100) : 0;
+
+    // ── 8. Generate insights ────────────────────────────────────────────────
+    const insights = generateInsights({
+      salesTrend: momGrowth,
+      purchaseTrend: pctChange(monthlyPurchases[monthlyPurchases.length - 1] || 0, monthlyPurchases[monthlyPurchases.length - 2] || 0),
+      grossMargin,
+      topCustomers,
+      slowMoving,
+      fastMoving: Math.max(0, fastMoving - slowMoving),
+      outstandingRatio,
     });
 
-    const data = await response.json();
-    if (!response.ok) throw new Error(data?.error?.message || `API error ${response.status}`);
-
-    const reply = data.choices?.[0]?.message?.content || 'No response from AI.';
-    res.json({ status: true, data: { reply, source: GROQ_KEY ? 'groq' : 'openai' } });
-  } catch (err) {
-    console.error('[AI] LLM error:', err.message);
-    const lastMsg = messages[messages.length - 1]?.content?.toLowerCase() || '';
-    const reply = getRuleBasedReply(lastMsg);
-    res.json({ status: true, data: { reply, source: 'fallback' } });
-  }
-});
-
-// Rule-based fallback when no OpenAI key configured
-function getRuleBasedReply(msg, context) {
-  if (msg.includes('pair') || msg.includes('connect') || msg.includes('desktop')) {
-    return `To pair your device with the Desktop App:\n1. Open the TallyDekho Desktop App on your Windows PC\n2. Go to the Devices section\n3. Copy the 6-digit pairing code\n4. On Mobile: Settings → Account Pairing → enter the code\n5. On Web Portal: Settings → Tally ERP Sync → enter the code\n\nMake sure Tally Prime is open before pairing.`;
-  }
-  if (msg.includes('backup') || msg.includes('restore')) {
-    return `Backup & Restore:\n• Desktop App → Backup & Restore section\n• Click "Run Backup Now" for immediate backup\n• Set auto-backup schedule: 1 day / 7 days / 1 month\n• To restore: click Restore on any backup in the list\n• If Tally is open, the app will close it first before restoring`;
-  }
-  if (msg.includes('sync') || msg.includes('not showing') || msg.includes('data')) {
-    return `If data is not syncing:\n1. Check Desktop App shows "Connected" status\n2. Make sure Tally Prime is open with the company open\n3. Click "Sync Now" in Desktop App\n4. Check Tally HTTP port is 9000 (Tally → F12 → Advanced Config)\n5. Restart Desktop App if issue persists`;
-  }
-  if (msg.includes('invoice') || msg.includes('voucher') || msg.includes('entry') || msg.includes('create')) {
-    return `To create an entry in Tally:\n1. Open Mobile App or Web Portal\n2. Go to Data Entry section\n3. Fill in the form (party, items, amount)\n4. Click Submit — this sends the entry directly to Tally Prime\n5. The auto-assigned voucher number is shown on success\n\nTip: Use "Save as Optional" to save without affecting books. Approve in Tally Prime later.`;
-  }
-  if (msg.includes('optional')) {
-    return `Optional entries:\n• Optional entries are saved in Tally but do NOT affect books (P&L, Balance Sheet)\n• Use them for draft entries or entries pending approval\n• To approve: open Tally Prime → Vouchers → Optional → select and approve\n• All entry forms have a "Save as Optional" button`;
-  }
-  if (msg.includes('otp') || msg.includes('login') || msg.includes('password')) {
-    return `Login to TallyDekho:\n• Enter your mobile number → receive OTP on WhatsApp\n• OTP expires in 5 minutes\n• If OTP not received, check your WhatsApp and try again\n• No password needed — OTP is the only authentication method`;
-  }
-  if (msg.includes('tally') && (msg.includes('port') || msg.includes('9000') || msg.includes('connect'))) {
-    return `Tally Prime setup:\n1. Open Tally Prime\n2. Press F12 → Advanced Configuration\n3. Enable ODBC/HTTP Server\n4. Set port to 9000\n5. Restart Tally if you changed the port\n6. Open your company in Tally\n\nThe TallyDekho Desktop App connects to port 9000 to read/write data.`;
-  }
-  if (msg.includes('report') || msg.includes('pl') || msg.includes('balance sheet') || msg.includes('profit')) {
-    return `Reports in TallyDekho:\n• Web Portal → Reports → P&L or Balance Sheet\n• Data is pulled from Tally in real-time\n• Select the financial year from the dropdown\n• Multi-year support is available\n\nFor detailed reports, open Tally Prime directly.`;
-  }
-  if (msg.includes('hello') || msg.includes('hi') || msg.includes('help')) {
-    return `Hi! I'm the TallyDekho AI Assistant. I can help you with:\n\n• Pairing your devices\n• Creating invoices and vouchers\n• Sync and connection issues\n• Backup and restore\n• Understanding optional entries\n• Tally Prime setup\n• Reports and data questions\n\nWhat do you need help with?`;
-  }
-  return `I'm here to help with TallyDekho! You can ask me about:\n• Device pairing and connection issues\n• Creating invoices, vouchers, orders\n• Sync problems\n• Backup and restore\n• Tally Prime configuration\n• Understanding any feature\n\nWhat's your question?`;
-}
-
-// POST /app/ai/attachment — email attachment to project@tallydekho.com
-router.post('/attachment', authMiddleware, async (req, res) => {
-  const { fileName, fileData, fileType, userMessage, userName, userMobile } = req.body || {};
-  if (!fileName || !fileData) {
-    return res.status(400).json({ status: false, message: 'fileName and fileData required' });
-  }
-
-  const SMTP_HOST  = process.env.SMTP_HOST;
-  const SMTP_PORT  = parseInt(process.env.SMTP_PORT || '587');
-  const SMTP_USER  = process.env.SMTP_USER;
-  const SMTP_PASS  = process.env.SMTP_PASS;
-  const SUPPORT_TO = 'project@tallydekho.com';
-
-  // If no SMTP configured, log and acknowledge
-  if (!SMTP_HOST || !SMTP_USER) {
-    console.warn('[AI] Attachment received but SMTP not configured:', fileName);
-    return res.json({
+    res.json({
       status: true,
-      message: 'Attachment received. Add SMTP config to .env to enable email forwarding.',
+      data: {
+        // Sales forecast chart (8 weeks)
+        salesForecast: forecastSales.slice(-8),
+        salesActual:   smoothedActual.slice(-8),
+        weekLabels:    weekLabels.slice(-8),
+
+        // Growth metrics
+        growth: {
+          revenue:    momGrowth,         // month-over-month %
+          weeklyGrowth,                  // week-over-week 4W %
+          customers:  topCustomers.length,
+          avgTicket,
+          grossMargin: parseFloat(grossMargin.toFixed(1)),
+        },
+
+        // Inventory analytics
+        inventory: {
+          turnoverRatio: inventoryTurnover,
+          dsi,
+          fastMoving: Math.max(0, fastMoving - slowMoving),
+          slowMoving,
+          totalValue: totalInventoryValue,
+        },
+
+        // Top customers
+        topCustomers: topCustomers.slice(0, 5),
+
+        // Next month prediction
+        forecast: {
+          nextMonthSales: nextMonthForecast,
+          confidence: forecastConfidence,
+          trend: momGrowth > 0 ? 'up' : momGrowth < 0 ? 'down' : 'flat',
+        },
+
+        // AI-generated text insights
+        insights,
+
+        // Data quality flag
+        hasEnoughData: weeklyRows.length >= 4 && monthlySales.filter(v => v > 0).length >= 2,
+      },
     });
-  }
-
-  try {
-    const nodemailer = await import('nodemailer');
-    const transporter = nodemailer.default.createTransporter({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_PORT === 465,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
-    });
-
-    const base64Data = fileData.replace(/^data:[^;]+;base64,/, '');
-
-    await transporter.sendMail({
-      from: `"TallyDekho Support" <${SMTP_USER}>`,
-      to: SUPPORT_TO,
-      subject: `[TallyDekho Help] Attachment from ${userName || userMobile || 'User'}`,
-      text: `User: ${userName || 'Unknown'} (${userMobile || 'no mobile'})\n\nMessage: ${userMessage || '(none)'}\n\nFile: ${fileName}`,
-      attachments: [{
-        filename: fileName,
-        content: base64Data,
-        encoding: 'base64',
-        contentType: fileType || 'application/octet-stream',
-      }],
-    });
-
-    res.json({ status: true, message: `Attachment sent to ${SUPPORT_TO}` });
   } catch (err) {
-    console.error('[AI] Email error:', err.message);
-    res.status(500).json({ status: false, message: 'Failed to send attachment email' });
+    console.error('[ai-insights]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to compute AI insights' });
   }
 });
 
