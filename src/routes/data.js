@@ -210,7 +210,7 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
       }
     }
 
-    const [sales, purchase, payments, receipts, cash, bank, receivables, payables] = await Promise.all([
+    const [sales, purchase, payments, receipts, cash, bank, receivables, payables, pendingIRN, pendingEWB, creditNotesCount] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND date BETWEEN $2 AND $3 AND is_cancelled=FALSE`, [companyGuid, from, to]),
@@ -219,6 +219,12 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
       query(`SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyGuid]),
       query(`SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent = 'Sundry Debtors') AND closing_balance != 0`, [companyGuid]),
       query(`SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent = 'Sundry Creditors') AND closing_balance != 0`, [companyGuid]),
+      // Pending IRN — sales invoices ≥₹50K without IRN
+      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn = '') AND (irn_cancelled IS NULL OR irn_cancelled = FALSE) AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
+      // Pending EWB — sales invoices without EWB number
+      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number = '') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
+      // Credit notes count this FY
+      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND (voucher_type ILIKE '%Credit%' OR voucher_type ILIKE '%Debit%') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
     ]);
 
     const totalSales    = parseFloat(sales.rows[0].v || 0);
@@ -263,6 +269,14 @@ router.post('/dashboard', authMiddleware, async (req, res) => {
       toDate: to,
       monthlySales: monthlyRows.map(r => ({ month: r.month, sales: parseFloat(r.sales||0), purchase: parseFloat(r.purchase||0) })),
       topCustomers: topCustRows.map(r => ({ name: r.name, revenue: parseFloat(r.revenue||0), invoices: parseInt(r.invoices||0) })),
+      // Alert counts
+      pendingIRNCount:   parseInt(pendingIRN.rows[0]?.v || 0),
+      pendingEWBCount:   parseInt(pendingEWB.rows[0]?.v || 0),
+      creditNotesCount:  parseInt(creditNotesCount.rows[0]?.v || 0),
+      alerts: [
+        ...(parseInt(pendingIRN.rows[0]?.v || 0) > 0 ? [{ type: 'irn', message: `${pendingIRN.rows[0].v} invoices due for IRN generation`, action: 'generate_irn', severity: 'warning' }] : []),
+        ...(parseInt(pendingEWB.rows[0]?.v || 0) > 0 ? [{ type: 'ewb', message: `${pendingEWB.rows[0].v} invoices need E-Way Bill`, action: 'generate_ewb', severity: 'warning' }] : []),
+      ],
     }});
   } catch (err) {
     console.error('[dashboard] Error:', err.message);
@@ -656,6 +670,144 @@ router.post('/gst-summary', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[gst-summary]', err.message);
     res.status(500).json({ status: false, message: 'Failed to fetch GST data' });
+  }
+});
+
+// ─── Alerts endpoint ─────────────────────────────────────────────────────────
+// GET /alerts — real-time compliance + IRN + EWB alert counts for dashboard & sales screen
+router.get('/alerts', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const now = new Date();
+    const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+    const from = `${fyYear}-04-01`;
+    const to   = `${fyYear + 1}-03-31`;
+
+    const [
+      pendingIRN, pendingEWB, expiredEWB,
+      outstandingRec, creditNotes, unmatched
+    ] = await Promise.all([
+      // Invoices needing IRN (≥₹50K sales, no IRN)
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+           AND amount >= 50000
+           AND (irn IS NULL OR irn = '')
+           AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+
+      // Invoices needing EWB (≥₹50K sales, no EWB)
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+           AND amount >= 50000
+           AND (ewb_number IS NULL OR ewb_number = '')
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+
+      // Expired EWBs needing extension
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1 AND ewb_number IS NOT NULL AND ewb_number != ''
+           AND ewb_valid_upto IS NOT NULL AND ewb_valid_upto < NOW()
+           AND is_cancelled = FALSE`,
+        [companyGuid]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+
+      // Outstanding receivables (overdue > 30 days)
+      query(
+        `SELECT COUNT(*) as count, COALESCE(SUM(ABS(closing_balance)),0) as amount
+         FROM ledgers
+         WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent = 'Sundry Debtors')
+           AND closing_balance > 0`,
+        [companyGuid]
+      ).catch(() => ({ rows: [{ count: 0, amount: 0 }] })),
+
+      // Credit notes this FY
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1
+           AND (voucher_type ILIKE '%Credit Note%' OR voucher_type ILIKE '%Debit Note%')
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+
+      // GST unmatched invoices (missing HSN or GSTIN)
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1
+           AND voucher_type ILIKE '%Sales%'
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
+           AND (party_gstin IS NULL OR party_gstin = '' OR hsn_code IS NULL OR hsn_code = '')`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+    ]);
+
+    const irnCount     = parseInt(pendingIRN.rows[0]?.count || 0);
+    const ewbCount     = parseInt(pendingEWB.rows[0]?.count || 0);
+    const ewbExpired   = parseInt(expiredEWB.rows[0]?.count || 0);
+    const recCount     = parseInt(outstandingRec.rows[0]?.count || 0);
+    const recAmount    = parseFloat(outstandingRec.rows[0]?.amount || 0);
+    const cnCount      = parseInt(creditNotes.rows[0]?.count || 0);
+    const unmatchedCnt = parseInt(unmatched.rows[0]?.count || 0);
+
+    // Build alerts array (only show non-zero)
+    const alerts = [
+      irnCount > 0 && {
+        id: 'irn_pending',
+        type: 'irn',
+        severity: 'warning',
+        message: `${irnCount} invoice${irnCount > 1 ? 's' : ''} due for IRN generation`,
+        action: 'generate_irn',
+        count: irnCount,
+      },
+      ewbCount > 0 && {
+        id: 'ewb_pending',
+        type: 'ewb',
+        severity: 'warning',
+        message: `${ewbCount} invoice${ewbCount > 1 ? 's' : ''} need E-Way Bill`,
+        action: 'generate_ewb',
+        count: ewbCount,
+      },
+      ewbExpired > 0 && {
+        id: 'ewb_expired',
+        type: 'ewb',
+        severity: 'error',
+        message: `${ewbExpired} E-Way Bill${ewbExpired > 1 ? 's' : ''} expired`,
+        action: 'extend_ewb',
+        count: ewbExpired,
+      },
+      unmatchedCnt > 0 && {
+        id: 'gst_unmatched',
+        type: 'gst',
+        severity: 'warning',
+        message: `${unmatchedCnt} invoice${unmatchedCnt > 1 ? 's' : ''} have GST mismatch`,
+        action: 'fix_gst',
+        count: unmatchedCnt,
+      },
+    ].filter(Boolean);
+
+    res.json({
+      status: true,
+      data: {
+        pendingIRNCount:   irnCount,
+        pendingEWBCount:   ewbCount,
+        expiredEWBCount:   ewbExpired,
+        outstandingCount:  recCount,
+        outstandingAmount: recAmount,
+        creditNotesCount:  cnCount,
+        unmatchedGSTCount: unmatchedCnt,
+        alerts,
+        totalAlerts: alerts.length,
+      },
+    });
+  } catch (err) {
+    console.error('[alerts]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch alerts' });
   }
 });
 
