@@ -302,6 +302,23 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/company/years — financial years for a company
+router.get('/company/years', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC', [companyGuid]);
+    const fys = rows.map(r => {
+      const start = new Date(r.begin_date);
+      const end   = new Date(r.end_date);
+      const sy = start.getFullYear();
+      const ey = end.getFullYear();
+      return { begin_date: r.begin_date, end_date: r.end_date, label: `FY ${sy}-${String(ey).slice(2)}` };
+    });
+    res.json({ success: true, data: fys });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 // GET /api/companies
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
