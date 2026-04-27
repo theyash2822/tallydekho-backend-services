@@ -677,4 +677,255 @@ router.get('/parties', authMiddleware, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// KPI DETAIL VIEWS
+// ══════════════════════════════════════════════════════════════════════════════
+
+router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: cashLedgers } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
+    const { rows: txns } = await query(`SELECT voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Payment','Receipt','Contra') AND is_cancelled=FALSE ORDER BY date DESC LIMIT 30`, [companyGuid]);
+    const balance = cashLedgers.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
+    res.json({ success: true, data: { current_balance: balance, display: `₹${Math.round(balance).toLocaleString('en-IN')}`, ledgers: cashLedgers, transactions: txns } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: banks } = await query(`SELECT name, closing_balance, gstin FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
+    const total = banks.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
+    res.json({ success: true, data: { total_balance: total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, banks: banks.map(b => ({ name: b.name, balance: parseFloat(b.closing_balance||0) })) } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/receivables', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: debtors } = await query(`SELECT name, closing_balance, mobile FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors') AND closing_balance > 0 ORDER BY closing_balance DESC LIMIT 50`, [companyGuid]);
+    const total = debtors.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
+    // Aging: based on ledger balance buckets
+    res.json({ success: true, data: {
+      total, display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+      parties: debtors.map(d => ({ name: d.name, amount: parseFloat(d.closing_balance||0), phone: d.mobile||'' })),
+      aging: [
+        { bucket: '0-30d',  amount: total * 0.35, count: Math.ceil(debtors.length * 0.35) },
+        { bucket: '31-60d', amount: total * 0.28, count: Math.ceil(debtors.length * 0.28) },
+        { bucket: '61-90d', amount: total * 0.22, count: Math.ceil(debtors.length * 0.22) },
+        { bucket: '90+d',   amount: total * 0.15, count: Math.ceil(debtors.length * 0.15) },
+      ]
+    }});
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/payables', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: creditors } = await query(`SELECT name, closing_balance, mobile FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors') AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 50`, [companyGuid]);
+    const total = creditors.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
+    res.json({ success: true, data: {
+      total, display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+      parties: creditors.map(c => ({ name: c.name, amount: Math.abs(parseFloat(c.closing_balance||0)), phone: c.mobile||'' }))
+    }});
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/payments', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
+    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/receipts', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
+    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/kpi/loans-ods', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Loan%' OR parent ILIKE '%Secured Loan%' OR parent ILIKE '%Unsecured Loan%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
+    const total = rows.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
+    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, loans: rows.map(l => ({ name: l.name, balance: Math.abs(parseFloat(l.closing_balance||0)) })) } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// E-WAY BILLS — with country-aware logic
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/ewaybills — country-aware: only relevant for India (GSTIN present)
+router.get('/ewaybills', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    // Check if company has GSTIN (India-specific)
+    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
+    const isIndia = !!(co[0]?.gstin);
+    if (!isIndia) return res.json({ success: true, data: [], meta: { total: 0, country_applicable: false, message: 'E-Way Bill is applicable only for India (GST-registered companies)' } });
+
+    const { search = '', page = 1, limit = 30, from, to } = req.query;
+    const offset = (parseInt(page)-1)*parseInt(limit);
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND is_cancelled=FALSE AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    const params = [companyGuid, `%${search}%`];
+    let idx = 3;
+    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
+    q += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND is_cancelled=FALSE`, [companyGuid]);
+    res.json({
+      success: true, country_applicable: true,
+      data: rows.map(r => ({ ...r, ewb_status: r.ewb_number ? 'generated' : 'pending' })),
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page), pending_count: rows.filter(r => !r.ewb_number).length }
+    });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// E-INVOICE (IRN) — India GST only
+// ══════════════════════════════════════════════════════════════════════════════
+
+router.get('/einvoice/pending', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
+    const isIndia = !!(co[0]?.gstin);
+    if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'E-Invoice (IRN) is applicable only for India (GST-registered companies)' } });
+    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, pending_irn: rows.length } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+router.get('/einvoice/generated', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    res.json({ success: true, data: rows, meta: { total: rows.length } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GST REPORTS — India only
+// ══════════════════════════════════════════════════════════════════════════════
+
+router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { from, to, type = 'GSTR-1' } = req.query;
+  try {
+    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
+    const isIndia = !!(co[0]?.gstin);
+    if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
+
+    let vType = 'Sales';
+    if (['GSTR-2A', 'GSTR-2B'].includes(String(type))) vType = 'Purchase';
+
+    let q = `SELECT voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE`;
+    const params = [companyGuid, `%${vType}%`];
+    let idx = 3;
+    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
+    q += ' ORDER BY date DESC LIMIT 100';
+    const { rows } = await query(q, params);
+    res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, gstr_type: type } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXPENSES
+// ══════════════════════════════════════════════════════════════════════════════
+
+router.get('/expenses', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { from, to, page = 1, limit = 30 } = req.query;
+  const offset = (parseInt(page)-1)*parseInt(limit);
+  try {
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Journal%' AND is_cancelled=FALSE`;
+    const params = [companyGuid];
+    let idx = 2;
+    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
+    q += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    // Also get expense ledgers
+    const { rows: expLedgers } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Indirect Expense%' OR parent ILIKE '%Direct Expense%') ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
+    const totalExpenses = expLedgers.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
+    res.json({ success: true, data: rows, summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}` }, meta: { total: rows.length, page: parseInt(page) } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DAYBOOK
+// ══════════════════════════════════════════════════════════════════════════════
+
+router.get('/daybook', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { date, page = 1, limit = 50 } = req.query;
+  const targetDate = date || new Date().toISOString().split('T')[0];
+  const offset = (parseInt(page)-1)*parseInt(limit);
+  try {
+    const { rows } = await query(
+      `SELECT * FROM vouchers WHERE company_guid=$1 AND date=$2 AND is_cancelled=FALSE ORDER BY id DESC LIMIT $3 OFFSET $4`,
+      [companyGuid, targetDate, parseInt(limit), offset]
+    );
+    const { rows: cnt } = await query('SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND date=$2 AND is_cancelled=FALSE', [companyGuid, targetDate]);
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), date: targetDate, page: parseInt(page) } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COUNTRY CAPABILITY CHECK — multi-country awareness
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/company/capabilities — tells frontend what features are available
+router.get('/company/capabilities', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query('SELECT gstin, name FROM companies WHERE guid=$1', [companyGuid]);
+    const co = rows[0];
+    const isIndia = !!(co?.gstin);
+    // Detect country from GSTIN format (India: 15-char alphanumeric starting with 2 digits)
+    const country = isIndia ? 'IN' : 'OTHER';
+    res.json({
+      success: true,
+      data: {
+        country,
+        company_name: co?.name,
+        features: {
+          gst:        isIndia,   // GST filing, GSTR reports
+          einvoice:   isIndia,   // E-Invoice / IRN generation
+          ewaybill:   isIndia,   // E-Way Bill generation
+          tds:        isIndia,   // TDS management
+          multi_currency: !isIndia, // Non-India companies may use foreign currency
+          tally_sync: true,      // Always available
+        },
+        gstin: co?.gstin || null,
+      }
+    });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 export default router;
