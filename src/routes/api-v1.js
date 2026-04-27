@@ -318,4 +318,363 @@ router.get('/companies', authMiddleware, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════
+
+// GET /api/dashboard/kpi-strip?period=7D
+router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    // Delegate to existing /app/dashboard logic by calling the same queries
+    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
+    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyGuid]);
+    const { rows: rec }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyGuid]);
+    const { rows: pay }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`, [companyGuid]);
+    const { rows: loans } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Loan%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%')`, [companyGuid]);
+    const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE`, [companyGuid]);
+    const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE`, [companyGuid]);
+
+    const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
+    const kpi = [
+      { id: 'cash',       label: 'Cash In Hand', amount: fmt(+cash[0].v),  amount_raw: +cash[0].v,  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
+      { id: 'bank',       label: 'Bank Balance', amount: fmt(+bank[0].v),  amount_raw: +bank[0].v,  icon: 'card-outline',                route: '/kpi/bank-balance' },
+      { id: 'receivable', label: 'Receivables',  amount: fmt(+rec[0].v),   amount_raw: +rec[0].v,   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
+      { id: 'payable',    label: 'Payables',     amount: fmt(+pay[0].v),   amount_raw: +pay[0].v,   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
+      { id: 'loans',      label: 'Loans & ODs',  amount: fmt(+loans[0].v), amount_raw: +loans[0].v, icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
+      { id: 'payments',   label: 'Payments',     amount: fmt(+pmts[0].v),  amount_raw: +pmts[0].v,  icon: 'send-outline',                route: '/kpi/payments' },
+      { id: 'receipts',   label: 'Receipts',     amount: fmt(+rcts[0].v),  amount_raw: +rcts[0].v,  icon: 'download-outline',            route: '/kpi/receipts' },
+    ];
+    res.json({ success: true, data: kpi });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/metrics?period=7D&companyGuid=xxx
+router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: fy } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+    const from = fy[0]?.begin_date || new Date().getFullYear() + '-04-01';
+    const to   = fy[0]?.end_date   || (new Date().getFullYear() + 1) + '-03-31';
+    const [s, p] = await Promise.all([
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+    ]);
+    const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
+    res.json({ success: true, data: [
+      { id: 'sales',     label: 'Sales',     amount: fmt(+s[0].v), amount_raw: +s[0].v, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
+      { id: 'purchases', label: 'Purchases', amount: fmt(+p[0].v), amount_raw: +p[0].v, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+    ]});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/cashflow
+router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
+    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
+    const [s, p] = await Promise.all([
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]),
+    ]);
+    const netCash = +cash[0].v + +bank[0].v;
+    const grossProfit = +s[0].v - +p[0].v;
+    res.json({ success: true, data: {
+      net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
+      gross_profit: grossProfit, net_profit: grossProfit,
+      income_percentage: +s[0].v > 0 ? Math.round((grossProfit / +s[0].v) * 100) : 0,
+      updated_at: 'just now',
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/recent-activity
+router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(
+      `SELECT id, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ORDER BY date DESC, id DESC LIMIT 10`,
+      [companyGuid]
+    );
+    const fmt = v => `₹${Math.abs(+v||0).toLocaleString('en-IN')}`;
+    const activity = rows.map(r => ({
+      id: String(r.id),
+      type: (r.voucher_type||'').toLowerCase().includes('receipt') ? 'credit' : 'debit',
+      label: `${r.voucher_type} ${r.voucher_number ? '#'+r.voucher_number : ''}`.trim(),
+      amount: (r.voucher_type||'').toLowerCase().includes('receipt') ? `+${fmt(r.amount)}` : `-${fmt(r.amount)}`,
+      amount_raw: +r.amount || 0,
+      date: r.date || '',
+      party: r.party_name || '',
+    }));
+    res.json({ success: true, data: activity });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// SALES
+// ══════════════════════════════════════════════════════════════
+
+const voucherListHandler = (voucherType) => async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { search = '', page = 1, limit = 30, from, to } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND (party_name ILIKE $3 OR voucher_number ILIKE $3)`;
+    const params = [companyGuid, `%${voucherType}%`, `%${search}%`];
+    let idx = 4;
+    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
+    q += ` ORDER BY date DESC, id DESC LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2`, [companyGuid, `%${voucherType}%`]);
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+};
+
+router.get('/sales/invoices',    authMiddleware, voucherListHandler('Sales'));
+router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
+router.get('/sales/quotations',  authMiddleware, voucherListHandler('Quotation'));
+router.get('/sales/credit-notes',authMiddleware, voucherListHandler('Credit Note'));
+router.get('/sales/delivery-notes', authMiddleware, voucherListHandler('Delivery Note'));
+router.get('/sales/ewaybills',   authMiddleware, voucherListHandler('Sales'));
+
+// ══════════════════════════════════════════════════════════════
+// PURCHASE
+// ══════════════════════════════════════════════════════════════
+
+router.get('/purchase/invoices', authMiddleware, voucherListHandler('Purchase'));
+router.get('/purchase/orders',   authMiddleware, voucherListHandler('Purchase Order'));
+router.get('/purchase/debit-notes', authMiddleware, voucherListHandler('Debit Note'));
+
+// ══════════════════════════════════════════════════════════════
+// VOUCHERS
+// ══════════════════════════════════════════════════════════════
+
+router.get('/vouchers', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { type, search = '', page = 1, limit = 30, from, to } = req.query;
+  const typeMap = { payment: 'Payment', receipt: 'Receipt', journal: 'Journal', contra: 'Contra', sales: 'Sales', purchase: 'Purchase' };
+  const vType = typeMap[type] || null;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND NOT (voucher_type='Voucher' AND (amount=0 OR amount IS NULL)) AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    const params = [companyGuid, `%${search}%`];
+    let idx = 3;
+    if (vType) { q += ` AND voucher_type ILIKE $${idx++}`; params.push(`%${vType}%`); }
+    if (from)  { q += ` AND date >= $${idx++}`; params.push(from); }
+    if (to)    { q += ` AND date <= $${idx++}`; params.push(to); }
+    q += ` ORDER BY date DESC, id DESC LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE`, [companyGuid]);
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// LEDGERS
+// ══════════════════════════════════════════════════════════════
+
+router.get('/ledgers', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { search = '', nature, group, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    let q = `SELECT * FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)`;
+    const params = [companyGuid, `%${search}%`];
+    let idx = 3;
+    if (nature) { q += ` AND nature = $${idx++}`; params.push(nature); }
+    if (group)  { q += ` AND parent = $${idx++}`; params.push(group); }
+    q += ` ORDER BY ABS(closing_balance) DESC, name LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const { rows: cnt } = await query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]);
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.get('/ledgers/:id', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  const { id } = req.params;
+  try {
+    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_guid=$1 AND guid=$2', [companyGuid, id]);
+    if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
+    const { from, to, page = 1, limit = 30 } = req.query;
+    const offset = (parseInt(page)-1)*parseInt(limit);
+    let tq = `SELECT * FROM vouchers WHERE company_guid=$1 AND (party_guid=$2 OR party_name=$3) AND is_cancelled=FALSE`;
+    const tp = [companyGuid, id, lr[0].name];
+    let idx = 4;
+    if (from) { tq += ` AND date >= $${idx++}`; tp.push(from); }
+    if (to)   { tq += ` AND date <= $${idx++}`; tp.push(to); }
+    tq += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    tp.push(parseInt(limit), offset);
+    const { rows: txns } = await query(tq, tp);
+    res.json({ success: true, data: { ledger: lr[0], transactions: txns, meta: { page: parseInt(page), limit: parseInt(limit) } } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// STOCKS
+// ══════════════════════════════════════════════════════════════
+
+router.get('/stocks/items', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  const { search = '', category, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page)-1)*parseInt(limit);
+  try {
+    let q = `SELECT * FROM stocks WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR hsn ILIKE $2)`;
+    const params = [companyGuid, `%${search}%`];
+    let idx = 3;
+    if (category) { q += ` AND category = $${idx++}`; params.push(category); }
+    q += ` ORDER BY closing_value DESC NULLS LAST, name LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const { rows: cnt } = await query('SELECT COUNT(*) as c, COALESCE(SUM(closing_value),0) as v FROM stocks WHERE company_guid=$1', [companyGuid]);
+    const { rows: low } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid=$1 AND closing_qty > 0 AND closing_qty <= reorder_level AND reorder_level > 0', [companyGuid]);
+    res.json({
+      success: true,
+      data: {
+        summary: { total_value: `₹${(+cnt[0].v/1e5).toFixed(1)}L`, total_skus: parseInt(cnt[0].c), low_stock_count: parseInt(low[0].c) },
+        items: rows,
+      },
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  try {
+    const { rows } = await query('SELECT * FROM stocks WHERE company_guid=$1 AND guid=$2', [companyGuid, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  try {
+    const { rows } = await query('SELECT DISTINCT warehouse_name as name FROM stocks WHERE company_guid=$1 AND warehouse_name IS NOT NULL', [companyGuid]);
+    res.json({ success: true, data: rows.map(r => ({ name: r.name, id: r.name })) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// REPORTS
+// ══════════════════════════════════════════════════════════════
+
+router.get('/reports/financial', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(`
+      SELECT TO_CHAR(date::date,'Mon') as month, EXTRACT(MONTH FROM date::date) as mnum, EXTRACT(YEAR FROM date::date) as yr,
+        SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as revenue,
+        SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as expenses
+      FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY TO_CHAR(date::date,'Mon'), EXTRACT(MONTH FROM date::date), EXTRACT(YEAR FROM date::date)
+      ORDER BY yr, mnum LIMIT 12
+    `, [companyGuid]);
+    res.json({ success: true, data: {
+      months:   rows.map(r => r.month),
+      revenue:  rows.map(r => parseFloat(r.revenue||0)),
+      expenses: rows.map(r => parseFloat(r.expenses||0)),
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.get('/reports/gst', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  try {
+    const { rows: sales } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]);
+    const { rows: purchase } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]);
+    const outputGst = +sales[0].v * 0.18;
+    const inputGst  = +purchase[0].v * 0.18;
+    res.json({ success: true, data: {
+      output_gst: outputGst, input_gst: inputGst,
+      net_gst: outputGst - inputGst,
+      sales_taxable: +sales[0].v, purchase_taxable: +purchase[0].v,
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ══════════════════════════════════════════════════════════════
+
+router.get('/notifications', authMiddleware, async (req, res) => {
+  // Notifications are derived from business data — no separate table yet
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  try {
+    const notifs = [];
+    if (companyGuid) {
+      const { rows: lowStock } = await query('SELECT name, closing_qty, reorder_level FROM stocks WHERE company_guid=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3', [companyGuid]);
+      lowStock.forEach(s => notifs.push({ id: `stock_${s.name}`, type: 'warning', title: 'Low Stock Alert', body: `${s.name} has only ${s.closing_qty} units left`, read: false, created_at: new Date().toISOString() }));
+      const { rows: overdue } = await query(`SELECT party_name, ABS(closing_balance) as bal FROM ledgers WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000 ORDER BY closing_balance DESC LIMIT 3`, [companyGuid]);
+      overdue.forEach(l => notifs.push({ id: `recv_${l.party_name}`, type: 'info', title: 'Outstanding Receivable', body: `${l.party_name} owes ₹${Math.round(l.bal).toLocaleString('en-IN')}`, read: false, created_at: new Date().toISOString() }));
+    }
+    res.json({ success: true, data: notifs });
+  } catch (err) {
+    res.json({ success: true, data: [] });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// PARTIES (for dropdowns in create forms)
+// ══════════════════════════════════════════════════════════════
+
+router.get('/parties', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  const { search = '', type } = req.query;
+  try {
+    let q = `SELECT guid, name, gstin, parent FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2)`;
+    const params = [companyGuid, `%${search}%`];
+    let idx = 3;
+    if (type === 'customer') { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Debtor%'); }
+    if (type === 'vendor')   { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Creditor%'); }
+    q += ' ORDER BY name LIMIT 50';
+    const { rows } = await query(q, params);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 export default router;
