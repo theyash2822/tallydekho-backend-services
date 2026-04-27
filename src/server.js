@@ -19,6 +19,7 @@ import ingestRoutes, { setSocketService } from './routes/ingest.js';
 import { setPairingSocket } from './routes/pairing.js';
 import dataRoutes from './routes/data.js';
 import integrationRoutes from './routes/integrations.js';
+import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -58,6 +59,7 @@ app.use('/app/integrations', integrationRoutes);
 app.use('/app/ai', aiRoutes);
 app.use('/desktop', pairingRoutes);
 app.use('/tally', tallyWriteRoutes);
+app.use('/api', apiV1Routes);
 app.use('/', ingestRoutes);
 
 // ── Internal notify ────────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ app.use((err, req, res, next) => {
 setSocketService(socketService);
 setTallyWriteSocket(socketService);
 setPairingSocket(socketService);
+setApiSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()
