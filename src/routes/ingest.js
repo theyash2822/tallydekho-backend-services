@@ -142,10 +142,14 @@ router.post('/ingest/chunk', async (req, res) => {
   const deviceId  = req.headers['device-id'];
 
   if (!uploadId || !streamName) return res.status(400).json({ status: false, message: 'Missing headers' });
+  // Require device-id header to prevent unauthenticated writes
+  if (!deviceId) return res.status(401).json({ status: false, message: 'device-id header required' });
 
   try {
     const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
     const device = devices[0];
+    // Device must be registered (even if not paired) to write data
+    if (!device) return res.status(403).json({ status: false, message: 'Device not registered. Run the desktop app first.' });
     const userId = device?.user_id;
 
     let data;

@@ -129,10 +129,11 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
     }));
 
     // ── 5. Inventory analytics ──────────────────────────────────────────────
+    // Fix: correct table is 'stocks', correct columns are closing_qty/closing_rate
     const { rows: stockRows } = await query(`
-      SELECT name, current_stock, unit_price,
-        COALESCE(current_stock * unit_price, 0) as total_value
-      FROM stock_items
+      SELECT name, closing_qty as current_stock, closing_rate as unit_price,
+        COALESCE(closing_qty * closing_rate, 0) as total_value
+      FROM stocks
       WHERE company_guid=$1
       ORDER BY total_value DESC LIMIT 20
     `, [companyGuid]).catch(() => ({ rows: [] }));
@@ -145,9 +146,9 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
       ? Math.round(365 / inventoryTurnover)
       : 0;
 
-    // Fast/slow moving (approx by stock level vs purchase frequency)
-    const fastMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 0 && parseFloat(r.unit_price || 0) > 0).length;
-    const slowMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 100).length; // high stock = slow moving
+    // Fast/slow moving based on stock quantity
+    const fastMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 0).length;
+    const slowMoving = stockRows.filter(r => parseFloat(r.current_stock || 0) > 100).length;
 
     // ── 6. Outstanding receivables ratio ───────────────────────────────────
     const { rows: recRows } = await query(`

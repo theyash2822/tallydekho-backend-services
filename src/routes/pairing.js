@@ -28,32 +28,57 @@ router.get('/me', async (req, res) => {
   }
 });
 
-// GET /pairing-device (mounted at /desktop/pairing-device)
+// GET /pairing-device — smart handler for BOTH desktop (/desktop) and mobile (/app)
+// Desktop sends device-id header (no JWT). Mobile sends Bearer token (no device-id).
+// This prevents the auth bypass caused by duplicate route declarations.
 router.get('/pairing-device', async (req, res) => {
   const deviceId = req.headers['device-id'];
-  if (!deviceId) return res.status(400).json({ status: false });
+  const bearerToken = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+
   try {
-    // Check if THIS desktop device is paired to a user
-    const { rows } = await query(
-      'SELECT d.device_id, d.name, d.user_id, d.last_seen, u.mobile, u.name as user_name FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
-      [deviceId]
-    );
-    if (!rows[0]) return res.json({ status: true, data: { pairing: null } });
-    const d = rows[0];
-    res.json({
-      status: true,
-      data: {
-        pairing: {
-          NAME: d.name || d.device_id.slice(0,8),
-          MOBILE: d.mobile || '',
-          USER_NAME: d.user_name || '',
-          LAST_SYNC_AT: d.last_seen,
-          IS_PAIRED: true,
+    // Desktop path: device-id header present
+    if (deviceId) {
+      const { rows } = await query(
+        'SELECT d.device_id, d.name, d.user_id, d.last_seen, u.mobile, u.name as user_name FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
+        [deviceId]
+      );
+      if (!rows[0]) return res.json({ status: true, data: { pairing: null } });
+      const d = rows[0];
+      return res.json({
+        status: true,
+        data: {
+          pairing: {
+            NAME: d.name || d.device_id.slice(0,8),
+            MOBILE: d.mobile || '',
+            USER_NAME: d.user_name || '',
+            LAST_SYNC_AT: d.last_seen,
+            IS_PAIRED: true,
+          }
         }
-      }
+      });
+    }
+
+    // Mobile/Web path: Bearer token required
+    if (!bearerToken) return res.status(401).json({ status: false, message: 'Authorization required' });
+    let userId;
+    try {
+      const jwt = await import('jsonwebtoken');
+      const payload = jwt.default.verify(bearerToken, process.env.JWT_SECRET);
+      userId = payload.userId;
+    } catch { return res.status(401).json({ status: false, message: 'Invalid token' }); }
+
+    const { rows } = await query(
+      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [userId]
+    );
+    const device = rows[0];
+    if (!device) return res.json({ status: true, data: null });
+    return res.json({
+      status: true,
+      data: { device: { code: device.device_id.slice(0, 8), deviceId: device.device_id, lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null, paired: true } },
     });
   } catch (err) {
-    res.status(500).json({ status: false });
+    res.status(500).json({ status: false, message: 'Failed' });
   }
 });
 
@@ -129,23 +154,7 @@ router.post('/pairing', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /app/pairing-device
-router.get('/pairing-device', authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
-    );
-    const device = rows[0];
-    if (!device) return res.json({ status: true, data: null });
-    res.json({
-      status: true,
-      data: { device: { code: device.device_id.slice(0, 8), deviceId: device.device_id, lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null, paired: true } },
-    });
-  } catch (err) {
-    res.status(500).json({ status: false, message: 'Failed to fetch device' });
-  }
-});
+// Note: GET /pairing-device is handled above (smart handler for both desktop + mobile)
 
 // GET /app/paired-device — alias
 router.get('/paired-device', authMiddleware, async (req, res) => {

@@ -14,6 +14,23 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// Ownership check helper — verifies companyGuid belongs to req.user.userId
+// Returns true if owned (or no companyGuid provided), false + sends 403 if not owned
+async function verifyCompanyOwnership(req, res, companyGuid) {
+  if (!companyGuid) return true; // no GUID to check — let route handle it
+  try {
+    const { rows } = await query(
+      'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
+      [companyGuid, req.user.userId]
+    );
+    if (rows.length === 0) {
+      res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Company not found or access denied' } });
+      return false;
+    }
+    return true;
+  } catch { return true; } // on DB error, allow through (don't block on check failure)
+}
+
 // Lazy ref to socket service (set by server.js after WS init)
 let _socketService = null;
 export function setApiSocket(svc) { _socketService = svc; }
@@ -362,6 +379,7 @@ router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
 router.get('/company/years', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC', [companyGuid]);
     const fys = rows.map(r => {
@@ -399,6 +417,7 @@ router.get('/companies', authMiddleware, async (req, res) => {
 router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     // Delegate to existing /app/dashboard logic by calling the same queries
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
@@ -431,6 +450,7 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
 router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows: fy } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
     const from = fy[0]?.begin_date || new Date().getFullYear() + '-04-01';
@@ -455,6 +475,7 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
 router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);

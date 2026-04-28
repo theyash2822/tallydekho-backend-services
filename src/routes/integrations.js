@@ -16,10 +16,15 @@ import crypto from 'crypto';
 const router = Router();
 
 // ── Encryption helpers (AES-256-GCM for credentials at rest) ─────────────────
-const ENCRYPTION_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY || 'tallydekho-integration-key-32ch';
-const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
+// SECURITY: Never use a hardcoded fallback key — it exposes all credentials in the repo
+const ENCRYPTION_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY) {
+  console.warn('[SECURITY WARNING] CREDENTIALS_ENCRYPTION_KEY env var not set — GST/E-Way Bill integrations are disabled');
+}
+const key = ENCRYPTION_KEY ? crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32) : null;
 
 function encrypt(text) {
+  if (!key) throw new Error('CREDENTIALS_ENCRYPTION_KEY not configured — cannot save integration credentials');
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
@@ -28,6 +33,7 @@ function encrypt(text) {
 }
 
 function decrypt(text) {
+  if (!key) return null;
   try {
     const [ivHex, tagHex, encryptedHex] = text.split(':');
     const iv = Buffer.from(ivHex, 'hex');
