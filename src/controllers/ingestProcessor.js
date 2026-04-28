@@ -173,13 +173,14 @@ async function processVouchers(data, companyGuid) {
       if (!guid) continue;
 
       const voucherNumber = r.VoucherNumber || r.VOUCHERNUMBER || (r.F02 !== undefined ? String(r.F02) : null) || null;
-      const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.voucherType || 'Voucher';
+      // VoucherType is the field name in AllVoucher.xml; VoucherTypeName in SimplifiedVoucher / Voucher.xml
+      const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.VoucherType || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
-      const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes');
+      const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes' || r.ISCANCELLED === true);
       const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
 
       // Calculate amount from ledger entries (positive = debit side)
-      const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || [];
+      const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries || [];
       let amount = parseFloat(r.Amount || r.AMOUNT || r.amount || 0);
       if (amount === 0 && Array.isArray(ledgerEntries) && ledgerEntries.length > 0) {
         // Sum positive (Dr) entries as the voucher amount
@@ -202,7 +203,8 @@ async function processVouchers(data, companyGuid) {
             raw_data=EXCLUDED.raw_data, synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, date,
-          r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
+          // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml
+          r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
           partyGuid,
           amount,
           r.Narration || r.NARRATION || r.narration || null,
@@ -215,7 +217,7 @@ async function processVouchers(data, companyGuid) {
         saved++;
 
         // Ledger line items
-        const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || [];
+        const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries || [];
         if (Array.isArray(ledgerEntries)) {
           // Clear existing items before re-inserting to prevent duplicates on re-sync
           await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_guid = $2 AND item_name IS NULL', [guid, companyGuid]);
