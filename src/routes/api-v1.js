@@ -700,10 +700,21 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
     const { rows: purchase } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]);
     const outputGst = +(sales?.[0]?.v ?? 0) * 0.18;
     const inputGst  = +(purchase?.[0]?.v ?? 0) * 0.18;
+
+    // Count months with voucher activity (proxy for filed months)
+    const { rows: monthsData } = await query(`
+      SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
+      FROM vouchers
+      WHERE company_guid=$1 AND is_cancelled=FALSE
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    `, [companyGuid]).catch(() => ({ rows: [{ filed_months: 0 }] }));
+    const filedMonths = parseInt(monthsData?.[0]?.filed_months || 0);
+
     res.json({ success: true, data: {
       output_gst: outputGst, input_gst: inputGst,
       net_gst: outputGst - inputGst,
       sales_taxable: +(sales?.[0]?.v ?? 0), purchase_taxable: +(purchase?.[0]?.v ?? 0),
+      filed_months: Math.min(filedMonths, 12),
     }});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
