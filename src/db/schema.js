@@ -413,6 +413,35 @@ export async function initSchema() {
       ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS stock_count   INTEGER DEFAULT 0;
       ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS record_count  INTEGER DEFAULT 0;
       ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+      -- companies migrations
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS device_id TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS synced_at BIGINT;
+
+      -- ledgers migrations (columns referenced in routes but missing from schema)
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS mobile TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS nature TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS warehouse_name TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS alias TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS pan TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS phone TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS email TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS address TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS opening_balance NUMERIC(18,4) DEFAULT 0;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS alter_id BIGINT DEFAULT 0;
+
+      -- vouchers migrations (E-Invoice / E-Way Bill columns)
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn_date TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn_cancelled BOOLEAN DEFAULT FALSE;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS ewb_number TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS ewb_date TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS qr_code TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS signed_invoice TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS created_at BIGINT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS party_gstin TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS place_of_supply TEXT;
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

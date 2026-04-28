@@ -248,7 +248,7 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
       // Deactivate old user's companies from this device
       await query('UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2', [oldUserId, device.device_id]).catch(() => {});
       // Notify old user via WebSocket if connected
-      if (_socket) { try { _socket.notifyUnpaired(oldUserId); } catch {} }
+      if (_socketService) { try { _socketService.notifyUnpaired(oldUserId); } catch {} }
       console.log(`[API PAIR] Auto-unpaired previous user ${oldUserId} from device ${device.device_id}`);
     }
 
@@ -261,7 +261,7 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
     await query('UPDATE companies SET user_id = $1, is_active = TRUE WHERE device_id = $2', [req.user.userId, device.device_id]).catch(() => {});
 
     // Notify connected clients
-    if (_socket) _socket.notifyPaired(req.user.userId, device.name || 'Desktop');
+    if (_socketService) _socketService.notifyPaired(req.user.userId, device.name || 'Desktop');
 
     // Get company info
     const { rows: companies } = await query(
@@ -435,14 +435,16 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const { rows: fy } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
     const from = fy[0]?.begin_date || new Date().getFullYear() + '-04-01';
     const to   = fy[0]?.end_date   || (new Date().getFullYear() + 1) + '-03-31';
-    const [s, p] = await Promise.all([
+    const [sRes, pRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
     ]);
+    const sVal = +(sRes.rows?.[0]?.v ?? 0);  // Fix: destructure .rows from pg Result
+    const pVal = +(pRes.rows?.[0]?.v ?? 0);
     const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount: fmt(+(s?.[0]?.v ?? 0)), amount_raw: +(s?.[0]?.v ?? 0), change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
-      { id: 'purchases', label: 'Purchases', amount: fmt(+(p?.[0]?.v ?? 0)), amount_raw: +(p?.[0]?.v ?? 0), change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'sales',     label: 'Sales',     amount: fmt(sVal), amount_raw: sVal, change: 0, positive: true, icon: 'stats-chart-outline', route: '/sales/register' },
+      { id: 'purchases', label: 'Purchases', amount: fmt(pVal), amount_raw: pVal, change: 0, positive: true, icon: 'cart-outline',        route: '/purchase/register' },
     ]});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -456,16 +458,19 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   try {
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
-    const [s, p] = await Promise.all([
+    const [sRes2, pRes2] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]),
     ]);
+    const sVal2 = +(sRes2.rows?.[0]?.v ?? 0);  // Fix: .rows from pg Result
+    const pVal2 = +(pRes2.rows?.[0]?.v ?? 0);
     const netCash = +(cash?.[0]?.v ?? 0) + +(bank?.[0]?.v ?? 0);
-    const grossProfit = +(s?.[0]?.v ?? 0) - +(p?.[0]?.v ?? 0);
+    const grossProfit = sVal2 - pVal2;
     res.json({ success: true, data: {
       net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
       gross_profit: grossProfit, net_profit: grossProfit,
-      income_percentage: +(s?.[0]?.v ?? 0) > 0 ? Math.round((grossProfit / +(s?.[0]?.v ?? 0)) * 100) : 0,
+      total_income: sVal2, total_expense: pVal2,
+      income_percentage: sVal2 > 0 ? Math.round((grossProfit / sVal2) * 100) : 0,
       updated_at: 'just now',
     }});
   } catch (err) {
