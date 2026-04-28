@@ -235,13 +235,18 @@ router.post('/register', async (req, res) => {
   }
 
   try {
+    // Auto-generate a permanent pairing code if this device doesn’t have one yet
+    const genCode = () => String(Math.floor(100000 + Math.random() * 900000));
+
     await query(`
-      INSERT INTO devices (device_id, name, last_seen)
-      VALUES ($1, $2, $3)
+      INSERT INTO devices (device_id, name, last_seen, pairing_code)
+      VALUES ($1, $2, $3, $4)
       ON CONFLICT (device_id) DO UPDATE SET
-        name = COALESCE($2, devices.name),
-        last_seen = EXCLUDED.last_seen
-    `, [resolvedId, host || 'TallyDekho Desktop', now()]);
+        name       = COALESCE($2, devices.name),
+        last_seen  = EXCLUDED.last_seen,
+        -- Only set code if none exists yet (permanent code)
+        pairing_code = COALESCE(devices.pairing_code, EXCLUDED.pairing_code)
+    `, [resolvedId, host || 'TallyDekho Desktop', now(), genCode()]);
 
     const { rows } = await query('SELECT * FROM devices WHERE device_id = $1', [resolvedId]);
     const device = rows[0];
@@ -255,7 +260,8 @@ router.post('/register', async (req, res) => {
         lastSync,
         forceUpdate: false,
         isPaired,
-        versionLevel,      // 0=ok, 1=update available, 2=sync blocked, 3=force
+        pairingCode: device?.pairing_code || null,  // permanent code returned on every register
+        versionLevel,
         versionMessage,
         latestVersion: CURRENT_VERSION,
       }

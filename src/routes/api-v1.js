@@ -334,19 +334,24 @@ router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
       [userId]
     );
 
-    // Mark device as unpaired (keep the device row for re-pairing later)
+    // Generate a new permanent pairing code for the device (replaces old one)
+    const newCode = String(Math.floor(100000 + Math.random() * 900000));
+    const deviceId = devices[0]?.device_id;
+
+    // Mark device as unpaired + assign fresh pairing code
     await query(
-      'UPDATE devices SET paired = FALSE, user_id = NULL WHERE user_id = $1',
-      [userId]
+      'UPDATE devices SET paired = FALSE, user_id = NULL, pairing_code = $1 WHERE user_id = $2',
+      [newCode, userId]
     );
 
-    // Notify all connected clients (mobile, web) via WebSocket
+    // Notify all connected clients with the new code
+    // Desktop uses newCode to update its display; mobile/web clear their paired state
     const socketSvc = getSocketService?.();
     if (socketSvc?.notifyUnpaired) {
-      socketSvc.notifyUnpaired(userId);
+      socketSvc.notifyUnpaired(userId, newCode);
     }
 
-    res.json({ success: true, message: 'Unpaired successfully' });
+    res.json({ success: true, message: 'Unpaired successfully', newCode });
   } catch (err) {
     console.error('[unpair]', err.message);
     res.status(500).json({ success: false, error: { message: err.message } });

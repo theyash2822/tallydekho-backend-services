@@ -113,11 +113,19 @@ export function setupSocket(io) {
     },
 
     // Called when device is unpaired
-    notifyUnpaired: (userId) => {
+    // newCode: the freshly generated replacement pairing code (for desktop to display)
+    notifyUnpaired: (userId, newCode) => {
+      // Notify mobile + web: they are now unpaired
       ['mobile', 'web'].forEach(type => {
         const client = connectedClients.get(`${type}_${userId}`);
         if (client?.connected) client.emit('unpaired', {});
       });
+      // Notify desktop: update pairing panel with the new code
+      for (const [key, s] of connectedClients.entries()) {
+        if (key.startsWith('desktop_') && s?.connected) {
+          s.emit('unpaired', { newCode: newCode || null });
+        }
+      }
     },
 
     // Force logout (e.g. login on another device)
