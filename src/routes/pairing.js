@@ -57,28 +57,37 @@ router.get('/pairing-device', async (req, res) => {
   }
 });
 
-// GET /desktop/pairing-code — Desktop generates pairing code
+// GET /desktop/pairing-code — Returns EXISTING permanent pairing code for this device.
+// Code is set on /desktop/register and only changes when device is unpaired.
+// Never generates a new code here — that would break the permanent code design.
 router.get('/pairing-code', async (req, res) => {
   const deviceId = req.headers['device-id'];
   if (!deviceId) return res.status(400).json({ status: false, message: 'device-id header required' });
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  const expires = Date.now() + 10 * 60 * 1000;
-
   try {
-    await query(`
-      INSERT INTO devices (device_id, pairing_code, code_expires, last_seen)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (device_id) DO UPDATE SET
-        pairing_code = EXCLUDED.pairing_code,
-        code_expires = EXCLUDED.code_expires,
-        last_seen = EXCLUDED.last_seen
-    `, [deviceId, code, expires, now()]);
+    const { rows } = await query(
+      'SELECT pairing_code FROM devices WHERE device_id = $1',
+      [deviceId]
+    );
+    const device = rows[0];
 
-    console.log(`[PAIRING] Device ${deviceId} → code ${code}`);
-    res.json({ status: true, data: { code, expiresIn: 600 } });
+    if (!device) return res.status(404).json({ status: false, message: 'Device not registered' });
+
+    // If somehow no code exists (old install before this change), generate one now
+    let code = device.pairing_code;
+    if (!code) {
+      code = String(Math.floor(100000 + Math.random() * 900000));
+      await query(
+        'UPDATE devices SET pairing_code = $1 WHERE device_id = $2',
+        [code, deviceId]
+      );
+    }
+
+    console.log(`[PAIRING] Device ${deviceId} → returning permanent code`);
+    // No expiry — code is permanent. generatedAt sent for display purposes only.
+    res.json({ status: true, data: { code, generatedAt: Date.now() } });
   } catch (err) {
-    res.status(500).json({ status: false, message: 'Failed to generate code' });
+    res.status(500).json({ status: false, message: 'Failed to get code' });
   }
 });
 
