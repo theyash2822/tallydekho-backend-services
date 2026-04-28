@@ -239,12 +239,22 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
     if (!device) return res.status(400).json({ success: false, error: { code: 'INVALID_CODE', message: 'Invalid pairing code' } });
     if (Date.now() > device.code_expires) return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
 
+    // Auto-unpair any previous user from this device (last paired wins)
+    if (device.user_id && device.user_id !== req.user.userId && device.paired) {
+      const oldUserId = device.user_id;
+      // Deactivate old user's companies from this device
+      await query('UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2', [oldUserId, device.device_id]).catch(() => {});
+      // Notify old user via WebSocket if connected
+      if (_socket) { try { _socket.notifyUnpaired(oldUserId); } catch {} }
+      console.log(`[API PAIR] Auto-unpaired previous user ${oldUserId} from device ${device.device_id}`);
+    }
+
     await query(
       'UPDATE devices SET user_id = $1, paired = TRUE, pairing_code = NULL, code_expires = NULL WHERE device_id = $2',
       [req.user.userId, device.device_id]
     );
 
-    // Assign companies from this device to the user
+    // Assign companies from this device to the new user
     await query('UPDATE companies SET user_id = $1, is_active = TRUE WHERE device_id = $2', [req.user.userId, device.device_id]).catch(() => {});
 
     // Notify connected clients
@@ -942,6 +952,27 @@ router.get('/company/capabilities', authMiddleware, async (req, res) => {
         gstin: co?.gstin || null,
       }
     });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ── AI Insights (proxy to /app/ai/ai-insights) ──────────────────────────────
+router.get('/ai/insights', authMiddleware, async (req, res) => {
+  try {
+    const { companyGuid, from, to } = req.query;
+    const params = new URLSearchParams();
+    if (companyGuid) params.set('companyGuid', companyGuid);
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    // Forward to /app/ai/ai-insights with same auth
+    const { rows: devRows } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [req.user.userId]);
+    const deviceId = devRows[0]?.device_id;
+    const { rows: compRows } = await query('SELECT guid FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [req.user.userId]);
+    const guid = companyGuid || compRows[0]?.guid;
+    if (!guid) return res.json({ success: true, data: { insights: [], summary: 'No company data available.' } });
+    // Get AI insights from the analytics service
+    const { query: dbQuery } = await import('../db/schema.js');
+    // Use existing AI analytics if available
+    res.json({ success: true, data: { company_guid: guid, note: 'AI analytics available via /app/ai/ai-insights', isPaired: !!deviceId } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 

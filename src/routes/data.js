@@ -963,5 +963,93 @@ router.get('/reports-dashboard', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── POST /reports/trial-balance ─────────────────────────────────────────────
+router.post('/reports/trial-balance', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const { rows } = await query(`
+      SELECT name, parent, closing_balance, balance_type,
+        CASE WHEN balance_type = 'Dr' THEN ABS(closing_balance) ELSE 0 END as debit_amount,
+        CASE WHEN balance_type = 'Cr' THEN ABS(closing_balance) ELSE 0 END as credit_amount
+      FROM ledgers
+      WHERE company_guid = $1 AND closing_balance != 0
+      ORDER BY parent, name
+    `, [companyGuid]);
+
+    const totalDebit = rows.reduce((s, r) => s + parseFloat(r.debit_amount || 0), 0);
+    const totalCredit = rows.reduce((s, r) => s + parseFloat(r.credit_amount || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        ledgers: rows,
+        totals: { debit: totalDebit, credit: totalCredit },
+      },
+    });
+  } catch (err) {
+    console.error('[trial-balance]', err.message);
+    res.status(500).json({ status: false, message: 'Failed' });
+  }
+});
+
+// ─── POST /reports/bill-ageing ────────────────────────────────────────────────
+router.post('/reports/bill-ageing', authMiddleware, async (req, res) => {
+  const { companyGuid, ledgerGuid } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const q = ledgerGuid
+      ? `SELECT v.date, v.voucher_number, v.amount, v.party_name, v.voucher_type,
+           CURRENT_DATE - v.date::date as days_overdue
+         FROM vouchers v
+         WHERE v.company_guid = $1
+           AND v.party_guid = $2
+           AND v.is_cancelled = FALSE
+           AND v.voucher_type ILIKE '%Sales%'
+           AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+         ORDER BY v.date ASC LIMIT 100`
+      : `SELECT v.date, v.voucher_number, v.amount, v.party_name, v.voucher_type,
+           CURRENT_DATE - v.date::date as days_overdue
+         FROM vouchers v
+         WHERE v.company_guid = $1
+           AND v.is_cancelled = FALSE
+           AND v.voucher_type ILIKE '%Sales%'
+           AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+         ORDER BY v.date ASC LIMIT 200`;
+
+    const params = ledgerGuid ? [companyGuid, ledgerGuid] : [companyGuid];
+    const { rows } = await query(q, params);
+
+    const buckets = { current: [], days30: [], days60: [], days90: [], over90: [] };
+    rows.forEach(r => {
+      const d = parseInt(r.days_overdue || 0);
+      if (d <= 0)       buckets.current.push(r);
+      else if (d <= 30) buckets.days30.push(r);
+      else if (d <= 60) buckets.days60.push(r);
+      else if (d <= 90) buckets.days90.push(r);
+      else              buckets.over90.push(r);
+    });
+
+    const sumBucket = b => b.reduce((s, r) => s + parseFloat(r.amount || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        buckets,
+        summary: {
+          current: sumBucket(buckets.current),
+          days30:  sumBucket(buckets.days30),
+          days60:  sumBucket(buckets.days60),
+          days90:  sumBucket(buckets.days90),
+          over90:  sumBucket(buckets.over90),
+          total:   rows.reduce((s, r) => s + parseFloat(r.amount || 0), 0),
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[bill-ageing]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
 export default router;
-// Already has export default router at end — this gets inserted before it

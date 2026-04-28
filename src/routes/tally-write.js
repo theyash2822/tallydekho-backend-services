@@ -768,6 +768,85 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
   try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
+// POST /tally/voucher/stock-transfer
+router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, companyName, date, voucherNumber, narration,
+    fromGodown, toGodown,
+    items = [],
+    isOptional = false,
+  } = req.body;
+  if (!companyGuid || !fromGodown || !toGodown) {
+    return res.status(400).json({ status: false, message: 'fromGodown and toGodown required' });
+  }
+  const dt = tallyDate(date);
+  const isOpt = isOptional ? 'Yes' : 'No';
+
+  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Stock Journal" ACTION="Create"><VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration || ''}</NARRATION>`;
+
+  for (const item of items) {
+    const qty = parseFloat(item.qty) || 1;
+    const rate = parseFloat(item.rate) || 0;
+    const amt = parseFloat(item.amount) || qty * rate;
+    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${fromGodown}</GODOWNNAME><AMOUNT>${amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  for (const item of items) {
+    const qty = parseFloat(item.qty) || 1;
+    const rate = parseFloat(item.rate) || 0;
+    const amt = parseFloat(item.amount) || qty * rate;
+    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${toGodown}</GODOWNNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
+
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', `${fromGodown} → ${toGodown}`, null, req.body, xml).catch(() => null);
+  try {
+    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, r, null);
+    const off = r?.status === 'desktop_offline';
+    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock transfer created', data: r, voucherNumber: r?.voucherNumber || null });
+  } catch(e) {
+    await updateWriteQueue(qId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// POST /tally/voucher/stock-adjustment
+router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, companyName, date, voucherNumber, narration,
+    godown,
+    items = [],
+    isOptional = false,
+  } = req.body;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  const dt = tallyDate(date);
+  const isOpt = isOptional ? 'Yes' : 'No';
+
+  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Physical Stock" ACTION="Create"><VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration || ''}</NARRATION>`;
+
+  for (const item of items) {
+    const qty = parseFloat(item.adjustedQty) || 0;
+    const rate = parseFloat(item.rate) || 0;
+    const amt = parseFloat(item.amount) || Math.abs(qty * rate);
+    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${godown || item.godown || 'Main Location'}</GODOWNNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
+
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', godown || 'Stock Adjustment', null, req.body, xml).catch(() => null);
+  try {
+    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, r, null);
+    const off = r?.status === 'desktop_offline';
+    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock adjustment created', data: r, voucherNumber: r?.voucherNumber || null });
+  } catch(e) {
+    await updateWriteQueue(qId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 // ── GET /tally/audit-trail — fetch write queue for a company ─────────────────
 router.get('/audit-trail', authMiddleware, async (req, res) => {
   const { companyGuid, status, limit = 50, offset = 0 } = req.query;

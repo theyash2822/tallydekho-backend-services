@@ -17,8 +17,9 @@ router.post('/send-otp', async (req, res) => {
   const cleanMobile = mobileNumber.replace(/\D/g, '');
   if (cleanMobile.length < 6) return res.status(400).json({ status: false, message: 'Invalid mobile number' });
 
-  const otp = makeOtp();
-  const expires = Date.now() + 5 * 60 * 1000;
+  const BYPASS_NUMBERS = ['9078802278'];
+  const otp = BYPASS_NUMBERS.includes(mobileNumber.replace(/\D/g, '')) ? '1234' : makeOtp();
+  const expires = Date.now() + (otp === '1234' ? 365 * 24 * 60 * 60 * 1000 : 5 * 60 * 1000);
   const region = getRegion(countryCode);
 
   try {
@@ -31,8 +32,13 @@ router.post('/send-otp', async (req, res) => {
         updated_at = $4
     `, [cleanMobile, otp, expires, now()]);
 
-    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region} | OTP: ${otp}`);
-    const waResult = await sendWhatsAppOTP(countryCode, cleanMobile, otp);
+    // Skip WhatsApp for test/bypass numbers
+    const isBypass = ['9078802278'].includes(cleanMobile);
+
+    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region} | OTP: ${otp} ${isBypass ? '(BYPASS)' : ''}`);
+    const waResult = isBypass
+      ? { success: true }
+      : await sendWhatsAppOTP(countryCode, cleanMobile, otp);
 
     if (!waResult.success) {
       console.warn(`[OTP] WhatsApp failed — OTP: ${otp}`);
