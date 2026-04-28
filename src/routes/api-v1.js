@@ -257,7 +257,10 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
     const device = rows[0];
 
     if (!device) return res.status(400).json({ success: false, error: { code: 'INVALID_CODE', message: 'Invalid pairing code' } });
-    if (Date.now() > device.code_expires) return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
+    // Permanent codes have code_expires=NULL — only check expiry for legacy timed codes
+    if (device.code_expires && Date.now() > device.code_expires) {
+      return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
+    }
 
     // Auto-unpair any previous user from this device (last paired wins)
     if (device.user_id && device.user_id !== req.user.userId && device.paired) {
@@ -270,7 +273,8 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
     }
 
     await query(
-      'UPDATE devices SET user_id = $1, paired = TRUE, pairing_code = NULL, code_expires = NULL WHERE device_id = $2',
+      // Keep pairing_code intact (permanent code stays for future reference/re-pairing)
+      'UPDATE devices SET user_id = $1, paired = TRUE, code_expires = NULL WHERE device_id = $2',
       [req.user.userId, device.device_id]
     );
 
