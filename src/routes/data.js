@@ -176,7 +176,7 @@ router.post('/vouchers', authMiddleware, requirePaired, requireCompanySynced, as
 });
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-router.post('/dashboard', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
+router.post('/dashboard', authMiddleware, requirePaired, async (req, res) => {
   const { companyGuid, fromDate, toDate } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 

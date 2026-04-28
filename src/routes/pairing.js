@@ -300,6 +300,17 @@ router.get('/company-sync-status', desktopAuth, async (req, res) => {
   }
 });
 
+// POST /desktop/logs — receive log file from desktop and email to support
+router.post('/logs', async (req, res) => {
+  try {
+    // Accept plain text or multipart — just acknowledge receipt
+    // Future: parse and email to project@tallydekho.com
+    res.json({ status: true, message: 'Logs received' });
+  } catch (err) {
+    res.status(500).json({ status: false });
+  }
+});
+
 // POST /desktop/heartbeat — lightweight ping to keep last_seen fresh
 // Desktop calls this every 2 minutes so mobile can detect desktop online status
 router.post('/heartbeat', async (req, res) => {
