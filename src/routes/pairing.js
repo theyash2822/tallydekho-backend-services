@@ -1,7 +1,7 @@
 // Pairing routes
 import { Router } from 'express';
 import { query } from '../db/schema.js';
-import { authMiddleware, generateToken } from '../middleware/auth.js';
+import { authMiddleware, desktopAuth, generateToken } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
 
 // Socket service injected after startup
@@ -262,6 +262,41 @@ router.post('/register', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Registration failed' });
+  }
+});
+
+// GET /desktop/company-sync-status — used by desktop for multi-device conflict detection
+// Returns when the company was last synced and from which device
+// Uses desktopAuth (device-id header only, no JWT needed)
+router.get('/company-sync-status', desktopAuth, async (req, res) => {
+  const { companyGuid } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const deviceId = req.deviceId;
+    // Get the device's owner (user_id)
+    const { rows: devices } = await query(
+      'SELECT user_id FROM devices WHERE device_id = $1 LIMIT 1',
+      [deviceId]
+    );
+    if (!devices[0]) return res.status(403).json({ status: false, message: 'Device not registered' });
+
+    // Get when this company was last synced and from which device
+    const { rows: companies } = await query(
+      'SELECT synced_at, device_id FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
+      [companyGuid, devices[0].user_id]
+    );
+
+    const company = companies[0];
+    res.json({
+      status: true,
+      data: {
+        lastSyncedAt: company?.synced_at || null,
+        lastSyncDeviceId: company?.device_id || null,
+        isMyDevice: company?.device_id === deviceId,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
   }
 });
 
