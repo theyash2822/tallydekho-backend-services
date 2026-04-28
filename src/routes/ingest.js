@@ -190,7 +190,7 @@ router.post('/ingest/chunk', async (req, res) => {
 router.post('/ingest/complete', async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
-  const { uploadId } = body || {};
+  const { uploadId, isHardSync, voucherCount, ledgerCount, stockCount, recordCount } = body || {};
   let { companyGuid } = body || {};
   const deviceId = req.headers['device-id'];
 
@@ -208,8 +208,23 @@ router.post('/ingest/complete', async (req, res) => {
 
     if (companyGuid) {
       await query('UPDATE companies SET synced_at = $1 WHERE guid = $2', [now(), companyGuid]);
-      await query(`INSERT INTO sync_log (company_guid, device_id, stream, status, completed_at) VALUES ($1, $2, 'complete', 'success', $3)`,
-        [companyGuid, deviceId, now()]);
+
+      // Log the sync operation
+      await query(
+        `INSERT INTO sync_log (device_id, user_id, company_guid, synced_at, mode, voucher_count, ledger_count, stock_count, record_count, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'success')`,
+        [
+          deviceId || 'unknown',
+          userId || null,
+          companyGuid,
+          now(),
+          isHardSync ? 'hard' : 'normal',
+          voucherCount || 0,
+          ledgerCount  || 0,
+          stockCount   || 0,
+          recordCount  || 0,
+        ]
+      ).catch(err => console.error('[sync_log] insert failed:', err.message));
     }
 
     console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);

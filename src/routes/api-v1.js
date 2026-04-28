@@ -14,6 +14,11 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// Lazy ref to socket service (set by server.js after WS init)
+let _socketService = null;
+export function setApiSocket(svc) { _socketService = svc; }
+const getSocketService = () => _socketService;
+
 // ══════════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════════
@@ -222,9 +227,7 @@ router.post('/auth/logout', authMiddleware, async (req, res) => {
 // TALLY SYNC / PAIRING
 // ══════════════════════════════════════════════════════════════
 
-// Socket service injected after startup
-let _socket = null;
-export function setApiSocket(s) { _socket = s; }
+// Socket service — use the shared ref declared at top of file
 
 // POST /api/tally-sync/pair
 // Frontend sends: { pairing_code: "123456" }
@@ -293,6 +296,13 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
     const isPaired = devices.length > 0;
     const device = devices[0] || null;
 
+    // Desktop online = last_seen within 5 minutes
+    const ONLINE_THRESHOLD_SECS = 5 * 60;
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const desktopOnline = isPaired && device &&
+      typeof device.last_seen === 'number' &&
+      (nowSecs - device.last_seen) < ONLINE_THRESHOLD_SECS;
+
     let company = null;
     if (isPaired) {
       const { rows: companies } = await query('SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [req.user.userId]);
@@ -303,12 +313,43 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
       success: true,
       data: {
         is_paired: isPaired,
+        desktop_online: !!desktopOnline,
         device: isPaired ? { id: device.device_id, name: device.name || 'Desktop', last_seen: device.last_seen } : null,
         company,
       }
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch sync status' } });
+  }
+});
+
+// POST /api/tally-sync/unpair — unpair this user from their device (cross-platform)
+router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get the device before unpairing (for WS notification)
+    const { rows: devices } = await query(
+      'SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1',
+      [userId]
+    );
+
+    // Mark device as unpaired (keep the device row for re-pairing later)
+    await query(
+      'UPDATE devices SET paired = FALSE, user_id = NULL WHERE user_id = $1',
+      [userId]
+    );
+
+    // Notify all connected clients (mobile, web) via WebSocket
+    const socketSvc = getSocketService?.();
+    if (socketSvc?.notifyUnpaired) {
+      socketSvc.notifyUnpaired(userId);
+    }
+
+    res.json({ success: true, message: 'Unpaired successfully' });
+  } catch (err) {
+    console.error('[unpair]', err.message);
+    res.status(500).json({ success: false, error: { message: err.message } });
   }
 });
 
@@ -364,14 +405,16 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE`, [companyGuid]);
 
     const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
+    // Safe access — COALESCE should always return a row, but guard anyway
+    const g = (rows) => +(rows?.[0]?.v ?? 0);
     const kpi = [
-      { id: 'cash',       label: 'Cash In Hand', amount: fmt(+cash[0].v),  amount_raw: +cash[0].v,  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
-      { id: 'bank',       label: 'Bank Balance', amount: fmt(+bank[0].v),  amount_raw: +bank[0].v,  icon: 'card-outline',                route: '/kpi/bank-balance' },
-      { id: 'receivable', label: 'Receivables',  amount: fmt(+rec[0].v),   amount_raw: +rec[0].v,   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
-      { id: 'payable',    label: 'Payables',     amount: fmt(+pay[0].v),   amount_raw: +pay[0].v,   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
-      { id: 'loans',      label: 'Loans & ODs',  amount: fmt(+loans[0].v), amount_raw: +loans[0].v, icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
-      { id: 'payments',   label: 'Payments',     amount: fmt(+pmts[0].v),  amount_raw: +pmts[0].v,  icon: 'send-outline',                route: '/kpi/payments' },
-      { id: 'receipts',   label: 'Receipts',     amount: fmt(+rcts[0].v),  amount_raw: +rcts[0].v,  icon: 'download-outline',            route: '/kpi/receipts' },
+      { id: 'cash',       label: 'Cash In Hand', amount: fmt(g(cash)),  amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
+      { id: 'bank',       label: 'Bank Balance', amount: fmt(g(bank)),  amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance' },
+      { id: 'receivable', label: 'Receivables',  amount: fmt(g(rec)),   amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
+      { id: 'payable',    label: 'Payables',     amount: fmt(g(pay)),   amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
+      { id: 'loans',      label: 'Loans & ODs',  amount: fmt(g(loans)), amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
+      { id: 'payments',   label: 'Payments',     amount: fmt(g(pmts)),  amount_raw: g(pmts),  icon: 'send-outline',                route: '/kpi/payments' },
+      { id: 'receipts',   label: 'Receipts',     amount: fmt(g(rcts)),  amount_raw: g(rcts),  icon: 'download-outline',            route: '/kpi/receipts' },
     ];
     res.json({ success: true, data: kpi });
   } catch (err) {
@@ -393,8 +436,8 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     ]);
     const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount: fmt(+s[0].v), amount_raw: +s[0].v, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
-      { id: 'purchases', label: 'Purchases', amount: fmt(+p[0].v), amount_raw: +p[0].v, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'sales',     label: 'Sales',     amount: fmt(+(s?.[0]?.v ?? 0)), amount_raw: +(s?.[0]?.v ?? 0), change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
+      { id: 'purchases', label: 'Purchases', amount: fmt(+(p?.[0]?.v ?? 0)), amount_raw: +(p?.[0]?.v ?? 0), change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
     ]});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -412,12 +455,12 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]),
     ]);
-    const netCash = +cash[0].v + +bank[0].v;
-    const grossProfit = +s[0].v - +p[0].v;
+    const netCash = +(cash?.[0]?.v ?? 0) + +(bank?.[0]?.v ?? 0);
+    const grossProfit = +(s?.[0]?.v ?? 0) - +(p?.[0]?.v ?? 0);
     res.json({ success: true, data: {
       net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
       gross_profit: grossProfit, net_profit: grossProfit,
-      income_percentage: +s[0].v > 0 ? Math.round((grossProfit / +s[0].v) * 100) : 0,
+      income_percentage: +(s?.[0]?.v ?? 0) > 0 ? Math.round((grossProfit / +(s?.[0]?.v ?? 0)) * 100) : 0,
       updated_at: 'just now',
     }});
   } catch (err) {
@@ -587,7 +630,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       data: {
-        summary: { total_value: `₹${(+cnt[0].v/1e5).toFixed(1)}L`, total_skus: parseInt(cnt[0].c), low_stock_count: parseInt(low[0].c) },
+        summary: { total_value: `₹${(+(cnt?.[0]?.v ?? 0)/1e5).toFixed(1)}L`, total_skus: parseInt(cnt[0].c), low_stock_count: parseInt(low[0].c) },
         items: rows,
       },
       meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
@@ -650,12 +693,12 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
   try {
     const { rows: sales } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]);
     const { rows: purchase } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]);
-    const outputGst = +sales[0].v * 0.18;
-    const inputGst  = +purchase[0].v * 0.18;
+    const outputGst = +(sales?.[0]?.v ?? 0) * 0.18;
+    const inputGst  = +(purchase?.[0]?.v ?? 0) * 0.18;
     res.json({ success: true, data: {
       output_gst: outputGst, input_gst: inputGst,
       net_gst: outputGst - inputGst,
-      sales_taxable: +sales[0].v, purchase_taxable: +purchase[0].v,
+      sales_taxable: +(sales?.[0]?.v ?? 0), purchase_taxable: +(purchase?.[0]?.v ?? 0),
     }});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -953,6 +996,29 @@ router.get('/company/capabilities', authMiddleware, async (req, res) => {
       }
     });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SYNC HISTORY
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/sync-history — audit log of desktop sync operations
+router.get('/sync-history', authMiddleware, async (req, res) => {
+  const { companyGuid, limit = 50 } = req.query;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { message: 'companyGuid required' } });
+  try {
+    const { rows } = await query(
+      `SELECT id, device_id, mode, synced_at, voucher_count, ledger_count, stock_count, record_count, status, error_message
+       FROM sync_log
+       WHERE company_guid = $1 AND user_id = $2
+       ORDER BY synced_at DESC
+       LIMIT $3`,
+      [companyGuid, req.user.userId, parseInt(limit)]
+    );
+    res.json({ success: true, data: { entries: rows } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { message: err.message } });
+  }
 });
 
 // ── AI Insights (proxy to /app/ai/ai-insights) ──────────────────────────────

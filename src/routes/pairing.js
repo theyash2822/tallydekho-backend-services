@@ -204,6 +204,36 @@ router.post('/register', async (req, res) => {
   const resolvedId = headerDeviceId || deviceId;
   if (!resolvedId) return res.status(400).json({ status: false, message: 'device-id required' });
 
+  // Version compatibility check
+  const CURRENT_VERSION = process.env.DESKTOP_VERSION || '1.0.0';
+  const MINIMUM_VERSION = process.env.DESKTOP_MIN_VERSION || '1.0.0';
+
+  function parseVer(v) {
+    const [ma = 0, mi = 0, pa = 0] = (v || '0.0.0').split('.').map(Number);
+    return { major: ma, minor: mi, patch: pa };
+  }
+
+  // Level: 0=ok, 1=update available (minor/patch), 2=sync blocked (major mismatch), 3=force update
+  let versionLevel = 0;
+  let versionMessage = null;
+
+  if (desktopVersion) {
+    const curr   = parseVer(desktopVersion);
+    const min    = parseVer(MINIMUM_VERSION);
+    const latest = parseVer(CURRENT_VERSION);
+
+    if (curr.major < min.major) {
+      versionLevel = 3; // force update
+      versionMessage = `Desktop v${desktopVersion} is too old. Please update to v${CURRENT_VERSION} to continue.`;
+    } else if (curr.major < latest.major) {
+      versionLevel = 2; // sync blocked
+      versionMessage = `Sync requires desktop v${CURRENT_VERSION}. Please update.`;
+    } else if (curr.minor < latest.minor || curr.patch < latest.patch) {
+      versionLevel = 1; // update available, non-blocking
+      versionMessage = `Update available: v${CURRENT_VERSION}`;
+    }
+  }
+
   try {
     await query(`
       INSERT INTO devices (device_id, name, last_seen)
@@ -218,9 +248,36 @@ router.post('/register', async (req, res) => {
     const lastSync = device?.last_seen ? new Date(device.last_seen * 1000).toISOString() : null;
     const isPaired = device?.paired === true;
 
-    res.json({ status: true, message: 'Registered', data: { lastSync, forceUpdate: false, isPaired } });
+    res.json({
+      status: true,
+      message: 'Registered',
+      data: {
+        lastSync,
+        forceUpdate: false,
+        isPaired,
+        versionLevel,      // 0=ok, 1=update available, 2=sync blocked, 3=force
+        versionMessage,
+        latestVersion: CURRENT_VERSION,
+      }
+    });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Registration failed' });
+  }
+});
+
+// POST /desktop/heartbeat — lightweight ping to keep last_seen fresh
+// Desktop calls this every 2 minutes so mobile can detect desktop online status
+router.post('/heartbeat', async (req, res) => {
+  const deviceId = req.headers['device-id'];
+  if (!deviceId) return res.status(400).json({ status: false, message: 'device-id required' });
+  try {
+    await query(
+      'UPDATE devices SET last_seen = $1 WHERE device_id = $2',
+      [now(), deviceId]
+    );
+    res.json({ status: true });
+  } catch (err) {
+    res.status(500).json({ status: false });
   }
 });
 

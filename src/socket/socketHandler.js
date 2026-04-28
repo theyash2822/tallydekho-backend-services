@@ -26,11 +26,11 @@ export function setupSocket(io) {
         console.log(`[WS] registered desktop via register event: ${deviceId}`);
         socket.emit('registered', { status: true });
         // Auto-retry offline entries
-        query('SELECT user_id, company_guid FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+        query('SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
           .then(({ rows }) => {
             if (rows[0] && _retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-              _retryOfflineEntries(rows[0].user_id, rows[0].company_guid);
+              _retryOfflineEntries(rows[0].user_id, null);
             }
           }).catch(() => {});
         return;
@@ -56,11 +56,11 @@ export function setupSocket(io) {
       connectedClients.set(`desktop_${deviceId}`, socket);
       console.log(`[WS] registered desktop: ${deviceId}`);
       // Auto-retry offline entries for this device
-      query('SELECT user_id, company_guid FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+      query('SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
         .then(({ rows }) => {
           if (rows[0] && _retryOfflineEntries) {
             console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-            _retryOfflineEntries(rows[0].user_id, rows[0].company_guid);
+            _retryOfflineEntries(rows[0].user_id, null);
           }
         }).catch(() => {});
     });

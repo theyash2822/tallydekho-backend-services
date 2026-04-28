@@ -1,9 +1,12 @@
 // Data routes — read endpoints for mobile & web portal
 import { Router } from 'express';
 import { query } from '../db/schema.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requirePaired, requireCompanySynced } from '../middleware/auth.js';
 
 const router = Router();
+
+// GET /ping — lightweight health check for desktop connectivity detection
+router.get('/ping', (_req, res) => res.json({ ok: true }));
 
 // ─── Ledgers ──────────────────────────────────────────────────────────────────
 // POST /parties — unique party names from vouchers (customers/vendors)
@@ -26,7 +29,7 @@ router.post('/parties', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/ledgers', authMiddleware, async (req, res) => {
+router.post('/ledgers', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
   const { companyGuid, page = 1, pageSize = 50, searchText = '', parent } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 
@@ -95,7 +98,7 @@ router.post('/stock-filters', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/stocks', authMiddleware, async (req, res) => {
+router.post('/stocks', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
   const { companyGuid, page = 1, pageSize = 50, searchText = '', category, lowStockOnly } = req.body || {};
   const offset = (page - 1) * pageSize;
   const search = `%${searchText}%`;
@@ -132,7 +135,7 @@ router.post('/stock', authMiddleware, async (req, res) => {
 });
 
 // ─── Vouchers ─────────────────────────────────────────────────────────────────
-router.post('/vouchers', authMiddleware, async (req, res) => {
+router.post('/vouchers', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
   const { companyGuid, voucherType, page = 1, pageSize = 50, searchText = '', fromDate, toDate, status } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 
@@ -173,7 +176,7 @@ router.post('/vouchers', authMiddleware, async (req, res) => {
 });
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-router.post('/dashboard', authMiddleware, async (req, res) => {
+router.post('/dashboard', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
   const { companyGuid, fromDate, toDate } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 

@@ -190,14 +190,17 @@ export async function initSchema() {
       -- Sync log
       CREATE TABLE IF NOT EXISTS sync_log (
         id            SERIAL PRIMARY KEY,
+        device_id     TEXT NOT NULL,
+        user_id       INTEGER REFERENCES users(id),
         company_guid  TEXT NOT NULL,
-        device_id     TEXT,
-        stream        TEXT,
-        records_count INTEGER DEFAULT 0,
-        status        TEXT DEFAULT 'success',
-        error         TEXT,
-        started_at    BIGINT,
-        completed_at  BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+        synced_at     BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        mode          TEXT DEFAULT 'normal',       -- 'normal' | 'hard'
+        voucher_count INTEGER DEFAULT 0,
+        ledger_count  INTEGER DEFAULT 0,
+        stock_count   INTEGER DEFAULT 0,
+        record_count  INTEGER DEFAULT 0,
+        status        TEXT DEFAULT 'success',      -- 'success' | 'failed'
+        error_message TEXT
       );
 
       -- Ingest uploads
@@ -400,6 +403,16 @@ export async function initSchema() {
 
       -- Migrations for existing installs
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+
+      -- sync_log migrations (add new columns for existing installs)
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS user_id       INTEGER REFERENCES users(id);
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS synced_at     BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS mode          TEXT DEFAULT 'normal';
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS voucher_count INTEGER DEFAULT 0;
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS ledger_count  INTEGER DEFAULT 0;
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS stock_count   INTEGER DEFAULT 0;
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS record_count  INTEGER DEFAULT 0;
+      ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS error_message TEXT;
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {
