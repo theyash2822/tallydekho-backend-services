@@ -101,10 +101,15 @@ router.post('/pairing', authMiddleware, async (req, res) => {
     const device = rows[0];
 
     if (!device) return res.status(400).json({ status: false, message: 'Invalid pairing code' });
-    if (Date.now() > device.code_expires) return res.status(400).json({ status: false, message: 'Pairing code expired. Generate a new one.' });
+    // Permanent codes: code_expires is NULL — skip expiry check.
+    // Legacy timed codes: check expiry only if code_expires is set.
+    if (device.code_expires && Date.now() > device.code_expires) {
+      return res.status(400).json({ status: false, message: 'Pairing code expired. Generate a new one.' });
+    }
 
+    // Keep pairing_code intact (permanent code stays, just set paired=TRUE)
     await query(
-      'UPDATE devices SET user_id = $1, paired = TRUE, pairing_code = NULL, code_expires = NULL WHERE device_id = $2',
+      'UPDATE devices SET user_id = $1, paired = TRUE WHERE device_id = $2',
       [req.user.userId, device.device_id]
     );
 
