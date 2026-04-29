@@ -196,11 +196,19 @@ async function processVouchers(data, companyGuid) {
           INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
-            voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
-            date=EXCLUDED.date, party_name=EXCLUDED.party_name, party_guid=EXCLUDED.party_guid,
-            amount=EXCLUDED.amount, narration=EXCLUDED.narration, reference=EXCLUDED.reference,
-            is_cancelled=EXCLUDED.is_cancelled, alter_id=EXCLUDED.alter_id,
-            raw_data=EXCLUDED.raw_data, synced_at=EXCLUDED.synced_at
+            -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
+            voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+            voucher_type   = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
+            date           = COALESCE(EXCLUDED.date, vouchers.date),
+            party_name     = COALESCE(EXCLUDED.party_name, vouchers.party_name),
+            party_guid     = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
+            amount         = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
+            narration      = COALESCE(EXCLUDED.narration, vouchers.narration),
+            reference      = COALESCE(EXCLUDED.reference, vouchers.reference),
+            is_cancelled   = EXCLUDED.is_cancelled,
+            alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
+            raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            synced_at      = EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, date,
           // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml
@@ -803,11 +811,18 @@ async function processAllVoucher(data, companyGuid) {
           INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
-            voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
-            date=EXCLUDED.date, party_name=EXCLUDED.party_name, party_guid=EXCLUDED.party_guid,
-            amount=EXCLUDED.amount, narration=EXCLUDED.narration, reference=EXCLUDED.reference,
-            is_cancelled=EXCLUDED.is_cancelled, alter_id=EXCLUDED.alter_id,
-            raw_data=EXCLUDED.raw_data, synced_at=EXCLUDED.synced_at
+            voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+            voucher_type   = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
+            date           = COALESCE(EXCLUDED.date, vouchers.date),
+            party_name     = COALESCE(EXCLUDED.party_name, vouchers.party_name),
+            party_guid     = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
+            amount         = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
+            narration      = COALESCE(EXCLUDED.narration, vouchers.narration),
+            reference      = COALESCE(EXCLUDED.reference, vouchers.reference),
+            is_cancelled   = EXCLUDED.is_cancelled,
+            alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
+            raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            synced_at      = EXCLUDED.synced_at
         `, [
           guid, companyGuid,
           r.VoucherNumber || r.VoucherNumber || null,
