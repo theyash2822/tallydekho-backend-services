@@ -738,6 +738,46 @@ router.get('/reports/financial', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /reports/pl-bs — P&L + Balance Sheet from ledger closing balances
+router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: income }   = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Income%' OR parent ILIKE '%Revenue%' OR parent ILIKE '%Sales%' OR parent ILIKE '%Direct Income%' OR parent ILIKE '%Indirect Income%')`, [companyGuid]);
+    const { rows: expenses } = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Purchase%' OR parent ILIKE '%Direct Expense%' OR parent ILIKE '%Indirect Expense%')`, [companyGuid]);
+    const { rows: assets }   = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Dr' AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
+    const { rows: liab }     = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Cr' AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
+    const { rows: tb }       = await query(`SELECT name, parent, closing_balance, balance_type, CASE WHEN balance_type='Dr' THEN ABS(closing_balance) ELSE 0 END as debit, CASE WHEN balance_type='Cr' THEN ABS(closing_balance) ELSE 0 END as credit FROM ledgers WHERE company_guid=$1 AND closing_balance != 0 ORDER BY parent, name LIMIT 100`, [companyGuid]);
+
+    const totalIncome   = income.reduce((s, l)   => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const totalExpenses = expenses.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const totalAssets   = assets.reduce((s, l)   => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const totalLiab     = liab.reduce((s, l)     => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const totalDebit    = tb.reduce((s, r) => s + parseFloat(r.debit || 0), 0);
+    const totalCredit   = tb.reduce((s, r) => s + parseFloat(r.credit || 0), 0);
+
+    res.json({ success: true, data: {
+      pl: {
+        income:         income.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        expenses:       expenses.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        totalIncome, totalExpenses, netProfit: totalIncome - totalExpenses,
+      },
+      bs: {
+        assets:       assets.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        liabilities:  liab.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        totalAssets, totalLiabilities: totalLiab,
+      },
+      trialBalance: {
+        ledgers: tb.map(r => ({ name: r.name, parent: r.parent, debit: parseFloat(r.debit || 0), credit: parseFloat(r.credit || 0) })),
+        totalDebit, totalCredit,
+      },
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/reports/gst', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
