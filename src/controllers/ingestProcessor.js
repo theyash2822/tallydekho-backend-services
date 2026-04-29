@@ -241,7 +241,7 @@ async function processVouchers(data, companyGuid) {
                 parseFloat(entry.AMOUNT || entry.Amount || 0),
                 (entry.ISDEEMEDPOSITIVE === 'Yes' || entry.IsDeemedPositive === 'Yes') ? 'Dr' : 'Cr',
               ]);
-            } catch {}
+            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
           }
         }
 
@@ -266,7 +266,7 @@ async function processVouchers(data, companyGuid) {
                 parseFloat(entry.GSTRATE || entry.GstRate || 0),
                 entry.HSNCODE || entry.HsnCode || null,
               ]);
-            } catch {}
+            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
           }
         }
       } catch (e) {
@@ -321,7 +321,7 @@ async function processStockTransactions(data, companyGuid) {
           now(),
         ]);
         saved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
 
     await client.query('COMMIT');
@@ -486,7 +486,7 @@ async function processVoucherInventoryItems(data, companyGuid) {
           parseInt(r.AlterId || 0),
         ]);
         saved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
     console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -524,7 +524,7 @@ async function processGSTDetails(data, companyGuid) {
           parseInt(r.AlterId || 0), now(),
         ]);
         saved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
     console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -553,7 +553,7 @@ async function processBillOutstanding(data, companyGuid) {
           r.BillType || null, parseInt(r.AlterId || 0), now(),
         ]);
         saved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
     console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -585,7 +585,7 @@ async function processStockOpeningBalance(data, companyGuid) {
           [openQty, openRate, name, companyGuid]
         );
         if (result.rowCount > 0) updated++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
 
     await client.query('COMMIT');
@@ -676,7 +676,7 @@ async function processLedgerTransactions(data, companyGuid) {
           amount >= 0 ? 'Cr' : 'Dr',
         ]);
         itemsSaved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
 
       // Accumulate Cr (positive/credit) amounts per voucher for total
       const absAmount = isNaN(amount) ? 0 : Math.abs(parseFloat(r.Amount || 0));
@@ -792,11 +792,14 @@ async function processRecords(data, companyGuid, userId, deviceId) {
 async function processAllVoucher(data, companyGuid) {
   // AllVoucher.xml — full voucher with inventory entries, ledger entries, bill allocations
   // Each record has: guid, Date, VoucherType, VoucherNumber, PartyName, AllInventoryentries, AllLedgerEntries, Billallocations
+  // NOTE: AllVoucher.xml LINE has <XMLTAG>Voucher</XMLTAG> so Tally wraps each row in <Voucher>
+  // normalizeEnvelope returns { Voucher: { guid, Date, ... } } — we must unwrap it
   const client = await getClient();
   try {
     await client.query('BEGIN');
     let saved = 0;
-    for (const r of data) {
+    for (const raw of data) {
+      const r = raw.Voucher || raw;  // unwrap <Voucher> wrapper if present
       const guid = r.guid || r.GUID || r.Guid || '';
       if (!guid) continue;
       const voucherType = r.VoucherType || r.VOUCHERTYPENAME || r.VoucherTypeName || 'Voucher';
@@ -848,7 +851,7 @@ async function processAllVoucher(data, companyGuid) {
             try {
               await client.query(`INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, amount, type) VALUES ($1,$2,$3,$4,$5)`,
                 [guid, companyGuid, e.Ledgername || e.LedgerName || null, Math.abs(amt), amt >= 0 ? 'Cr' : 'Dr']);
-            } catch {}
+            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
           }
         }
         // Insert inventory entries
@@ -860,7 +863,7 @@ async function processAllVoucher(data, companyGuid) {
             try {
               await client.query(`INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, actual_qty, billed_qty, rate, amount) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
                 [guid, companyGuid, e.Stockitemname || null, Math.abs(qty), Math.abs(qty), parseFloat(e.Rate || 0), Math.abs(iamt)]);
-            } catch {}
+            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
           }
         }
       } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
@@ -989,7 +992,7 @@ async function processCurrencies(data, companyGuid) {
           ON CONFLICT (name, company_guid) DO UPDATE SET guid=EXCLUDED.guid, synced_at=EXCLUDED.synced_at
         `, [r.Guid || null, companyGuid, name, parseInt(r.ALTERID || 0), now()]);
         saved++;
-      } catch {}
+      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
     console.log(`[DB] Currencies: saved ${saved}/${data.length} for ${companyGuid}`);
