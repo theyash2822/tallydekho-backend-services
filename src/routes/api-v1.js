@@ -365,6 +365,14 @@ router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
       [newCode, userId]
     );
 
+    // Mark all companies belonging to this user+device as inactive
+    if (deviceId) {
+      await query(
+        'UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2',
+        [userId, deviceId]
+      ).catch(e => console.warn('[unpair] companies update failed:', e.message));
+    }
+
     // Notify all connected clients with the new code
     // Desktop uses newCode to update its display; mobile/web clear their paired state
     const socketSvc = getSocketService?.();

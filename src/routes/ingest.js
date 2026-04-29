@@ -151,6 +151,7 @@ router.post('/ingest/chunk', async (req, res) => {
     // Device must be registered (even if not paired) to write data
     if (!device) return res.status(403).json({ status: false, message: 'Device not registered. Run the desktop app first.' });
     const userId = device?.user_id;
+    if (!userId) return res.status(403).json({ status: false, message: 'Device not paired to any user. Complete pairing first.' });
 
     let data;
     const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body;
