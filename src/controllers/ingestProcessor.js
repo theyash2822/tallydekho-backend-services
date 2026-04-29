@@ -3,6 +3,32 @@
 import { getClient, query as dbQuery } from '../db/schema.js';
 
 // Normalize Tally date: '20240401' → '2024-04-01'
+// Recursively search an object (parsing JSON strings) for any of the target keys
+// Returns the found array or empty array if not found
+function findNestedArray(obj, keys, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 6) return [];
+  for (const k of keys) {
+    if (obj[k] !== undefined) {
+      const v = obj[k];
+      return Array.isArray(v) ? v : (v ? [v] : []);
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (typeof val === 'string' && val.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(val);
+        const found = findNestedArray(parsed, keys, depth + 1);
+        if (found.length > 0) return found;
+      } catch {}
+    } else if (val && typeof val === 'object') {
+      const found = findNestedArray(val, keys, depth + 1);
+      if (found.length > 0) return found;
+    }
+  }
+  return [];
+}
+
 function normalizeDate(val) {
   if (!val) return null;
   const s = String(val).trim();
@@ -113,9 +139,23 @@ async function processStocks(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
 
-    for (const r of data) {
-      const name = r.Name || r.NAME || r.name || '';
-      const guid = r.Guid || r.GUID || r.guid || name + '_' + companyGuid;
+    // StockItemFull.xml — same nested pattern. Search for STOCKITEM[].
+    let expandedStockData = data;
+    if (data.length <= 3) {
+      const found = findNestedArray(data[0], ['STOCKITEM', 'StockItem', 'STOCKITEMREPORT']);
+      if (found.length > 0) {
+        expandedStockData = found;
+        console.log('[INGEST] Stocks expanded:', expandedStockData.length, 'items');
+      }
+    }
+    for (const rawItem of expandedStockData) {
+      let r = rawItem;
+      const stockVal = rawItem.STOCKITEM ?? rawItem.StockItem;
+      if (stockVal) {
+        try { r = typeof stockVal === 'string' ? JSON.parse(stockVal) : stockVal; } catch { r = rawItem; }
+      }
+      const name = r.NAME || r.Name || r.name || '';
+      const guid = r.GUID || r.Guid || r.guid || name + '_' + companyGuid;
       if (!name) continue;
 
       try {
@@ -399,12 +439,30 @@ async function processFullLedger(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
-    for (const r of data) {
-      const name = r.Name || r.NAME || '';
-      const guid = r.Guid || r.GUID || name + '_' + companyGuid;
+    // LedgerFull.xml — Tally NATIVEMETHOD Collection wraps all data in TALLYMESSAGE.
+    // The actual ledger items are inside TALLYMESSAGE.LEDGER[] (JSON-stringified by coerce).
+    // Expand the TALLYMESSAGE wrapper into individual ledger records.
+    // LedgerFull.xml — Collection: normalizeEnvelope returns 1-2 rows wrapping all ledger data.
+    // Use recursive search to find LEDGER[] regardless of nesting depth.
+    let expandedData = data;
+    if (data.length <= 3) {
+      const found = findNestedArray(data[0], ['LEDGER', 'Ledger']);
+      if (found.length > 0) {
+        expandedData = found;
+        console.log('[INGEST] FullLedger expanded:', expandedData.length, 'ledgers');
+      }
+    }
+    for (const raw of expandedData) {
+      let r = raw;
+      const ledgerVal = raw.LEDGER ?? raw.Ledger;
+      if (ledgerVal) {
+        try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
+      }
+      const name = r.NAME || r.Name || r.LEDGERNAME || '';
+      const guid = r.GUID || r.Guid || name + '_' + companyGuid;
       if (!name) continue;
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
-      if (r.LedgerName && !r.Name) continue;
+      if (r.LedgerName && !r.Name && !r.NAME) continue;
 
       // CLOSINGBALANCE is computed as negative for Dr (assets), positive for Cr (liabilities)
       // Fall back to OPENINGBALANCE if CLOSINGBALANCE not available
@@ -799,18 +857,32 @@ async function processAllVoucher(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
     for (const raw of data) {
-      const r = raw.Voucher || raw;  // unwrap <Voucher> wrapper if present
-      const guid = r.guid || r.GUID || r.Guid || '';
+      // AllVoucher.xml has <XMLTAG>Voucher</XMLTAG> but Tally returns it as uppercase VOUCHER.
+      // normalizeEnvelope's coerce() also JSON.stringifies the nested object.
+      // So raw = { VOUCHER: '{"GUID":"...","DATE":"...","VOUCHERTYPE":"...", ...}', ... }
+      // We parse the VOUCHER string to get the real data with uppercase keys.
+      let r;
+      const voucherVal = raw.VOUCHER ?? raw.Voucher;
+      if (voucherVal) {
+        try { r = typeof voucherVal === 'string' ? JSON.parse(voucherVal) : voucherVal; }
+        catch { r = raw; }
+      } else {
+        r = raw;
+      }
+      const guid = r.GUID || r.guid || r.Guid || '';
       if (!guid) continue;
-      const voucherType = r.VoucherType || r.VOUCHERTYPENAME || r.VoucherTypeName || 'Voucher';
-      const date = normalizeDate(r.Date || r.DATE || r.date);
-      const isCancelled = false;
-      const partyGuid = r._PartyName || r.PartyGuid || null;
-      let amount = parseFloat(r.Amount || 0);
-      // Compute amount from ledger entries if not set
-      const ledgerEntries = r.AllLedgerEntries || [];
+      // Tally returns uppercase field names: VOUCHERTYPE, DATE, PARTYNAME, etc.
+      const voucherType = r.VOUCHERTYPE || r.VoucherType || r.VOUCHERTYPENAME || r.VoucherTypeName || 'Voucher';
+      const date = normalizeDate(r.DATE || r.Date || r.date);
+      const isCancelled = r.ISCANCELLED === 'Yes' || r.CANCELLED === 'Yes' || false;
+      const partyGuid = r._VOUCHERTYPE || r._PartyName || r.PartyGuid || null;
+      let amount = parseFloat(r.AMOUNT || r.Amount || 0);
+      // Compute from ledger entries if amount is 0
+      const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries || [];
       if ((!amount || amount === 0) && Array.isArray(ledgerEntries)) {
-        amount = ledgerEntries.filter(e => parseFloat(e.Amount || 0) > 0).reduce((s, e) => s + parseFloat(e.Amount || 0), 0);
+        amount = ledgerEntries
+          .filter(e => parseFloat(e.AMOUNT || e.Amount || 0) > 0)
+          .reduce((s, e) => s + parseFloat(e.AMOUNT || e.Amount || 0), 0);
       }
       try {
         await client.query(`
@@ -831,14 +903,15 @@ async function processAllVoucher(data, companyGuid) {
             synced_at      = EXCLUDED.synced_at
         `, [
           guid, companyGuid,
-          r.VoucherNumber || r.VoucherNumber || null,
+          r.VOUCHERNUMBER || r.VoucherNumber || null,
           voucherType, date,
-          r.PartyName || r.PARTYLEDGERNAME || null,
+          r.PARTYNAME || r.PartyName || r.PARTYLEDGERNAME || null,
           partyGuid,
           amount,
-          r.Narration || null, r.Reference || null,
+          r.NARRATION || r.Narration || null,
+          r.REFERENCE || r.Reference || null,
           isCancelled,
-          parseInt(r.AlterId || 0),
+          parseInt(r.ALTERID || r.AlterId || 0),
           JSON.stringify(r).slice(0, 5000),
           now(),
         ]);
@@ -850,8 +923,8 @@ async function processAllVoucher(data, companyGuid) {
             if (isNaN(amt)) continue;
             try {
               await client.query(`INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, amount, type) VALUES ($1,$2,$3,$4,$5)`,
-                [guid, companyGuid, e.Ledgername || e.LedgerName || null, Math.abs(amt), amt >= 0 ? 'Cr' : 'Dr']);
-            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+                [guid, companyGuid, e.LEDGERNAME || e.Ledgername || e.LedgerName || null, Math.abs(amt), amt >= 0 ? 'Cr' : 'Dr']);
+            } catch (le) { console.warn('[DB] LedgerEntry insert failed:', le.message); }
           }
         }
         // Insert inventory entries
