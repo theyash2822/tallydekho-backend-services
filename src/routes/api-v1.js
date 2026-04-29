@@ -467,16 +467,19 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const { rows: fy } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
     const from = fy[0]?.begin_date || new Date().getFullYear() + '-04-01';
     const to   = fy[0]?.end_date   || (new Date().getFullYear() + 1) + '-03-31';
-    const [sRes, pRes] = await Promise.all([
+    const [sRes, pRes, eRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Indirect Expense%' OR parent ILIKE '%Direct Expense%')`, [companyGuid]),
     ]);
-    const sVal = +(sRes.rows?.[0]?.v ?? 0);  // Fix: destructure .rows from pg Result
+    const sVal = +(sRes.rows?.[0]?.v ?? 0);
     const pVal = +(pRes.rows?.[0]?.v ?? 0);
+    const eVal = +(eRes.rows?.[0]?.v ?? 0);
     const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount: fmt(sVal), amount_raw: sVal, change: 0, positive: true, icon: 'stats-chart-outline', route: '/sales/register' },
-      { id: 'purchases', label: 'Purchases', amount: fmt(pVal), amount_raw: pVal, change: 0, positive: true, icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'sales',     label: 'Sales',     amount: fmt(sVal), amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
+      { id: 'purchases', label: 'Purchases', amount: fmt(pVal), amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'expenses',  label: 'Expenses',  amount: fmt(eVal), amount_raw: eVal, change: 0, positive: false, icon: 'trending-up-outline', route: '/expenses' },
     ]});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });

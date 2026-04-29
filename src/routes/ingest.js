@@ -67,6 +67,7 @@ router.post('/desktop/init-sync', async (req, res) => {
             INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
             ON CONFLICT (guid) DO UPDATE SET
+              user_id = EXCLUDED.user_id, device_id = EXCLUDED.device_id,
               name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
               gstin = EXCLUDED.gstin, fy_start = EXCLUDED.fy_start,
               fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at,
