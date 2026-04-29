@@ -5,17 +5,29 @@ import { getClient, query as dbQuery } from '../db/schema.js';
 // Normalize Tally date: '20240401' → '2024-04-01'
 // Recursively search an object (parsing JSON strings) for any of the target keys
 // Returns the found array or empty array if not found
+// Recursively search an object (parsing JSON strings) for any of the target array keys
 function findNestedArray(obj, keys, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 6) return [];
+  if (!obj || depth > 8) return [];
+  // If obj is an array, search inside each element
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = findNestedArray(item, keys, depth + 1);
+      if (found.length > 0) return found;
+    }
+    return [];
+  }
+  if (typeof obj !== 'object') return [];
+  // Check if this object has any of the target keys
   for (const k of keys) {
     if (obj[k] !== undefined) {
       const v = obj[k];
       return Array.isArray(v) ? v : (v ? [v] : []);
     }
   }
+  // Recurse into values (including JSON strings)
   for (const key of Object.keys(obj)) {
     const val = obj[key];
-    if (typeof val === 'string' && val.startsWith('{')) {
+    if (typeof val === 'string' && (val.startsWith('{') || val.startsWith('['))) {
       try {
         const parsed = JSON.parse(val);
         const found = findNestedArray(parsed, keys, depth + 1);
