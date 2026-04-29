@@ -314,7 +314,7 @@ async function processStockTransactions(data, companyGuid) {
           r.VOUCHERTYPENAME || null,
           normalizeDate(r.Date || r.DATE || r.date),
           Math.abs(qty),
-          0,
+          parseFloat(r.Rate || r.RATE || 0) || 0,
           Math.abs(amount),
           type,
           r.GodownName || r.GODOWNNAME || null,
@@ -406,10 +406,13 @@ async function processFullLedger(data, companyGuid) {
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
       if (r.LedgerName && !r.Name) continue;
 
-      const bal = r.ClosingBalance || r.CLOSINGBALANCE || '0';
+      // CLOSINGBALANCE is computed as negative for Dr (assets), positive for Cr (liabilities)
+      // Fall back to OPENINGBALANCE if CLOSINGBALANCE not available
+      const bal = r.CLOSINGBALANCE ?? r.ClosingBalance ?? r.OPENINGBALANCE ?? r.OpeningBalance ?? '0';
       const balStr = String(bal).replace('(-)', '-');
       const balNum = parseFloat(balStr.replace(/[^0-9.-]/g, '')) || 0;
-      const balType = balStr.includes('-') ? 'Cr' : 'Dr';
+      // Negative → Dr (asset/expense), Positive → Cr (liability/income)
+      const balType = balNum < 0 ? 'Dr' : 'Cr';
 
       try {
         await client.query(`
@@ -432,9 +435,9 @@ async function processFullLedger(data, companyGuid) {
           r.Phone || r.LedPhone || r.LedgerPhone || null,
           r.Email || null,
           r.Address || null,
-          parseFloat(String(r.OpeningBalance || '0').replace(/[^0-9.-]/g, '')) || 0,
+          Math.abs(parseFloat(String(r.OPENINGBALANCE ?? r.OpeningBalance ?? '0').replace(/[^0-9.-]/g, '')) || 0),
           Math.abs(balNum), balType,
-          !!(r.IsRevenue === 1 || r.IsRevenue === '1'),
+          !!(r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
           parseInt(r.AlterId || r.ALTERID || 0), now(),
         ]);
         saved++;
