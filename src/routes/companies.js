@@ -18,7 +18,7 @@ router.get('/companies', authMiddleware, async (req, res) => {
     let allYearsRows = [];
     if (guids.length > 0) {
       const ph = guids.map((_, i) => `$${i + 1}`).join(',');
-      const { rows } = await query(`SELECT * FROM company_years WHERE company_guid IN (${ph}) ORDER BY begin_date ASC`, guids);
+      const { rows } = await query(`SELECT * FROM company_years WHERE company_guid IN (${ph}) AND is_active = TRUE ORDER BY begin_date ASC`, guids);
       allYearsRows = rows;
     }
 

@@ -77,10 +77,18 @@ router.post('/desktop/init-sync', async (req, res) => {
           console.log(`[DB] Company saved: ${c.name || c.guid}`);
 
           // Store all financial years for this company
+          // c.years = user-selected years to sync (is_active = TRUE)
+          // c.allYears = all years Tally knows about (is_active = FALSE unless also selected)
           const allYears = c.allYears || c.years || [];
-          console.log(`[DB] Years for ${c.name}:`, allYears.length, allYears[0]);
+          const selectedYears = c.years || [];
+          const selectedFYNames = new Set(selectedYears.map(y => y.finYear || y.fin_year || y.name).filter(Boolean));
+          console.log(`[DB] Years for ${c.name}: total=${allYears.length} selected=${selectedFYNames.size}`);
+
+          // First deactivate all years for this company, then activate selected ones
+          await query('UPDATE company_years SET is_active = FALSE WHERE company_guid = $1', [c.guid]).catch(() => {});
+
+          const norm = d => d && d.length === 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
           for (const y of allYears) {
-            // finYear can be '2017-2018' or '2017-18' or just a string
             const finYear = y.finYear || y.fin_year || y.name || null;
             const beginDate = y.begin || y.beginDate || y.startDate || null;
             const endDate = y.end || y.endDate || null;
@@ -88,15 +96,15 @@ router.post('/desktop/init-sync', async (req, res) => {
               console.log('[DB] Skipping year (missing fields):', y);
               continue;
             }
-            // Normalize: '20170401' -> '2017-04-01'
-            const norm = d => d && d.length === 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
+            const isActive = selectedFYNames.has(finYear);
             try {
               await query(`
-                INSERT INTO company_years (company_guid, fin_year, begin_date, end_date)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO company_years (company_guid, fin_year, begin_date, end_date, is_active)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (company_guid, fin_year) DO UPDATE SET
-                  begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date
-              `, [c.guid, finYear, norm(beginDate), norm(endDate)]);
+                  begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date,
+                  is_active = EXCLUDED.is_active
+              `, [c.guid, finYear, norm(beginDate), norm(endDate), isActive]);
             } catch (ye) { console.warn('[DB] Year insert failed:', ye.message, y); }
           }
         } catch (e) {

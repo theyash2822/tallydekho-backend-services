@@ -414,6 +414,9 @@ export async function initSchema() {
       ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS record_count  INTEGER DEFAULT 0;
       ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS error_message TEXT;
 
+      -- company_years migrations
+      ALTER TABLE company_years ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE;
+
       -- companies migrations
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS device_id TEXT;

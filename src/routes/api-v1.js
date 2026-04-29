@@ -393,7 +393,7 @@ router.get('/company/years', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC', [companyGuid]);
+    const { rows } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyGuid]);
     const fys = rows.map(r => {
       const start = new Date(r.begin_date);
       const end   = new Date(r.end_date);
