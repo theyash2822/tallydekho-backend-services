@@ -657,7 +657,7 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     // GST details
     const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]);
     // Company info
-    const { rows: co } = await query('SELECT name, gstin FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    const { rows: co } = await query('SELECT name, gstin, address, state FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
     // Party ledger details (GSTIN, address etc)
     const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, email, address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
     res.json({
