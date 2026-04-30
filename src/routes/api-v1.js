@@ -31,6 +31,25 @@ async function verifyCompanyOwnership(req, res, companyGuid) {
   } catch { return true; } // on DB error, allow through (don't block on check failure)
 }
 
+// FY date resolver — returns from/to for a company, defaulting to latest active FY
+async function resolveFYDates(companyGuid, from, to) {
+  if (from && to) return { from, to };
+  try {
+    const { rows } = await query(
+      'SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
+      [companyGuid]
+    );
+    const yr = new Date().getFullYear();
+    return {
+      from: rows[0]?.begin_date || `${yr}-04-01`,
+      to:   rows[0]?.end_date   || `${yr + 1}-03-31`,
+    };
+  } catch {
+    const yr = new Date().getFullYear();
+    return { from: `${yr}-04-01`, to: `${yr + 1}-03-31` };
+  }
+}
+
 // Lazy ref to socket service (set by server.js after WS init)
 let _socketService = null;
 export function setApiSocket(svc) { _socketService = svc; }
@@ -502,13 +521,14 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
     const [sRes2, pRes2] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
     ]);
-    const sVal2 = +(sRes2.rows?.[0]?.v ?? 0);  // Fix: .rows from pg Result
+    const sVal2 = +(sRes2.rows?.[0]?.v ?? 0);
     const pVal2 = +(pRes2.rows?.[0]?.v ?? 0);
     const netCash = +(cash?.[0]?.v ?? 0) + +(bank?.[0]?.v ?? 0);
     const grossProfit = sVal2 - pVal2;
@@ -517,6 +537,7 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
       gross_profit: grossProfit, net_profit: grossProfit,
       total_income: sVal2, total_expense: pVal2,
       income_percentage: sVal2 > 0 ? Math.round((grossProfit / sVal2) * 100) : 0,
+      fy_from: from, fy_to: to,
       updated_at: 'just now',
     }});
   } catch (err) {
@@ -529,9 +550,10 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
     const { rows } = await query(
-      `SELECT id, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ORDER BY date DESC, id DESC LIMIT 10`,
-      [companyGuid]
+      `SELECT id, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
+      [companyGuid, from, to]
     );
     const fmt = v => `₹${Math.abs(+v||0).toLocaleString('en-IN')}`;
     const activity = rows.map(r => ({
@@ -557,19 +579,20 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { search = '', page = 1, limit = 30, from, to } = req.query;
+  const { search = '', page = 1, limit = 30 } = req.query;
+  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   try {
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND (party_name ILIKE $3 OR voucher_number ILIKE $3)`;
-    const params = [companyGuid, `%${voucherType}%`, `%${search}%`];
-    let idx = 4;
-    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
-    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
-    q += ` ORDER BY date DESC, id DESC LIMIT $${idx++} OFFSET $${idx}`;
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND (party_name ILIKE $3 OR voucher_number ILIKE $3) AND date BETWEEN $4 AND $5`;
+    const params = [companyGuid, `%${voucherType}%`, `%${search}%`, from, to];
+    q += ` ORDER BY date DESC, id DESC LIMIT $6 OFFSET $7`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2`, [companyGuid, `%${voucherType}%`]);
-    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
+    const { rows: cnt } = await query(
+      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND date BETWEEN $3 AND $4`,
+      [companyGuid, `%${voucherType}%`, from, to]
+    );
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -874,8 +897,9 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
     const { rows: cashLedgers } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
-    const { rows: txns } = await query(`SELECT voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Payment','Receipt','Contra') AND is_cancelled=FALSE ORDER BY date DESC LIMIT 30`, [companyGuid]);
+    const { rows: txns } = await query(`SELECT voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Payment','Receipt','Contra') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 30`, [companyGuid, from, to]);
     const balance = cashLedgers.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
     res.json({ success: true, data: { current_balance: balance, display: `₹${Math.round(balance).toLocaleString('en-IN')}`, ledgers: cashLedgers, transactions: txns } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
@@ -932,9 +956,10 @@ router.get('/kpi/payments', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 50`, [companyGuid, from, to]);
     const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
-    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows } });
+    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows, from, to } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
@@ -943,9 +968,10 @@ router.get('/kpi/receipts', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 50`, [companyGuid, from, to]);
     const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
-    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows } });
+    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows, from, to } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
