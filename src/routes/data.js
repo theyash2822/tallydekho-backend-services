@@ -657,10 +657,11 @@ router.post('/expenses', authMiddleware, async (req, res) => {
       FROM vouchers v
       LEFT JOIN voucher_items vi ON vi.voucher_guid = v.guid
         AND vi.company_guid = v.company_guid
-        AND vi.amount_type = 'Dr'
+        AND vi.type = 'Dr'
       WHERE v.company_guid=$1
-        AND v.voucher_type IN ('Journal','Payment')
+        AND v.voucher_type IN ('Journal','Payment','Contra')
         AND v.is_cancelled = FALSE
+        AND v.amount > 0
         AND v.date BETWEEN $2 AND $3
         AND v.date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
       ORDER BY v.date::date DESC
