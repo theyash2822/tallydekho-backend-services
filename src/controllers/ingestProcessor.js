@@ -969,6 +969,8 @@ async function processAllVoucher(data, companyGuid) {
       // Tally returns uppercase field names: VOUCHERTYPE, DATE, PARTYNAME, etc.
       const voucherType = r.VOUCHERTYPE || r.VoucherType || r.VOUCHERTYPENAME || r.VoucherTypeName || 'Voucher';
       const date = normalizeDate(r.DATE || r.Date || r.date);
+      // Skip junk records: no date + no meaningful type + no number = header/metadata rows
+      if (!date && voucherType === 'Voucher' && !(r.VOUCHERNUMBER || r.VoucherNumber)) continue;
       const isCancelled = r.ISCANCELLED === 'Yes' || r.CANCELLED === 'Yes' || false;
       const partyGuid = r._VOUCHERTYPE || r._PartyName || r.PartyGuid || null;
       let amount = parseFloat(r.AMOUNT || r.Amount || 0);

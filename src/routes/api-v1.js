@@ -499,7 +499,7 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const [sRes, pRes, eRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Indirect Expense%' OR parent ILIKE '%Direct Expense%')`, [companyGuid]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date IS NOT NULL AND date != '' AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
     ]);
     const sVal = +(sRes.rows?.[0]?.v ?? 0);
     const pVal = +(pRes.rows?.[0]?.v ?? 0);
@@ -1083,21 +1083,45 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from, to, page = 1, limit = 30 } = req.query;
+  const { from, to, page = 1, limit = 30, type } = req.query;
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Journal%' AND is_cancelled=FALSE`;
-    const params = [companyGuid];
-    let idx = 2;
-    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
-    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
-    q += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    // Expenses = Journal (adjustments/accruals) + Payment (cash expense payments)
+    // Exclude amount=0 junk records; filter by FY date range
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1
+      AND voucher_type IN ('Journal','Payment','Contra')
+      AND is_cancelled=FALSE
+      AND amount > 0
+      AND date IS NOT NULL AND date != ''
+      AND date BETWEEN $2 AND $3`;
+    const params = [companyGuid, fyFrom, fyTo];
+    // Optional sub-type filter
+    if (type) { q += ` AND voucher_type = $4`; params.push(type); }
+    q += ` ORDER BY date DESC, amount DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    // Also get expense ledgers
-    const { rows: expLedgers } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Indirect Expense%' OR parent ILIKE '%Direct Expense%') ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
-    const totalExpenses = expLedgers.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
-    res.json({ success: true, data: rows, summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}` }, meta: { total: rows.length, page: parseInt(page) } });
+    // Total from voucher amounts (not ledger closing balance which can be 0)
+    const { rows: totRow } = await query(
+      `SELECT COALESCE(SUM(amount),0) as total FROM vouchers
+       WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra')
+         AND is_cancelled=FALSE AND amount > 0
+         AND date IS NOT NULL AND date != ''
+         AND date BETWEEN $2 AND $3`,
+      [companyGuid, fyFrom, fyTo]
+    );
+    const totalExpenses = parseFloat(totRow[0]?.total || 0);
+    const cnt = await query(
+      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra')
+       AND is_cancelled=FALSE AND amount > 0 AND date IS NOT NULL AND date != '' AND date BETWEEN $2 AND $3`,
+      [companyGuid, fyFrom, fyTo]
+    );
+    res.json({
+      success: true,
+      data: rows,
+      summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}` },
+      meta: { total: parseInt(cnt.rows[0].c), page: parseInt(page), limit: parseInt(limit), from: fyFrom, to: fyTo }
+    });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
