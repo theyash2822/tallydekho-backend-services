@@ -62,12 +62,42 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
   if (stream === 'vouchers' || stream === 'voucher') {
     await processVouchers(data, companyGuid);
   } else if (stream === 'master' || stream === 'masters') {
-    if (collectionName === 'stockitem' || collectionName === 'stock item') {
-      await processStocks(data, companyGuid);
-    } else if (collectionName === 'stocktransaction' || collectionName === 'stock transaction') {
-      await processStockTransactions(data, companyGuid);
-    } else {
-      await processMasters(data, companyGuid);
+    // Master stream contains mixed XML types — group by XML field and route each group properly
+    const byXml = {};
+    for (const r of data) {
+      const xml = r.XML || r.xml || '__unknown__';
+      if (!byXml[xml]) byXml[xml] = [];
+      byXml[xml].push(r);
+    }
+    for (const [xml, records] of Object.entries(byXml)) {
+      if (records.length === 0) continue;
+      const s = records[0];
+      const cName = s?.COLLECTION_NAME?.toLowerCase() || '';
+      if (xml === 'LedgerFull.xml' || xml === 'FullLedger.xml') {
+        await processFullLedger(records, companyGuid);
+      } else if (xml === 'StockItemFull.xml' || cName === 'stockitem' || cName === 'stock item' || s?.BASEUNITS) {
+        await processStocks(records, companyGuid);
+      } else if (cName === 'stocktransaction' || cName === 'stock transaction') {
+        await processStockTransactions(records, companyGuid);
+      } else if (xml === 'StockGroupFull.xml') {
+        await processStockGroups(records, companyGuid);
+      } else if (xml === 'GroupMaster.xml') {
+        await processGroupMasters(records, companyGuid);
+      } else if (xml === 'UnitFull.xml') {
+        await processUnits(records, companyGuid);
+      } else if (xml === 'VoucherTypeFull.xml') {
+        await processVoucherTypes(records, companyGuid);
+      } else if (xml === 'BillOutstanding.xml') {
+        await processBillOutstanding(records, companyGuid);
+      } else if (xml === 'Godown.xml') {
+        await processWarehouses(records, companyGuid);
+      } else if (xml === 'CurrencyMaster.xml') {
+        await processCurrencies(records, companyGuid);
+      } else if (xml === 'StockOpeningBalance.xml') {
+        await processStockOpeningBalance(records, companyGuid);
+      } else {
+        await processMasters(records, companyGuid);
+      }
     }
   } else if (stream === 'records') {
     await processRecords(data, companyGuid, userId, deviceId);
