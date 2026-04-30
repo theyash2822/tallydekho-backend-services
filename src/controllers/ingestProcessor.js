@@ -69,11 +69,14 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       if (!byXml[xml]) byXml[xml] = [];
       byXml[xml].push(r);
     }
+    console.log('[INGEST] master stream XML groups:', Object.entries(byXml).map(([k,v]) => `${k}(${v.length})`).join(', '));
     for (const [xml, records] of Object.entries(byXml)) {
       if (records.length === 0) continue;
       const s = records[0];
       const cName = s?.COLLECTION_NAME?.toLowerCase() || '';
       if (xml === 'LedgerFull.xml' || xml === 'FullLedger.xml') {
+        console.log('[INGEST] LedgerFull sample keys:', Object.keys(s).join(', '));
+        console.log('[INGEST] LedgerFull sample[0]:', JSON.stringify(s).slice(0, 500));
         await processFullLedger(records, companyGuid);
       } else if (xml === 'StockItemFull.xml' || cName === 'stockitem' || cName === 'stock item' || s?.BASEUNITS) {
         await processStocks(records, companyGuid);
@@ -486,12 +489,18 @@ async function processFullLedger(data, companyGuid) {
     // Expand the TALLYMESSAGE wrapper into individual ledger records.
     // LedgerFull.xml — Collection: normalizeEnvelope returns 1-2 rows wrapping all ledger data.
     // Use recursive search to find LEDGER[] regardless of nesting depth.
+    console.log('[INGEST] processFullLedger called, records:', data.length, 'sample keys:', Object.keys(data[0] || {}).join(', '));
     let expandedData = data;
     if (data.length <= 3) {
       const found = findNestedArray(data[0], ['LEDGER', 'Ledger']);
+      console.log('[INGEST] FullLedger findNestedArray result:', found.length, 'items');
       if (found.length > 0) {
         expandedData = found;
         console.log('[INGEST] FullLedger expanded:', expandedData.length, 'ledgers');
+        console.log('[INGEST] FullLedger first item keys:', Object.keys(expandedData[0] || {}).join(', '));
+        console.log('[INGEST] FullLedger first item:', JSON.stringify(expandedData[0]).slice(0, 600));
+      } else {
+        console.log('[INGEST] FullLedger raw data[0] (no LEDGER found):', JSON.stringify(data[0]).slice(0, 1200));
       }
     }
     for (const raw of expandedData) {
@@ -500,7 +509,11 @@ async function processFullLedger(data, companyGuid) {
       if (ledgerVal) {
         try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
       }
-      const name = r.NAME || r.Name || r.LEDGERNAME || '';
+      // Tally wraps the name in LANGUAGENAME.LIST.NAME.LIST.NAME for multi-language support
+      const langName = r['LANGUAGENAME.LIST']?.['NAME.LIST']?.NAME ||
+                       (Array.isArray(r['LANGUAGENAME.LIST']) ? r['LANGUAGENAME.LIST'][0]?.['NAME.LIST']?.NAME : null) ||
+                       r['LANGUAGENAME.LIST']?.['NAME.LIST']?.[0];
+      const name = r.NAME || r.Name || r.LEDGERNAME || langName || '';
       const guid = r.GUID || r.Guid || name + '_' + companyGuid;
       if (!name) continue;
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
@@ -529,16 +542,16 @@ async function processFullLedger(data, companyGuid) {
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
-          r.Alias || r.OnlyAlias || null,
+          r.ALIAS || r.Alias || r.OnlyAlias || null,
           r.GSTIN || r.PartyGSTIN || null,
-          r.PAN || r.IncomeTaxNumber || null,
-          r.Phone || r.LedPhone || r.LedgerPhone || null,
-          r.Email || null,
-          r.Address || null,
+          r.ITPAN || r.PAN || r.IncomeTaxNumber || null,
+          r.PHONE || r.Phone || r.LedPhone || r.LedgerPhone || null,
+          r.EMAIL || r.Email || null,
+          r.MAILINGADDRESS || r.Address || null,
           Math.abs(parseFloat(String(r.OPENINGBALANCE ?? r.OpeningBalance ?? '0').replace(/[^0-9.-]/g, '')) || 0),
           Math.abs(balNum), balType,
-          !!(r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
-          parseInt(r.AlterId || r.ALTERID || 0), now(),
+          !!(r.ISREVENUE === 'Yes' || r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
+          parseInt(r.ALTERID || r.AlterId || 0), now(),
         ]);
         saved++;
       } catch (e) { console.warn('[DB] FullLedger insert failed:', e.message); }
