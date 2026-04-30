@@ -41,6 +41,20 @@ function findNestedArray(obj, keys, depth = 0) {
   return [];
 }
 
+// Extract name from Tally record — handles both plain NAME and LANGUAGENAME.LIST multi-lang wrapper
+function tallyName(r) {
+  if (r.NAME) return r.NAME;
+  if (r.Name) return r.Name;
+  if (r.name) return r.name;
+  if (r.LEDGERNAME) return r.LEDGERNAME;
+  const ll = r['LANGUAGENAME.LIST'];
+  if (ll) {
+    const nl = Array.isArray(ll) ? ll[0]?.['NAME.LIST'] : ll['NAME.LIST'];
+    if (nl) return Array.isArray(nl) ? nl[0]?.NAME || nl[0] : nl.NAME || nl;
+  }
+  return '';
+}
+
 function normalizeDate(val) {
   if (!val) return null;
   const s = String(val).trim();
@@ -199,7 +213,7 @@ async function processStocks(data, companyGuid) {
       if (stockVal) {
         try { r = typeof stockVal === 'string' ? JSON.parse(stockVal) : stockVal; } catch { r = rawItem; }
       }
-      const name = r.NAME || r.Name || r.name || '';
+      const name = tallyName(r);
       const guid = r.GUID || r.Guid || r.guid || name + '_' + companyGuid;
       if (!name) continue;
 
@@ -509,11 +523,7 @@ async function processFullLedger(data, companyGuid) {
       if (ledgerVal) {
         try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
       }
-      // Tally wraps the name in LANGUAGENAME.LIST.NAME.LIST.NAME for multi-language support
-      const langName = r['LANGUAGENAME.LIST']?.['NAME.LIST']?.NAME ||
-                       (Array.isArray(r['LANGUAGENAME.LIST']) ? r['LANGUAGENAME.LIST'][0]?.['NAME.LIST']?.NAME : null) ||
-                       r['LANGUAGENAME.LIST']?.['NAME.LIST']?.[0];
-      const name = r.NAME || r.Name || r.LEDGERNAME || langName || '';
+      const name = tallyName(r);
       const guid = r.GUID || r.Guid || name + '_' + companyGuid;
       if (!name) continue;
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
