@@ -568,44 +568,59 @@ async function processFullLedger(data, companyGuid) {
   finally { client.release(); }
 }
 
+// Parse Tally quantity string: '(-)20', '-20', '20 nos' → number
+function parseTallyQty(val) {
+  if (!val && val !== 0) return 0;
+  const s = String(val).replace('(-)', '-').replace('(', '-').replace(')', '');
+  const m = s.match(/^-?[\d.]+/);
+  return m ? parseFloat(m[0]) : 0;
+}
+// Parse Tally rate string: '400.00/nos', '2,700.00/nos' → number
+function parseTallyRate(val) {
+  if (!val) return 0;
+  const s = String(val).split('/')[0].replace(/,/g, '');
+  return parseFloat(s) || 0;
+}
+
 async function processVoucherInventoryItems(data, companyGuid) {
   const client = await getClient();
   try {
     await client.query('BEGIN');
     let saved = 0;
     for (const r of data) {
-      const voucherGuid = r.VoucherGuid || r.Guid || r.GUID || '';
-      const itemName = r.StockItemName || r.STOCKITEMNAME || '';
+      // Tally sends ALL keys uppercase
+      const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
+      const itemName    = r.STOCKITEMNAME || r.StockItemName || '';
       if (!voucherGuid || !itemName) continue;
 
-      const qtyRaw = String(r.ActualQty || r.ACTUALQTY || '0');
-      const qtyMatch = qtyRaw.match(/^-?[\d.]+/);
-      const qty = qtyMatch ? parseFloat(qtyMatch[0]) : 0;
-
-      const billedRaw = String(r.BilledQty || r.BILLEDQTY || '0');
-      const billedMatch = billedRaw.match(/^-?[\d.]+/);
-      const billedQty = billedMatch ? parseFloat(billedMatch[0]) : 0;
-
-      const rawAmt = parseFloat(r.Amount || r.AMOUNT || 0);
-      const amount = isNaN(rawAmt) ? 0 : rawAmt;
+      const qty       = parseTallyQty(r.ACTUALQTY || r.ActualQty);
+      const billedQty = parseTallyQty(r.BILLEDQTY || r.BilledQty);
+      const rate      = parseTallyRate(r.RATE || r.Rate);
+      const rawAmt    = parseFloat(r.AMOUNT ?? r.Amount ?? 0);
+      const amount    = isNaN(rawAmt) ? 0 : rawAmt;
 
       try {
         await client.query(`
           INSERT INTO voucher_inventory_items
             (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          ON CONFLICT (voucher_guid, company_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
+            actual_qty=EXCLUDED.actual_qty, billed_qty=EXCLUDED.billed_qty,
+            rate=EXCLUDED.rate, amount=EXCLUDED.amount,
+            discount=EXCLUDED.discount, alter_id=EXCLUDED.alter_id
         `, [
           voucherGuid, companyGuid, itemName,
-          r.StockItemGuid || null,
-          Math.abs(qty), Math.abs(billedQty),
-          parseFloat(r.Rate || 0), Math.abs(amount),
-          parseFloat(r.Discount || 0),
-          r.GodownName || null, r.BatchName || null,
-          r.Unit || null, r.HSN || null,
-          parseInt(r.AlterId || 0),
+          r.STOCKITEMGUID || r.StockItemGuid || null,
+          Math.abs(qty), Math.abs(billedQty), rate, Math.abs(amount),
+          parseFloat(r.DISCOUNT ?? r.Discount ?? 0),
+          r.GODOWNNAME || r.GodownName || null,
+          r.BATCHNAME  || r.BatchName  || null,
+          r.UNIT       || r.Unit       || null,
+          r.HSN        || null,
+          parseInt(r.ALTERID ?? r.AlterId ?? 0),
         ]);
         saved++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+      } catch (e) { console.warn('[DB] VoucherInvItem insert failed:', e.message); }
     }
     await client.query('COMMIT');
     console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -618,32 +633,38 @@ async function processGSTDetails(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
+    const n = (f) => { const v = parseFloat(f || 0); return isNaN(v) ? 0 : v; };
     for (const r of data) {
-      const voucherGuid = r.VoucherGuid || r.Guid || r.GUID || '';
+      // Tally sends ALL keys uppercase
+      const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
       if (!voucherGuid) continue;
-      const rawAmt = (f) => { const v = parseFloat(f || 0); return isNaN(v) ? 0 : v; };
       try {
         await client.query(`
           INSERT INTO gst_voucher_details
             (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
           ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
+            voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
             taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
             sgst_amount=EXCLUDED.sgst_amount, igst_amount=EXCLUDED.igst_amount,
             irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           voucherGuid, companyGuid,
-          r.VoucherNumber || null, r.VoucherTypeName || null,
-          normalizeDate(r.Date || r.DATE),
-          r.PartyLedgerName || null, r.GSTRegType || null,
-          r.PlaceOfSupply || null,
-          rawAmt(r.TaxableAmount), rawAmt(r.CGSTAmount),
-          rawAmt(r.SGSTAmount), rawAmt(r.IGSTAmount),
+          r.VOUCHERNUMBER  || r.VoucherNumber  || null,
+          r.VOUCHERTYPENAME|| r.VoucherTypeName|| null,
+          normalizeDate(r.DATE || r.Date),
+          r.PARTYLEDGERNAME|| r.PartyLedgerName|| null,
+          r.GSTREGTYPE     || r.GSTRegType     || null,
+          r.PLACEOFSUPPLY  || r.PlaceOfSupply  || null,
+          n(r.TAXABLEAMOUNT ?? r.TaxableAmount),
+          n(r.CGSTAMOUNT    ?? r.CGSTAmount),
+          n(r.SGSTAMOUNT    ?? r.SGSTAmount),
+          n(r.IGSTAMOUNT    ?? r.IGSTAmount),
           r.IRN || null,
-          parseInt(r.AlterId || 0), now(),
+          parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
         ]);
         saved++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+      } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
     }
     await client.query('COMMIT');
     console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);

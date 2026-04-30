@@ -389,6 +389,7 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
       CREATE INDEX IF NOT EXISTS idx_vii_voucher        ON voucher_inventory_items(voucher_guid);
       CREATE INDEX IF NOT EXISTS idx_vii_company        ON voucher_inventory_items(company_guid);
+      ALTER TABLE voucher_inventory_items ADD CONSTRAINT IF NOT EXISTS voucher_inventory_items_unique UNIQUE (voucher_guid, company_guid, stock_item_name, godown_name, batch_name);
       CREATE INDEX IF NOT EXISTS idx_gst_company        ON gst_voucher_details(company_guid);
       CREATE INDEX IF NOT EXISTS idx_bill_company       ON bill_outstanding(company_guid);
       CREATE INDEX IF NOT EXISTS idx_bill_ledger        ON bill_outstanding(ledger_name);
