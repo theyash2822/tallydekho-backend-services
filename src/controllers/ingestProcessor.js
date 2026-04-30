@@ -324,7 +324,6 @@ async function processVouchers(data, companyGuid) {
         const parsedLedgerEntries = parseLedgerEntries(r);
         if (parsedLedgerEntries.length > 0) {
           await saveLedgerEntries(client, guid, companyGuid, parsedLedgerEntries);
-          }
         }
 
         // Inventory line items
