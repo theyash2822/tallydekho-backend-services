@@ -642,6 +642,39 @@ router.get('/vouchers', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/vouchers/:id — single voucher with inventory items + GST details
+router.get('/vouchers/:id', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { id } = req.params;
+  try {
+    const { rows: vRows } = await query('SELECT * FROM vouchers WHERE (guid=$1 OR voucher_number=$1) AND company_guid=$2 LIMIT 1', [id, companyGuid]);
+    if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
+    const v = vRows[0];
+    // Inventory items (for Sales/Purchase vouchers)
+    const { rows: items } = await query('SELECT * FROM voucher_inventory_items WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY id', [v.guid, companyGuid]);
+    // GST details
+    const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]);
+    // Company info
+    const { rows: co } = await query('SELECT name, gstin FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    // Party ledger details (GSTIN, address etc)
+    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, email, address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
+    res.json({
+      success: true,
+      data: {
+        voucher: v,
+        items,
+        gst: gst[0] || null,
+        company: co[0] || null,
+        party: partyLedger[0] || null,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // LEDGERS
 // ══════════════════════════════════════════════════════════════
