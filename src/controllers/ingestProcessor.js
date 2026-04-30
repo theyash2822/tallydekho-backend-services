@@ -83,14 +83,11 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       if (!byXml[xml]) byXml[xml] = [];
       byXml[xml].push(r);
     }
-    console.log('[INGEST] master stream XML groups:', Object.entries(byXml).map(([k,v]) => `${k}(${v.length})`).join(', '));
     for (const [xml, records] of Object.entries(byXml)) {
       if (records.length === 0) continue;
       const s = records[0];
       const cName = s?.COLLECTION_NAME?.toLowerCase() || '';
       if (xml === 'LedgerFull.xml' || xml === 'FullLedger.xml') {
-        console.log('[INGEST] LedgerFull sample keys:', Object.keys(s).join(', '));
-        console.log('[INGEST] LedgerFull sample[0]:', JSON.stringify(s).slice(0, 500));
         await processFullLedger(records, companyGuid);
       } else if (xml === 'StockItemFull.xml' || cName === 'stockitem' || cName === 'stock item' || s?.BASEUNITS) {
         await processStocks(records, companyGuid);
@@ -511,8 +508,7 @@ async function processFullLedger(data, companyGuid) {
       if (found.length > 0) {
         expandedData = found;
         console.log('[INGEST] FullLedger expanded:', expandedData.length, 'ledgers');
-        console.log('[INGEST] FullLedger first item keys:', Object.keys(expandedData[0] || {}).join(', '));
-        console.log('[INGEST] FullLedger first item:', JSON.stringify(expandedData[0]).slice(0, 600));
+
       } else {
         console.log('[INGEST] FullLedger raw data[0] (no LEDGER found):', JSON.stringify(data[0]).slice(0, 1200));
       }
