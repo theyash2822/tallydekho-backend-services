@@ -400,6 +400,36 @@ router.post('/voucher-detail', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Ledger Balance Trend ────────────────────────────────────────────────────────────────────
+router.post('/ledger-trend', authMiddleware, async (req, res) => {
+  const { companyGuid, ledgerName, fromDate, toDate } = req.body || {};
+  if (!companyGuid || !ledgerName) return res.status(400).json({ status: false, message: 'companyGuid and ledgerName required' });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const from = fromDate || '2024-04-01';
+    const to   = toDate   || '2025-03-31';
+    const { rows } = await query(`
+      SELECT
+        TO_CHAR(date::date, 'Mon') as month,
+        TO_CHAR(date::date, 'YYYY-MM') as ym,
+        SUM(amount) as total,
+        COUNT(*) as txn_count
+      FROM vouchers
+      WHERE company_guid=$1
+        AND party_name=$2
+        AND is_cancelled=FALSE
+        AND date IS NOT NULL AND date != ''
+        AND date BETWEEN $3 AND $4
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      GROUP BY TO_CHAR(date::date, 'Mon'), TO_CHAR(date::date, 'YYYY-MM')
+      ORDER BY ym
+    `, [companyGuid, ledgerName, from, to]);
+    res.json({ status: true, data: rows.map(r => ({ month: r.month, balance: parseFloat(r.total || 0), count: parseInt(r.txn_count || 0) })) });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to fetch trend' });
+  }
+});
+
 // ─── Ledger Vouchers (vouchers linked to a specific ledger via line items or party name) ───
 router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
   const { companyGuid, ledgerName, page = 1, pageSize = 25 } = req.body || {};
