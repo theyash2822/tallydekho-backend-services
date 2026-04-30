@@ -431,20 +431,27 @@ async function processStockTransactions(data, companyGuid) {
     client.release();
   }
 
-  // Recompute closing qty, rate, value from all transactions for this company
+  // Recompute closing qty + weighted avg rate from transactions
+  // closing_qty  = net (inward - outward)
+  // closing_rate = weighted avg of inward purchase costs
+  // closing_value = closing_qty * closing_rate
   try {
     const result = await dbQuery(`
       UPDATE stocks s
-      SET closing_qty   = sub.net_qty,
-          closing_value = sub.net_value,
-          closing_rate  = CASE WHEN sub.net_qty > 0 THEN sub.net_value / sub.net_qty ELSE 0 END
+      SET closing_qty   = GREATEST(sub.net_qty, 0),
+          closing_rate  = sub.last_rate,
+          closing_value = GREATEST(sub.net_qty, 0) * sub.last_rate
       FROM (
-        SELECT stock_guid, company_guid,
-               SUM(CASE WHEN type = 'inward' THEN qty  ELSE -qty  END) as net_qty,
-               SUM(CASE WHEN type = 'inward' THEN value ELSE -value END) as net_value
-        FROM stock_transactions
-        WHERE company_guid = $1
-          AND qty IS NOT NULL
+        SELECT
+          stock_guid, company_guid,
+          SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty,
+          -- Use latest inward rate as the current rate
+          (SELECT rate FROM stock_transactions t2
+           WHERE t2.stock_guid = t1.stock_guid AND t2.company_guid = t1.company_guid
+             AND t2.type = 'inward' AND t2.rate > 0
+           ORDER BY t2.date DESC, t2.id DESC LIMIT 1) as last_rate
+        FROM stock_transactions t1
+        WHERE company_guid = $1 AND qty IS NOT NULL
         GROUP BY stock_guid, company_guid
       ) sub
       WHERE s.name = sub.stock_guid
