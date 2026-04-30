@@ -320,24 +320,10 @@ async function processVouchers(data, companyGuid) {
         ]);
         saved++;
 
-        // Ledger line items
-        const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries || [];
-        if (Array.isArray(ledgerEntries)) {
-          // Clear existing items before re-inserting to prevent duplicates on re-sync
-          await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_guid = $2 AND item_name IS NULL', [guid, companyGuid]);
-          for (const entry of ledgerEntries) {
-            try {
-              await client.query(`
-                INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, ledger_guid, amount, type)
-                VALUES ($1,$2,$3,$4,$5,$6)
-              `, [
-                guid, companyGuid,
-                entry.LEDGERNAME || entry.LedgerName || null,
-                entry.LEDGERGUID || entry.LedgerGuid || null,
-                parseFloat(entry.AMOUNT || entry.Amount || 0),
-                (entry.ISDEEMEDPOSITIVE === 'Yes' || entry.IsDeemedPositive === 'Yes') ? 'Dr' : 'Cr',
-              ]);
-            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+        // Ledger line items — use parseLedgerEntries with correct Dr/Cr from amount sign
+        const parsedLedgerEntries = parseLedgerEntries(r);
+        if (parsedLedgerEntries.length > 0) {
+          await saveLedgerEntries(client, guid, companyGuid, parsedLedgerEntries);
           }
         }
 
@@ -579,6 +565,52 @@ async function processFullLedger(data, companyGuid) {
     console.log(`[DB] FullLedger: saved ${saved}/${data.length} for ${companyGuid}`);
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message); }
   finally { client.release(); }
+}
+
+// Parse AllLedgerEntries from a voucher record — handles JSON string or array
+function parseLedgerEntries(r) {
+  const raw = r.ALLLEDGERENTRIES ?? r.AllLedgerEntries ?? r.AllLedgerentries ?? r.Allledgerentries ?? [];
+  let entries = raw;
+  // normalizeEnvelope coerces nested objects to JSON strings — parse if needed
+  if (typeof entries === 'string') {
+    try { entries = JSON.parse(entries); } catch { return []; }
+  }
+  if (!Array.isArray(entries)) {
+    // Single entry wrapped in object
+    if (entries && typeof entries === 'object') entries = [entries];
+    else return [];
+  }
+  return entries
+    .map((e, i) => {
+      const name = e.LEDGERNAME || e.Ledgername || e.LedgerName || e.ledgername || null;
+      const guid = e.LEDGERGUID || e.LedgerGuid || e.ledgerGuid || null;
+      // Amount sign from Tally: negative=Dr, positive=Cr (from company perspective)
+      const rawAmt = e.AMOUNT ?? e.Amount ?? e.amount;
+      const amount = typeof rawAmt === 'string'
+        ? parseFloat(String(rawAmt).replace('(-)', '-').replace(/[^0-9.-]/g, ''))
+        : parseFloat(rawAmt || 0);
+      if (!name || isNaN(amount)) return null;
+      return { name, guid, amount, drCr: amount < 0 ? 'Dr' : 'Cr', index: i };
+    })
+    .filter(Boolean);
+}
+
+// Save AllLedgerEntries for a voucher to voucher_ledger_entries table
+async function saveLedgerEntries(client, voucherGuid, companyGuid, entries) {
+  if (!entries || entries.length === 0) return;
+  // Delete existing entries for this voucher (idempotent re-sync)
+  await client.query('DELETE FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2', [voucherGuid, companyGuid]);
+  for (const e of entries) {
+    try {
+      await client.query(
+        `INSERT INTO voucher_ledger_entries (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [voucherGuid, companyGuid, e.name, e.guid, e.amount, e.drCr, e.index]
+      );
+    } catch (err) {
+      console.warn('[DB] LedgerEntry insert failed:', err.message, e.name);
+    }
+  }
 }
 
 // Parse Tally quantity string: '(-)20', '-20', '20 nos' → number
@@ -1013,28 +1045,10 @@ async function processAllVoucher(data, companyGuid) {
           now(),
         ]);
         saved++;
-        // Insert ledger entries
-        if (Array.isArray(ledgerEntries)) {
-          for (const e of ledgerEntries) {
-            const amt = parseFloat(e.Amount || 0);
-            if (isNaN(amt)) continue;
-            try {
-              await client.query(`INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, amount, type) VALUES ($1,$2,$3,$4,$5)`,
-                [guid, companyGuid, e.LEDGERNAME || e.Ledgername || e.LedgerName || null, Math.abs(amt), amt >= 0 ? 'Cr' : 'Dr']);
-            } catch (le) { console.warn('[DB] LedgerEntry insert failed:', le.message); }
-          }
-        }
-        // Insert inventory entries
-        const invEntries = r.AllInventoryentries || [];
-        if (Array.isArray(invEntries)) {
-          for (const e of invEntries) {
-            const qty = parseFloat(e.BilledQty || e.ActualQty || 0);
-            const iamt = parseFloat(e.Amount || 0);
-            try {
-              await client.query(`INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, actual_qty, billed_qty, rate, amount) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                [guid, companyGuid, e.Stockitemname || null, Math.abs(qty), Math.abs(qty), parseFloat(e.Rate || 0), Math.abs(iamt)]);
-            } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
-          }
+        // Save AllLedgerEntries to voucher_ledger_entries (proper Dr/Cr from amount sign)
+        const parsedEntries = parseLedgerEntries(r);
+        if (parsedEntries.length > 0) {
+          await saveLedgerEntries(client, guid, companyGuid, parsedEntries);
         }
       } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
     }

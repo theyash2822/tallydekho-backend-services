@@ -497,9 +497,37 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
       to   = fy[0]?.end_date   || (new Date().getFullYear() + 1) + '-03-31';
     }
     const [sRes, pRes, eRes] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date IS NOT NULL AND date != '' AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      // Sales = Credit entries (Cr) in ledgers under Sales Accounts group
+      // Falls back to voucher_type match if ledger entries not populated yet
+      query(`SELECT COALESCE(
+        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+         WHERE vle.company_guid=$1 AND vle.dr_cr='Cr'
+           AND (l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')
+           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3)
+      ) as v`, [companyGuid, from, to]),
+      // Purchase = Debit entries (Dr) in Purchase Accounts group
+      query(`SELECT COALESCE(
+        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+         WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+           AND (l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')
+           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3)
+      ) as v`, [companyGuid, from, to]),
+      // Expenses = Debit entries in Indirect Expenses group
+      query(`SELECT COALESCE(
+        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+         WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+           AND l.parent ILIKE '%Indirect Expense%'
+           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3)
+      ) as v`, [companyGuid, from, to]),
     ]);
     const sVal = +(sRes.rows?.[0]?.v ?? 0);
     const pVal = +(pRes.rows?.[0]?.v ?? 0);
@@ -701,6 +729,81 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/ledgers/:id/statement — FY-specific ledger statement using voucher_ledger_entries
+router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { id } = req.params;
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  try {
+    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_guid=$1 AND guid=$2', [companyGuid, id]);
+    if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
+    const ledger = lr[0];
+    const ledgerName = ledger.name;
+
+    // Get all vouchers that have a ledger entry for this ledger within the FY
+    const { rows: txns } = await query(`
+      SELECT v.guid, v.voucher_number, v.voucher_type, v.date, v.narration, v.party_name,
+             vle.amount as entry_amount, vle.dr_cr
+      FROM voucher_ledger_entries vle
+      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+      WHERE vle.company_guid = $1
+        AND vle.ledger_name = $2
+        AND v.is_cancelled = FALSE
+        AND v.date IS NOT NULL AND v.date != ''
+        AND v.date BETWEEN $3 AND $4
+      ORDER BY v.date ASC, v.id ASC
+    `, [companyGuid, ledgerName, fyFrom, fyTo]);
+
+    // Compute running balance from opening
+    const opening = parseFloat(ledger.opening_balance || 0);
+    const balType = ledger.balance_type || 'Dr';
+    let runningBalance = balType === 'Dr' ? -opening : opening; // Dr balances are negative internally
+
+    const transactions = txns.map(t => {
+      const entryAmt = parseFloat(t.entry_amount || 0); // negative=Dr, positive=Cr
+      runningBalance += entryAmt;
+      return {
+        guid: t.guid,
+        voucher_number: t.voucher_number,
+        voucher_type: t.voucher_type,
+        date: t.date,
+        narration: t.narration,
+        party_name: t.party_name,
+        debit: t.dr_cr === 'Dr' ? Math.abs(entryAmt) : 0,
+        credit: t.dr_cr === 'Cr' ? Math.abs(entryAmt) : 0,
+        balance: Math.abs(runningBalance),
+        balance_type: runningBalance < 0 ? 'Dr' : 'Cr',
+        dr_cr: t.dr_cr,
+      };
+    });
+
+    const closingBalance = Math.abs(runningBalance);
+    const closingType = runningBalance < 0 ? 'Dr' : 'Cr';
+    const totalDr = transactions.reduce((s, t) => s + t.debit, 0);
+    const totalCr = transactions.reduce((s, t) => s + t.credit, 0);
+
+    res.json({
+      success: true,
+      data: {
+        ledger,
+        opening_balance: opening,
+        opening_balance_type: balType,
+        closing_balance: closingBalance,
+        closing_balance_type: closingType,
+        total_debit: totalDr,
+        total_credit: totalCr,
+        from: fyFrom, to: fyTo,
+        transactions,
+        has_ledger_entries: txns.length > 0,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/ledgers/:id — basic detail with transactions (party_name match fallback)
 router.get('/ledgers/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;

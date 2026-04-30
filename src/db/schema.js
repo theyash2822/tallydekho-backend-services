@@ -324,6 +324,28 @@ export async function initSchema() {
         alter_id        INTEGER DEFAULT 0
       );
 
+      -- Voucher ledger entries (AllLedgerEntries from AllVoucher.xml)
+      -- amount: negative = Debit, positive = Credit (Tally sign convention from company perspective)
+      CREATE TABLE IF NOT EXISTS voucher_ledger_entries (
+        id           SERIAL PRIMARY KEY,
+        voucher_guid TEXT NOT NULL,
+        company_guid TEXT NOT NULL,
+        ledger_name  TEXT,
+        ledger_guid  TEXT,
+        amount       DECIMAL(15,4) NOT NULL,  -- negative=Dr, positive=Cr
+        dr_cr        TEXT,                    -- 'Dr' or 'Cr' (derived from amount sign)
+        line_index   INTEGER DEFAULT 0,
+        synced_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_vle_voucher ON voucher_ledger_entries(voucher_guid);
+      CREATE INDEX IF NOT EXISTS idx_vle_company ON voucher_ledger_entries(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_vle_ledger  ON voucher_ledger_entries(ledger_name);
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vle_unique') THEN
+          ALTER TABLE voucher_ledger_entries ADD CONSTRAINT vle_unique UNIQUE (voucher_guid, company_guid, ledger_name, line_index);
+        END IF;
+      END $$;
+
       -- GST voucher details
       CREATE TABLE IF NOT EXISTS gst_voucher_details (
         id              SERIAL PRIMARY KEY,
