@@ -233,13 +233,13 @@ async function processStocks(data, companyGuid) {
           r.BaseUnits || r.BASEUNITS || r.UNIT || r.unit || 'Pcs',
           r.Hsncode || r.HSNDETAILS?.[0]?.HSNCODE || r.HSN || null,
           parseFloat(r.IGSTRate || r.GSTRATE || r.TAXRATE || 18),
-          // StockItem.xml has OpeningBalance not ClosingBalance
-          // closing_qty will be computed from StockTransaction stream
-          parseFloat(r.CLOSINGBALANCE || r.CLOSINGQTY || r.OpeningBalance || 0),
-          parseFloat(r.OpeningRate || r.CLOSINGRATE || r.RATE || 0),
-          parseFloat(r.OpeningValue || r.CLOSINGVALUE || r.VALUE || 0),
-          parseFloat(r.REORDERLEVEL || 0),
-          parseInt(r.AlterId || r.ALTERID || 0),
+          // closing_qty/rate/value will be recomputed from StockTransaction stream after processing
+          // Store 0 here; transactions will update it correctly
+          0, // closing_qty — will be set by stock transaction recompute
+          0, // closing_rate
+          0, // closing_value
+          parseTallyQty(r.REORDERLEVEL || 0),
+          parseInt(r.ALTERID || r.AlterId || 0),
           now(),
         ]);
         saved++;
@@ -387,33 +387,35 @@ async function processStockTransactions(data, companyGuid) {
     let saved = 0;
 
     for (const r of data) {
-      // StockTransaction.xml fields: StockItemName, StockItemGuid, ActualQty, Amount, GodownName
-      const stockName = r.StockItemName || r.STOCKITEMNAME || r.stockGuid || '';
-      const stockGuid = r.StockItemGuid || r.STOCKITEMGUID || stockName;
-      // ActualQty can come as '21 Nos' or '-21' or 21 — extract numeric part
-      const qtyRaw = String(r.ActualQty || r.ACTUALQTY || r.qty || '0');
-      const qtyMatch = qtyRaw.match(/^-?[\d.]+/);
-      const rawQty = qtyMatch ? parseFloat(qtyMatch[0]) : 0;
-      const qty = isNaN(rawQty) ? 0 : rawQty;
-      const rawAmt    = parseFloat(r.Amount || r.AMOUNT || r.value || 0);
-      const amount    = isNaN(rawAmt) ? 0 : rawAmt;
-      const type      = qty >= 0 ? 'inward' : 'outward';
+      // StockTransaction.xml: Tally sends ALL keys uppercase
+      const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
+      if (!stockName) continue;
+      // parseTallyQty handles '(-)20', '-20', '20 nos' formats
+      const rawQty = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.qty || '0');
+      const qty    = isNaN(rawQty) ? 0 : rawQty;
+      const rawAmt = parseFloat(r.AMOUNT ?? r.Amount ?? r.value ?? 0);
+      const amount = isNaN(rawAmt) ? 0 : rawAmt;
+      // Determine direction: negative qty = outward (sales/issue), positive = inward (purchase/receipt)
+      // Also check VOUCHERTYPENAME for explicit direction
+      const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
+      const isOutward = qty < 0 || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery');
+      const type = isOutward ? 'outward' : 'inward';
 
       try {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         `, [
-          stockName,  // use name as key (StockItem.xml stores name as guid too)
+          stockName,  // stock_guid stores name (join key to stocks.name)
           companyGuid,
-          r.Guid || r.GUID || null,
-          r.VOUCHERTYPENAME || null,
-          normalizeDate(r.Date || r.DATE || r.date),
+          r.GUID || r.Guid || null,
+          r.VOUCHERTYPENAME || r.VoucherTypeName || null,
+          normalizeDate(r.DATE || r.Date || r.date),
           Math.abs(qty),
-          parseFloat(r.Rate || r.RATE || 0) || 0,
+          parseTallyRate(r.RATE || r.Rate || '0'),
           Math.abs(amount),
           type,
-          r.GodownName || r.GODOWNNAME || null,
+          r.GODOWNNAME || r.GodownName || null,
           now(),
         ]);
         saved++;
@@ -429,20 +431,20 @@ async function processStockTransactions(data, companyGuid) {
     client.release();
   }
 
-  // Compute closing qty from transactions and update stocks
+  // Recompute closing qty, rate, value from all transactions for this company
   try {
     const result = await dbQuery(`
       UPDATE stocks s
-      SET closing_qty = sub.net_qty,
-          closing_value = sub.net_value
+      SET closing_qty   = sub.net_qty,
+          closing_value = sub.net_value,
+          closing_rate  = CASE WHEN sub.net_qty > 0 THEN sub.net_value / sub.net_qty ELSE 0 END
       FROM (
         SELECT stock_guid, company_guid,
-               SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty,
+               SUM(CASE WHEN type = 'inward' THEN qty  ELSE -qty  END) as net_qty,
                SUM(CASE WHEN type = 'inward' THEN value ELSE -value END) as net_value
         FROM stock_transactions
         WHERE company_guid = $1
           AND qty IS NOT NULL
-          AND qty::text != 'NaN'
         GROUP BY stock_guid, company_guid
       ) sub
       WHERE s.name = sub.stock_guid
@@ -525,13 +527,16 @@ async function processFullLedger(data, companyGuid) {
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
       if (r.LedgerName && !r.Name && !r.NAME) continue;
 
-      // CLOSINGBALANCE is computed as negative for Dr (assets), positive for Cr (liabilities)
-      // Fall back to OPENINGBALANCE if CLOSINGBALANCE not available
+      // ISDEEMEDPOSITIVE=1 means the ledger's natural balance is Dr (assets/expenses)
+      // This is more reliable than the sign of CLOSINGBALANCE
+      const isDeemedPositive = r.ISDEEMEDPOSITIVE === 1 || r.ISDEEMEDPOSITIVE === '1' ||
+                               r.ISDEEMEDPOSITIVE === 'Yes' || r.IsDeemedPositive === 'Yes' ||
+                               r.IsDeemedPositive === 1;
       const bal = r.CLOSINGBALANCE ?? r.ClosingBalance ?? r.OPENINGBALANCE ?? r.OpeningBalance ?? '0';
       const balStr = String(bal).replace('(-)', '-');
       const balNum = parseFloat(balStr.replace(/[^0-9.-]/g, '')) || 0;
-      // Negative → Dr (asset/expense), Positive → Cr (liability/income)
-      const balType = balNum < 0 ? 'Dr' : 'Cr';
+      // Primary source: ISDEEMEDPOSITIVE flag. Fallback: negative balance = Dr
+      const balType = isDeemedPositive ? 'Dr' : (balNum < 0 ? 'Dr' : 'Cr');
 
       try {
         await client.query(`
