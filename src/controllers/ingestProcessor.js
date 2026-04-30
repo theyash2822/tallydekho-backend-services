@@ -405,6 +405,7 @@ async function processStockTransactions(data, companyGuid) {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO NOTHING
         `, [
           stockName,  // stock_guid stores name (join key to stocks.name)
           companyGuid,

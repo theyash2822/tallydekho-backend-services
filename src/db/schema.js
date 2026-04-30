@@ -394,6 +394,11 @@ export async function initSchema() {
           ALTER TABLE voucher_inventory_items ADD CONSTRAINT voucher_inventory_items_unique UNIQUE (voucher_guid, company_guid, stock_item_name, godown_name, batch_name);
         END IF;
       END $$;
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_transactions_unique') THEN
+          ALTER TABLE stock_transactions ADD CONSTRAINT stock_transactions_unique UNIQUE (stock_guid, company_guid, voucher_guid, warehouse, type);
+        END IF;
+      END $$;
       CREATE INDEX IF NOT EXISTS idx_gst_company        ON gst_voucher_details(company_guid);
       CREATE INDEX IF NOT EXISTS idx_bill_company       ON bill_outstanding(company_guid);
       CREATE INDEX IF NOT EXISTS idx_bill_ledger        ON bill_outstanding(ledger_name);
