@@ -66,8 +66,30 @@ function normalizeDate(val) {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+// V2: Optionally store raw records before processing (TALLY_STORE_RAW=true env var)
+const STORE_RAW = process.env.TALLY_STORE_RAW === 'true';
+async function maybeStoreRaw(records, companyGuid, streamName) {
+  if (!STORE_RAW || !records?.length) return;
+  const client = await getClient();
+  try {
+    for (const r of records.slice(0, 1000)) { // cap at 1000 per call to avoid overload
+      await client.query(
+        `INSERT INTO raw_tally_records (upload_id, company_guid, financial_year, record_type, source_xml, payload, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
+        [r.UPLOAD_ID || null, companyGuid, r._FINANCIAL_YEAR || null, r._RECORD_TYPE || streamName, r.XML || null, JSON.stringify(r)]
+      );
+    }
+  } catch (err) {
+    console.warn('[RAW] store failed (non-fatal):', err.message);
+  } finally {
+    client.release();
+  }
+}
+
 export async function processIngestedData(streamName, data, companyGuid, userId, deviceId) {
   if (!data?.length || !companyGuid) return;
+  // V2: optionally persist raw records for debugging/reprocessing
+  await maybeStoreRaw(data, companyGuid, streamName);
 
   const stream = streamName?.toLowerCase();
   const sample = data[0];

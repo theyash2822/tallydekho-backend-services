@@ -559,6 +559,24 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vouchers_fy    ON vouchers(company_guid, financial_year);
       CREATE INDEX IF NOT EXISTS idx_vle_fy         ON voucher_ledger_entries(company_guid, financial_year);
       CREATE INDEX IF NOT EXISTS idx_st_fy          ON stock_transactions(company_guid, financial_year);
+
+      -- V2: raw_tally_records — optional audit/debug table
+      -- Stores raw record before processing. Useful for reprocessing without re-syncing Tally.
+      -- Set TALLY_STORE_RAW=true env var to enable; disabled by default to save storage.
+      CREATE TABLE IF NOT EXISTS raw_tally_records (
+        id             BIGSERIAL PRIMARY KEY,
+        upload_id      TEXT,
+        sync_run_id    UUID,
+        company_guid   TEXT,
+        financial_year TEXT,
+        record_type    TEXT,
+        source_xml     TEXT,
+        payload        JSONB,
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_rtr_company ON raw_tally_records(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_rtr_type    ON raw_tally_records(record_type);
+      CREATE INDEX IF NOT EXISTS idx_rtr_fy      ON raw_tally_records(company_guid, financial_year);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {
