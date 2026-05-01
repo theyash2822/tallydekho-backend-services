@@ -31,22 +31,38 @@ async function verifyCompanyOwnership(req, res, companyGuid) {
   } catch { return true; } // on DB error, allow through (don't block on check failure)
 }
 
-// FY date resolver — returns from/to for a company, defaulting to latest active FY
-async function resolveFYDates(companyGuid, from, to) {
-  if (from && to) return { from, to };
+// FY date resolver — returns from/to/financialYear for a company
+// V2: also returns financialYear label (e.g. "2025-2026") for direct DB queries
+async function resolveFYDates(companyGuid, from, to, fyParam) {
+  // If explicit financialYear label passed (e.g. "2025-2026"), look up its dates
+  if (fyParam) {
+    try {
+      const { rows } = await query(
+        'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND fin_year=$2 LIMIT 1',
+        [companyGuid, fyParam]
+      );
+      if (rows[0]) return { from: rows[0].begin_date, to: rows[0].end_date, financialYear: rows[0].fin_year };
+    } catch {}
+  }
+  if (from && to) {
+    // Compute financialYear label from dates
+    const yr = parseInt(String(from).slice(0, 4), 10);
+    return { from, to, financialYear: `${yr}-${yr + 1}` };
+  }
   try {
     const { rows } = await query(
-      'SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
+      'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
       [companyGuid]
     );
     const yr = new Date().getFullYear();
     return {
-      from: rows[0]?.begin_date || `${yr}-04-01`,
-      to:   rows[0]?.end_date   || `${yr + 1}-03-31`,
+      from:           rows[0]?.begin_date || `${yr}-04-01`,
+      to:             rows[0]?.end_date   || `${yr + 1}-03-31`,
+      financialYear:  rows[0]?.fin_year   || `${yr}-${yr + 1}`,
     };
   } catch {
     const yr = new Date().getFullYear();
-    return { from: `${yr}-04-01`, to: `${yr + 1}-03-31` };
+    return { from: `${yr}-04-01`, to: `${yr + 1}-03-31`, financialYear: `${yr}-${yr + 1}` };
   }
 }
 
@@ -734,49 +750,47 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
 router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
   try {
-    // Anchor on closing_balance (reliable Tally value):
-    // fy_closing_signed = closing_signed - SUM(entries AFTER fyTo)
-    // fy_opening_signed = closing_signed - SUM(entries FROM fyFrom onwards)
+    // V2: Use financial_year column directly + ledger_fy_balances for opening
+    // opening = from ledger_fy_balances (LedgerOpeningBalance.xml per FY)
+    // closing = opening + SUM(vle WHERE financial_year = fy)
     const { rows } = await query(`
       SELECT
-        l.guid,
-        l.name,
-        l.parent,
-        l.balance_type,
-        l.closing_balance,
-        COALESCE(SUM(
-          CASE WHEN v.date IS NOT NULL AND v.date != '' AND v.date > $3 THEN vle.amount ELSE 0 END
-        ), 0) as sum_after_fy,
-        COALESCE(SUM(
-          CASE WHEN v.date IS NOT NULL AND v.date != '' AND v.date >= $2 THEN vle.amount ELSE 0 END
-        ), 0) as sum_from_fy
+        l.guid, l.name, l.parent, l.balance_type,
+        COALESCE(lfb.opening_balance, l.opening_balance, 0) as fy_opening_abs,
+        COALESCE(lfb.balance_type, l.balance_type, 'Dr')    as fy_balance_type,
+        COALESCE((
+          SELECT SUM(vle.amount)
+          FROM voucher_ledger_entries vle
+          WHERE vle.company_guid = l.company_guid
+            AND vle.ledger_name  = l.name
+            AND vle.financial_year = $2
+        ), 0) as fy_movement
       FROM ledgers l
-      LEFT JOIN voucher_ledger_entries vle ON vle.ledger_name = l.name AND vle.company_guid = l.company_guid
-      LEFT JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-        AND v.is_cancelled = FALSE
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid
+        AND lfb.ledger_name  = l.name
+        AND lfb.financial_year = $2
       WHERE l.company_guid = $1
-      GROUP BY l.guid, l.name, l.parent, l.balance_type, l.closing_balance
-    `, [companyGuid, fyFrom, fyTo]);
+    `, [companyGuid, financialYear]);
 
     const data = rows.map(l => {
-      const closingSigned = l.balance_type === 'Dr'
-        ? -Math.abs(parseFloat(l.closing_balance || 0))
-        : Math.abs(parseFloat(l.closing_balance || 0));
-      const fyClosingSigned = closingSigned - parseFloat(l.sum_after_fy || 0);
-      const fyOpeningSigned = closingSigned - parseFloat(l.sum_from_fy  || 0);
+      const bt             = l.fy_balance_type || 'Dr';
+      const openingSigned  = bt === 'Dr' ? -Math.abs(parseFloat(l.fy_opening_abs || 0)) : Math.abs(parseFloat(l.fy_opening_abs || 0));
+      const fyClosingSigned = openingSigned + parseFloat(l.fy_movement || 0);
       return {
         guid:            l.guid,
         name:            l.name,
         parent:          l.parent,
         balance_type:    l.balance_type,
-        fy_opening:      Math.abs(fyOpeningSigned),
-        fy_opening_type: fyOpeningSigned <= 0 ? 'Dr' : 'Cr',
+        fy_opening:      Math.abs(openingSigned),
+        fy_opening_type: openingSigned <= 0 ? 'Dr' : 'Cr',
         fy_closing:      Math.abs(fyClosingSigned),
         fy_closing_type: fyClosingSigned <= 0 ? 'Dr' : 'Cr',
         fy_debit:        fyClosingSigned < 0 ? Math.abs(fyClosingSigned) : 0,
         fy_credit:       fyClosingSigned > 0 ? Math.abs(fyClosingSigned) : 0,
+        financial_year:  financialYear,
       };
     });
 
@@ -791,7 +805,7 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { id } = req.params;
-  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
   try {
     const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_guid=$1 AND guid=$2', [companyGuid, id]);
     if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
@@ -812,42 +826,19 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
       ORDER BY v.date ASC, v.id ASC
     `, [companyGuid, ledgerName, fyFrom, fyTo]);
 
-    // Compute FY-specific opening balance
-    // Strategy: anchor on closing_balance (reliable Tally all-time value) then subtract
-    // entries after fyTo to get FY closing, entries >= fyFrom to get FY opening.
-    // Formula: fy_opening_signed = closing_signed - SUM(entries WHERE date >= fyFrom)
-    const balType = ledger.balance_type || 'Dr';
-    const closingAbs = parseFloat(ledger.closing_balance || 0);
-    const closingSigned = balType === 'Dr' ? -closingAbs : closingAbs;
+    // V2: FY-specific opening balance from ledger_fy_balances table
+    // Source: LedgerOpeningBalance.xml per FY — Tally's authoritative opening per year
+    // Fallback: use ledger.opening_balance from LedgerFull.xml (current FY opening)
+    const { rows: fyBalRows } = await query(
+      'SELECT opening_balance, balance_type FROM ledger_fy_balances WHERE company_guid=$1 AND ledger_name=$2 AND financial_year=$3 LIMIT 1',
+      [companyGuid, ledgerName, financialYear]
+    );
 
-    // Sum entries from fyFrom onwards (FY period + any future entries)
-    const { rows: fromFyRows } = await query(`
-      SELECT COALESCE(SUM(vle.amount), 0) as sum_from_fy
-      FROM voucher_ledger_entries vle
-      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-      WHERE vle.company_guid = $1
-        AND vle.ledger_name = $2
-        AND v.is_cancelled = FALSE
-        AND v.date IS NOT NULL AND v.date != ''
-        AND v.date >= $3
-    `, [companyGuid, ledgerName, fyFrom]);
-
-    // Sum entries AFTER fyTo (post-FY entries)
-    const { rows: afterFyRows } = await query(`
-      SELECT COALESCE(SUM(vle.amount), 0) as sum_after_fy
-      FROM voucher_ledger_entries vle
-      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-      WHERE vle.company_guid = $1
-        AND vle.ledger_name = $2
-        AND v.is_cancelled = FALSE
-        AND v.date IS NOT NULL AND v.date != ''
-        AND v.date > $3
-    `, [companyGuid, ledgerName, fyTo]);
-
-    // FY opening = closing - SUM(entries from fyFrom onwards)
-    const fyOpeningSigned = closingSigned - parseFloat(fromFyRows[0]?.sum_from_fy || 0);
-    const opening = Math.abs(fyOpeningSigned);
-    const openingType = fyOpeningSigned <= 0 ? 'Dr' : 'Cr';
+    const balType = fyBalRows[0]?.balance_type || ledger.balance_type || 'Dr';
+    const openingAbs = parseFloat(fyBalRows[0]?.opening_balance ?? ledger.opening_balance ?? 0);
+    const fyOpeningSigned = balType === 'Dr' ? -openingAbs : openingAbs;
+    const opening = openingAbs;
+    const openingType = balType;
     let runningBalance = fyOpeningSigned;
 
     const transactions = txns.map(t => {

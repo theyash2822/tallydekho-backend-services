@@ -143,6 +143,64 @@ router.post('/ingest/init', async (req, res) => {
   }
 });
 
+// POST /ingest/sync-run/start — V2: create a sync_run record before sync starts
+router.post('/ingest/sync-run/start', async (req, res) => {
+  let body = req.body;
+  if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
+  const { companyGuid, syncType = 'normal', expectedCounts } = body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const { rows } = await query(
+      `INSERT INTO sync_runs (company_guid, sync_type, status, expected_counts, started_at)
+       VALUES ($1, $2, 'running', $3, NOW()) RETURNING id`,
+      [companyGuid, syncType, expectedCounts ? JSON.stringify(expectedCounts) : null]
+    );
+    const syncRunId = rows[0].id;
+    console.log(`[SYNC_RUN] started ${syncRunId} | company: ${companyGuid} | type: ${syncType}`);
+    res.json({ status: true, data: { syncRunId } });
+  } catch (err) {
+    console.error('[SYNC_RUN] start error:', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /ingest/sync-run/complete — V2: mark sync_run as completed with record counts
+router.post('/ingest/sync-run/complete', async (req, res) => {
+  let body = req.body;
+  if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
+  const { syncRunId, uploadId, recordCounts, status = 'completed', errorMessage } = body || {};
+  if (!syncRunId) return res.status(400).json({ status: false, message: 'syncRunId required' });
+  try {
+    await query(
+      `UPDATE sync_runs SET status=$1, record_counts=$2, upload_id=$3, error_message=$4, completed_at=NOW()
+       WHERE id=$5`,
+      [status, recordCounts ? JSON.stringify(recordCounts) : null, uploadId || null, errorMessage || null, syncRunId]
+    );
+    console.log(`[SYNC_RUN] ${status} ${syncRunId}`);
+    res.json({ status: true, data: { syncRunId, status } });
+  } catch (err) {
+    console.error('[SYNC_RUN] complete error:', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// GET /ingest/sync-run/history?companyGuid= — V2: sync run history + monitoring
+router.get('/ingest/sync-run/history', async (req, res) => {
+  const { companyGuid, limit = 20 } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const { rows } = await query(
+      `SELECT id, sync_type, status, record_counts, expected_counts, error_message, started_at, completed_at,
+              EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_seconds
+       FROM sync_runs WHERE company_guid=$1 ORDER BY started_at DESC LIMIT $2`,
+      [companyGuid, parseInt(limit)]
+    );
+    res.json({ status: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
 // POST /ingest/chunk
 router.post('/ingest/chunk', async (req, res) => {
   const uploadId  = req.headers['upload-id'];
@@ -241,13 +299,39 @@ router.post('/ingest/complete', async (req, res) => {
       ).catch(err => console.error('[sync_log] insert failed:', err.message));
     }
 
+    // V2 Monitoring: compute record counts from DB for validation
+    let recordCounts = {};
+    if (companyGuid) {
+      try {
+        const [vCount, lCount, sCount, vleCount] = await Promise.all([
+          query('SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1', [companyGuid]),
+          query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]),
+          query('SELECT COUNT(*) as c FROM stocks WHERE company_guid=$1', [companyGuid]),
+          query('SELECT COUNT(*) as c FROM voucher_ledger_entries WHERE company_guid=$1', [companyGuid]),
+        ]);
+        recordCounts = {
+          vouchers: parseInt(vCount.rows[0]?.c || 0),
+          ledgers:  parseInt(lCount.rows[0]?.c || 0),
+          stocks:   parseInt(sCount.rows[0]?.c || 0),
+          voucher_ledger_entries: parseInt(vleCount.rows[0]?.c || 0),
+        };
+        // Log warning if counts look suspiciously low (basic sanity check)
+        if (isHardSync && recordCounts.vouchers < 10) {
+          console.warn(`[INGEST] ⚠️ Hard sync completed but only ${recordCounts.vouchers} vouchers — may indicate sync issue`);
+        }
+        console.log(`[INGEST] Record counts post-sync:`, recordCounts);
+      } catch (countErr) {
+        console.warn('[INGEST] Count check failed:', countErr.message);
+      }
+    }
+
     console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
 
     if (userId) {
       try { socketService.notifySynced(userId, companyGuid); } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }
 
-    res.json({ status: true, message: 'Sync complete' });
+    res.json({ status: true, message: 'Sync complete', data: { recordCounts } });
   } catch (err) {
     console.error('[INGEST] complete error:', err.message);
     res.status(500).json({ status: false, message: 'Complete failed' });

@@ -930,4 +930,58 @@ export async function retryOfflineEntries(userId, companyGuid) {
   }
 }
 
+// ── V2 Write-back Lifecycle ──────────────────────────────────────────────────
+// Status lifecycle: draft → submitted → queued → processing → posted | failed
+// Maps to existing: pending=queued, success=posted, failed=failed, desktop_offline=queued
+
+// GET /write-queue/status/:id — get lifecycle status for a write-queue entry
+router.get('/write-queue/status/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await query(
+      `SELECT id, entry_type, entry_label, amount, status, tally_voucher_number, tally_id,
+              error_message, attempt_count, created_at, updated_at,
+              CASE status
+                WHEN 'pending'         THEN 'queued'
+                WHEN 'success'         THEN 'posted'
+                WHEN 'desktop_offline' THEN 'queued'
+                WHEN 'failed'          THEN 'failed'
+                ELSE status
+              END as v2_status
+       FROM write_queue WHERE id = $1 AND user_id = $2`,
+      [id, req.user.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ status: false, error: { code: 'NOT_FOUND' } });
+    res.json({ status: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /write-queue/history?companyGuid=&status= — full write-back audit trail
+router.get('/write-queue/history', authMiddleware, async (req, res) => {
+  const { companyGuid, status, limit = 50, offset = 0 } = req.query;
+  const companyGuidVal = companyGuid || req.user.companyGuid;
+  try {
+    let q = `SELECT id, entry_type, entry_label, amount, status, tally_voucher_number,
+                    error_message, attempt_count, created_at, updated_at,
+                    CASE status
+                      WHEN 'pending'         THEN 'queued'
+                      WHEN 'success'         THEN 'posted'
+                      WHEN 'desktop_offline' THEN 'queued'
+                      WHEN 'failed'          THEN 'failed'
+                      ELSE status
+                    END as v2_status
+             FROM write_queue WHERE user_id = $1 AND company_guid = $2`;
+    const params = [req.user.userId, companyGuidVal];
+    if (status) { q += ` AND status = $${params.length + 1}`; params.push(status); }
+    q += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit), parseInt(offset));
+    const { rows } = await query(q, params);
+    res.json({ status: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ status: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 export default router;

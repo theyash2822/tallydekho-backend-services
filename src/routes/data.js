@@ -537,23 +537,31 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
       return rows[0]?.begin_date || `${new Date().getFullYear()}-04-01`;
     })());
 
-    // Anchor on closing_balance (reliable Tally value)
-    // fy_closing_signed = closing_signed - SUM(entries AFTER fyTo)
+    // V2: Use financial_year column + ledger_fy_balances for accurate FY P&L
+    const fyYear = `${new Date(fyFrom).getFullYear()}-${new Date(fyTo).getFullYear() + (new Date(fyTo).getMonth() < 3 ? 0 : 1)}`;
+    // Compute from fyFrom to handle year boundaries correctly
+    const fyYearLabel = (() => {
+      const y = parseInt(String(fyFrom).slice(0, 4), 10);
+      return `${y}-${y + 1}`;
+    })();
     const fyBalQuery = `
       SELECT l.name, l.parent, l.balance_type,
-        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
-          - COALESCE((
+        CASE WHEN COALESCE(lfb.balance_type, l.balance_type, 'Dr') = 'Dr'
+             THEN -ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+             ELSE  ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+        END
+        + COALESCE((
             SELECT SUM(vle.amount)
             FROM voucher_ledger_entries vle
-            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
             WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
-              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
-              AND v.date > $2
+              AND vle.financial_year = $2
           ), 0) as fy_closing_signed
       FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
       WHERE l.company_guid = $1
     `;
-    const { rows: allLedgers } = await query(fyBalQuery, [companyGuid, fyTo]);
+    const { rows: allLedgers } = await query(fyBalQuery, [companyGuid, fyYearLabel]);
 
     const income   = allLedgers.filter(l => l.parent && (l.parent.match(/Income|Revenue|Sales|Direct Income|Indirect Income/i)))
       .map(l => ({ name: l.name, parent: l.parent, closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)), balance_type: parseFloat(l.fy_closing_signed || 0) <= 0 ? 'Dr' : 'Cr' }));
@@ -579,21 +587,25 @@ router.post('/reports/balance-sheet', authMiddleware, async (req, res) => {
       return rows[0]?.end_date || `${new Date().getFullYear() + 1}-03-31`;
     })());
 
-    // FY-specific balance sheet: anchor on closing_balance, subtract post-FY entries
+    // V2: Balance Sheet uses financial_year + ledger_fy_balances
+    const bsFyYear = (() => { const y = parseInt(String(fyTo).slice(0, 4), 10); return new Date(fyTo).getMonth() < 3 ? `${y - 1}-${y}` : `${y}-${y + 1}`; })();
     const { rows: allLedgers } = await query(`
       SELECT l.name, l.parent, l.balance_type,
-        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
-          - COALESCE((
+        CASE WHEN COALESCE(lfb.balance_type, l.balance_type, 'Dr') = 'Dr'
+             THEN -ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+             ELSE  ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+        END
+        + COALESCE((
             SELECT SUM(vle.amount)
             FROM voucher_ledger_entries vle
-            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
             WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
-              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
-              AND v.date > $2
+              AND vle.financial_year = $2
           ), 0) as fy_closing_signed
       FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
       WHERE l.company_guid = $1
-    `, [companyGuid, fyTo]);
+    `, [companyGuid, bsFyYear]);
 
     const assets      = allLedgers.filter(l => parseFloat(l.fy_closing_signed || 0) < 0)
       .map(l => ({ name: l.name, parent: l.parent, balance_type: 'Dr', closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)) }));
@@ -1105,22 +1117,26 @@ router.post('/reports/trial-balance', authMiddleware, async (req, res) => {
       return rows[0]?.begin_date || `${new Date().getFullYear()}-04-01`;
     })());
 
-    // FY-specific trial balance: anchor on closing_balance, subtract post-FY entries
+    // V2: Trial Balance uses financial_year column + ledger_fy_balances directly
+    const tbFyYear = (() => { const y = parseInt(String(fyTo).slice(0, 4), 10); return new Date(fyTo).getMonth() < 3 ? `${y - 1}-${y}` : `${y}-${y + 1}`; })();
     const { rows: allLedgers } = await query(`
       SELECT l.name, l.parent, l.balance_type,
-        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
-          - COALESCE((
+        CASE WHEN COALESCE(lfb.balance_type, l.balance_type, 'Dr') = 'Dr'
+             THEN -ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+             ELSE  ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+        END
+        + COALESCE((
             SELECT SUM(vle.amount)
             FROM voucher_ledger_entries vle
-            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
             WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
-              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
-              AND v.date > $2
+              AND vle.financial_year = $2
           ), 0) as fy_closing_signed
       FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
       WHERE l.company_guid = $1
       ORDER BY l.parent, l.name
-    `, [companyGuid, fyTo]);
+    `, [companyGuid, tbFyYear]);
 
     const rows = allLedgers
       .filter(l => parseFloat(l.fy_closing_signed || 0) !== 0)
@@ -1209,6 +1225,170 @@ router.post('/reports/bill-ageing', authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('[bill-ageing]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// ── V2 Reports ───────────────────────────────────────────────────────────────────
+
+// POST /reports/stock-valuation — V2 required report
+// Returns: stock items with qty, rate, total value per warehouse
+router.post('/reports/stock-valuation', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(`
+      SELECT
+        s.guid, s.name, s.unit, s.hsn, s.tax_rate,
+        s.closing_qty  as qty,
+        s.closing_rate as rate,
+        s.closing_value as value,
+        s.closing_qty * s.closing_rate as computed_value
+      FROM stocks s
+      WHERE s.company_guid = $1 AND s.closing_qty != 0
+      ORDER BY (s.closing_qty * s.closing_rate) DESC
+    `, [companyGuid]);
+    const totalValue = rows.reduce((s, r) => s + parseFloat(r.computed_value || 0), 0);
+    res.json({ status: true, data: { items: rows, total_value: totalValue, count: rows.length } });
+  } catch (err) {
+    console.error('[stock-valuation]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /reports/inventory-ageing — V2 required report
+// Returns: stock items grouped by how long they've had no movement
+router.post('/reports/inventory-ageing', authMiddleware, async (req, res) => {
+  const { companyGuid, thresholdDays = 90 } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(`
+      SELECT
+        s.guid, s.name, s.unit,
+        s.closing_qty  as qty,
+        s.closing_rate as rate,
+        s.closing_qty * s.closing_rate as value,
+        MAX(st.date::date) as last_movement_date,
+        CURRENT_DATE - MAX(st.date::date) as days_since_movement
+      FROM stocks s
+      LEFT JOIN stock_transactions st
+        ON st.stock_guid = s.guid AND st.company_guid = s.company_guid
+      WHERE s.company_guid = $1 AND s.closing_qty > 0
+      GROUP BY s.guid, s.name, s.unit, s.closing_qty, s.closing_rate
+      HAVING CURRENT_DATE - MAX(st.date::date) >= $2
+         OR MAX(st.date::date) IS NULL
+      ORDER BY days_since_movement DESC NULLS FIRST
+    `, [companyGuid, parseInt(thresholdDays)]);
+    res.json({ status: true, data: { items: rows, threshold_days: thresholdDays, count: rows.length } });
+  } catch (err) {
+    console.error('[inventory-ageing]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /reports/stock-movement — V2: Fast/Slow Moving Stock report
+router.post('/reports/stock-movement', authMiddleware, async (req, res) => {
+  const { companyGuid, from, to, topN = 20 } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const fromDate = from || `${new Date().getFullYear()}-04-01`;
+    const toDate   = to   || new Date().toISOString().slice(0, 10);
+    const { rows } = await query(`
+      SELECT
+        s.guid, s.name, s.unit,
+        COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0) as total_inward,
+        COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) as total_outward,
+        COALESCE(COUNT(DISTINCT st.voucher_guid), 0) as transaction_count,
+        s.closing_qty as current_qty
+      FROM stocks s
+      LEFT JOIN stock_transactions st
+        ON st.stock_guid = s.guid AND st.company_guid = s.company_guid
+        AND st.date BETWEEN $2 AND $3
+      WHERE s.company_guid = $1
+      GROUP BY s.guid, s.name, s.unit, s.closing_qty
+      ORDER BY total_outward DESC
+    `, [companyGuid, fromDate, toDate]);
+
+    const fast = rows.slice(0, parseInt(topN));
+    const slow = [...rows].sort((a, b) => parseFloat(a.total_outward) - parseFloat(b.total_outward)).slice(0, parseInt(topN));
+
+    res.json({
+      status: true,
+      data: { fast_moving: fast, slow_moving: slow, from: fromDate, to: toDate }
+    });
+  } catch (err) {
+    console.error('[stock-movement]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /reports/gst-summary — V2: GST report (GSTR-1 style summary)
+router.post('/reports/gst-summary', authMiddleware, async (req, res) => {
+  const { companyGuid, from, to } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const fromDate = from || `${new Date().getFullYear()}-04-01`;
+    const toDate   = to   || new Date().toISOString().slice(0, 10);
+    const { rows } = await query(`
+      SELECT
+        v.voucher_type,
+        COUNT(*)                                               as count,
+        COALESCE(SUM(g.taxable_amount), 0)                    as taxable_amount,
+        COALESCE(SUM(g.cgst_amount),    0)                    as cgst,
+        COALESCE(SUM(g.sgst_amount),    0)                    as sgst,
+        COALESCE(SUM(g.igst_amount),    0)                    as igst,
+        COALESCE(SUM(g.cgst_amount + g.sgst_amount + g.igst_amount), 0) as total_tax
+      FROM gst_voucher_details g
+      JOIN vouchers v ON v.guid = g.voucher_guid AND v.company_guid = g.company_guid
+      WHERE g.company_guid = $1
+        AND v.date BETWEEN $2 AND $3
+        AND v.is_cancelled = FALSE
+      GROUP BY v.voucher_type
+      ORDER BY taxable_amount DESC
+    `, [companyGuid, fromDate, toDate]);
+
+    const totalTax = rows.reduce((s, r) => s + parseFloat(r.total_tax || 0), 0);
+    const totalTaxable = rows.reduce((s, r) => s + parseFloat(r.taxable_amount || 0), 0);
+    const cgstTotal = rows.reduce((s, r) => s + parseFloat(r.cgst || 0), 0);
+    const sgstTotal = rows.reduce((s, r) => s + parseFloat(r.sgst || 0), 0);
+    const igstTotal = rows.reduce((s, r) => s + parseFloat(r.igst || 0), 0);
+
+    res.json({
+      status: true,
+      data: {
+        from: fromDate, to: toDate,
+        by_type: rows,
+        summary: { taxable_amount: totalTaxable, cgst: cgstTotal, sgst: sgstTotal, igst: igstTotal, total_tax: totalTax },
+      }
+    });
+  } catch (err) {
+    console.error('[gst-summary]', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /reports/stock-summary — V2: Stock Summary overview
+router.post('/reports/stock-summary', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const [totals, byGroup] = await Promise.all([
+      query(`SELECT COUNT(*) as total_items, SUM(closing_qty) as total_qty, SUM(closing_qty * closing_rate) as total_value,
+                    SUM(CASE WHEN closing_qty <= reorder_level AND reorder_level > 0 THEN 1 ELSE 0 END) as low_stock_count
+             FROM stocks WHERE company_guid = $1 AND closing_qty != 0`, [companyGuid]),
+      query(`SELECT group_name, COUNT(*) as item_count, SUM(closing_qty * closing_rate) as value
+             FROM stocks WHERE company_guid = $1 AND closing_qty != 0
+             GROUP BY group_name ORDER BY value DESC LIMIT 10`, [companyGuid]),
+    ]);
+    res.json({
+      status: true,
+      data: {
+        totals: totals.rows[0],
+        by_group: byGroup.rows,
+      }
+    });
+  } catch (err) {
+    console.error('[stock-summary]', err.message);
     res.status(500).json({ status: false, message: err.message });
   }
 });

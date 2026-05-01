@@ -109,6 +109,9 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
         await processCurrencies(records, companyGuid);
       } else if (xml === 'StockOpeningBalance.xml') {
         await processStockOpeningBalance(records, companyGuid);
+      } else if (xml === 'LedgerOpeningBalance.xml') {
+        // V2: per-FY opening balance — populate ledger_fy_balances
+        await processLedgerFyBalances(records, companyGuid);
       } else {
         await processMasters(records, companyGuid);
       }
@@ -289,8 +292,8 @@ async function processVouchers(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
@@ -304,6 +307,7 @@ async function processVouchers(data, companyGuid) {
             is_cancelled   = EXCLUDED.is_cancelled,
             alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            financial_year = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
             synced_at      = EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, date,
@@ -317,6 +321,7 @@ async function processVouchers(data, companyGuid) {
           parseInt(r.AlterId || r.ALTERID || 0),
           JSON.stringify(r).slice(0, 10000),
           now(),
+          r._FINANCIAL_YEAR || null,
         ]);
         saved++;
 
@@ -595,20 +600,66 @@ function parseLedgerEntries(r) {
 }
 
 // Save AllLedgerEntries for a voucher to voucher_ledger_entries table
-async function saveLedgerEntries(client, voucherGuid, companyGuid, entries) {
+// V2: includes financial_year from record metadata
+async function saveLedgerEntries(client, voucherGuid, companyGuid, entries, financialYear) {
   if (!entries || entries.length === 0) return;
   // Delete existing entries for this voucher (idempotent re-sync)
   await client.query('DELETE FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2', [voucherGuid, companyGuid]);
   for (const e of entries) {
     try {
       await client.query(
-        `INSERT INTO voucher_ledger_entries (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [voucherGuid, companyGuid, e.name, e.guid, e.amount, e.drCr, e.index]
+        `INSERT INTO voucher_ledger_entries (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index, financial_year)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT DO NOTHING`,
+        [voucherGuid, companyGuid, e.name, e.guid, e.amount, e.drCr, e.index, financialYear || null]
       );
     } catch (err) {
       console.warn('[DB] LedgerEntry insert failed:', err.message, e.name);
     }
+  }
+}
+
+// V2: Process LedgerOpeningBalance.xml — stores per-FY opening balance per ledger
+// Previously this was skipped. Now it populates ledger_fy_balances table.
+async function processLedgerFyBalances(data, companyGuid) {
+  if (!data || data.length === 0) return;
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name  = r.NAME || r.Name || r.LEDGERNAME || r.LedgerName || '';
+      const guid  = r.GUID || r.Guid || null;
+      const fy    = r._FINANCIAL_YEAR || null;
+      if (!name || !fy) continue;
+
+      const balRaw  = String(r.OPENINGBALANCE || r.OpeningBalance || r.CLOSINGBALANCE || '0').replace('(-)', '-');
+      const balNum  = parseFloat(balRaw.replace(/[^0-9.-]/g, '')) || 0;
+      const balType = balRaw.includes('Cr') ? 'Cr' : (balNum < 0 ? 'Dr' : 'Dr');
+      const balAbs  = Math.abs(balNum);
+
+      try {
+        await client.query(`
+          INSERT INTO ledger_fy_balances (ledger_guid, ledger_name, company_guid, financial_year, opening_balance, balance_type, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,NOW())
+          ON CONFLICT (company_guid, ledger_name, financial_year) DO UPDATE SET
+            opening_balance = EXCLUDED.opening_balance,
+            balance_type    = EXCLUDED.balance_type,
+            ledger_guid     = COALESCE(EXCLUDED.ledger_guid, ledger_fy_balances.ledger_guid),
+            synced_at       = NOW()
+        `, [guid, name, companyGuid, fy, balAbs, balType]);
+        saved++;
+      } catch (err) {
+        console.warn('[DB] LedgerFyBalance insert failed:', err.message, name, fy);
+      }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] LedgerFyBalances: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[DB] LedgerFyBalances failed:', err.message);
+  } finally {
+    client.release();
   }
 }
 
@@ -943,8 +994,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'BillOutstanding.xml') {
       await processBillOutstanding(records, companyGuid);
     } else if (xml === 'LedgerOpeningBalance.xml') {
-      // Opening balances captured in ledger master sync
-      console.log(`[INGEST] Skipping ${records.length} LedgerOpeningBalance records`);
+      // V2: Now actively processed into ledger_fy_balances table
+      await processLedgerFyBalances(records, companyGuid);
     } else if (xml === 'AllVoucher.xml') {
       // AllVoucher has header + inventory + ledger entries + bill allocations
       await processAllVoucher(records, companyGuid);
@@ -1014,8 +1065,8 @@ async function processAllVoucher(data, companyGuid) {
       }
       try {
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type   = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
@@ -1028,6 +1079,7 @@ async function processAllVoucher(data, companyGuid) {
             is_cancelled   = EXCLUDED.is_cancelled,
             alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            financial_year = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
             synced_at      = EXCLUDED.synced_at
         `, [
           guid, companyGuid,
@@ -1042,12 +1094,14 @@ async function processAllVoucher(data, companyGuid) {
           parseInt(r.ALTERID || r.AlterId || 0),
           JSON.stringify(r).slice(0, 5000),
           now(),
+          r._FINANCIAL_YEAR || null,
         ]);
         saved++;
         // Save AllLedgerEntries to voucher_ledger_entries (proper Dr/Cr from amount sign)
+        // V2: pass financial_year from record metadata
         const parsedEntries = parseLedgerEntries(r);
         if (parsedEntries.length > 0) {
-          await saveLedgerEntries(client, guid, companyGuid, parsedEntries);
+          await saveLedgerEntries(client, guid, companyGuid, parsedEntries, r._FINANCIAL_YEAR || null);
         }
       } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
     }

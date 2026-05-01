@@ -477,6 +477,88 @@ export async function initSchema() {
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS created_at BIGINT;
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS party_gstin TEXT;
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS place_of_supply TEXT;
+
+      -- V2 Migration: financial_year on transactional tables
+      ALTER TABLE vouchers              ADD COLUMN IF NOT EXISTS financial_year TEXT;
+      ALTER TABLE voucher_ledger_entries ADD COLUMN IF NOT EXISTS financial_year TEXT;
+      ALTER TABLE stock_transactions    ADD COLUMN IF NOT EXISTS financial_year TEXT;
+      ALTER TABLE voucher_inventory_items ADD COLUMN IF NOT EXISTS financial_year TEXT;
+      ALTER TABLE gst_voucher_details   ADD COLUMN IF NOT EXISTS financial_year TEXT;
+
+      -- V2: sync_runs table — atomic sync tracking
+      CREATE TABLE IF NOT EXISTS sync_runs (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_guid  TEXT NOT NULL,
+        sync_type     TEXT NOT NULL DEFAULT 'normal' CHECK (sync_type IN ('normal', 'hard')),
+        status        TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+        record_counts JSONB,
+        expected_counts JSONB,
+        error_message TEXT,
+        started_at    TIMESTAMPTZ DEFAULT NOW(),
+        completed_at  TIMESTAMPTZ,
+        upload_id     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_sync_runs_company ON sync_runs(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_sync_runs_status  ON sync_runs(status);
+
+      -- V2: ledger_fy_balances — per-FY opening balance from LedgerOpeningBalance.xml
+      CREATE TABLE IF NOT EXISTS ledger_fy_balances (
+        id             SERIAL PRIMARY KEY,
+        ledger_guid    TEXT,
+        ledger_name    TEXT NOT NULL,
+        company_guid   TEXT NOT NULL,
+        financial_year TEXT NOT NULL,
+        opening_balance NUMERIC(18,4) DEFAULT 0,
+        balance_type   TEXT DEFAULT 'Dr',
+        synced_at      TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(company_guid, ledger_name, financial_year)
+      );
+      CREATE INDEX IF NOT EXISTS idx_lfb_company ON ledger_fy_balances(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_lfb_ledger  ON ledger_fy_balances(company_guid, ledger_name);
+
+      -- V2: e_invoice_details — dedicated e-invoice table
+      CREATE TABLE IF NOT EXISTS e_invoice_details (
+        id             SERIAL PRIMARY KEY,
+        voucher_guid   TEXT NOT NULL,
+        company_guid   TEXT NOT NULL,
+        financial_year TEXT,
+        irn            TEXT,
+        ack_no         TEXT,
+        ack_date       TEXT,
+        signed_invoice TEXT,
+        qr_code        TEXT,
+        status         TEXT DEFAULT 'pending',
+        error_message  TEXT,
+        synced_at      TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(voucher_guid, company_guid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_einv_company ON e_invoice_details(company_guid);
+
+      -- V2: e_way_bill_details — dedicated e-way bill table
+      CREATE TABLE IF NOT EXISTS e_way_bill_details (
+        id              SERIAL PRIMARY KEY,
+        voucher_guid    TEXT NOT NULL,
+        company_guid    TEXT NOT NULL,
+        financial_year  TEXT,
+        ewb_no          TEXT,
+        ewb_date        TEXT,
+        valid_till      TEXT,
+        vehicle_no      TEXT,
+        transporter_id  TEXT,
+        status          TEXT DEFAULT 'pending',
+        distance_km     INTEGER,
+        supply_type     TEXT,
+        sub_supply_type TEXT,
+        error_message   TEXT,
+        synced_at       TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(voucher_guid, company_guid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ewb_company ON e_way_bill_details(company_guid);
+
+      -- V2: FY indexes for performance
+      CREATE INDEX IF NOT EXISTS idx_vouchers_fy    ON vouchers(company_guid, financial_year);
+      CREATE INDEX IF NOT EXISTS idx_vle_fy         ON voucher_ledger_entries(company_guid, financial_year);
+      CREATE INDEX IF NOT EXISTS idx_st_fy          ON stock_transactions(company_guid, financial_year);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {
