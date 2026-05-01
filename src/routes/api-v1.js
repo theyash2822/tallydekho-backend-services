@@ -912,6 +912,10 @@ router.get('/ledgers/:id', authMiddleware, async (req, res) => {
 // STOCKS
 // ══════════════════════════════════════════════════════════════
 
+// GET /api/stocks/items
+// Per Tally FY guide §3.4: Stock qty is NEVER static. It's always derived from transactions.
+// When fy= param is passed: compute FY-specific closing qty from stock_transactions
+// When no fy param: serve stored closing_qty (as-of last sync = current stock)
 router.get('/stocks/items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -919,9 +923,60 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   const { search = '', category, page = 1, limit = 50 } = req.query;
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
-    let q = `SELECT * FROM stocks WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR hsn ILIKE $2)`;
-    const params = [companyGuid, `%${search}%`];
-    let idx = 3;
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
+
+    let q, params, idx;
+    if (fyRequested) {
+      // FY-specific: derive closing qty from stock_transactions up to fyTo (Tally FY guide compliant)
+      q = `
+        SELECT s.guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+               s.reorder_level, s.closing_rate,
+               -- FY closing qty = opening stock qty + inward - outward up to fyTo
+               COALESCE(s.opening_qty, 0)
+               + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
+               - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) AS fy_closing_qty,
+               s.closing_rate * (
+                 COALESCE(s.opening_qty, 0)
+                 + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
+                 - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
+               ) AS fy_closing_value
+        FROM stocks s
+        LEFT JOIN stock_transactions st ON st.stock_guid = s.guid AND st.company_guid = s.company_guid
+          AND st.date <= $3
+        WHERE s.company_guid = $1
+          AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
+        GROUP BY s.guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+                 s.reorder_level, s.closing_rate, s.opening_qty
+        ORDER BY fy_closing_value DESC NULLS LAST, s.name
+      `;
+      params = [companyGuid, `%${search}%`, fyTo];
+      if (category) { q = q.replace('GROUP BY', `AND s.category = $4 GROUP BY`); params.push(category); }
+      const { rows: allRows } = await query(q, params);
+      // Apply pagination in JS after FY computation
+      const totalRows = allRows.length;
+      const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
+        ...r,
+        closing_qty:   parseFloat(r.fy_closing_qty   || 0),
+        closing_value: parseFloat(r.fy_closing_value || 0),
+      }));
+      const totalValue  = allRows.reduce((s, r) => s + parseFloat(r.fy_closing_value || 0), 0);
+      const lowStockCnt = allRows.filter(r => parseFloat(r.fy_closing_qty || 0) > 0 && parseFloat(r.fy_closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
+      return res.json({
+        success: true,
+        data: {
+          summary: { total_value: `₹${(totalValue/1e5).toFixed(1)}L`, total_skus: totalRows, low_stock_count: lowStockCnt },
+          items: rows,
+          financial_year: financialYear,
+        },
+        meta: { total: totalRows, page: parseInt(page) }
+      });
+    }
+
+    // No FY param: serve stored closing_qty (current stock as of last sync)
+    q = `SELECT * FROM stocks WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR hsn ILIKE $2)`;
+    params = [companyGuid, `%${search}%`];
+    idx = 3;
     if (category) { q += ` AND category = $${idx++}`; params.push(category); }
     q += ` ORDER BY closing_value DESC NULLS LAST, name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
@@ -991,38 +1046,70 @@ router.get('/reports/financial', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /reports/pl-bs — P&L + Balance Sheet from ledger closing balances
+// GET /reports/pl-bs — P&L + Balance Sheet — FY-derived (Tally FY Guide compliant)
+// Rule: Balance = anchor (ledger_fy_balances) + SUM(movements). Never static closing.
 router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: income }   = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Income%' OR parent ILIKE '%Revenue%' OR parent ILIKE '%Sales%' OR parent ILIKE '%Direct Income%' OR parent ILIKE '%Indirect Income%')`, [companyGuid]);
-    const { rows: expenses } = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Purchase%' OR parent ILIKE '%Direct Expense%' OR parent ILIKE '%Indirect Expense%')`, [companyGuid]);
-    const { rows: assets }   = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Dr' AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
-    const { rows: liab }     = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Cr' AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 20`, [companyGuid]);
-    const { rows: tb }       = await query(`SELECT name, parent, closing_balance, balance_type, CASE WHEN balance_type='Dr' THEN ABS(closing_balance) ELSE 0 END as debit, CASE WHEN balance_type='Cr' THEN ABS(closing_balance) ELSE 0 END as credit FROM ledgers WHERE company_guid=$1 AND closing_balance != 0 ORDER BY parent, name LIMIT 100`, [companyGuid]);
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
 
-    const totalIncome   = income.reduce((s, l)   => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const totalExpenses = expenses.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const totalAssets   = assets.reduce((s, l)   => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const totalLiab     = liab.reduce((s, l)     => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const totalDebit    = tb.reduce((s, r) => s + parseFloat(r.debit || 0), 0);
-    const totalCredit   = tb.reduce((s, r) => s + parseFloat(r.credit || 0), 0);
+    // FY-derived balance per ledger: anchor + SUM(movements for this FY)
+    // This is correct per Tally FY guide: Balance = anchor + transactions. Never static.
+    const { rows: allLedgers } = await query(`
+      SELECT
+        l.guid, l.name, l.parent, l.balance_type,
+        CASE WHEN COALESCE(lfb.balance_type, l.balance_type, 'Dr') = 'Dr'
+             THEN -ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+             ELSE  ABS(COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric)
+        END
+        + COALESCE((
+            SELECT SUM(vle.amount)
+            FROM voucher_ledger_entries vle
+            WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+              AND vle.financial_year = $2
+          ), 0) as fy_signed
+      FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
+      WHERE l.company_guid = $1
+    `, [companyGuid, financialYear]);
+
+    const toAmount = (l) => Math.abs(parseFloat(l.fy_signed || 0));
+    const isDr = (l) => parseFloat(l.fy_signed || 0) < 0;
+    const isCr = (l) => parseFloat(l.fy_signed || 0) >= 0;
+
+    const income   = allLedgers.filter(l => l.parent && /Income|Revenue|Sales|Direct Income|Indirect Income/i.test(l.parent) && toAmount(l) > 0);
+    const expenses = allLedgers.filter(l => l.parent && /Expense|Purchase|Direct Expense|Indirect Expense/i.test(l.parent) && toAmount(l) > 0);
+    const assets   = allLedgers.filter(l => isDr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
+    const liab     = allLedgers.filter(l => isCr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
+    const tb       = allLedgers.filter(l => toAmount(l) > 0).sort((a, b) => a.parent?.localeCompare(b.parent || '') || a.name.localeCompare(b.name)).slice(0, 100);
+
+    const totalIncome   = income.reduce((s, l)   => s + toAmount(l), 0);
+    const totalExpenses = expenses.reduce((s, l) => s + toAmount(l), 0);
+    const totalAssets   = assets.reduce((s, l)   => s + toAmount(l), 0);
+    const totalLiab     = liab.reduce((s, l)     => s + toAmount(l), 0);
+    const totalDebit    = tb.filter(l => isDr(l)).reduce((s, l) => s + toAmount(l), 0);
+    const totalCredit   = tb.filter(l => isCr(l)).reduce((s, l) => s + toAmount(l), 0);
 
     res.json({ success: true, data: {
+      financial_year: financialYear, from: fyFrom, to: fyTo,
       pl: {
-        income:         income.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
-        expenses:       expenses.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        income:   income.map(l   => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
+        expenses: expenses.map(l => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
         totalIncome, totalExpenses, netProfit: totalIncome - totalExpenses,
       },
       bs: {
-        assets:       assets.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
-        liabilities:  liab.map(l => ({ name: l.name, parent: l.parent, amount: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        assets:       assets.map(l => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
+        liabilities:  liab.map(l  => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
         totalAssets, totalLiabilities: totalLiab,
       },
       trialBalance: {
-        ledgers: tb.map(r => ({ name: r.name, parent: r.parent, debit: parseFloat(r.debit || 0), credit: parseFloat(r.credit || 0) })),
+        ledgers: tb.map(l => ({ name: l.name, parent: l.parent,
+          debit:  isDr(l) ? toAmount(l) : 0,
+          credit: isCr(l) ? toAmount(l) : 0,
+        })),
         totalDebit, totalCredit,
       },
     }});
