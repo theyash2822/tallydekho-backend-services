@@ -524,33 +524,88 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
 router.post('/reports/pl', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.body || {};
+  const { companyGuid, from, to } = req.body || {};
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: income }   = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Income%' OR parent ILIKE '%Revenue%' OR parent ILIKE '%Sales%')`, [companyGuid]);
-    const { rows: expenses } = await query(`SELECT name, parent, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Expense%' OR parent ILIKE '%Purchase%')`, [companyGuid]);
+    // Use FY-specific balances computed from voucher_ledger_entries
+    const fyTo = to || (await (async () => {
+      const { rows } = await query('SELECT end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+      return rows[0]?.end_date || `${new Date().getFullYear() + 1}-03-31`;
+    })());
+    const fyFrom = from || (await (async () => {
+      const { rows } = await query('SELECT begin_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+      return rows[0]?.begin_date || `${new Date().getFullYear()}-04-01`;
+    })());
+
+    // Anchor on closing_balance (reliable Tally value)
+    // fy_closing_signed = closing_signed - SUM(entries AFTER fyTo)
+    const fyBalQuery = `
+      SELECT l.name, l.parent, l.balance_type,
+        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
+          - COALESCE((
+            SELECT SUM(vle.amount)
+            FROM voucher_ledger_entries vle
+            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+            WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
+              AND v.date > $2
+          ), 0) as fy_closing_signed
+      FROM ledgers l
+      WHERE l.company_guid = $1
+    `;
+    const { rows: allLedgers } = await query(fyBalQuery, [companyGuid, fyTo]);
+
+    const income   = allLedgers.filter(l => l.parent && (l.parent.match(/Income|Revenue|Sales|Direct Income|Indirect Income/i)))
+      .map(l => ({ name: l.name, parent: l.parent, closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)), balance_type: parseFloat(l.fy_closing_signed || 0) <= 0 ? 'Dr' : 'Cr' }));
+    const expenses = allLedgers.filter(l => l.parent && (l.parent.match(/Expense|Purchase|Direct Expense|Indirect Expense/i)))
+      .map(l => ({ name: l.name, parent: l.parent, closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)), balance_type: parseFloat(l.fy_closing_signed || 0) <= 0 ? 'Dr' : 'Cr' }));
 
     const totalIncome   = income.reduce((s, l)   => s + parseFloat(l.closing_balance || 0), 0);
     const totalExpenses = expenses.reduce((s, l) => s + parseFloat(l.closing_balance || 0), 0);
 
-    res.json({ status: true, data: { income, expenses, summary: { totalIncome, totalExpenses, grossProfit: totalIncome - totalExpenses, netProfit: totalIncome - totalExpenses } } });
+    res.json({ status: true, data: { income, expenses, from: fyFrom, to: fyTo, summary: { totalIncome, totalExpenses, grossProfit: totalIncome - totalExpenses, netProfit: totalIncome - totalExpenses } } });
   } catch (err) {
+    console.error('[pl]', err.message);
     res.status(500).json({ status: false, message: 'Failed' });
   }
 });
 
 router.post('/reports/balance-sheet', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.body || {};
+  const { companyGuid, from, to } = req.body || {};
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: assets }      = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Dr'`, [companyGuid]);
-    const { rows: liabilities } = await query(`SELECT name, parent, closing_balance, balance_type FROM ledgers WHERE company_guid=$1 AND balance_type='Cr'`, [companyGuid]);
+    const fyTo = to || (await (async () => {
+      const { rows } = await query('SELECT end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+      return rows[0]?.end_date || `${new Date().getFullYear() + 1}-03-31`;
+    })());
+
+    // FY-specific balance sheet: anchor on closing_balance, subtract post-FY entries
+    const { rows: allLedgers } = await query(`
+      SELECT l.name, l.parent, l.balance_type,
+        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
+          - COALESCE((
+            SELECT SUM(vle.amount)
+            FROM voucher_ledger_entries vle
+            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+            WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
+              AND v.date > $2
+          ), 0) as fy_closing_signed
+      FROM ledgers l
+      WHERE l.company_guid = $1
+    `, [companyGuid, fyTo]);
+
+    const assets      = allLedgers.filter(l => parseFloat(l.fy_closing_signed || 0) < 0)
+      .map(l => ({ name: l.name, parent: l.parent, balance_type: 'Dr', closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)) }));
+    const liabilities = allLedgers.filter(l => parseFloat(l.fy_closing_signed || 0) > 0)
+      .map(l => ({ name: l.name, parent: l.parent, balance_type: 'Cr', closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)) }));
 
     const totalAssets      = assets.reduce((s, l)      => s + parseFloat(l.closing_balance || 0), 0);
     const totalLiabilities = liabilities.reduce((s, l) => s + parseFloat(l.closing_balance || 0), 0);
 
-    res.json({ status: true, data: { assets, liabilities, summary: { totalAssets, totalLiabilities } } });
+    res.json({ status: true, data: { assets, liabilities, to: fyTo, summary: { totalAssets, totalLiabilities } } });
   } catch (err) {
+    console.error('[balance-sheet]', err.message);
     res.status(500).json({ status: false, message: 'Failed' });
   }
 });
@@ -1037,26 +1092,58 @@ router.get('/reports-dashboard', authMiddleware, async (req, res) => {
 
 // ─── POST /reports/trial-balance ─────────────────────────────────────────────
 router.post('/reports/trial-balance', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.body || {};
+  const { companyGuid, from, to } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query(`
-      SELECT name, parent, closing_balance, balance_type,
-        CASE WHEN balance_type = 'Dr' THEN ABS(closing_balance) ELSE 0 END as debit_amount,
-        CASE WHEN balance_type = 'Cr' THEN ABS(closing_balance) ELSE 0 END as credit_amount
-      FROM ledgers
-      WHERE company_guid = $1 AND closing_balance != 0
-      ORDER BY parent, name
-    `, [companyGuid]);
+    const fyTo = to || (await (async () => {
+      const { rows } = await query('SELECT end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+      return rows[0]?.end_date || `${new Date().getFullYear() + 1}-03-31`;
+    })());
+    const fyFrom = from || (await (async () => {
+      const { rows } = await query('SELECT begin_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
+      return rows[0]?.begin_date || `${new Date().getFullYear()}-04-01`;
+    })());
 
-    const totalDebit = rows.reduce((s, r) => s + parseFloat(r.debit_amount || 0), 0);
+    // FY-specific trial balance: anchor on closing_balance, subtract post-FY entries
+    const { rows: allLedgers } = await query(`
+      SELECT l.name, l.parent, l.balance_type,
+        CASE WHEN l.balance_type = 'Dr' THEN -ABS(l.closing_balance::numeric) ELSE ABS(l.closing_balance::numeric) END
+          - COALESCE((
+            SELECT SUM(vle.amount)
+            FROM voucher_ledger_entries vle
+            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+            WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+              AND v.is_cancelled = FALSE AND v.date IS NOT NULL AND v.date != ''
+              AND v.date > $2
+          ), 0) as fy_closing_signed
+      FROM ledgers l
+      WHERE l.company_guid = $1
+      ORDER BY l.parent, l.name
+    `, [companyGuid, fyTo]);
+
+    const rows = allLedgers
+      .filter(l => parseFloat(l.fy_closing_signed || 0) !== 0)
+      .map(l => {
+        const signed = parseFloat(l.fy_closing_signed || 0);
+        return {
+          name: l.name,
+          parent: l.parent,
+          balance_type: signed <= 0 ? 'Dr' : 'Cr',
+          closing_balance: Math.abs(signed),
+          debit_amount:  signed < 0  ? Math.abs(signed) : 0,
+          credit_amount: signed >= 0 ? Math.abs(signed) : 0,
+        };
+      });
+
+    const totalDebit  = rows.reduce((s, r) => s + parseFloat(r.debit_amount  || 0), 0);
     const totalCredit = rows.reduce((s, r) => s + parseFloat(r.credit_amount || 0), 0);
 
     res.json({
       status: true,
       data: {
         ledgers: rows,
+        from: fyFrom, to: fyTo,
         totals: { debit: totalDebit, credit: totalCredit },
       },
     });

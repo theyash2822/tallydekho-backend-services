@@ -729,6 +729,63 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/ledgers/fy-balances — FY-specific closing balance for all ledgers (used by Trial Balance, P&L, Balance Sheet)
+// IMPORTANT: must be registered BEFORE /ledgers/:id routes to avoid :id matching "fy-balances"
+router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  try {
+    // Anchor on closing_balance (reliable Tally value):
+    // fy_closing_signed = closing_signed - SUM(entries AFTER fyTo)
+    // fy_opening_signed = closing_signed - SUM(entries FROM fyFrom onwards)
+    const { rows } = await query(`
+      SELECT
+        l.guid,
+        l.name,
+        l.parent,
+        l.balance_type,
+        l.closing_balance,
+        COALESCE(SUM(
+          CASE WHEN v.date IS NOT NULL AND v.date != '' AND v.date > $3 THEN vle.amount ELSE 0 END
+        ), 0) as sum_after_fy,
+        COALESCE(SUM(
+          CASE WHEN v.date IS NOT NULL AND v.date != '' AND v.date >= $2 THEN vle.amount ELSE 0 END
+        ), 0) as sum_from_fy
+      FROM ledgers l
+      LEFT JOIN voucher_ledger_entries vle ON vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+      LEFT JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+        AND v.is_cancelled = FALSE
+      WHERE l.company_guid = $1
+      GROUP BY l.guid, l.name, l.parent, l.balance_type, l.closing_balance
+    `, [companyGuid, fyFrom, fyTo]);
+
+    const data = rows.map(l => {
+      const closingSigned = l.balance_type === 'Dr'
+        ? -Math.abs(parseFloat(l.closing_balance || 0))
+        : Math.abs(parseFloat(l.closing_balance || 0));
+      const fyClosingSigned = closingSigned - parseFloat(l.sum_after_fy || 0);
+      const fyOpeningSigned = closingSigned - parseFloat(l.sum_from_fy  || 0);
+      return {
+        guid:            l.guid,
+        name:            l.name,
+        parent:          l.parent,
+        balance_type:    l.balance_type,
+        fy_opening:      Math.abs(fyOpeningSigned),
+        fy_opening_type: fyOpeningSigned <= 0 ? 'Dr' : 'Cr',
+        fy_closing:      Math.abs(fyClosingSigned),
+        fy_closing_type: fyClosingSigned <= 0 ? 'Dr' : 'Cr',
+        fy_debit:        fyClosingSigned < 0 ? Math.abs(fyClosingSigned) : 0,
+        fy_credit:       fyClosingSigned > 0 ? Math.abs(fyClosingSigned) : 0,
+      };
+    });
+
+    res.json({ success: true, data, from: fyFrom, to: fyTo });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/ledgers/:id/statement — FY-specific ledger statement using voucher_ledger_entries
 router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -755,10 +812,43 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
       ORDER BY v.date ASC, v.id ASC
     `, [companyGuid, ledgerName, fyFrom, fyTo]);
 
-    // Compute running balance from opening
-    const opening = parseFloat(ledger.opening_balance || 0);
+    // Compute FY-specific opening balance
+    // Strategy: anchor on closing_balance (reliable Tally all-time value) then subtract
+    // entries after fyTo to get FY closing, entries >= fyFrom to get FY opening.
+    // Formula: fy_opening_signed = closing_signed - SUM(entries WHERE date >= fyFrom)
     const balType = ledger.balance_type || 'Dr';
-    let runningBalance = balType === 'Dr' ? -opening : opening; // Dr balances are negative internally
+    const closingAbs = parseFloat(ledger.closing_balance || 0);
+    const closingSigned = balType === 'Dr' ? -closingAbs : closingAbs;
+
+    // Sum entries from fyFrom onwards (FY period + any future entries)
+    const { rows: fromFyRows } = await query(`
+      SELECT COALESCE(SUM(vle.amount), 0) as sum_from_fy
+      FROM voucher_ledger_entries vle
+      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+      WHERE vle.company_guid = $1
+        AND vle.ledger_name = $2
+        AND v.is_cancelled = FALSE
+        AND v.date IS NOT NULL AND v.date != ''
+        AND v.date >= $3
+    `, [companyGuid, ledgerName, fyFrom]);
+
+    // Sum entries AFTER fyTo (post-FY entries)
+    const { rows: afterFyRows } = await query(`
+      SELECT COALESCE(SUM(vle.amount), 0) as sum_after_fy
+      FROM voucher_ledger_entries vle
+      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+      WHERE vle.company_guid = $1
+        AND vle.ledger_name = $2
+        AND v.is_cancelled = FALSE
+        AND v.date IS NOT NULL AND v.date != ''
+        AND v.date > $3
+    `, [companyGuid, ledgerName, fyTo]);
+
+    // FY opening = closing - SUM(entries from fyFrom onwards)
+    const fyOpeningSigned = closingSigned - parseFloat(fromFyRows[0]?.sum_from_fy || 0);
+    const opening = Math.abs(fyOpeningSigned);
+    const openingType = fyOpeningSigned <= 0 ? 'Dr' : 'Cr';
+    let runningBalance = fyOpeningSigned;
 
     const transactions = txns.map(t => {
       const entryAmt = parseFloat(t.entry_amount || 0); // negative=Dr, positive=Cr
@@ -788,7 +878,7 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
       data: {
         ledger,
         opening_balance: opening,
-        opening_balance_type: balType,
+        opening_balance_type: openingType,
         closing_balance: closingBalance,
         closing_balance_type: closingType,
         total_debit: totalDr,
