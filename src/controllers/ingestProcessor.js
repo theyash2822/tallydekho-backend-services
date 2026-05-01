@@ -132,8 +132,15 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       } else if (xml === 'StockOpeningBalance.xml') {
         await processStockOpeningBalance(records, companyGuid);
       } else if (xml === 'LedgerOpeningBalance.xml') {
-        // V2: per-FY opening balance — populate ledger_fy_balances
         await processLedgerFyBalances(records, companyGuid);
+      } else if (xml === 'StockCategory.xml') {
+        // CTO Spec: dedicated stock_categories table
+        await processStockCategories(records, companyGuid);
+      } else if (xml === 'VoucherInventoryDetail.xml') {
+        // Also extract batch allocations from inventory detail
+        const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
+        if (withBatch.length > 0) await processBatchAllocations(withBatch, companyGuid);
+        await processVoucherInventoryItems(records, companyGuid);
       } else {
         await processMasters(records, companyGuid);
       }
@@ -1007,6 +1014,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processStockOpeningBalance(records, companyGuid);
     } else if (xml === 'VoucherInventoryDetail.xml') {
       await processVoucherInventoryItems(records, companyGuid);
+      const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
+      if (withBatch.length > 0) await processBatchAllocations(withBatch, companyGuid);
     } else if (xml === 'GSTDetails.xml') {
       await processGSTDetails(records, companyGuid);
     } else if (xml === 'GroupMaster.xml') {
@@ -1234,6 +1243,78 @@ async function processVoucherTypes(data, companyGuid) {
 async function processStockGroups(data, companyGuid) {
   // Uses the groups table (same as group masters)
   await processGroupMasters(data, companyGuid);
+}
+
+// CTO Spec: stock_categories table — dedicated stock category master from StockCategory.xml
+async function processStockCategories(data, companyGuid) {
+  if (!data?.length) return;
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const name = r.NAME || r.Name || r.CATEGORYNAME || r.CategoryName || '';
+      if (!name) continue;
+      const guid   = r.GUID || r.Guid || null;
+      const parent = r.PARENT || r.Parent || null;
+      try {
+        await client.query(`
+          INSERT INTO stock_categories (guid, company_guid, name, parent, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,NOW())
+          ON CONFLICT (company_guid, name) DO UPDATE SET
+            guid=COALESCE(EXCLUDED.guid, stock_categories.guid),
+            parent=EXCLUDED.parent, alter_id=EXCLUDED.alter_id, synced_at=NOW()
+        `, [guid, companyGuid, name, parent, parseInt(r.ALTERID || r.AlterId || 0)]);
+        saved++;
+      } catch (e) { console.warn('[DB] StockCategory insert failed:', e.message, name); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] StockCategories: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] StockCategories failed:', e.message); }
+  finally { client.release(); }
+}
+
+// CTO Spec: batch_allocations table — batch/expiry tracking per voucher line item
+async function processBatchAllocations(data, companyGuid) {
+  if (!data?.length) return;
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+    for (const r of data) {
+      const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
+      const itemName    = r.STOCKITEMNAME || r.StockItemName || r.ItemName || '';
+      const batchName   = r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME || '';
+      if (!voucherGuid || !batchName) continue;
+      const qty         = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.QTY || 0);
+      const rate        = parseTallyRate(r.RATE || r.Rate || 0);
+      const fy          = r._FINANCIAL_YEAR || null;
+      try {
+        await client.query(`
+          INSERT INTO batch_allocations
+            (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
+             expiry_date, mfg_date, qty, rate, godown_name, financial_year, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+          ON CONFLICT (voucher_guid, company_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
+            qty=EXCLUDED.qty, rate=EXCLUDED.rate, expiry_date=EXCLUDED.expiry_date,
+            mfg_date=EXCLUDED.mfg_date, financial_year=EXCLUDED.financial_year, synced_at=NOW()
+        `, [
+          voucherGuid, companyGuid, itemName,
+          r.STOCKITEMGUID || r.StockItemGuid || null,
+          batchName,
+          r.EXPIRYDATE || r.ExpiryDate || null,
+          r.MFGDATE    || r.MfgDate    || null,
+          qty, rate,
+          r.GODOWNNAME || r.GodownName || null,
+          fy,
+        ]);
+        saved++;
+      } catch (e) { console.warn('[DB] BatchAllocation insert failed:', e.message, batchName); }
+    }
+    await client.query('COMMIT');
+    console.log(`[DB] BatchAllocations: saved ${saved}/${data.length} for ${companyGuid}`);
+  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BatchAllocations failed:', e.message); }
+  finally { client.release(); }
 }
 
 async function processCurrencies(data, companyGuid) {

@@ -299,6 +299,43 @@ router.post('/ingest/complete', async (req, res) => {
       ).catch(err => console.error('[sync_log] insert failed:', err.message));
     }
 
+    // CTO Spec: Backdated Sync Cascade
+    // When a sync completes, check if any vouchers have dates in past FYs
+    // If so, invalidate (delete) ledger_fy_balances for affected FYs so they
+    // get fresh anchors on the next LedgerOpeningBalance.xml sync.
+    // This ensures backdated entries cascade correctly to future FY openings.
+    if (companyGuid) {
+      try {
+        // Find all FYs that have voucher entries newer than their fy_balance anchor
+        const { rows: staleAnchors } = await query(`
+          SELECT DISTINCT vle.financial_year
+          FROM voucher_ledger_entries vle
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+          JOIN ledger_fy_balances lfb
+            ON lfb.company_guid = vle.company_guid
+            AND lfb.ledger_name = vle.ledger_name
+            AND lfb.financial_year = vle.financial_year
+          WHERE vle.company_guid = $1
+            AND v.synced_at > lfb.synced_at  -- voucher newer than the FY anchor
+            AND vle.financial_year IS NOT NULL
+        `, [companyGuid]);
+
+        if (staleAnchors.length > 0) {
+          const staleYears = staleAnchors.map(r => r.financial_year);
+          console.log(`[INGEST] Backdated sync detected. Stale FY anchors: ${staleYears.join(', ')}. Will refresh on next sync.`);
+          // Delete stale anchors — they'll be repopulated on next LedgerOpeningBalance.xml sync
+          // This forces correct recalculation instead of serving stale opening balances
+          await query(
+            `DELETE FROM ledger_fy_balances WHERE company_guid = $1 AND financial_year = ANY($2::text[])`,
+            [companyGuid, staleYears]
+          );
+          console.log(`[INGEST] ♻️ Invalidated ${staleYears.length} stale FY anchors for recalculation`);
+        }
+      } catch (cascadeErr) {
+        console.warn('[INGEST] Backdated cascade check failed (non-fatal):', cascadeErr.message);
+      }
+    }
+
     // V2 Monitoring: compute record counts from DB for validation
     let recordCounts = {};
     if (companyGuid) {

@@ -560,6 +560,43 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vle_fy         ON voucher_ledger_entries(company_guid, financial_year);
       CREATE INDEX IF NOT EXISTS idx_st_fy          ON stock_transactions(company_guid, financial_year);
 
+      -- CTO Spec: batch_allocations — batch/expiry tracking per voucher line item
+      -- Populated from VoucherInventoryDetail.xml batch allocation data
+      CREATE TABLE IF NOT EXISTS batch_allocations (
+        id             SERIAL PRIMARY KEY,
+        voucher_guid   TEXT NOT NULL,
+        company_guid   TEXT NOT NULL,
+        stock_item_name TEXT,
+        stock_item_guid TEXT,
+        batch_name     TEXT,
+        expiry_date    TEXT,
+        mfg_date       TEXT,
+        qty            NUMERIC(15,4) DEFAULT 0,
+        rate           NUMERIC(15,4) DEFAULT 0,
+        godown_name    TEXT,
+        financial_year TEXT,
+        synced_at      TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(voucher_guid, company_guid, stock_item_name, batch_name, godown_name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ba_company ON batch_allocations(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_ba_stock   ON batch_allocations(company_guid, stock_item_name);
+      CREATE INDEX IF NOT EXISTS idx_ba_batch   ON batch_allocations(batch_name);
+      CREATE INDEX IF NOT EXISTS idx_ba_fy      ON batch_allocations(company_guid, financial_year);
+
+      -- CTO Spec: stock_categories — dedicated stock category master
+      -- Populated from StockCategory.xml
+      CREATE TABLE IF NOT EXISTS stock_categories (
+        id           SERIAL PRIMARY KEY,
+        guid         TEXT,
+        company_guid TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        parent       TEXT,
+        alter_id     BIGINT DEFAULT 0,
+        synced_at    TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(company_guid, name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sc_company ON stock_categories(company_guid);
+
       -- V2: raw_tally_records — optional audit/debug table
       -- Stores raw record before processing. Useful for reprocessing without re-syncing Tally.
       -- Set TALLY_STORE_RAW=true env var to enable; disabled by default to save storage.
