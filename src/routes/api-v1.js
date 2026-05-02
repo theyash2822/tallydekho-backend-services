@@ -961,15 +961,29 @@ router.get('/ledgers/:id', authMiddleware, async (req, res) => {
     if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
     const { from, to, page = 1, limit = 30 } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
-    let tq = `SELECT * FROM vouchers WHERE company_guid=$1 AND (party_guid=$2 OR party_name=$3) AND is_cancelled=FALSE`;
+    // Join with voucher_ledger_entries to get the per-ledger entry amount (not the full voucher total)
+    let tq = `
+      SELECT v.*, 
+        ABS(vle.amount) as entry_amount, vle.dr_cr as entry_dr_cr
+      FROM vouchers v
+      LEFT JOIN voucher_ledger_entries vle 
+        ON vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid AND vle.ledger_name = $3
+      WHERE v.company_guid=$1 AND (v.party_guid=$2 OR v.party_name=$3) AND v.is_cancelled=FALSE
+    `;
     const tp = [companyGuid, id, lr[0].name];
     let idx = 4;
-    if (from) { tq += ` AND date >= $${idx++}`; tp.push(from); }
-    if (to)   { tq += ` AND date <= $${idx++}`; tp.push(to); }
-    tq += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    if (from) { tq += ` AND v.date >= $${idx++}`; tp.push(from); }
+    if (to)   { tq += ` AND v.date <= $${idx++}`; tp.push(to); }
+    tq += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
     tp.push(parseInt(limit), offset);
     const { rows: txns } = await query(tq, tp);
-    res.json({ success: true, data: { ledger: lr[0], transactions: txns, meta: { page: parseInt(page), limit: parseInt(limit) } } });
+    // Use ledger-specific entry amount when available, fall back to voucher total
+    const transactions = txns.map(t => ({
+      ...t,
+      amount: t.entry_amount != null ? t.entry_amount : t.amount,
+      dr_cr:  t.entry_dr_cr  || (t.amount > 0 ? 'Dr' : 'Cr'),
+    }));
+    res.json({ success: true, data: { ledger: lr[0], transactions, meta: { page: parseInt(page), limit: parseInt(limit) } } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
