@@ -357,7 +357,7 @@ async function processVouchers(data, companyGuid) {
         // Ledger line items — use parseLedgerEntries with correct Dr/Cr from amount sign
         const parsedLedgerEntries = parseLedgerEntries(r);
         if (parsedLedgerEntries.length > 0) {
-          await saveLedgerEntries(client, guid, companyGuid, parsedLedgerEntries);
+          await saveLedgerEntries(client, guid, companyGuid, parsedLedgerEntries, r._FINANCIAL_YEAR || null);
         }
 
         // Inventory line items

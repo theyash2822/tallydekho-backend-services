@@ -763,9 +763,14 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
         COALESCE((
           SELECT SUM(vle.amount)
           FROM voucher_ledger_entries vle
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
           WHERE vle.company_guid = l.company_guid
             AND vle.ledger_name  = l.name
-            AND vle.financial_year = $2
+            AND (
+              vle.financial_year = $2
+              OR (vle.financial_year IS NULL AND v.date IS NOT NULL AND v.date BETWEEN $3 AND $4)
+            )
+            AND v.is_cancelled = FALSE
         ), 0) as fy_movement
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
@@ -773,7 +778,7 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
         AND lfb.ledger_name  = l.name
         AND lfb.financial_year = $2
       WHERE l.company_guid = $1
-    `, [companyGuid, financialYear]);
+    `, [companyGuid, financialYear, fyFrom, fyTo]);
 
     const data = rows.map(l => {
       const bt             = l.fy_balance_type || 'Dr';
