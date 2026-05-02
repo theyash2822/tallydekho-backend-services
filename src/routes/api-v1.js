@@ -686,6 +686,38 @@ router.get('/vouchers', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/vouchers/my-entries — vouchers created via this user's mobile app
+router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { from, to, type, page = 1, limit = 50 } = req.query;
+  const userId = req.user.userId;
+  const offset = (parseInt(page)-1)*parseInt(limit);
+  try {
+    let q = `
+      SELECT DISTINCT v.*
+      FROM vouchers v
+      JOIN write_queue wq ON wq.company_guid = v.company_guid
+        AND wq.tally_voucher_number = v.voucher_number
+      WHERE v.company_guid = $1
+        AND wq.user_id = $2
+        AND v.is_cancelled = FALSE
+    `;
+    const params = [companyGuid, userId];
+    let idx = 3;
+    if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
+    if (type) { q += ` AND v.voucher_type ILIKE $${idx++}`; params.push(`%${type}%`); }
+    q += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/vouchers/:id — single voucher with inventory items + GST details
 router.get('/vouchers/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -1017,8 +1049,11 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query('SELECT DISTINCT warehouse_name as name FROM stocks WHERE company_guid=$1 AND warehouse_name IS NOT NULL', [companyGuid]);
-    res.json({ success: true, data: rows.map(r => ({ name: r.name, id: r.name })) });
+    const { rows } = await query(
+      'SELECT guid, name, parent, address FROM warehouses WHERE company_guid=$1 ORDER BY name',
+      [companyGuid]
+    );
+    res.json({ success: true, data: rows.map(r => ({ id: r.guid, name: r.name, parent: r.parent, address: r.address || '' })) });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
