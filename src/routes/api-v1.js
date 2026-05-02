@@ -725,7 +725,11 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { id } = req.params;
   try {
-    const { rows: vRows } = await query('SELECT * FROM vouchers WHERE (guid=$1 OR voucher_number=$1) AND company_guid=$2 LIMIT 1', [id, companyGuid]);
+    // Prefer GUID match; fall back to voucher_number (most recent when number repeats across FYs)
+    const { rows: vRows } = await query(
+      'SELECT * FROM vouchers WHERE company_guid=$2 AND (guid=$1 OR voucher_number=$1) ORDER BY (guid=$1)::int DESC, date DESC LIMIT 1',
+      [id, companyGuid]
+    );
     if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
     const v = vRows[0];
     // Inventory items (for Sales/Purchase vouchers)
