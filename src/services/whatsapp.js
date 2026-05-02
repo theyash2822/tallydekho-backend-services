@@ -93,16 +93,24 @@ export function getRegion(countryCode) {
 
 /**
  * Send Payment Reminder via WhatsApp (Cronberry WABA)
- * Template variables will be filled based on what the user's Cronberry template expects.
- * Currently uses: {{1}} = party name, {{2}} = amount, {{3}} = company name
- * 
- * IMPORTANT: Update CRONBERRY_REMINDER_TEMPLATE in .env with your actual template name
- * and adjust the components array to match your template's variable placeholders.
+ * Template: "payment reminder"
+ * Variables:
+ *   {{1}} party_name      — e.g. "Ashish Lokendrasingh"
+ *   {{2}} business_name   — your company name
+ *   {{3}} amount_due      — e.g. "₹5,000"
+ *   {{4}} invoice_no      — e.g. "INV-001"
+ *   {{5}} invoice_date    — e.g. "02/05/2026"
+ *   {{6}} due_date        — e.g. "15/05/2026"
+ *   {{7}} contact_number  — your contact number
  */
-export async function sendPaymentReminder({ countryCode = '+91', mobile, partyName, amount, companyName, dueDate = '' }) {
+export async function sendPaymentReminder({ 
+  countryCode = '+91', mobile, 
+  partyName, businessName, amountDue, 
+  invoiceNo, invoiceDate, dueDate, contactNumber 
+}) {
   const cc = (countryCode || '+91').replace(/^\+/, '');
   const to = `${cc}${mobile}`;
-  const templateName = process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment_reminder';
+  const templateName = process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment reminder';
 
   const data = JSON.stringify({
     to,
@@ -115,10 +123,13 @@ export async function sendPaymentReminder({ countryCode = '+91', mobile, partyNa
         {
           type: 'body',
           parameters: [
-            { type: 'text', text: partyName || 'Customer' },
-            { type: 'text', text: `₹${Math.round(amount || 0).toLocaleString('en-IN')}` },
-            { type: 'text', text: companyName || 'Company' },
-            ...(dueDate ? [{ type: 'text', text: dueDate }] : []),
+            { type: 'text', text: partyName       || 'Customer'     }, // {{1}}
+            { type: 'text', text: businessName    || 'Company'      }, // {{2}}
+            { type: 'text', text: amountDue       || '₹0'           }, // {{3}}
+            { type: 'text', text: invoiceNo       || ''             }, // {{4}}
+            { type: 'text', text: invoiceDate     || ''             }, // {{5}}
+            { type: 'text', text: dueDate         || ''             }, // {{6}}
+            { type: 'text', text: contactNumber   || ''             }, // {{7}}
           ],
         },
       ],

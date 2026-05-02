@@ -1855,7 +1855,7 @@ router.patch('/auth/user-settings', authMiddleware, async (req, res) => {
 
 // POST /api/reminders/send — Send WhatsApp payment reminder to a party
 router.post('/reminders/send', authMiddleware, async (req, res) => {
-  const { companyGuid, ledgerName, mobile, amount, dueDate } = req.body || {};
+  const { companyGuid, ledgerName, mobile, amount, dueDate, invoiceNo, invoiceDate, contactNumber } = req.body || {};
   if (!companyGuid || !mobile) return res.status(400).json({ success: false, error: { code: 'MISSING_FIELDS', message: 'companyGuid and mobile required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   
@@ -1870,11 +1870,14 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
     
     const result = await sendPaymentReminder({
       countryCode: '+91',
-      mobile: digits.slice(-10), // last 10 digits
-      partyName: ledgerName || 'Customer',
-      amount: parseFloat(amount || 0),
-      companyName,
-      dueDate: dueDate || '',
+      mobile: digits.slice(-10),       // last 10 digits
+      partyName: ledgerName || 'Customer', // {{1}}
+      businessName: companyName,           // {{2}}
+      amountDue: amount ? `₹${Math.round(parseFloat(amount)).toLocaleString('en-IN')}` : '₹0', // {{3}}
+      invoiceNo: invoiceNo || '',          // {{4}}
+      invoiceDate: invoiceDate || '',      // {{5}}
+      dueDate: dueDate || '',              // {{6}}
+      contactNumber: contactNumber || '',  // {{7}}
     });
     
     if (result.success) {
