@@ -425,7 +425,16 @@ router.post('/voucher-detail', authMiddleware, async (req, res) => {
     const { rows: companies } = await query('SELECT * FROM companies WHERE guid = $1', [companyGuid]);
     const company = companies[0];
 
-    res.json({ status: true, data: { voucher, items, company } });
+    // Ledger entries from vle (authoritative per-party amounts)
+    const { rows: ledgerEntries } = await query(
+      'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY ABS(amount) DESC',
+      [voucher.guid, companyGuid]
+    );
+    // party_amount = the Dr entry for the party ledger
+    const partyEntry = ledgerEntries.find(e => e.ledger_name === voucher.party_name);
+    const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(voucher.amount||'0');
+
+    res.json({ status: true, data: { voucher: { ...voucher, party_amount: partyAmount }, items, company, ledger_entries: ledgerEntries } });
   } catch (err) {
     console.error('[voucher-detail] Error:', err.message);
     res.status(500).json({ status: false, message: 'Failed to fetch voucher' });
