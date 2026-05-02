@@ -1744,3 +1744,34 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
 });
 
 export default router;
+
+// POST /api/admin/backfill-gst — Recompute gst_voucher_details from ledger entries (CGST/SGST/IGST)
+router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
+  const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rowCount } = await query(`
+      UPDATE gst_voucher_details gvd
+      SET cgst_amount=sub.cgst, sgst_amount=sub.sgst, igst_amount=sub.igst, taxable_amount=sub.taxable
+      FROM (
+        SELECT v.guid as voucher_guid, v.company_guid,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' THEN ABS(vle.amount) ELSE 0 END),0) as cgst,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%UTGST%' THEN ABS(vle.amount) ELSE 0 END),0) as sgst,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0) as igst,
+          GREATEST(0, COALESCE(SUM(CASE WHEN vle.dr_cr='Dr' THEN ABS(vle.amount) ELSE 0 END),0) -
+            COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0)) as taxable
+        FROM vouchers v
+        JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+        WHERE v.company_guid=$1
+        GROUP BY v.guid, v.company_guid
+        HAVING SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END) > 0
+      ) sub
+      WHERE gvd.voucher_guid = sub.voucher_guid AND gvd.company_guid = sub.company_guid`,
+      [companyGuid]
+    );
+    res.json({ success: true, data: { updated: rowCount } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});

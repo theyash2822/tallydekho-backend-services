@@ -782,9 +782,9 @@ async function processGSTDetails(data, companyGuid) {
           r.GSTREGTYPE     || r.GSTRegType     || null,
           r.PLACEOFSUPPLY  || r.PlaceOfSupply  || null,
           n(r.TAXABLEAMOUNT ?? r.TaxableAmount),
-          n(r.CGSTAMOUNT    ?? r.CGSTAmount),
-          n(r.SGSTAMOUNT    ?? r.SGSTAmount),
-          n(r.IGSTAMOUNT    ?? r.IGSTAmount),
+          n(r.CGSTAMOUNT    ?? r.CGSTAmount    ?? r.CGST_AMOUNT),
+          n(r.SGSTAMOUNT    ?? r.SGSTAmount    ?? r.SGST_AMOUNT),
+          n(r.IGSTAMOUNT    ?? r.IGSTAmount    ?? r.IGST_AMOUNT),
           r.IRN || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
         ]);
@@ -1139,6 +1139,25 @@ async function processAllVoucher(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}`);
+    // Post-process: backfill gst_voucher_details from CGST/SGST ledger entries
+    // This fixes cases where Tally's $$GSTTaxableValue returns 0 but ledger entries have real amounts
+    await query(`
+      UPDATE gst_voucher_details gvd
+      SET cgst_amount=sub.cgst, sgst_amount=sub.sgst, igst_amount=sub.igst, taxable_amount=sub.taxable
+      FROM (
+        SELECT v.guid as vg, v.company_guid as cg,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' THEN ABS(vle.amount) ELSE 0 END),0) as cgst,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%UTGST%' THEN ABS(vle.amount) ELSE 0 END),0) as sgst,
+          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0) as igst,
+          GREATEST(0, COALESCE(SUM(CASE WHEN vle.dr_cr='Dr' THEN ABS(vle.amount) ELSE 0 END),0) -
+            COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0)) as taxable
+        FROM vouchers v JOIN voucher_ledger_entries vle ON vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
+        WHERE v.company_guid=$1
+        GROUP BY v.guid, v.company_guid
+        HAVING SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END) > 0
+      ) sub
+      WHERE gvd.voucher_guid=sub.vg AND gvd.company_guid=sub.cg AND gvd.cgst_amount=0
+    `, [companyGuid]).catch(e => console.warn('[DB] GST backfill warning:', e.message));
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] AllVoucher failed:', e.message); }
   finally { client.release(); }
 }
