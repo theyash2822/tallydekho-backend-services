@@ -106,11 +106,12 @@ export function getRegion(countryCode) {
 export async function sendPaymentReminder({ 
   countryCode = '+91', mobile, 
   partyName, businessName, amountDue, 
-  invoiceNo, invoiceDate, dueDate, contactNumber 
+  invoiceNo, invoiceDate, dueDate, contactNumber,
+  templateName // optional override from user settings
 }) {
   const cc = (countryCode || '+91').replace(/^\+/, '');
   const to = `${cc}${mobile}`;
-  const templateName = process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment reminder';
+  const templateName = templateName || process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment reminder';
 
   const data = JSON.stringify({
     to,

@@ -1868,7 +1868,11 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
     const digits = (mobile || '').replace(/[^0-9]/g, '');
     if (digits.length < 10) return res.status(400).json({ success: false, error: { code: 'INVALID_MOBILE', message: 'Invalid mobile number' } });
     
-    const result = await sendPaymentReminder({
+    // Get user's configured template name from their settings
+    const { rows: userSettings } = await query('SELECT alert_settings FROM users WHERE id=$1', [req.user.userId]);
+    const userTemplateName = userSettings[0]?.alert_settings?.payment_reminders?.template_name;
+
+        const result = await sendPaymentReminder({
       countryCode: '+91',
       mobile: digits.slice(-10),       // last 10 digits
       partyName: ledgerName || 'Customer', // {{1}}
@@ -1878,6 +1882,7 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
       invoiceDate: invoiceDate || '',      // {{5}}
       dueDate: dueDate || '',              // {{6}}
       contactNumber: contactNumber || '',  // {{7}}
+      templateName: userTemplateName, // use user's configured template if set
     });
     
     if (result.success) {
