@@ -1895,4 +1895,80 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
   }
 });
 
+
+// ── User Settings (accessible from mobile via /api prefix) ───────────────────
+router.get('/user-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, notification_settings, alert_settings, integration_settings, voucher_config FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    res.json({ status: true, data: rows[0] || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.patch('/user-settings', authMiddleware, async (req, res) => {
+  const { language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config } = req.body || {};
+  try {
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    const addField = (col, val) => { if (val !== undefined) { fields.push(`${col} = $${idx++}`); values.push(val); } };
+    addField('language', language);
+    addField('currency', currency);
+    addField('number_format', number_format);
+    addField('date_format', date_format);
+    addField('theme', theme);
+    addField('kpi_autoscroll', kpi_autoscroll);
+    addField('decimal_places', decimal_places);
+    if (voucher_config !== undefined) { fields.push(`voucher_config = voucher_config || $${idx++}::jsonb`); values.push(JSON.stringify(voucher_config)); }
+    if (fields.length === 0) return res.json({ status: true, message: 'Nothing to update' });
+    values.push(req.user.userId);
+    await query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx}`, values);
+    res.json({ status: true, message: 'Settings updated' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.get('/notification-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT notification_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.notification_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.patch('/notification-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET notification_settings = notification_settings || $1::jsonb WHERE id=$2', [JSON.stringify(req.body||{}), req.user.userId]);
+    res.json({ status: true, message: 'Saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.get('/alert-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT alert_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.alert_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.patch('/alert-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET alert_settings = alert_settings || $1::jsonb WHERE id=$2', [JSON.stringify(req.body||{}), req.user.userId]);
+    res.json({ status: true, message: 'Saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.get('/integration-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT integration_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.integration_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+router.patch('/integration-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET integration_settings = integration_settings || $1::jsonb WHERE id=$2', [JSON.stringify(req.body||{}), req.user.userId]);
+    res.json({ status: true, message: 'Saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
 export default router;

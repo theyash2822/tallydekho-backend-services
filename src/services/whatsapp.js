@@ -111,7 +111,7 @@ export async function sendPaymentReminder({
 }) {
   const cc = (countryCode || '+91').replace(/^\+/, '');
   const to = `${cc}${mobile}`;
-  const templateName = templateName || process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment reminder';
+  const resolvedTemplate = templateName || process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment reminder';
 
   const data = JSON.stringify({
     to,
@@ -119,7 +119,7 @@ export async function sendPaymentReminder({
     type: 'template',
     template: {
       language: { policy: 'deterministic', code: 'en' },
-      name: templateName,
+      name: resolvedTemplate,
       components: [
         {
           type: 'body',
