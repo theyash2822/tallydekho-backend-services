@@ -486,13 +486,18 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
       [companyGuid, ledgerName]
     );
 
-    // Strategy 2: party_name exact match in vouchers
-    const { rows: partyVouchers } = await query(
-      `SELECT * FROM vouchers WHERE company_guid = $1
-       AND party_name = $2 AND is_cancelled = FALSE
-       ORDER BY date DESC LIMIT $3 OFFSET $4`,
+    // Strategy 2: party_name exact match in vouchers + ledger entry amount
+    const { rows: partyRaw } = await query(
+      `SELECT v.*,
+        (SELECT ABS(vle.amount) FROM voucher_ledger_entries vle
+         WHERE vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+           AND vle.ledger_name = $2 LIMIT 1) as entry_amount
+       FROM vouchers v
+       WHERE v.company_guid = $1 AND v.party_name = $2 AND v.is_cancelled = FALSE
+       ORDER BY v.date DESC LIMIT $3 OFFSET $4`,
       [companyGuid, ledgerName, pageSize, offset]
     );
+    const partyVouchers = partyRaw.map(v => ({ ...v, amount: v.entry_amount != null ? v.entry_amount : v.amount }));
 
     // Strategy 3: ILIKE match in voucher_items if exact returns nothing
     let itemGuids = exactItems.map(i => i.voucher_guid);
@@ -512,6 +517,11 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
       const ph = itemGuids.map((_, i) => `$${i + 2}`).join(',');
       const { rows } = await query(
         `SELECT v.*,
+           -- Ledger-specific entry amount from voucher_ledger_entries (authoritative)
+           (SELECT ABS(vle.amount) FROM voucher_ledger_entries vle
+            WHERE vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+              AND vle.ledger_name = $${itemGuids.length + 2}
+            LIMIT 1) as entry_amount,
            -- Sum Cr items as the voucher amount if voucher amount is 0
            CASE WHEN v.amount = 0 THEN
              (SELECT SUM(vi2.amount) FROM voucher_items vi2
@@ -520,13 +530,13 @@ router.post('/ledger-vouchers', authMiddleware, async (req, res) => {
          FROM vouchers v
          WHERE v.company_guid = $1
          AND v.guid IN (${ph})
-         ORDER BY v.date DESC LIMIT $${itemGuids.length + 2}`,
-        [companyGuid, ...itemGuids, pageSize]
+         ORDER BY v.date DESC LIMIT $${itemGuids.length + 3}`,
+        [companyGuid, ...itemGuids, ledgerName, pageSize]
       );
-      // Use computed_amount if present
+      // Use entry_amount (per-ledger) first, then computed_amount, then v.amount
       itemVouchers = rows.map(v => ({
         ...v,
-        amount: v.computed_amount || v.amount,
+        amount: v.entry_amount != null ? v.entry_amount : (v.computed_amount || v.amount),
       }));
     }
 
