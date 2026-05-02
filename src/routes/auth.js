@@ -183,4 +183,45 @@ router.post('/onboarding', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── GET /app/user-settings ──────────────────────────────────────────────────
+router.get('/user-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    res.json({ status: true, data: rows[0] || {} });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Failed to get settings' });
+  }
+});
+
+// ─── PATCH /app/user-settings ─────────────────────────────────────────────────
+router.patch('/user-settings', authMiddleware, async (req, res) => {
+  const { language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config } = req.body || {};
+  try {
+    await query(`
+      UPDATE users SET
+        language = COALESCE($1, language),
+        currency = COALESCE($2, currency),
+        number_format = COALESCE($3, number_format),
+        date_format = COALESCE($4, date_format),
+        theme = COALESCE($5, theme),
+        kpi_autoscroll = COALESCE($6, kpi_autoscroll),
+        decimal_places = COALESCE($7, decimal_places),
+        voucher_config = COALESCE($8, voucher_config),
+        updated_at = $9
+      WHERE id = $10
+    `, [language, currency, number_format, date_format, theme,
+        kpi_autoscroll !== undefined ? kpi_autoscroll : null,
+        decimal_places !== undefined ? decimal_places : null,
+        voucher_config ? JSON.stringify(voucher_config) : null,
+        now(), req.user.userId]);
+    res.json({ status: true, message: 'Settings updated' });
+  } catch (err) {
+    console.error('[user-settings PATCH]', err);
+    res.status(500).json({ status: false, message: 'Failed to update settings' });
+  }
+});
+
 export default router;
