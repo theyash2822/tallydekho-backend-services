@@ -8,7 +8,7 @@ import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
-import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
+import { sendWhatsAppOTP, getRegion, sendPaymentReminder } from '../services/whatsapp.js';
 
 const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
@@ -1849,6 +1849,41 @@ router.patch('/auth/user-settings', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[user-settings PATCH]', err);
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to update settings' } });
+  }
+});
+
+
+// POST /api/reminders/send — Send WhatsApp payment reminder to a party
+router.post('/reminders/send', authMiddleware, async (req, res) => {
+  const { companyGuid, ledgerName, mobile, amount, dueDate } = req.body || {};
+  if (!companyGuid || !mobile) return res.status(400).json({ success: false, error: { code: 'MISSING_FIELDS', message: 'companyGuid and mobile required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  
+  try {
+    // Get company name for the message
+    const { rows: co } = await query('SELECT name FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    const companyName = co[0]?.name || 'Company';
+    
+    // Clean mobile number
+    const digits = (mobile || '').replace(/[^0-9]/g, '');
+    if (digits.length < 10) return res.status(400).json({ success: false, error: { code: 'INVALID_MOBILE', message: 'Invalid mobile number' } });
+    
+    const result = await sendPaymentReminder({
+      countryCode: '+91',
+      mobile: digits.slice(-10), // last 10 digits
+      partyName: ledgerName || 'Customer',
+      amount: parseFloat(amount || 0),
+      companyName,
+      dueDate: dueDate || '',
+    });
+    
+    if (result.success) {
+      res.json({ success: true, message: 'Reminder sent successfully' });
+    } else {
+      res.status(500).json({ success: false, error: { code: 'SEND_FAILED', message: result.error || 'Failed to send reminder' } });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
 

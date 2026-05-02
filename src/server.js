@@ -61,6 +61,7 @@ app.use('/app', dataRoutes);
 app.use('/app', pairingRoutes);
 app.use('/app/integrations', integrationRoutes);
 app.use('/app/ai', aiRoutes);
+app.use('/api/ai', aiRoutes); // also accessible via /api prefix for mobile
 app.use('/desktop', pairingRoutes);
 app.use('/tally', tallyWriteRoutes);
 app.use('/api', apiV1Routes);

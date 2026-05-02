@@ -90,3 +90,56 @@ export function getRegion(countryCode) {
   if (cc === '65') return 'Singapore';
   return 'International';
 }
+
+/**
+ * Send Payment Reminder via WhatsApp (Cronberry WABA)
+ * Template variables will be filled based on what the user's Cronberry template expects.
+ * Currently uses: {{1}} = party name, {{2}} = amount, {{3}} = company name
+ * 
+ * IMPORTANT: Update CRONBERRY_REMINDER_TEMPLATE in .env with your actual template name
+ * and adjust the components array to match your template's variable placeholders.
+ */
+export async function sendPaymentReminder({ countryCode = '+91', mobile, partyName, amount, companyName, dueDate = '' }) {
+  const cc = (countryCode || '+91').replace(/^\+/, '');
+  const to = `${cc}${mobile}`;
+  const templateName = process.env.CRONBERRY_REMINDER_TEMPLATE || 'payment_reminder';
+
+  const data = JSON.stringify({
+    to,
+    recipient_type: 'individual',
+    type: 'template',
+    template: {
+      language: { policy: 'deterministic', code: 'en' },
+      name: templateName,
+      components: [
+        {
+          type: 'body',
+          parameters: [
+            { type: 'text', text: partyName || 'Customer' },
+            { type: 'text', text: `₹${Math.round(amount || 0).toLocaleString('en-IN')}` },
+            { type: 'text', text: companyName || 'Company' },
+            ...(dueDate ? [{ type: 'text', text: dueDate }] : []),
+          ],
+        },
+      ],
+    },
+  });
+
+  try {
+    const { default: axios } = await import('axios');
+    const response = await axios.request({
+      method: 'post',
+      maxBodyLength: Infinity,
+      url: process.env.CRONBERRY_URL || 'https://crmapi.cronberry.com/api/v1/messages',
+      headers: {
+        'Authorization': `Bearer ${process.env.CRONBERRY_TOKEN || ''}`,
+        'Content-Type': 'application/json',
+      },
+      data,
+    });
+    return { success: true, data: response.data };
+  } catch (err) {
+    console.error('[WhatsApp Reminder]', err?.response?.data || err.message);
+    return { success: false, error: err?.response?.data?.message || err.message };
+  }
+}
