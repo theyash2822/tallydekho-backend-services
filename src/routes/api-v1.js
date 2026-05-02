@@ -33,7 +33,7 @@ async function verifyCompanyOwnership(req, res, companyGuid) {
 
 // FY date resolver — returns from/to/financialYear for a company
 // V2: also returns financialYear label (e.g. "2025-2026") for direct DB queries
-async function resolveFYDates(companyGuid, from, to, fyParam) {
+export async function resolveFYDates(companyGuid, from, to, fyParam) {
   // If explicit financialYear label passed (e.g. "2025-2026"), look up its dates
   if (fyParam) {
     try {
@@ -761,17 +761,47 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { search = '', nature, group, page = 1, limit = 50 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
+  // If FY params provided, compute FY-specific closing balance (opening + net movement)
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
   try {
-    let q = `SELECT * FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)`;
-    const params = [companyGuid, `%${search}%`];
-    let idx = 3;
-    if (nature) { q += ` AND nature = $${idx++}`; params.push(nature); }
-    if (group)  { q += ` AND parent = $${idx++}`; params.push(group); }
-    q += ` ORDER BY ABS(closing_balance) DESC, name LIMIT $${idx++} OFFSET $${idx}`;
+    let q = `
+      SELECT l.*,
+        -- FY-specific computed closing balance
+        COALESCE(lfb.opening_balance, l.opening_balance, 0) as fy_opening_abs,
+        COALESCE(lfb.balance_type, l.balance_type, 'Dr') as fy_opening_type,
+        COALESCE((
+          SELECT SUM(vle.amount)
+          FROM voucher_ledger_entries vle
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+          WHERE vle.company_guid = l.company_guid AND vle.ledger_name = l.name
+            AND (vle.financial_year = $3 OR (vle.financial_year IS NULL AND v.date BETWEEN $4 AND $5))
+            AND v.is_cancelled = FALSE
+        ), 0) as fy_movement
+      FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $3
+      WHERE l.company_guid=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
+    `;
+    const params = [companyGuid, `%${search}%`, financialYear, fyFrom, fyTo];
+    let idx = 6;
+    if (nature) { q += ` AND l.nature = $${idx++}`; params.push(nature); }
+    if (group)  { q += ` AND l.parent = $${idx++}`; params.push(group); }
+    q += ` ORDER BY ABS(l.closing_balance) DESC, l.name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
+    // Compute FY closing: openingSigned + movement → abs + type
+    const data = rows.map(l => {
+      const bt = l.fy_opening_type || 'Dr';
+      const openSigned = bt === 'Dr' ? -Math.abs(parseFloat(l.fy_opening_abs||0)) : Math.abs(parseFloat(l.fy_opening_abs||0));
+      const closeSigned = openSigned + parseFloat(l.fy_movement||0);
+      return {
+        ...l,
+        closing_balance: Math.abs(closeSigned),   // FY-computed closing
+        balance_type:    closeSigned <= 0 ? 'Dr' : 'Cr',
+      };
+    });
     const { rows: cnt } = await query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]);
-    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
+    res.json({ success: true, data, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }

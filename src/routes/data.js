@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware, requirePaired, requireCompanySynced } from '../middleware/auth.js';
+import { resolveFYDates } from './api-v1.js';
 
 const router = Router();
 
@@ -50,7 +51,7 @@ router.post('/parties', authMiddleware, async (req, res) => {
 });
 
 router.post('/ledgers', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
-  const { companyGuid, page = 1, pageSize = 50, searchText = '', parent } = req.body || {};
+  const { companyGuid, page = 1, pageSize = 50, searchText = '', parent, from, to, fy } = req.body || {};
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
@@ -58,16 +59,47 @@ router.post('/ledgers', authMiddleware, requirePaired, requireCompanySynced, asy
   const search = `%${searchText}%`;
 
   try {
-    let q = `SELECT * FROM ledgers WHERE company_guid = $1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)`;
-    const params = [companyGuid, search];
-    let idx = 3;
+    // Resolve FY dates for balance computation
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, from, to, fy);
 
-    if (parent) { q += ` AND parent = $${idx++}`; params.push(parent); }
-    // Sort by balance descending so ledgers with real balances appear first
-    q += ` ORDER BY ABS(closing_balance) DESC, name LIMIT $${idx++} OFFSET $${idx}`;
+    let q = `
+      SELECT l.*,
+        COALESCE(lfb.opening_balance, l.opening_balance, 0) as fy_opening_abs,
+        COALESCE(lfb.balance_type, l.balance_type, 'Dr') as fy_opening_type,
+        COALESCE((
+          SELECT SUM(vle.amount)
+          FROM voucher_ledger_entries vle
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+          WHERE vle.company_guid = l.company_guid AND vle.ledger_name = l.name
+            AND (vle.financial_year = $3 OR (vle.financial_year IS NULL AND v.date BETWEEN $4 AND $5))
+            AND v.is_cancelled = FALSE
+        ), 0) as fy_movement
+      FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $3
+      WHERE l.company_guid = $1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
+    `;
+    const params = [companyGuid, search, financialYear, fyFrom, fyTo];
+    let idx = 6;
+
+    if (parent) { q += ` AND l.parent = $${idx++}`; params.push(parent); }
+    q += ` ORDER BY ABS(l.closing_balance) DESC, l.name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(pageSize, offset);
 
-    const { rows: ledgers } = await query(q, params);
+    const { rows: rawLedgers } = await query(q, params);
+
+    // Compute FY-specific closing balance
+    const ledgers = rawLedgers.map(l => {
+      const bt = l.fy_opening_type || 'Dr';
+      const openSigned = bt === 'Dr' ? -Math.abs(parseFloat(l.fy_opening_abs||0)) : Math.abs(parseFloat(l.fy_opening_abs||0));
+      const closeSigned = openSigned + parseFloat(l.fy_movement||0);
+      return {
+        ...l,
+        closing_balance: Math.abs(closeSigned),
+        balance_type:    closeSigned <= 0 ? 'Dr' : 'Cr',
+      };
+    });
+
     const { rows: countRows } = await query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid = $1', [companyGuid]);
     const { rows: balRows } = await query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid = $1 AND closing_balance != 0', [companyGuid]);
 
