@@ -740,14 +740,23 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     const { rows: co } = await query('SELECT name, gstin, address, state FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
     // Party ledger details (GSTIN, address etc)
     const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, email, address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
+    // Ledger entries — used to compute the TRUE party amount (not v.amount which may be wrong)
+    const { rows: ledgerEntries } = await query(
+      'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY ABS(amount) DESC',
+      [v.guid, companyGuid]
+    );
+    // Party amount = the Dr entry for the party ledger (what party owes / paid)
+    const partyEntry = ledgerEntries.find(e => e.ledger_name === v.party_name);
+    const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(v.amount||'0');
     res.json({
       success: true,
       data: {
-        voucher: v,
+        voucher: { ...v, party_amount: partyAmount }, // party_amount = authoritative per-party amount
         items,
         gst: gst[0] || null,
         company: co[0] || null,
         party: partyLedger[0] || null,
+        ledger_entries: ledgerEntries,
       }
     });
   } catch (err) {
