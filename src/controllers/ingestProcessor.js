@@ -664,7 +664,8 @@ async function processLedgerFyBalances(data, companyGuid) {
 
       const balRaw  = String(r.OPENINGBALANCE || r.OpeningBalance || r.CLOSINGBALANCE || '0').replace('(-)', '-');
       const balNum  = parseFloat(balRaw.replace(/[^0-9.-]/g, '')) || 0;
-      const balType = balRaw.includes('Cr') ? 'Cr' : (balNum < 0 ? 'Dr' : 'Dr');
+      // Tally exports Dr as negative, Cr as positive (numeric). Also handle string 'Cr'/'Dr' suffixes.
+      const balType = balRaw.includes('Cr') ? 'Cr' : (balRaw.includes('Dr') ? 'Dr' : (balNum >= 0 ? 'Cr' : 'Dr'));
       const balAbs  = Math.abs(balNum);
 
       try {
