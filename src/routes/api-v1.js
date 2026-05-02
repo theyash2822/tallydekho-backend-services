@@ -1542,6 +1542,59 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// REPORTS — UNMATCHED INVOICES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/reports/unmatched — Sales/Purchase vouchers missing GST details or with 0 GST
+router.get('/reports/unmatched', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { from, to, page = 1, limit = 50 } = req.query;
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
+  const offset = (parseInt(page)-1)*parseInt(limit);
+  try {
+    // Unmatched = sales/purchase vouchers where GST details are missing or 0
+    const { rows } = await query(`
+      SELECT v.voucher_number, v.voucher_type, v.date, v.party_name, ABS(v.amount) as amount,
+        CASE
+          WHEN gst.id IS NULL THEN 'No GST entry'
+          WHEN COALESCE(gst.cgst_amount,0)+COALESCE(gst.sgst_amount,0)+COALESCE(gst.igst_amount,0) = 0
+            AND gst.gst_reg_type IS NULL THEN 'Missing GST type'
+          WHEN gst.gst_reg_type = 'Unregistered' THEN 'Unregistered party'
+          ELSE 'Incomplete GST'
+        END as issue,
+        v.guid
+      FROM vouchers v
+      LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_guid = v.company_guid
+      WHERE v.company_guid = $1
+        AND v.is_cancelled = FALSE
+        AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
+        AND v.date BETWEEN $2 AND $3
+        AND (
+          gst.id IS NULL
+          OR COALESCE(gst.cgst_amount,0)+COALESCE(gst.sgst_amount,0)+COALESCE(gst.igst_amount,0) = 0
+        )
+        AND ABS(v.amount) > 0
+      ORDER BY v.date DESC
+      LIMIT $4 OFFSET $5
+    `, [companyGuid, fyFrom, fyTo, parseInt(limit), offset]);
+    const { rows: cnt } = await query(
+      `SELECT COUNT(*) as c FROM vouchers v
+       LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_guid = v.company_guid
+       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
+         AND v.date BETWEEN $2 AND $3
+         AND (gst.id IS NULL OR COALESCE(gst.cgst_amount,0)+COALESCE(gst.sgst_amount,0)+COALESCE(gst.igst_amount,0)=0)
+         AND ABS(v.amount)>0`,
+      [companyGuid, fyFrom, fyTo]
+    );
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // EXPENSES
 // ══════════════════════════════════════════════════════════════════════════════
 
