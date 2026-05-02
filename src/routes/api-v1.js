@@ -1014,7 +1014,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { search = '', category, page = 1, limit = 50 } = req.query;
+  const { search = '', category, page = 1, limit = 500 } = req.query; // Default 500 — most companies have < 1000 stock items
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
