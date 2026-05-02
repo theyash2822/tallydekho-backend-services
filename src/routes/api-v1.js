@@ -736,8 +736,8 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     const { rows: items } = await query('SELECT * FROM voucher_inventory_items WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY id', [v.guid, companyGuid]);
     // GST details
     const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]);
-    // Company info
-    const { rows: co } = await query('SELECT name, gstin, address, state FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    // Company info — full profile
+    const { rows: co } = await query('SELECT name, formal_name, gstin, address, state, country FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
     // Party ledger details (GSTIN, address etc)
     const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, email, address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
     // Ledger entries — used to compute the TRUE party amount (not v.amount which may be wrong)
@@ -1743,7 +1743,6 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
-export default router;
 
 // POST /api/admin/backfill-gst — Recompute gst_voucher_details from ledger entries (CGST/SGST/IGST)
 router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
@@ -1775,3 +1774,42 @@ router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
+
+// ── Company Profile — GET + PUT ────────────────────────────────────────────────
+router.get('/company/profile', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query('SELECT * FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH + PUT both accepted for company profile update
+const _companyProfileUpdate = async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.body?.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { gstin, address, state, email, formal_name } = req.body || {};
+  try {
+    await query(`
+      UPDATE companies SET
+        gstin = COALESCE($1, gstin),
+        address = COALESCE($2, address),
+        state = COALESCE($3, state),
+        formal_name = COALESCE($5, formal_name)
+      WHERE guid = $4
+    `, [gstin || null, address || null, state || null, companyGuid, formal_name || null]);
+    res.json({ success: true, message: 'Company profile updated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+};
+router.put('/company/profile', authMiddleware, _companyProfileUpdate);
+router.patch('/company/profile', authMiddleware, _companyProfileUpdate);
+
+export default router;
