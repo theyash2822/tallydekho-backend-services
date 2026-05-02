@@ -1094,10 +1094,75 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows } = await query(
-      'SELECT guid, name, parent, address FROM warehouses WHERE company_guid=$1 ORDER BY name',
+      `SELECT w.guid, w.name, w.parent, w.address,
+        COALESCE(SUM(CASE WHEN st.type='inward' THEN st.qty ELSE -st.qty END), 0) as net_qty,
+        COUNT(DISTINCT st.stock_guid) as skus
+       FROM warehouses w
+       LEFT JOIN stock_transactions st ON st.warehouse = w.name AND st.company_guid = w.company_guid
+       WHERE w.company_guid=$1
+       GROUP BY w.guid, w.name, w.parent, w.address
+       ORDER BY w.name`,
       [companyGuid]
     );
-    res.json({ success: true, data: rows.map(r => ({ id: r.guid, name: r.name, parent: r.parent, address: r.address || '' })) });
+    res.json({ success: true, data: rows.map(r => ({
+      id: r.guid, name: r.name, parent: r.parent, address: r.address || '',
+      total_qty: parseFloat(r.net_qty||0), skus: parseInt(r.skus||0),
+    })) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/stocks/warehouses/:id — single warehouse detail with stock summary + recent activity
+router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { id } = req.params;
+  try {
+    // Warehouse info
+    const { rows: wh } = await query(
+      'SELECT guid, name, parent, address FROM warehouses WHERE company_guid=$1 AND guid=$2 LIMIT 1',
+      [companyGuid, id]
+    );
+    if (!wh[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Warehouse not found' } });
+    const whName = wh[0].name;
+
+    // Stock summary for this warehouse
+    const { rows: summary } = await query(
+      `SELECT
+        COALESCE(SUM(CASE WHEN type='inward' THEN qty ELSE -qty END), 0) as total_qty,
+        COUNT(DISTINCT stock_guid) as skus
+       FROM stock_transactions WHERE company_guid=$1 AND warehouse=$2`,
+      [companyGuid, whName]
+    );
+
+    // Recent stock activity (last 20 transactions)
+    const { rows: activity } = await query(
+      `SELECT st.type, st.qty, st.warehouse, s.name as stock_name, v.voucher_number, v.date, v.voucher_type
+       FROM stock_transactions st
+       LEFT JOIN stocks s ON s.guid = st.stock_guid AND s.company_guid = st.company_guid
+       LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+       WHERE st.company_guid=$1 AND st.warehouse=$2
+       ORDER BY v.date DESC, st.id DESC LIMIT 20`,
+      [companyGuid, whName]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        id: wh[0].guid, name: wh[0].name, parent: wh[0].parent, address: wh[0].address || '',
+        total_qty: parseFloat(summary[0]?.total_qty||0),
+        skus: parseInt(summary[0]?.skus||0),
+        activity: activity.map(a => ({
+          type: a.voucher_type || a.type,
+          ref: a.voucher_number || '',
+          date: a.date || '',
+          stock_name: a.stock_name || '',
+          qty: parseFloat(a.qty||0),
+          direction: a.type,
+        })),
+      }
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
