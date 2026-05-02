@@ -29,6 +29,10 @@ const PORT = process.env.PORT || 3001;
 const io = new SocketIO(httpServer, {
   cors: { origin: process.env.ALLOWED_ORIGINS?.split(',') || '*', methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling'],
+  pingTimeout: 90000,    // 90s — tolerates slow desktop responses during sync
+  pingInterval: 30000,   // ping every 30s (default 25s)
+  upgradeTimeout: 30000, // allow 30s for transport upgrade
+  maxHttpBufferSize: 10e6, // 10MB for large sync payloads
 });
 export const socketService = setupSocket(io);
 
