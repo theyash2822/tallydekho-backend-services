@@ -130,7 +130,30 @@ router.get('/me', authMiddleware, async (req, res) => {
     const { rows } = await query('SELECT id, mobile, name, email, language FROM users WHERE id = $1', [req.user.userId]);
     const user = rows[0];
     if (!user) return res.status(404).json({ status: false, message: 'User not found' });
-    res.json({ status: true, data: { id: user.id, mobile: user.mobile, name: user.name || '', email: user.email || '', language: user.language || 'English' } });
+
+    // Also return company + pairing status so the mobile can restore context on fresh install
+    const { rows: devices } = await query(
+      'SELECT paired FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [req.user.userId]
+    );
+    const isPaired = !!(devices[0]?.paired);
+    let company = null;
+    if (isPaired) {
+      const { rows: cos } = await query(
+        'SELECT guid, name, gstin FROM companies WHERE user_id = $1 ORDER BY synced_at DESC NULLS LAST, id ASC LIMIT 1',
+        [req.user.userId]
+      );
+      if (cos[0]) company = { guid: cos[0].guid, name: cos[0].name, gstin: cos[0].gstin || null };
+    }
+
+    res.json({
+      status: true,
+      data: {
+        id: user.id, mobile: user.mobile, name: user.name || '', email: user.email || '', language: user.language || 'English',
+        company,
+        is_paired: isPaired,
+      }
+    });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed to fetch profile' });
   }
