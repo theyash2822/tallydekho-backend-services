@@ -225,3 +225,54 @@ router.patch('/user-settings', authMiddleware, async (req, res) => {
 });
 
 export default router;
+
+// GET /app/notification-settings
+router.get('/notification-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT notification_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.notification_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// PATCH /app/notification-settings
+router.patch('/notification-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET notification_settings = notification_settings || $1::jsonb WHERE id=$2',
+      [JSON.stringify(req.body || {}), req.user.userId]);
+    res.json({ status: true, message: 'Notification settings saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// GET /app/alert-settings
+router.get('/alert-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT alert_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.alert_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// PATCH /app/alert-settings
+router.patch('/alert-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET alert_settings = alert_settings || $1::jsonb WHERE id=$2',
+      [JSON.stringify(req.body || {}), req.user.userId]);
+    res.json({ status: true, message: 'Alert settings saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// GET /app/integration-settings
+router.get('/integration-settings', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT integration_settings FROM users WHERE id=$1', [req.user.userId]);
+    res.json({ status: true, data: rows[0]?.integration_settings || {} });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// PATCH /app/integration-settings
+router.patch('/integration-settings', authMiddleware, async (req, res) => {
+  try {
+    await query('UPDATE users SET integration_settings = integration_settings || $1::jsonb WHERE id=$2',
+      [JSON.stringify(req.body || {}), req.user.userId]);
+    res.json({ status: true, message: 'Integration settings saved' });
+  } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
