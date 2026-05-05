@@ -77,20 +77,22 @@ export async function sendPaymentReminder({
   invoiceNo, invoiceDate, dueDate, contactNumber,
   channels = { whatsapp: true },
   templateName,
+  userId,       // for push token lookup
+  companyGuid,  // for push notification data
 }) {
   const results = {};
   const tasks = [];
 
   // Get push tokens for user if push channel enabled
-  if (channels.push && opts.userId) {
+  if (channels.push && userId) {
     try {
-      const { rows } = await query('SELECT token FROM push_tokens WHERE user_id=$1', [opts.userId]);
+      const { rows } = await query('SELECT token FROM push_tokens WHERE user_id=$1', [userId]);
       const tokens = rows.map(r => r.token);
       if (tokens.length > 0) {
         tasks.push(
           sendPaymentReminderPush(tokens, {
             partyName, amountDue, invoiceNo, dueDate,
-            companyGuid: opts.companyGuid,
+            companyGuid,
           })
             .then(r => { results.push_notification = r; })
             .catch(e => { results.push_notification = { success: false, error: e.message }; })
