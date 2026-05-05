@@ -623,8 +623,8 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const eVal = +(eRes.rows?.[0]?.v ?? 0);
     // Raw values only — formatting done client-side
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
-      { id: 'purchases', label: 'Purchases', amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'sales',     label: 'Sales',     amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales' },
+      { id: 'purchases', label: 'Purchases', amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase' },
       { id: 'expenses',  label: 'Expenses',  amount_raw: eVal, change: 0, positive: false, icon: 'trending-up-outline', route: '/expenses' },
     ]});
   } catch (err) {
