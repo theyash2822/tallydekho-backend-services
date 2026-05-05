@@ -1028,4 +1028,28 @@ router.post('/master/bank', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /tally/master/bank — fetch saved bank accounts for a company
+router.get('/master/bank', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.query;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  try {
+    const { rows } = await query(`
+      SELECT id, payload, status, created_at
+      FROM write_queue
+      WHERE user_id=$1 AND company_guid=$2 AND operation='bank'
+      ORDER BY created_at DESC
+      LIMIT 50
+    `, [req.user.userId, companyGuid]);
+    const accounts = rows.map(r => ({
+      id: r.id.toString(),
+      ...r.payload,
+      status: r.status,
+      createdAt: r.created_at,
+    }));
+    res.json({ status: true, data: accounts });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
 export default router;
