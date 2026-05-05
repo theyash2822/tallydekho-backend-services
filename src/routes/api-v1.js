@@ -1394,8 +1394,8 @@ router.get('/notifications', authMiddleware, async (req, res) => {
     if (companyGuid) {
       const { rows: lowStock } = await query('SELECT name, closing_qty, reorder_level FROM stocks WHERE company_guid=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3', [companyGuid]);
       lowStock.forEach(s => notifs.push({ id: `stock_${s.name}`, type: 'warning', title: 'Low Stock Alert', body: `${s.name} has only ${s.closing_qty} units left`, read: false, created_at: new Date().toISOString() }));
-      const { rows: overdue } = await query(`SELECT party_name, ABS(closing_balance) as bal FROM ledgers WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000 ORDER BY closing_balance DESC LIMIT 3`, [companyGuid]);
-      overdue.forEach(l => notifs.push({ id: `recv_${l.party_name}`, type: 'info', title: 'Outstanding Receivable', body: `${l.party_name} owes ₹${Math.round(l.bal).toLocaleString('en-IN')}`, read: false, created_at: new Date().toISOString() }));
+      const { rows: overdue } = await query(`SELECT name, ABS(closing_balance) as bal FROM ledgers WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000 ORDER BY closing_balance DESC LIMIT 3`, [companyGuid]);
+      overdue.forEach(l => notifs.push({ id: `recv_${l.name}`, type: 'info', title: 'Outstanding Receivable', body: `${l.name} owes ₹${Math.round(l.bal).toLocaleString('en-IN')}`, read: false, created_at: new Date().toISOString() }));
     }
     res.json({ success: true, data: notifs });
   } catch (err) {
