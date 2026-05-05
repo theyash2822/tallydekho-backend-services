@@ -65,6 +65,7 @@ async function runPaymentReminderJob() {
 
         const daysBefore = reminder.daysBefore || 0;
         const channels = reminder.channels || { whatsapp: true };
+        const threshold = parseFloat(reminderConfig.threshold) || 0; // min invoice amount to trigger reminder
 
         // Find outstanding bills due in `daysBefore` days for this user's companies
         const targetDate = new Date();
@@ -83,10 +84,10 @@ async function runPaymentReminderJob() {
             SELECT guid FROM companies WHERE user_id=$1
           )
           AND DATE(TO_TIMESTAMP(bo.due_date::bigint / 1000)) = $2::date
-          AND bo.amount > 0
+          AND bo.amount >= $3
           AND bo.ledger_name NOT IN (${buildExclusions(reminder.exceptions)})
           LIMIT 50
-        `, [user.id, targetDateStr]);
+        `, [user.id, targetDateStr, threshold]);
 
         if (bills.length === 0) continue;
 
@@ -116,11 +117,8 @@ async function runPaymentReminderJob() {
               whatsapp: channels.whatsapp && !!partyMobile,
               email:    channels.email && !!bill.party_email,
               sms:      channels.sms && !!partyMobile,
-              push:     channels.push,
+              push:     false, // push is only for app user's own notifications, not client reminders
             },
-            userId:      user.id,
-            companyGuid: bill.company_guid,
-            pushTokens,
           });
 
           console.log(`[Scheduler] Reminder sent: ${bill.ledger_name} | ₹${amount} | due ${dueDate}`);
