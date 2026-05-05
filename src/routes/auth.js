@@ -1,9 +1,30 @@
 // Auth routes — OTP login via WhatsApp
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
+
+// Pre-auth token — issued after OTP, before 2FA PIN verified
+// Has limited scope: only usable for /app/verify-pin and /app/reset-pin
+const generatePreAuthToken = (userId, mobile) =>
+  jwt.sign({ userId, mobile, scope: 'pre_auth' }, process.env.JWT_SECRET, { expiresIn: '5m' });
+
+// Middleware to verify pre-auth token (for PIN verify step)
+const preAuthMiddleware = (req, res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return res.status(401).json({ status: false, message: 'Pre-auth token required' });
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.scope !== 'pre_auth') return res.status(401).json({ status: false, message: 'Invalid token scope' });
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ status: false, message: 'Pre-auth token expired or invalid' });
+  }
+};
 
 const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
@@ -72,6 +93,24 @@ router.post('/verify-otp', async (req, res) => {
     if (user.otp !== String(otp)) return res.status(401).json({ status: false, message: 'Invalid OTP. Please try again.' });
     if (Date.now() > user.otp_expires) return res.status(401).json({ status: false, message: 'OTP has expired. Please request a new one.' });
 
+    // ── 2FA check ──────────────────────────────────────────────────────────
+    if (user.two_fa_enabled && user.two_fa_pin_hash) {
+      // Clear OTP but DO NOT issue a full token yet — issue a scoped pre-auth token instead
+      await query('UPDATE users SET otp = NULL, otp_expires = NULL, updated_at = $1 WHERE id = $2', [now(), user.id]);
+      const preAuthToken = generatePreAuthToken(user.id, cleanMobile);
+      console.log(`[AUTH] 2FA required for user ${user.id}`);
+      return res.json({
+        status: true,
+        message: '2FA verification required',
+        data: {
+          requires2FA: true,
+          biometric_enabled: user.biometric_enabled || false,
+          pre_auth_token: preAuthToken,
+        },
+      });
+    }
+
+    // ── No 2FA — issue full token ───────────────────────────────────────────
     const token = generateToken({ userId: user.id, mobile: cleanMobile });
 
     await query(`UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3`,
@@ -93,6 +132,7 @@ router.post('/verify-otp', async (req, res) => {
         token,
         isPaired,
         isNewUser,
+        requires2FA: false,
         user: { id: user.id, mobile: cleanMobile, name: user.name || null, language: user.language || 'English' },
       },
     });
@@ -224,7 +264,6 @@ router.patch('/user-settings', authMiddleware, async (req, res) => {
   }
 });
 
-export default router;
 
 // GET /app/notification-settings
 router.get('/notification-settings', authMiddleware, async (req, res) => {
@@ -276,3 +315,159 @@ router.patch('/integration-settings', authMiddleware, async (req, res) => {
     res.json({ status: true, message: 'Integration settings saved' });
   } catch (err) { res.status(500).json({ status: false, message: err.message }); }
 });
+
+// ─── POST /app/verify-pin ─────────────────────────────────────────────────────
+// Called after OTP when 2FA is enabled. Requires pre_auth_token.
+// On success: issues a full JWT.
+router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ status: false, message: 'PIN required' });
+
+  try {
+    const { rows } = await query(
+      'SELECT id, mobile, name, language, two_fa_pin_hash FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    const user = rows[0];
+    if (!user) return res.status(404).json({ status: false, message: 'User not found' });
+
+    const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
+    if (!match) return res.status(401).json({ status: false, message: 'Incorrect PIN. Try again.' });
+
+    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    await query('UPDATE users SET token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
+
+    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
+    const isPaired = devices.length > 0;
+    const isNewUser = !user.name;
+
+    console.log(`[2FA] PIN verified for user ${user.id}`);
+    res.json({
+      status: true,
+      message: 'PIN verified successfully',
+      data: {
+        token,
+        isPaired,
+        isNewUser,
+        user: { id: user.id, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },
+      },
+    });
+  } catch (err) {
+    console.error('[verify-pin]', err.message);
+    res.status(500).json({ status: false, message: 'Verification failed' });
+  }
+});
+
+// ─── POST /app/set-pin ────────────────────────────────────────────────────────
+// Set or update the 2FA PIN. Requires full auth token.
+router.post('/set-pin', authMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin || String(pin).length < 4) return res.status(400).json({ status: false, message: 'PIN must be at least 4 characters' });
+
+  try {
+    const hash = await bcrypt.hash(String(pin), 10);
+    await query(
+      'UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3',
+      [hash, now(), req.user.userId]
+    );
+    console.log(`[2FA] PIN set for user ${req.user.userId}`);
+    res.json({ status: true, message: '2FA PIN set successfully' });
+  } catch (err) {
+    console.error('[set-pin]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to set PIN' });
+  }
+});
+
+// ─── POST /app/reset-pin ──────────────────────────────────────────────────────
+// Reset PIN using a freshly verified OTP (pre_auth_token from verify-otp with 2FA bypassed).
+// Flow: user requests OTP → verifies OTP with reset_pin=true → gets pre_auth_token → sets new PIN here.
+router.post('/reset-pin', preAuthMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin || String(pin).length < 4) return res.status(400).json({ status: false, message: 'PIN must be at least 4 characters' });
+
+  try {
+    const hash = await bcrypt.hash(String(pin), 10);
+    await query(
+      'UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3',
+      [hash, now(), req.user.userId]
+    );
+
+    // After reset, issue a full token so user can log in
+    const { rows } = await query('SELECT mobile, name, language FROM users WHERE id=$1', [req.user.userId]);
+    const user = rows[0];
+    const token = generateToken({ userId: req.user.userId, mobile: user.mobile });
+    await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
+
+    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
+    console.log(`[2FA] PIN reset for user ${req.user.userId}`);
+    res.json({
+      status: true,
+      message: 'PIN reset successfully',
+      data: {
+        token,
+        isPaired: devices.length > 0,
+        isNewUser: !user.name,
+        user: { id: req.user.userId, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },
+      },
+    });
+  } catch (err) {
+    console.error('[reset-pin]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to reset PIN' });
+  }
+});
+
+// ─── DELETE /app/remove-pin ───────────────────────────────────────────────────
+// Disable 2FA entirely. Requires full auth + correct current PIN.
+router.delete('/remove-pin', authMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ status: false, message: 'Current PIN required to disable 2FA' });
+
+  try {
+    const { rows } = await query('SELECT two_fa_pin_hash FROM users WHERE id=$1', [req.user.userId]);
+    const user = rows[0];
+    if (!user?.two_fa_pin_hash) return res.json({ status: true, message: '2FA already disabled' });
+
+    const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
+    if (!match) return res.status(401).json({ status: false, message: 'Incorrect PIN' });
+
+    await query(
+      'UPDATE users SET two_fa_enabled=FALSE, two_fa_pin_hash=NULL, updated_at=$1 WHERE id=$2',
+      [now(), req.user.userId]
+    );
+    console.log(`[2FA] Disabled for user ${req.user.userId}`);
+    res.json({ status: true, message: '2FA disabled' });
+  } catch (err) {
+    console.error('[remove-pin]', err.message);
+    res.status(500).json({ status: false, message: 'Failed to disable 2FA' });
+  }
+});
+
+// ─── PATCH /app/set-biometric ─────────────────────────────────────────────────
+// Enable/disable biometric login.
+router.patch('/set-biometric', authMiddleware, async (req, res) => {
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') return res.status(400).json({ status: false, message: 'enabled (boolean) required' });
+  try {
+    await query('UPDATE users SET biometric_enabled=$1, updated_at=$2 WHERE id=$3', [enabled, now(), req.user.userId]);
+    res.json({ status: true, message: `Biometric ${enabled ? 'enabled' : 'disabled'}` });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// ─── GET /app/two-fa-status ───────────────────────────────────────────────────
+// Get current 2FA status for the profile screen.
+router.get('/two-fa-status', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT two_fa_enabled, biometric_enabled FROM users WHERE id=$1',
+      [req.user.userId]
+    );
+    const u = rows[0] || {};
+    res.json({ status: true, data: { two_fa_enabled: u.two_fa_enabled || false, biometric_enabled: u.biometric_enabled || false } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+export default router;

@@ -6,9 +6,27 @@
 
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion, sendPaymentReminder } from '../services/whatsapp.js';
+
+// Pre-auth token (scoped, 5-min) for 2FA PIN step
+const generatePreAuthToken = (userId, mobile) =>
+  jwt.sign({ userId, mobile, scope: 'pre_auth' }, process.env.JWT_SECRET, { expiresIn: '5m' });
+
+const preAuthMiddleware = (req, res, next) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Pre-auth token required' } });
+  try {
+    const p = jwt.verify(token, process.env.JWT_SECRET);
+    if (p.scope !== 'pre_auth') return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid token scope' } });
+    req.user = p;
+    next();
+  } catch {
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Pre-auth token expired' } });
+  }
+};
 
 const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
@@ -129,7 +147,7 @@ router.post('/auth/send-otp', async (req, res) => {
 // POST /api/auth/verify-otp
 // Frontend sends: { phone: "+919876543210", otp: "1234" }
 router.post('/auth/verify-otp', async (req, res) => {
-  const { phone, otp } = req.body;
+  const { phone, otp, reset_pin } = req.body;
   if (!phone || !otp) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Phone and OTP required' } });
 
   const digits = phone.replace(/\D/g, '');
@@ -143,6 +161,23 @@ router.post('/auth/verify-otp', async (req, res) => {
     if (user.otp !== String(otp)) return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP. Please try again.' } });
     if (Date.now() > user.otp_expires) return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
 
+    // ── 2FA check (skip if reset_pin=true — user is resetting PIN via OTP) ───────────────
+    if ((user.two_fa_enabled && user.two_fa_pin_hash && !reset_pin) || reset_pin) {
+      // 2FA required, OR PIN reset requested — issue scoped pre_auth_token
+      await query('UPDATE users SET otp = NULL, otp_expires = NULL, updated_at = $1 WHERE id = $2', [now(), user.id]);
+      const preAuthToken = generatePreAuthToken(user.id, cleanMobile);
+      if (!reset_pin) console.log(`[API AUTH] 2FA required for user ${user.id}`);
+      return res.json({
+        success: true,
+        data: {
+          requires_2fa: !reset_pin,
+          biometric_enabled: user.biometric_enabled || false,
+          pre_auth_token: preAuthToken,
+        },
+      });
+    }
+
+    // ── No 2FA — issue full token directly ──────────────────────────────
     const token = generateToken({ userId: user.id, mobile: cleanMobile });
     await query('UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
 
@@ -165,6 +200,7 @@ router.post('/auth/verify-otp', async (req, res) => {
       success: true,
       data: {
         is_new_user: isNewUser,
+        requires_2fa: false,
         access_token: token,
         expires_in: 3600,
         user: { id: user.id, name: user.name || null, phone: cleanMobile, language: user.language || 'en' },
@@ -480,17 +516,16 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
     const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
 
-    const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
-    // Safe access — COALESCE should always return a row, but guard anyway
+    // Raw values only — formatting is done client-side using user's currency/format settings
     const g = (rows) => +(rows?.[0]?.v ?? 0);
     const kpi = [
-      { id: 'cash',       label: 'Cash In Hand', amount: fmt(g(cash)),  amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
-      { id: 'bank',       label: 'Bank Balance', amount: fmt(g(bank)),  amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance' },
-      { id: 'receivable', label: 'Receivables',  amount: fmt(g(rec)),   amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
-      { id: 'payable',    label: 'Payables',     amount: fmt(g(pay)),   amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
-      { id: 'loans',      label: 'Loans & ODs',  amount: fmt(g(loans)), amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
-      { id: 'payments',   label: 'Payments',     amount: fmt(g(pmts)),  amount_raw: g(pmts),  icon: 'send-outline',                route: '/kpi/payments' },
-      { id: 'receipts',   label: 'Receipts',     amount: fmt(g(rcts)),  amount_raw: g(rcts),  icon: 'download-outline',            route: '/kpi/receipts' },
+      { id: 'cash',       label: 'Cash In Hand', amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
+      { id: 'bank',       label: 'Bank Balance', amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance' },
+      { id: 'receivable', label: 'Receivables',  amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
+      { id: 'payable',    label: 'Payables',     amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
+      { id: 'loans',      label: 'Loans & ODs',  amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
+      { id: 'payments',   label: 'Payments',     amount_raw: g(pmts),  icon: 'send-outline',                route: '/kpi/payments' },
+      { id: 'receipts',   label: 'Receipts',     amount_raw: g(rcts),  icon: 'download-outline',            route: '/kpi/receipts' },
     ];
     res.json({ success: true, data: kpi });
   } catch (err) {
@@ -548,11 +583,11 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const sVal = +(sRes.rows?.[0]?.v ?? 0);
     const pVal = +(pRes.rows?.[0]?.v ?? 0);
     const eVal = +(eRes.rows?.[0]?.v ?? 0);
-    const fmt = v => v >= 1e5 ? `₹${(v/1e5).toFixed(1)}L` : `₹${Math.round(v).toLocaleString('en-IN')}`;
+    // Raw values only — formatting done client-side
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount: fmt(sVal), amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
-      { id: 'purchases', label: 'Purchases', amount: fmt(pVal), amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
-      { id: 'expenses',  label: 'Expenses',  amount: fmt(eVal), amount_raw: eVal, change: 0, positive: false, icon: 'trending-up-outline', route: '/expenses' },
+      { id: 'sales',     label: 'Sales',     amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales/register' },
+      { id: 'purchases', label: 'Purchases', amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase/register' },
+      { id: 'expenses',  label: 'Expenses',  amount_raw: eVal, change: 0, positive: false, icon: 'trending-up-outline', route: '/expenses' },
     ]});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -599,13 +634,12 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
       `SELECT id, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
       [companyGuid, from, to]
     );
-    const fmt = v => `₹${Math.abs(+v||0).toLocaleString('en-IN')}`;
     const activity = rows.map(r => ({
       id: String(r.id),
       type: (r.voucher_type||'').toLowerCase().includes('receipt') ? 'credit' : 'debit',
       label: `${r.voucher_type} ${r.voucher_number ? '#'+r.voucher_number : ''}`.trim(),
-      amount: (r.voucher_type||'').toLowerCase().includes('receipt') ? `+${fmt(r.amount)}` : `-${fmt(r.amount)}`,
       amount_raw: +r.amount || 0,
+      is_credit: (r.voucher_type||'').toLowerCase().includes('receipt'),
       date: r.date || '',
       party: r.party_name || '',
     }));
@@ -1969,6 +2003,109 @@ router.patch('/integration-settings', authMiddleware, async (req, res) => {
     await query('UPDATE users SET integration_settings = integration_settings || $1::jsonb WHERE id=$2', [JSON.stringify(req.body||{}), req.user.userId]);
     res.json({ status: true, message: 'Saved' });
   } catch (err) { res.status(500).json({ status: false, message: err.message }); }
+});
+
+// ─── POST /api/auth/verify-pin ───────────────────────────────────────────────
+router.post('/auth/verify-pin', preAuthMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'PIN required' } });
+  try {
+    const { rows } = await query('SELECT id, mobile, name, language, two_fa_pin_hash FROM users WHERE id=$1', [req.user.userId]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } });
+    const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
+    if (!match) return res.status(401).json({ success: false, error: { code: 'PIN_INVALID', message: 'Incorrect PIN. Try again.' } });
+    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    await query('UPDATE users SET token=$1, updated_at=$2 WHERE id=$3', [token, now(), user.id]);
+    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
+    const isPaired = devices.length > 0;
+    let company = null;
+    if (isPaired) {
+      const { rows: companies } = await query('SELECT guid, name, gstin FROM companies WHERE user_id=$1 AND is_active=TRUE LIMIT 1', [user.id]);
+      if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
+    }
+    console.log(`[API 2FA] PIN verified for user ${user.id}`);
+    res.json({
+      success: true,
+      data: {
+        access_token: token,
+        is_new_user: !user.name,
+        is_paired: isPaired,
+        company,
+        user: { id: user.id, name: user.name || null, phone: user.mobile, language: user.language || 'en' },
+      },
+    });
+  } catch (err) {
+    console.error('[api verify-pin]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Verification failed' } });
+  }
+});
+
+// ─── POST /api/auth/set-pin ───────────────────────────────────────────────────
+router.post('/auth/set-pin', authMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin || String(pin).length < 4) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'PIN must be at least 4 characters' } });
+  try {
+    const hash = await bcrypt.hash(String(pin), 10);
+    await query('UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3', [hash, now(), req.user.userId]);
+    res.json({ success: true, data: { message: '2FA enabled' } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to set PIN' } }); }
+});
+
+// ─── POST /api/auth/reset-pin ─────────────────────────────────────────────────
+router.post('/auth/reset-pin', preAuthMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin || String(pin).length < 4) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'PIN must be at least 4 characters' } });
+  try {
+    const hash = await bcrypt.hash(String(pin), 10);
+    await query('UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3', [hash, now(), req.user.userId]);
+    const { rows } = await query('SELECT mobile, name, language FROM users WHERE id=$1', [req.user.userId]);
+    const u = rows[0];
+    const token = generateToken({ userId: req.user.userId, mobile: u.mobile });
+    await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
+    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
+    res.json({
+      success: true,
+      data: {
+        access_token: token,
+        is_paired: devices.length > 0,
+        is_new_user: !u.name,
+        user: { id: req.user.userId, name: u.name || null, phone: u.mobile, language: u.language || 'en' },
+      },
+    });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to reset PIN' } }); }
+});
+
+// ─── DELETE /api/auth/remove-pin ──────────────────────────────────────────────
+router.delete('/auth/remove-pin', authMiddleware, async (req, res) => {
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'PIN required' } });
+  try {
+    const { rows } = await query('SELECT two_fa_pin_hash FROM users WHERE id=$1', [req.user.userId]);
+    const match = rows[0]?.two_fa_pin_hash ? await bcrypt.compare(String(pin), rows[0].two_fa_pin_hash) : true;
+    if (!match) return res.status(401).json({ success: false, error: { code: 'PIN_INVALID', message: 'Incorrect PIN' } });
+    await query('UPDATE users SET two_fa_enabled=FALSE, two_fa_pin_hash=NULL, updated_at=$1 WHERE id=$2', [now(), req.user.userId]);
+    res.json({ success: true, data: { message: '2FA disabled' } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to disable 2FA' } }); }
+});
+
+// ─── PATCH /api/auth/set-biometric ────────────────────────────────────────────
+router.patch('/auth/set-biometric', authMiddleware, async (req, res) => {
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'enabled (boolean) required' } });
+  try {
+    await query('UPDATE users SET biometric_enabled=$1, updated_at=$2 WHERE id=$3', [enabled, now(), req.user.userId]);
+    res.json({ success: true, data: { message: `Biometric ${enabled ? 'enabled' : 'disabled'}` } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ─── GET /api/auth/two-fa-status ──────────────────────────────────────────────
+router.get('/auth/two-fa-status', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query('SELECT two_fa_enabled, biometric_enabled FROM users WHERE id=$1', [req.user.userId]);
+    const u = rows[0] || {};
+    res.json({ success: true, data: { two_fa_enabled: !!u.two_fa_enabled, biometric_enabled: !!u.biometric_enabled } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
 export default router;
