@@ -984,4 +984,48 @@ router.get('/write-queue/history', authMiddleware, async (req, res) => {
   }
 });
 
+// ── POST /tally/master/bank ─────────────────────────────────────────────────────────────────────
+router.post('/master/bank', authMiddleware, async (req, res) => {
+  const { companyGuid, bankName, accountNumber, ifsc, accountType, openingBalance } = req.body;
+  if (!companyGuid || !bankName)
+    return res.status(400).json({ status: false, message: 'companyGuid and bankName required' });
+
+  const ledgerName = bankName.trim();
+  const parentGroup = accountType === 'OD' || accountType === 'CC'
+    ? 'Bank OD A/c'
+    : 'Bank Accounts';
+  const openBal = parseFloat(openingBalance) || 0;
+
+  const xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<LEDGER NAME="${ledgerName}" ACTION="Create">
+  <NAME>${ledgerName}</NAME>
+  <PARENT>${parentGroup}</PARENT>
+  <OPENINGBALANCE>${openBal > 0 ? openBal.toFixed(2) + ' Dr' : Math.abs(openBal).toFixed(2) + ' Cr'}</OPENINGBALANCE>
+  ${ifsc ? `<IFSCODE>${ifsc}</IFSCODE>` : ''}
+  ${accountNumber ? `<BANKACNO>${accountNumber}</BANKACNO>` : ''}
+  <ISDEFAULTLEDGER>No</ISDEFAULTLEDGER>
+</LEDGER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const payload = { companyGuid, bankName, accountNumber, ifsc, accountType, openingBalance };
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'bank', ledgerName, openBal, payload, xml);
+  let result;
+  try {
+    result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(queueId, result, null);
+    return res.json({ status: true, data: { message: 'Bank ledger created in Tally', bankName: ledgerName, queueId, tallyResult: result } });
+  } catch (err) {
+    await updateWriteQueue(queueId, null, err.message);
+    // Still return 200 - entry is queued for when desktop comes online
+    return res.json({ status: true, data: { message: 'Bank ledger queued - will push when Tally is online', bankName: ledgerName, queueId, error: err.message } });
+  }
+});
+
 export default router;

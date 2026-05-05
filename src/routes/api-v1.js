@@ -11,6 +11,7 @@ import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
+import { sendOTPEmail } from '../services/email.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -2163,6 +2164,157 @@ router.get('/auth/two-fa-status', authMiddleware, async (req, res) => {
     const u = rows[0] || {};
     res.json({ success: true, data: { two_fa_enabled: !!u.two_fa_enabled, biometric_enabled: !!u.biometric_enabled } });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// ─── POST /api/auth/change-phone ──────────────────────────────────────────────
+// step 1: send OTP to currentPhone
+// step 2: verify OTP for currentPhone, send OTP to newPhone
+// step 3: verify OTP for newPhone, update users.mobile
+router.post('/auth/change-phone', authMiddleware, async (req, res) => {
+  const { step, currentPhone, otp, newPhone } = req.body;
+  const userId = req.user.userId;
+
+  const normalize = (p) => {
+    if (!p) return '';
+    const digits = String(p).replace(/\D/g, '');
+    return digits.length > 10 ? digits.slice(-10) : digits;
+  };
+
+  try {
+    if (step === 1) {
+      // Send OTP to current phone
+      const cleanPhone = normalize(currentPhone);
+      if (!cleanPhone || cleanPhone.length < 10)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid current phone required' } });
+
+      // Verify that currentPhone matches the user's mobile
+      const { rows } = await query('SELECT mobile FROM users WHERE id=$1', [userId]);
+      if (!rows[0] || rows[0].mobile !== cleanPhone)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Current phone does not match your account' } });
+
+      const otp4 = makeOtp();
+      const expires = Date.now() + 5 * 60 * 1000;
+      await query('UPDATE users SET phone_change_otp=$1, phone_change_otp_expires=$2, updated_at=$3 WHERE id=$4',
+        [otp4, expires, now(), userId]);
+
+      const waResult = await sendWhatsAppOTP('+91', cleanPhone, otp4);
+      console.log(`[CHANGE-PHONE S1] OTP ${otp4} → +91${cleanPhone}`);
+      const r = { success: true, data: { message: 'OTP sent to current phone via WhatsApp' } };
+      if (process.env.NODE_ENV !== 'production') r.data.otp = otp4;
+      return res.json(r);
+    }
+
+    if (step === 2) {
+      // Verify OTP for current phone, then send OTP to newPhone
+      if (!currentPhone || !otp || !newPhone)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'currentPhone, otp, and newPhone required' } });
+
+      const { rows } = await query('SELECT phone_change_otp, phone_change_otp_expires FROM users WHERE id=$1', [userId]);
+      const u = rows[0];
+      if (!u || u.phone_change_otp !== String(otp))
+        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP for current phone' } });
+      if (Date.now() > Number(u.phone_change_otp_expires))
+        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+
+      const cleanNew = normalize(newPhone);
+      if (!cleanNew || cleanNew.length < 10)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid new phone required' } });
+
+      // Check new phone not already taken
+      const { rows: taken } = await query('SELECT id FROM users WHERE mobile=$1 AND id!=$2', [cleanNew, userId]);
+      if (taken.length > 0)
+        return res.status(409).json({ success: false, error: { code: 'CONFLICT', message: 'This phone number is already in use' } });
+
+      const newOtp = makeOtp();
+      const newExpires = Date.now() + 5 * 60 * 1000;
+      await query('UPDATE users SET phone_change_otp=$1, phone_change_otp_expires=$2, phone_change_new=$3, updated_at=$4 WHERE id=$5',
+        [newOtp, newExpires, cleanNew, now(), userId]);
+
+      await sendWhatsAppOTP('+91', cleanNew, newOtp);
+      console.log(`[CHANGE-PHONE S2] OTP ${newOtp} → +91${cleanNew}`);
+      const r = { success: true, data: { message: 'OTP sent to new phone via WhatsApp' } };
+      if (process.env.NODE_ENV !== 'production') r.data.otp = newOtp;
+      return res.json(r);
+    }
+
+    if (step === 3) {
+      // Verify OTP for new phone, update mobile
+      if (!otp)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'OTP required' } });
+
+      const { rows } = await query('SELECT phone_change_otp, phone_change_otp_expires, phone_change_new FROM users WHERE id=$1', [userId]);
+      const u = rows[0];
+      if (!u || u.phone_change_otp !== String(otp))
+        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP for new phone' } });
+      if (Date.now() > Number(u.phone_change_otp_expires))
+        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+      if (!u.phone_change_new)
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'No pending phone change' } });
+
+      await query(
+        'UPDATE users SET mobile=$1, phone_change_otp=NULL, phone_change_otp_expires=NULL, phone_change_new=NULL, updated_at=$2 WHERE id=$3',
+        [u.phone_change_new, now(), userId]
+      );
+      console.log(`[CHANGE-PHONE S3] Updated phone for user ${userId} → ${u.phone_change_new}`);
+      return res.json({ success: true, data: { message: 'Phone number updated successfully', newPhone: u.phone_change_new } });
+    }
+
+    return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid step. Must be 1, 2, or 3.' } });
+  } catch (err) {
+    console.error('[CHANGE-PHONE] Error:', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ─── POST /api/auth/change-email ──────────────────────────────────────────────
+// step 1: send OTP to currentEmail
+// step 2: verify OTP, update users.email
+router.post('/auth/change-email', authMiddleware, async (req, res) => {
+  const { step, currentEmail, otp, newEmail } = req.body;
+  const userId = req.user.userId;
+
+  try {
+    if (step === 1) {
+      if (!currentEmail || !currentEmail.includes('@'))
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid current email required' } });
+
+      const otp4 = makeOtp();
+      const expires = Date.now() + 5 * 60 * 1000;
+      await query('UPDATE users SET email_change_otp=$1, email_change_otp_expires=$2, updated_at=$3 WHERE id=$4',
+        [otp4, expires, now(), userId]);
+
+      await sendOTPEmail(currentEmail, otp4);
+      console.log(`[CHANGE-EMAIL S1] OTP ${otp4} → ${currentEmail}`);
+      const r = { success: true, data: { message: 'OTP sent to your email' } };
+      if (process.env.NODE_ENV !== 'production') r.data.otp = otp4;
+      return res.json(r);
+    }
+
+    if (step === 2) {
+      // verify OTP, update email (newEmail is the target)
+      if (!otp || !newEmail || !newEmail.includes('@'))
+        return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'otp and newEmail required' } });
+
+      const { rows } = await query('SELECT email_change_otp, email_change_otp_expires FROM users WHERE id=$1', [userId]);
+      const u = rows[0];
+      if (!u || u.email_change_otp !== String(otp))
+        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP' } });
+      if (Date.now() > Number(u.email_change_otp_expires))
+        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+
+      await query(
+        'UPDATE users SET email=$1, email_change_otp=NULL, email_change_otp_expires=NULL, updated_at=$2 WHERE id=$3',
+        [newEmail.trim().toLowerCase(), now(), userId]
+      );
+      console.log(`[CHANGE-EMAIL S2] Updated email for user ${userId} → ${newEmail}`);
+      return res.json({ success: true, data: { message: 'Email updated successfully', newEmail } });
+    }
+
+    return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid step. Must be 1 or 2.' } });
+  } catch (err) {
+    console.error('[CHANGE-EMAIL] Error:', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 export default router;

@@ -615,6 +615,14 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_rtr_type    ON raw_tally_records(record_type);
       CREATE INDEX IF NOT EXISTS idx_rtr_fy      ON raw_tally_records(company_guid, financial_year);
 
+      -- Phone/Email OTP change columns
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_change_otp TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_change_otp_expires BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_change_new TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_otp TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_otp_expires BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_new TEXT;
+
       -- Push tokens — Expo push notification tokens per user device
       CREATE TABLE IF NOT EXISTS push_tokens (
         id         BIGSERIAL PRIMARY KEY,
