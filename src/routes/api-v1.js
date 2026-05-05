@@ -9,7 +9,8 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
-import { sendWhatsAppOTP, getRegion, sendPaymentReminder } from '../services/whatsapp.js';
+import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
+import { sendPaymentReminder } from '../services/notifications.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -1906,17 +1907,37 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
     const { rows: userSettings } = await query('SELECT alert_settings FROM users WHERE id=$1', [req.user.userId]);
     const userTemplateName = userSettings[0]?.alert_settings?.payment_reminders?.template_name;
 
-        const result = await sendPaymentReminder({
+    // Determine channels from user notification settings
+    const notifSettings = userSettings[0]?.alert_settings?.payment_reminders || {};
+    const channels = {
+      whatsapp: notifSettings.channels?.whatsapp !== false,
+      email:    notifSettings.channels?.email === true,
+      sms:      notifSettings.channels?.sms   === true,
+    };
+
+    // Get party email if email channel enabled
+    let partyEmail = null;
+    if (channels.email) {
+      const { rows: party } = await query(
+        'SELECT email FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1',
+        [companyGuid, ledgerName]
+      ).catch(() => ({ rows: [] }));
+      partyEmail = party[0]?.email || null;
+    }
+
+    const result = await sendPaymentReminder({
       countryCode: '+91',
-      mobile: digits.slice(-10),       // last 10 digits
-      partyName: ledgerName || 'Customer', // {{1}}
-      businessName: companyName,           // {{2}}
-      amountDue: amount ? `₹${Math.round(parseFloat(amount)).toLocaleString('en-IN')}` : '₹0', // {{3}}
-      invoiceNo: invoiceNo || '',          // {{4}}
-      invoiceDate: invoiceDate || '',      // {{5}}
-      dueDate: dueDate || '',              // {{6}}
-      contactNumber: contactNumber || '',  // {{7}}
-      templateName: userTemplateName, // use user's configured template if set
+      mobile: digits.slice(-10),
+      email: partyEmail,
+      partyName: ledgerName || 'Customer',
+      businessName: companyName,
+      amountDue: amount ? `₹${Math.round(parseFloat(amount)).toLocaleString('en-IN')}` : '₹0',
+      invoiceNo: invoiceNo || '',
+      invoiceDate: invoiceDate || '',
+      dueDate: dueDate || '',
+      contactNumber: contactNumber || '',
+      templateName: userTemplateName,
+      channels,
     });
     
     if (result.success) {

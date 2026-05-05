@@ -1,10 +1,11 @@
-// Auth routes — OTP login via WhatsApp
+// Auth routes — OTP login via WhatsApp / Email / SMS
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
+import { sendEmailVerificationOTP } from '../services/notifications.js';
 
 // Pre-auth token — issued after OTP, before 2FA PIN verified
 // Has limited scope: only usable for /app/verify-pin and /app/reset-pin
@@ -203,8 +204,23 @@ router.get('/me', authMiddleware, async (req, res) => {
 router.post('/me', authMiddleware, async (req, res) => {
   const { name, email, language } = req.body || {};
   try {
+    const current = await query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+    const currentEmail = current.rows[0]?.email;
+    const newEmail = email?.trim() || '';
+
     await query('UPDATE users SET name = $1, email = $2, language = $3, updated_at = $4 WHERE id = $5',
-      [name?.trim() || '', email?.trim() || '', language || 'English', now(), req.user.userId]);
+      [name?.trim() || '', newEmail, language || 'English', now(), req.user.userId]);
+
+    // If email changed, send verification OTP to new email
+    if (newEmail && newEmail !== currentEmail) {
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expires = Date.now() + 10 * 60 * 1000; // 10 min
+      await query('UPDATE users SET email_otp = $1, email_otp_expires = $2 WHERE id = $3',
+        [otp, expires, req.user.userId]).catch(() => {}); // non-blocking
+      sendEmailVerificationOTP(newEmail, otp).catch(() => {});
+      return res.json({ status: true, message: 'Profile updated. OTP sent to new email for verification.', emailVerificationRequired: true });
+    }
+
     res.json({ status: true, message: 'Profile updated successfully' });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed to update profile' });

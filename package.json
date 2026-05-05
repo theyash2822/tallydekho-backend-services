@@ -9,6 +9,7 @@
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-ses": "^3.1042.0",
     "axios": "^1.13.6",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^9.4.3",
@@ -21,6 +22,7 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^8.0.7",
     "pg": "^8.20.0",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
