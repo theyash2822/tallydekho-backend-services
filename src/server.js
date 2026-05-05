@@ -9,6 +9,7 @@ import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 
 import { initSchema } from './db/schema.js';
+import { startScheduler } from './services/scheduler.js';
 import { setupSocket } from './socket/socketHandler.js';
 import tallyWriteRoutes, { setTallyWriteSocket } from './routes/tally-write.js';
 import authRoutes from './routes/auth.js';
@@ -110,6 +111,7 @@ initSchema()
 ║  TallyDekho Backend v1.0.0 (PostgreSQL)       ║
 ║  http://0.0.0.0:${PORT}                           ║
 ╚═══════════════════════════════════════════════╝`);
+      startScheduler(); // Start cron jobs after DB is ready
     });
   })
   .catch(err => {

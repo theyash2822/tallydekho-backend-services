@@ -614,6 +614,19 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_rtr_company ON raw_tally_records(company_guid);
       CREATE INDEX IF NOT EXISTS idx_rtr_type    ON raw_tally_records(record_type);
       CREATE INDEX IF NOT EXISTS idx_rtr_fy      ON raw_tally_records(company_guid, financial_year);
+
+      -- Push tokens — Expo push notification tokens per user device
+      CREATE TABLE IF NOT EXISTS push_tokens (
+        id         BIGSERIAL PRIMARY KEY,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token      TEXT NOT NULL,
+        platform   TEXT,                          -- 'ios' | 'android'
+        device_id  TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, token)
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

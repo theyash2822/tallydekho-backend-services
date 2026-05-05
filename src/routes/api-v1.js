@@ -305,10 +305,46 @@ router.patch('/auth/me', authMiddleware, async (req, res) => {
 // POST /api/auth/logout
 router.post('/auth/logout', authMiddleware, async (req, res) => {
   try {
+    const { pushToken } = req.body || {};
+    // Remove push token on logout so stale tokens don't accumulate
+    if (pushToken) {
+      await query('DELETE FROM push_tokens WHERE user_id=$1 AND token=$2', [req.user.userId, pushToken]).catch(() => {});
+    }
     await query('UPDATE users SET token = NULL WHERE id = $1', [req.user.userId]);
     res.json({ success: true, data: { message: 'Logged out successfully' } });
   } catch {
     res.json({ success: true, data: { message: 'Logged out' } });
+  }
+});
+
+// POST /api/push-token — register or update Expo push token
+router.post('/push-token', authMiddleware, async (req, res) => {
+  const { token, platform, deviceId } = req.body || {};
+  if (!token) return res.status(400).json({ success: false, error: { code: 'MISSING_TOKEN', message: 'token required' } });
+  try {
+    await query(`
+      INSERT INTO push_tokens (user_id, token, platform, device_id, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (user_id, token) DO UPDATE SET platform=$3, device_id=$4, updated_at=NOW()
+    `, [req.user.userId, token, platform || null, deviceId || null]);
+    res.json({ success: true, data: { message: 'Push token registered' } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'DB_ERROR', message: err.message } });
+  }
+});
+
+// DELETE /api/push-token — remove push token (on logout or permission revoked)
+router.delete('/push-token', authMiddleware, async (req, res) => {
+  const { token } = req.body || {};
+  try {
+    if (token) {
+      await query('DELETE FROM push_tokens WHERE user_id=$1 AND token=$2', [req.user.userId, token]);
+    } else {
+      await query('DELETE FROM push_tokens WHERE user_id=$1', [req.user.userId]);
+    }
+    res.json({ success: true, data: { message: 'Push token removed' } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'DB_ERROR', message: err.message } });
   }
 });
 

@@ -5,6 +5,8 @@
 import { sendWhatsAppOTP, sendPaymentReminder as sendWhatsAppReminder } from './whatsapp.js';
 import { sendOTPEmail, sendPaymentReminderEmail } from './email.js';
 import { sendOTPSms, sendPaymentReminderSms } from './sms.js';
+import { sendPaymentReminderPush } from './push.js';
+import { query } from '../db/schema.js';
 
 /**
  * Send OTP via all available/requested channels
@@ -78,6 +80,26 @@ export async function sendPaymentReminder({
 }) {
   const results = {};
   const tasks = [];
+
+  // Get push tokens for user if push channel enabled
+  if (channels.push && opts.userId) {
+    try {
+      const { rows } = await query('SELECT token FROM push_tokens WHERE user_id=$1', [opts.userId]);
+      const tokens = rows.map(r => r.token);
+      if (tokens.length > 0) {
+        tasks.push(
+          sendPaymentReminderPush(tokens, {
+            partyName, amountDue, invoiceNo, dueDate,
+            companyGuid: opts.companyGuid,
+          })
+            .then(r => { results.push_notification = r; })
+            .catch(e => { results.push_notification = { success: false, error: e.message }; })
+        );
+      }
+    } catch (e) {
+      results.push_notification = { success: false, error: e.message };
+    }
+  }
 
   if (channels.whatsapp && mobile) {
     tasks.push(
