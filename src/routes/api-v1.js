@@ -1443,6 +1443,23 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
+// GET /api/bank-ledgers — lightweight list of bank account ledgers (for voucher config bank dropdown)
+router.get('/bank-ledgers', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(
+      `SELECT name, closing_balance, balance_type FROM ledgers
+       WHERE company_guid=$1
+         AND (parent ILIKE '%Bank Account%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%')
+       ORDER BY ABS(closing_balance) DESC`,
+      [companyGuid]
+    );
+    res.json({ success: true, data: rows.map(r => ({ name: r.name, balance: parseFloat(r.closing_balance||0), balance_type: r.balance_type })) });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
