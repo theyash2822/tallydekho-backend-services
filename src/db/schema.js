@@ -623,6 +623,11 @@ export async function initSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_otp_expires BIGINT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_new TEXT;
 
+      -- Language & Region settings (country, timezone, week_start)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS country    TEXT DEFAULT 'India';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone   TEXT DEFAULT 'UTC+05:30 · Asia/Kolkata';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS week_start TEXT DEFAULT 'Monday';
+
       -- Push tokens — Expo push notification tokens per user device
       CREATE TABLE IF NOT EXISTS push_tokens (
         id         BIGSERIAL PRIMARY KEY,

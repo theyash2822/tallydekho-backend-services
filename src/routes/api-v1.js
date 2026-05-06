@@ -1888,7 +1888,7 @@ router.patch('/company/profile', authMiddleware, _companyProfileUpdate);
 router.get('/auth/user-settings', authMiddleware, async (req, res) => {
   try {
     const { rows } = await query(
-      'SELECT language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config FROM users WHERE id=$1',
+      'SELECT language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config, country, timezone, week_start FROM users WHERE id=$1',
       [req.user.userId]
     );
     res.json({ success: true, data: rows[0] || {} });
@@ -1899,7 +1899,7 @@ router.get('/auth/user-settings', authMiddleware, async (req, res) => {
 
 // ─── PATCH /api/auth/user-settings ─────────────────────────────────────────────
 router.patch('/auth/user-settings', authMiddleware, async (req, res) => {
-  const { language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config } = req.body || {};
+  const { language, currency, number_format, date_format, theme, kpi_autoscroll, decimal_places, voucher_config, country, timezone, week_start } = req.body || {};
   try {
     await query(`
       UPDATE users SET
@@ -1910,13 +1910,17 @@ router.patch('/auth/user-settings', authMiddleware, async (req, res) => {
         theme = COALESCE($5, theme),
         kpi_autoscroll = COALESCE($6, kpi_autoscroll),
         decimal_places = COALESCE($7, decimal_places),
-        voucher_config = COALESCE($8, voucher_config)
+        voucher_config = COALESCE($8, voucher_config),
+        country = COALESCE($10, country),
+        timezone = COALESCE($11, timezone),
+        week_start = COALESCE($12, week_start)
       WHERE id = $9
     `, [language ?? null, currency ?? null, number_format ?? null, date_format ?? null, theme ?? null,
         kpi_autoscroll !== undefined ? kpi_autoscroll : null,
         decimal_places !== undefined ? decimal_places : null,
         voucher_config ? JSON.stringify(voucher_config) : null,
-        req.user.userId]);
+        req.user.userId,
+        country ?? null, timezone ?? null, week_start ?? null]);
     res.json({ success: true, message: 'Settings updated' });
   } catch (err) {
     console.error('[user-settings PATCH]', err);
