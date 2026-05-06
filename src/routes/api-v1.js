@@ -1452,7 +1452,14 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
     const { rows } = await query(
       `SELECT name, closing_balance, balance_type FROM ledgers
        WHERE company_guid=$1
-         AND (parent ILIKE '%Bank Account%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%')
+         AND (
+           parent ILIKE '%Bank Accounts%'
+           OR parent ILIKE '%Bank Account%'
+           OR parent ILIKE '%Bank OD%'
+           OR parent ILIKE '%Overdraft%'
+           OR parent ILIKE '%Bank A/c%'
+           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
+         )
        ORDER BY ABS(closing_balance) DESC`,
       [companyGuid]
     );
