@@ -624,9 +624,24 @@ export async function initSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email_change_new TEXT;
 
       -- Language & Region settings (country, timezone, week_start)
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS country    TEXT DEFAULT 'India';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone   TEXT DEFAULT 'UTC+05:30 · Asia/Kolkata';
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS week_start TEXT DEFAULT 'Monday';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS country      TEXT DEFAULT 'India';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone     TEXT DEFAULT 'UTC+05:30 · Asia/Kolkata';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS week_start   TEXT DEFAULT 'Monday';
+
+      -- User settings columns (ensure they exist on fresh installs)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS currency        TEXT DEFAULT 'INR';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS number_format   TEXT DEFAULT 'Indian';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS date_format     TEXT DEFAULT 'DD/MM/YYYY';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS theme           TEXT DEFAULT 'light';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS kpi_autoscroll  BOOLEAN DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS decimal_places  INTEGER DEFAULT 2;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS voucher_config  JSONB;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_settings JSONB;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_settings  JSONB;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS integration_settings JSONB;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_enabled  BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_pin_hash TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS biometric_enabled BOOLEAN DEFAULT FALSE;
 
       -- Push tokens — Expo push notification tokens per user device
       CREATE TABLE IF NOT EXISTS push_tokens (
