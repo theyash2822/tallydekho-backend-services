@@ -73,10 +73,14 @@ router.post('/ledgers', authMiddleware, requirePaired, requireCompanySynced, asy
           WHERE vle.company_guid = l.company_guid AND vle.ledger_name = l.name
             AND (vle.financial_year = $3 OR (vle.financial_year IS NULL AND v.date BETWEEN $4 AND $5))
             AND v.is_cancelled = FALSE
-        ), 0) as fy_movement
+        ), 0) as fy_movement,
+        -- Derive nature from parent group (ledgers.nature is rarely populated directly)
+        COALESCE(l.nature, g.nature) as nature
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
         ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $3
+      LEFT JOIN groups g
+        ON g.company_guid = l.company_guid AND g.name = l.parent
       WHERE l.company_guid = $1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
     `;
     const params = [companyGuid, search, financialYear, fyFrom, fyTo];
