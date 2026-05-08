@@ -453,6 +453,7 @@ export async function initSchema() {
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS device_id TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS synced_at BIGINT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url TEXT;
 
       -- ledgers migrations (columns referenced in routes but missing from schema)
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS mobile TEXT;

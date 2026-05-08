@@ -1912,6 +1912,37 @@ const _companyProfileUpdate = async (req, res) => {
 router.put('/company/profile', authMiddleware, _companyProfileUpdate);
 router.patch('/company/profile', authMiddleware, _companyProfileUpdate);
 
+// ─── POST /api/company/:guid/logo — upload company logo (base64 data URI) ──────
+router.post('/company/:guid/logo', authMiddleware, async (req, res) => {
+  const { guid } = req.params;
+  if (!await verifyCompanyOwnership(req, res, guid)) return;
+  const { logo } = req.body || {}; // expects base64 data URI: data:image/jpeg;base64,...
+  if (!logo) return res.status(400).json({ success: false, error: { code: 'MISSING_LOGO', message: 'logo field required (base64 data URI)' } });
+  // Validate it's a data URI image
+  if (!logo.startsWith('data:image/')) return res.status(400).json({ success: false, error: { code: 'INVALID_FORMAT', message: 'logo must be a base64 data URI (data:image/...)' } });
+  // Rough size check: base64 of 500KB image is ~680KB
+  if (logo.length > 750_000) return res.status(413).json({ success: false, error: { code: 'TOO_LARGE', message: 'Logo too large. Max 500 KB.' } });
+  try {
+    await query('UPDATE companies SET logo_url=$1 WHERE guid=$2', [logo, guid]);
+    res.json({ success: true, data: { logo_url: logo }, message: 'Logo updated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ─── GET /api/company/:guid/logo — fetch company logo ──────────────────────────
+router.get('/company/:guid/logo', authMiddleware, async (req, res) => {
+  const { guid } = req.params;
+  if (!await verifyCompanyOwnership(req, res, guid)) return;
+  try {
+    const { rows } = await query('SELECT logo_url FROM companies WHERE guid=$1 LIMIT 1', [guid]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
+    res.json({ success: true, data: { logo_url: rows[0].logo_url || null } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ─── GET /api/auth/user-settings ──────────────────────────────────────────────
 router.get('/auth/user-settings', authMiddleware, async (req, res) => {
   try {
