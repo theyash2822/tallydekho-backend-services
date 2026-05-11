@@ -582,7 +582,7 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
   const { companyGuid, from, to } = req.body || {};
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    // Use FY-specific balances computed from voucher_ledger_entries
+    // Resolve FY dates
     const fyTo = to || (await (async () => {
       const { rows } = await query('SELECT end_date FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
       return rows[0]?.end_date || `${new Date().getFullYear() + 1}-03-31`;
@@ -592,13 +592,12 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
       return rows[0]?.begin_date || `${new Date().getFullYear()}-04-01`;
     })());
 
-    // V2: Use financial_year column + ledger_fy_balances for accurate FY P&L
-    const fyYear = `${new Date(fyFrom).getFullYear()}-${new Date(fyTo).getFullYear() + (new Date(fyTo).getMonth() < 3 ? 0 : 1)}`;
-    // Compute from fyFrom to handle year boundaries correctly
     const fyYearLabel = (() => {
       const y = parseInt(String(fyFrom).slice(0, 4), 10);
       return `${y}-${y + 1}`;
     })();
+
+    // ── FY-specific ledger balances (anchor + movements) ──────────────────
     const fyBalQuery = `
       SELECT l.name, l.parent, l.balance_type,
         CASE WHEN COALESCE(lfb.balance_type, l.balance_type, 'Dr') = 'Dr'
@@ -618,15 +617,70 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
     `;
     const { rows: allLedgers } = await query(fyBalQuery, [companyGuid, fyYearLabel]);
 
-    const income   = allLedgers.filter(l => l.parent && (l.parent.match(/Income|Revenue|Sales|Direct Income|Indirect Income/i)))
-      .map(l => ({ name: l.name, parent: l.parent, closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)), balance_type: parseFloat(l.fy_closing_signed || 0) <= 0 ? 'Dr' : 'Cr' }));
-    const expenses = allLedgers.filter(l => l.parent && (l.parent.match(/Expense|Purchase|Direct Expense|Indirect Expense/i)))
-      .map(l => ({ name: l.name, parent: l.parent, closing_balance: Math.abs(parseFloat(l.fy_closing_signed || 0)), balance_type: parseFloat(l.fy_closing_signed || 0) <= 0 ? 'Dr' : 'Cr' }));
+    const toAmt  = l => Math.abs(parseFloat(l.fy_closing_signed || 0));
+    const mapLed = l => ({ name: l.name, parent: l.parent, amount: toAmt(l) });
 
-    const totalIncome   = income.reduce((s, l)   => s + parseFloat(l.closing_balance || 0), 0);
-    const totalExpenses = expenses.reduce((s, l) => s + parseFloat(l.closing_balance || 0), 0);
+    // ── P&L group buckets (Tally standard group names) ───────────────────
+    const salesLeds        = allLedgers.filter(l => l.parent && /Sales Accounts/i.test(l.parent));
+    const purchaseLeds     = allLedgers.filter(l => l.parent && /Purchase Accounts/i.test(l.parent));
+    const directExpLeds    = allLedgers.filter(l => l.parent && /Direct Expenses?/i.test(l.parent));
+    const directIncLeds    = allLedgers.filter(l => l.parent && /Direct Incomes?/i.test(l.parent));
+    const indirectExpLeds  = allLedgers.filter(l => l.parent && /Indirect Expenses?/i.test(l.parent));
+    const indirectIncLeds  = allLedgers.filter(l => l.parent && /Indirect Incomes?/i.test(l.parent));
 
-    res.json({ status: true, data: { income, expenses, from: fyFrom, to: fyTo, summary: { totalIncome, totalExpenses, grossProfit: totalIncome - totalExpenses, netProfit: totalIncome - totalExpenses } } });
+    const sales           = salesLeds.reduce((s, l)       => s + toAmt(l), 0);
+    const purchase        = purchaseLeds.reduce((s, l)    => s + toAmt(l), 0);
+    const directExpenses  = directExpLeds.reduce((s, l)   => s + toAmt(l), 0);
+    const directIncome    = directIncLeds.reduce((s, l)   => s + toAmt(l), 0);
+    const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmt(l), 0);
+    const indirectIncome  = indirectIncLeds.reduce((s, l) => s + toAmt(l), 0);
+
+    // ── Stock values from stocks table ────────────────────────────────────
+    const { rows: stockRows } = await query(`
+      SELECT
+        COALESCE(SUM(opening_qty::float * opening_rate::float), 0) AS opening_stock,
+        COALESCE(SUM(CASE WHEN closing_value IS NOT NULL AND closing_value::float > 0
+                         THEN closing_value::float
+                         ELSE closing_qty::float * closing_rate::float END), 0) AS closing_stock
+      FROM stocks WHERE company_guid = $1
+    `, [companyGuid]);
+    const openingStock = parseFloat(stockRows[0]?.opening_stock || 0);
+    const closingStock = parseFloat(stockRows[0]?.closing_stock || 0);
+
+    // ── Gross & Net Profit (Tally P&L formula) ────────────────────────────
+    // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
+    const grossProfit = (sales + directIncome + closingStock) - (purchase + directExpenses + openingStock);
+    // Net Profit = Gross Profit + Indirect Income - Indirect Expenses
+    const netProfit   = grossProfit + indirectIncome - indirectExpenses;
+
+    res.json({
+      status: true,
+      data: {
+        from: fyFrom, to: fyTo, financialYear: fyYearLabel,
+        pl: {
+          openingStock, closingStock,
+          sales, purchase, directExpenses, directIncome, indirectExpenses, indirectIncome,
+          grossProfit, grossLoss: grossProfit < 0 ? Math.abs(grossProfit) : 0,
+          netProfit:   netProfit  > 0 ? netProfit  : 0,
+          netLoss:     netProfit  < 0 ? Math.abs(netProfit) : 0,
+          // Ledger breakdowns for drill-down
+          salesLedgers:       salesLeds.map(mapLed),
+          purchaseLedgers:    purchaseLeds.map(mapLed),
+          directExpLedgers:   directExpLeds.map(mapLed),
+          directIncLedgers:   directIncLeds.map(mapLed),
+          indirectExpLedgers: indirectExpLeds.map(mapLed),
+          indirectIncLedgers: indirectIncLeds.map(mapLed),
+        },
+        // Keep legacy income/expenses arrays for web portal compatibility
+        income:   [...salesLeds, ...directIncLeds, ...indirectIncLeds].map(mapLed),
+        expenses: [...purchaseLeds, ...directExpLeds, ...indirectExpLeds].map(mapLed),
+        summary: {
+          totalIncome:   sales + directIncome + indirectIncome,
+          totalExpenses: purchase + directExpenses + indirectExpenses,
+          grossProfit, netProfit,
+        },
+      },
+    });
   } catch (err) {
     console.error('[pl]', err.message);
     res.status(500).json({ status: false, message: 'Failed' });

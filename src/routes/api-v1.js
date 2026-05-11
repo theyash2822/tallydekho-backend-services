@@ -1317,30 +1317,76 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const toAmount = (l) => Math.abs(parseFloat(l.fy_signed || 0));
     const isDr = (l) => parseFloat(l.fy_signed || 0) < 0;
     const isCr = (l) => parseFloat(l.fy_signed || 0) >= 0;
+    const mapLed = (l) => ({ name: l.name, parent: l.parent, amount: toAmount(l) });
 
-    const income   = allLedgers.filter(l => l.parent && /Income|Revenue|Sales|Direct Income|Indirect Income/i.test(l.parent) && toAmount(l) > 0);
-    const expenses = allLedgers.filter(l => l.parent && /Expense|Purchase|Direct Expense|Indirect Expense/i.test(l.parent) && toAmount(l) > 0);
+    // P&L group buckets (Tally standard group names, including plural variants)
+    const salesLeds       = allLedgers.filter(l => l.parent && /Sales Accounts/i.test(l.parent) && toAmount(l) > 0);
+    const purchaseLeds    = allLedgers.filter(l => l.parent && /Purchase Accounts/i.test(l.parent) && toAmount(l) > 0);
+    const directExpLeds   = allLedgers.filter(l => l.parent && /Direct Expenses?/i.test(l.parent) && toAmount(l) > 0);
+    const directIncLeds   = allLedgers.filter(l => l.parent && /Direct Incomes?/i.test(l.parent) && toAmount(l) > 0);
+    const indirectExpLeds = allLedgers.filter(l => l.parent && /Indirect Expenses?/i.test(l.parent) && toAmount(l) > 0);
+    const indirectIncLeds = allLedgers.filter(l => l.parent && /Indirect Incomes?/i.test(l.parent) && toAmount(l) > 0);
+
+    const sales           = salesLeds.reduce((s, l)       => s + toAmount(l), 0);
+    const purchase        = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
+    const directExpenses  = directExpLeds.reduce((s, l)   => s + toAmount(l), 0);
+    const directIncome    = directIncLeds.reduce((s, l)   => s + toAmount(l), 0);
+    const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmount(l), 0);
+    const indirectIncome  = indirectIncLeds.reduce((s, l) => s + toAmount(l), 0);
+
+    // Stock values from stocks table
+    const { rows: stockRows } = await query(`
+      SELECT
+        COALESCE(SUM(opening_qty::float * opening_rate::float), 0) AS opening_stock,
+        COALESCE(SUM(CASE WHEN closing_value IS NOT NULL AND closing_value::float > 0
+                         THEN closing_value::float
+                         ELSE closing_qty::float * closing_rate::float END), 0) AS closing_stock
+      FROM stocks WHERE company_guid = $1
+    `, [companyGuid]);
+    const openingStock = parseFloat(stockRows[0]?.opening_stock || 0);
+    const closingStock = parseFloat(stockRows[0]?.closing_stock || 0);
+
+    // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
+    const grossProfit = (sales + directIncome + closingStock) - (purchase + directExpenses + openingStock);
+    // Net Profit = Gross Profit + Indirect Income - Indirect Expenses
+    const netProfit   = grossProfit + indirectIncome - indirectExpenses;
+
+    // For Balance Sheet + Trial Balance
+    const income   = allLedgers.filter(l => l.parent && /Income|Revenue|Sales/i.test(l.parent) && toAmount(l) > 0);
+    const expenses = allLedgers.filter(l => l.parent && /Expense|Purchase/i.test(l.parent) && toAmount(l) > 0);
     const assets   = allLedgers.filter(l => isDr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
     const liab     = allLedgers.filter(l => isCr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
-    const tb       = allLedgers.filter(l => toAmount(l) > 0).sort((a, b) => a.parent?.localeCompare(b.parent || '') || a.name.localeCompare(b.name)).slice(0, 100);
-
-    const totalIncome   = income.reduce((s, l)   => s + toAmount(l), 0);
-    const totalExpenses = expenses.reduce((s, l) => s + toAmount(l), 0);
-    const totalAssets   = assets.reduce((s, l)   => s + toAmount(l), 0);
-    const totalLiab     = liab.reduce((s, l)     => s + toAmount(l), 0);
-    const totalDebit    = tb.filter(l => isDr(l)).reduce((s, l) => s + toAmount(l), 0);
-    const totalCredit   = tb.filter(l => isCr(l)).reduce((s, l) => s + toAmount(l), 0);
+    const tb       = allLedgers.filter(l => toAmount(l) > 0).sort((a, b) => (a.parent || '').localeCompare(b.parent || '') || a.name.localeCompare(b.name)).slice(0, 100);
+    const totalAssets = assets.reduce((s, l) => s + toAmount(l), 0);
+    const totalLiab   = liab.reduce((s, l)   => s + toAmount(l), 0);
+    const totalDebit  = tb.filter(l => isDr(l)).reduce((s, l) => s + toAmount(l), 0);
+    const totalCredit = tb.filter(l => isCr(l)).reduce((s, l) => s + toAmount(l), 0);
 
     res.json({ success: true, data: {
       financial_year: financialYear, from: fyFrom, to: fyTo,
       pl: {
-        income:   income.map(l   => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
-        expenses: expenses.map(l => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
-        totalIncome, totalExpenses, netProfit: totalIncome - totalExpenses,
+        // Tally P&L fields — direct from DB (no formulas needed for group totals)
+        openingStock, closingStock,
+        sales, purchase, directExpenses, directIncome, indirectExpenses, indirectIncome,
+        grossProfit, grossLoss: grossProfit < 0 ? Math.abs(grossProfit) : 0,
+        netProfit:   netProfit  > 0 ? netProfit  : 0,
+        netLoss:     netProfit  < 0 ? Math.abs(netProfit) : 0,
+        // Ledger breakdowns
+        salesLedgers:       salesLeds.map(mapLed),
+        purchaseLedgers:    purchaseLeds.map(mapLed),
+        directExpLedgers:   directExpLeds.map(mapLed),
+        directIncLedgers:   directIncLeds.map(mapLed),
+        indirectExpLedgers: indirectExpLeds.map(mapLed),
+        indirectIncLedgers: indirectIncLeds.map(mapLed),
+        // Legacy fields for backward compat
+        income:   [...salesLeds, ...directIncLeds, ...indirectIncLeds].map(mapLed),
+        expenses: [...purchaseLeds, ...directExpLeds, ...indirectExpLeds].map(mapLed),
+        totalIncome:   sales + directIncome + indirectIncome,
+        totalExpenses: purchase + directExpenses + indirectExpenses,
       },
       bs: {
-        assets:       assets.map(l => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
-        liabilities:  liab.map(l  => ({ name: l.name, parent: l.parent, amount: toAmount(l) })),
+        assets:       assets.map(mapLed),
+        liabilities:  liab.map(mapLed),
         totalAssets, totalLiabilities: totalLiab,
       },
       trialBalance: {
