@@ -1158,6 +1158,19 @@ async function processAllVoucher(data, companyGuid) {
       ) sub
       WHERE gvd.voucher_guid=sub.vg AND gvd.company_guid=sub.cg AND gvd.cgst_amount=0
     `, [companyGuid]).catch(e => console.warn('[DB] GST backfill warning:', e.message));
+
+    // Backfill VLE financial_year from parent voucher where NULL (handles legacy + re-sync gaps)
+    await client.query(`
+      UPDATE voucher_ledger_entries vle
+      SET financial_year = v.financial_year
+      FROM vouchers v
+      WHERE vle.voucher_guid = v.guid
+        AND vle.company_guid = v.company_guid
+        AND vle.company_guid = $1
+        AND vle.financial_year IS NULL
+        AND v.financial_year IS NOT NULL
+    `, [companyGuid]).catch(e => console.warn('[DB] VLE FY backfill warning:', e.message));
+
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] AllVoucher failed:', e.message); }
   finally { client.release(); }
 }
