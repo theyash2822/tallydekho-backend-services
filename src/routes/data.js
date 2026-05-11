@@ -621,12 +621,13 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
     const mapLed = l => ({ name: l.name, parent: l.parent, amount: toAmt(l) });
 
     // ── P&L group buckets (Tally standard group names) ───────────────────
-    const salesLeds        = allLedgers.filter(l => l.parent && /Sales Accounts/i.test(l.parent));
-    const purchaseLeds     = allLedgers.filter(l => l.parent && /Purchase Accounts/i.test(l.parent));
-    const directExpLeds    = allLedgers.filter(l => l.parent && /Direct Expenses?/i.test(l.parent));
-    const directIncLeds    = allLedgers.filter(l => l.parent && /Direct Incomes?/i.test(l.parent));
-    const indirectExpLeds  = allLedgers.filter(l => l.parent && /Indirect Expenses?/i.test(l.parent));
-    const indirectIncLeds  = allLedgers.filter(l => l.parent && /Indirect Incomes?/i.test(l.parent));
+    // Use anchored regex — prevents 'Direct' from matching inside 'Indirect'
+    const salesLeds        = allLedgers.filter(l => l.parent && /^Sales Accounts$/i.test(l.parent.trim()));
+    const purchaseLeds     = allLedgers.filter(l => l.parent && /^Purchase Accounts$/i.test(l.parent.trim()));
+    const directExpLeds    = allLedgers.filter(l => l.parent && /^Direct Expenses?$/i.test(l.parent.trim()));
+    const directIncLeds    = allLedgers.filter(l => l.parent && /^Direct Incomes?$/i.test(l.parent.trim()));
+    const indirectExpLeds  = allLedgers.filter(l => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim()));
+    const indirectIncLeds  = allLedgers.filter(l => l.parent && /^Indirect Incomes?$/i.test(l.parent.trim()));
 
     const sales           = salesLeds.reduce((s, l)       => s + toAmt(l), 0);
     const purchase        = purchaseLeds.reduce((s, l)    => s + toAmt(l), 0);

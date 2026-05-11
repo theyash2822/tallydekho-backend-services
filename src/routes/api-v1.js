@@ -1319,13 +1319,13 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const isCr = (l) => parseFloat(l.fy_signed || 0) >= 0;
     const mapLed = (l) => ({ name: l.name, parent: l.parent, amount: toAmount(l) });
 
-    // P&L group buckets (Tally standard group names, including plural variants)
-    const salesLeds       = allLedgers.filter(l => l.parent && /Sales Accounts/i.test(l.parent) && toAmount(l) > 0);
-    const purchaseLeds    = allLedgers.filter(l => l.parent && /Purchase Accounts/i.test(l.parent) && toAmount(l) > 0);
-    const directExpLeds   = allLedgers.filter(l => l.parent && /Direct Expenses?/i.test(l.parent) && toAmount(l) > 0);
-    const directIncLeds   = allLedgers.filter(l => l.parent && /Direct Incomes?/i.test(l.parent) && toAmount(l) > 0);
-    const indirectExpLeds = allLedgers.filter(l => l.parent && /Indirect Expenses?/i.test(l.parent) && toAmount(l) > 0);
-    const indirectIncLeds = allLedgers.filter(l => l.parent && /Indirect Incomes?/i.test(l.parent) && toAmount(l) > 0);
+    // P&L group buckets — use anchored regex to avoid 'Direct' matching inside 'Indirect'
+    const salesLeds       = allLedgers.filter(l => l.parent && /^Sales Accounts$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    const purchaseLeds    = allLedgers.filter(l => l.parent && /^Purchase Accounts$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    const directExpLeds   = allLedgers.filter(l => l.parent && /^Direct Expenses?$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    const directIncLeds   = allLedgers.filter(l => l.parent && /^Direct Incomes?$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    const indirectExpLeds = allLedgers.filter(l => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    const indirectIncLeds = allLedgers.filter(l => l.parent && /^Indirect Incomes?$/i.test(l.parent.trim()) && toAmount(l) > 0);
 
     const sales           = salesLeds.reduce((s, l)       => s + toAmount(l), 0);
     const purchase        = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
