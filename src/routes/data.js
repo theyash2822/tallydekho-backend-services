@@ -636,17 +636,20 @@ router.post('/reports/pl', authMiddleware, async (req, res) => {
     const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmt(l), 0);
     const indirectIncome  = indirectIncLeds.reduce((s, l) => s + toAmt(l), 0);
 
-    // ── Stock values from stocks table ────────────────────────────────────
-    const { rows: stockRows } = await query(`
-      SELECT
-        COALESCE(SUM(opening_qty::float * opening_rate::float), 0) AS opening_stock,
-        COALESCE(SUM(CASE WHEN closing_value IS NOT NULL AND closing_value::float > 0
-                         THEN closing_value::float
-                         ELSE closing_qty::float * closing_rate::float END), 0) AS closing_stock
-      FROM stocks WHERE company_guid = $1
-    `, [companyGuid]);
-    const openingStock = parseFloat(stockRows[0]?.opening_stock || 0);
-    const closingStock = parseFloat(stockRows[0]?.closing_stock || 0);
+    // ── Stock values — only use if FY-specific stock transaction data exists ───
+    const { rows: stxRows } = await query(`
+      SELECT COUNT(*) as txn_count,
+        COALESCE(SUM(CASE WHEN type='inward' THEN qty::float*rate::float ELSE 0 END),0) as inward_val,
+        COALESCE(SUM(CASE WHEN type='outward' THEN qty::float*rate::float ELSE 0 END),0) as outward_val
+      FROM stock_transactions WHERE company_guid = $1 AND financial_year = $2
+    `, [companyGuid, fyYearLabel]);
+    const hasFYStockData = parseInt(stxRows[0]?.txn_count || 0) > 0;
+    let openingStock = 0, closingStock = 0;
+    if (hasFYStockData) {
+      const { rows: ms } = await query('SELECT COALESCE(SUM(opening_qty::float*opening_rate::float),0) AS os FROM stocks WHERE company_guid=$1', [companyGuid]);
+      openingStock = parseFloat(ms[0]?.os || 0);
+      closingStock = openingStock + parseFloat(stxRows[0]?.inward_val||0) - parseFloat(stxRows[0]?.outward_val||0);
+    }
 
     // ── Gross & Net Profit (Tally P&L formula) ────────────────────────────
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
