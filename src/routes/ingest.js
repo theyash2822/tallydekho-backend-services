@@ -336,6 +336,26 @@ router.post('/ingest/complete', async (req, res) => {
       }
     }
 
+    // Backfill VLE financial_year from parent voucher (runs after every sync)
+    // Fixes cases where _FINANCIAL_YEAR was null during ingest
+    if (companyGuid) {
+      try {
+        const { rowCount } = await query(`
+          UPDATE voucher_ledger_entries vle
+          SET financial_year = v.financial_year
+          FROM vouchers v
+          WHERE vle.voucher_guid = v.guid
+            AND vle.company_guid = v.company_guid
+            AND vle.company_guid = $1
+            AND vle.financial_year IS NULL
+            AND v.financial_year IS NOT NULL
+        `, [companyGuid]);
+        if (rowCount > 0) console.log(`[INGEST] ✅ Backfilled financial_year for ${rowCount} VLE rows`);
+      } catch (fyErr) {
+        console.warn('[INGEST] VLE FY backfill failed (non-fatal):', fyErr.message);
+      }
+    }
+
     // V2 Monitoring: compute record counts from DB for validation
     let recordCounts = {};
     if (companyGuid) {
