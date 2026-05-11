@@ -1075,6 +1075,9 @@ async function processAllVoucher(data, companyGuid) {
       if (voucherVal) {
         try { r = typeof voucherVal === 'string' ? JSON.parse(voucherVal) : voucherVal; }
         catch { r = raw; }
+        // _FINANCIAL_YEAR is on the outer raw record (added by syncHelperWithDate),
+        // not inside the inner VOUCHER JSON — propagate it to r so it's not lost
+        if (!r._FINANCIAL_YEAR && raw._FINANCIAL_YEAR) r._FINANCIAL_YEAR = raw._FINANCIAL_YEAR;
       } else {
         r = raw;
       }
