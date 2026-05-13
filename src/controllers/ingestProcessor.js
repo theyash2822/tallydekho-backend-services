@@ -407,6 +407,16 @@ async function processStockTransactions(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
 
+    // Clear existing entries for all vouchers in this batch (idempotent re-sync)
+    // Prevents duplicate rows from batch allocations / multiple sync runs
+    const uniqueVoucherGuids = [...new Set(data.map(r => r.GUID || r.Guid).filter(Boolean))];
+    if (uniqueVoucherGuids.length > 0) {
+      await client.query(
+        `DELETE FROM stock_transactions WHERE company_guid=$1 AND voucher_guid = ANY($2::text[])`,
+        [companyGuid, uniqueVoucherGuids]
+      );
+    }
+
     for (const r of data) {
       // StockTransaction.xml: Tally sends ALL keys uppercase
       const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
@@ -416,28 +426,35 @@ async function processStockTransactions(data, companyGuid) {
       const qty    = isNaN(rawQty) ? 0 : rawQty;
       const rawAmt = parseFloat(r.AMOUNT ?? r.Amount ?? r.value ?? 0);
       const amount = isNaN(rawAmt) ? 0 : rawAmt;
+      const rate   = parseTallyRate(r.RATE || r.Rate || '0');
+      // Value = Tally's computed amount. If 0 or missing, fallback to qty * rate
+      // This ensures the formula Opening = Closing - NET(value) works correctly
+      const value  = Math.abs(amount) > 0 ? Math.abs(amount) : Math.abs(qty) * rate;
       // Determine direction: negative qty = outward (sales/issue), positive = inward (purchase/receipt)
       // Also check VOUCHERTYPENAME for explicit direction
       const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
       const isOutward = qty < 0 || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery');
       const type = isOutward ? 'outward' : 'inward';
+      // Normalize warehouse — treat empty string same as NULL to avoid duplicate key issues
+      const warehouse = r.GODOWNNAME || r.GodownName || null;
 
       try {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO NOTHING
+          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO UPDATE SET
+            qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
         `, [
-          stockName,  // stock_guid stores name (join key to stocks.name)
+          stockName,
           companyGuid,
           r.GUID || r.Guid || null,
           r.VOUCHERTYPENAME || r.VoucherTypeName || null,
           normalizeDate(r.DATE || r.Date || r.date),
           Math.abs(qty),
-          parseTallyRate(r.RATE || r.Rate || '0'),
-          Math.abs(amount),
+          rate,
+          value,
           type,
-          r.GODOWNNAME || r.GodownName || null,
+          warehouse,
           now(),
         ]);
         saved++;

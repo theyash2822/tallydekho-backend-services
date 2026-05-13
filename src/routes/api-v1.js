@@ -1399,11 +1399,29 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         closingStock = latestClosing;
       }
     } else {
-      // Historical FY: Tally's opening_value from latest sync = start of CURRENT FY = end of LAST FY
-      // So: latestOpening = closing stock of the previous FY
-      // Opening stock of historical FY is not available → 0
-      openingStock = 0;
-      closingStock = latestOpening; // = stock at start of current FY = closing of previous FY
+      // Historical FY: compute opening from closing using stock transaction formula
+      // Opening(FY N) = Closing(FY N) − NET(inward − outward value during FY N)
+      // Closing(FY N) = latestOpening (= stock at start of CURRENT FY = end of previous FY)
+      const fyClosing = latestOpening;
+      const { rows: stxFYRows } = await query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN type='inward'  THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS inward_val,
+          COALESCE(SUM(CASE WHEN type='outward' THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS outward_val
+        FROM (
+          -- Deduplicate: take one row per (stock, voucher, warehouse, type)
+          SELECT DISTINCT ON (stock_guid, voucher_guid, COALESCE(warehouse,''), type)
+            stock_guid, voucher_guid, warehouse, type, qty, rate, value
+          FROM stock_transactions
+          WHERE company_guid = $1 AND date >= $2 AND date <= $3
+          ORDER BY stock_guid, voucher_guid, COALESCE(warehouse,''), type, synced_at DESC
+        ) AS deduped
+      `, [companyGuid, fyFrom, fyTo]);
+      const inwardVal  = parseFloat(stxFYRows[0]?.inward_val  || 0);
+      const outwardVal = parseFloat(stxFYRows[0]?.outward_val || 0);
+      const netMovement = inwardVal - outwardVal; // positive = net increase in stock
+      closingStock = fyClosing;
+      openingStock = fyClosing - netMovement; // reverse: opening = closing - net increase
+      if (openingStock < 0) openingStock = 0; // safety floor
     }
 
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
