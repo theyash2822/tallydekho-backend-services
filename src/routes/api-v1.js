@@ -510,13 +510,18 @@ router.get('/company/years', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyGuid]);
+    const { rows } = await query('SELECT fin_year, begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyGuid]);
     const fys = rows.map(r => {
       const start = new Date(r.begin_date);
       const end   = new Date(r.end_date);
       const sy = start.getFullYear();
       const ey = end.getFullYear();
-      return { begin_date: r.begin_date, end_date: r.end_date, label: `FY ${sy}-${String(ey).slice(2)}` };
+      return {
+        fin_year:   r.fin_year,                          // e.g. '2025-2026' — for API fy= param
+        begin_date: r.begin_date,
+        end_date:   r.end_date,
+        label:      `FY ${sy}-${String(ey).slice(2)}`,  // e.g. 'FY 2025-26' — for display
+      };
     });
     res.json({ success: true, data: fys });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
