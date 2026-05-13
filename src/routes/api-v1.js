@@ -1437,7 +1437,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         // Tally P&L fields — direct from DB (no formulas needed for group totals)
         openingStock, closingStock,
         sales, purchase, directExpenses, directIncome, indirectExpenses, indirectIncome,
-        grossProfit, grossLoss: grossProfit < 0 ? Math.abs(grossProfit) : 0,
+        grossProfit:  grossProfit > 0 ? grossProfit : 0,  // 0 when loss (use grossLoss instead)
+        grossLoss:    grossProfit < 0 ? Math.abs(grossProfit) : 0,
         netProfit:   netProfit  > 0 ? netProfit  : 0,
         netLoss:     netProfit  < 0 ? Math.abs(netProfit) : 0,
         // Ledger breakdowns
