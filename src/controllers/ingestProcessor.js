@@ -1031,19 +1031,27 @@ async function processStockFyBalance(data, companyGuid) {
 async function processStockFyValuation(data, companyGuid) {
   if (!data || data.length === 0) return;
 
-  const financialYear = data[0]?._FINANCIAL_YEAR;
-  if (!financialYear) {
+  const now = Math.floor(Date.now() / 1000);
+  const client = await getClient();
+  // Group by financial_year so each FY is handled correctly
+  // (multiple FYs may arrive in one batch when several years are synced together)
+  const fyGroups = {};
+  for (const r of data) {
+    const fy = r._FINANCIAL_YEAR;
+    if (!fy) continue;
+    if (!fyGroups[fy]) fyGroups[fy] = [];
+    fyGroups[fy].push(r);
+  }
+  if (Object.keys(fyGroups).length === 0) {
     console.warn('[DB] StockFyValuation: no financial_year on records — skipping');
     return;
   }
-
-  const now = Math.floor(Date.now() / 1000);
-  const client = await getClient();
   try {
     await client.query('BEGIN');
     let saved = 0;
 
-    for (const r of data) {
+    for (const [financialYear, records] of Object.entries(fyGroups)) {
+    for (const r of records) {
       const name = r.Name || r.NAME || '';
       if (!name) continue;
 
@@ -1081,9 +1089,11 @@ async function processStockFyValuation(data, companyGuid) {
         console.warn('[DB] StockFyValuation upsert failed:', e.message, name);
       }
     }
+    } // end for fyGroups
 
     await client.query('COMMIT');
-    console.log(`[DB] StockFyValuation: saved ${saved}/${data.length} for ${companyGuid} FY ${financialYear}`);
+    const fyList = Object.keys(fyGroups).join(', ');
+    console.log(`[DB] StockFyValuation: saved ${saved}/${data.length} for ${companyGuid} FYs: ${fyList}`);
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockFyValuation failed:', e.message);
