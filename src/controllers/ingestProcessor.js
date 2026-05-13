@@ -604,30 +604,39 @@ async function processFullLedger(data, companyGuid) {
 
 // Parse AllLedgerEntries from a voucher record — handles JSON string or array
 function parseLedgerEntries(r) {
-  const raw = r.ALLLEDGERENTRIES ?? r.AllLedgerEntries ?? r.AllLedgerentries ?? r.Allledgerentries ?? [];
-  let entries = raw;
-  // normalizeEnvelope coerces nested objects to JSON strings — parse if needed
-  if (typeof entries === 'string') {
-    try { entries = JSON.parse(entries); } catch { return []; }
-  }
-  if (!Array.isArray(entries)) {
-    // Single entry wrapped in object
-    if (entries && typeof entries === 'object') entries = [entries];
-    else return [];
-  }
-  return entries
-    .map((e, i) => {
-      const name = e.LEDGERNAME || e.Ledgername || e.LedgerName || e.ledgername || null;
-      const guid = e.LEDGERGUID || e.LedgerGuid || e.ledgerGuid || null;
-      // Amount sign from Tally: negative=Dr, positive=Cr (from company perspective)
-      const rawAmt = e.AMOUNT ?? e.Amount ?? e.amount;
-      const amount = typeof rawAmt === 'string'
-        ? parseFloat(String(rawAmt).replace('(-)', '-').replace(/[^0-9.-]/g, ''))
-        : parseFloat(rawAmt || 0);
-      if (!name || isNaN(amount)) return null;
-      return { name, guid, amount, drCr: amount < 0 ? 'Dr' : 'Cr', index: i };
-    })
-    .filter(Boolean);
+  // Parse both AllLedgerEntries AND LedgerEntries — merge and deduplicate
+  // AllLedgerEntries = main P&L entries; LedgerEntries = sub-entries some Tally versions use
+  const parseList = (raw) => {
+    let entries = raw;
+    if (typeof entries === 'string') {
+      try { entries = JSON.parse(entries); } catch { return []; }
+    }
+    if (!Array.isArray(entries)) {
+      if (entries && typeof entries === 'object') entries = [entries];
+      else return [];
+    }
+    return entries
+      .map((e, i) => {
+        const name = e.LEDGERNAME || e.Ledgername || e.LedgerName || e.ledgername || null;
+        const guid = e.LEDGERGUID || e.LedgerGuid || e.ledgerGuid || null;
+        const rawAmt = e.AMOUNT ?? e.Amount ?? e.amount;
+        const amount = typeof rawAmt === 'string'
+          ? parseFloat(String(rawAmt).replace('(-)', '-').replace(/[^0-9.-]/g, ''))
+          : parseFloat(rawAmt || 0);
+        if (!name || isNaN(amount)) return null;
+        return { name, guid, amount, drCr: amount < 0 ? 'Dr' : 'Cr', index: i };
+      })
+      .filter(Boolean);
+  };
+
+  const allEntries = parseList(r.ALLLEDGERENTRIES ?? r.AllLedgerEntries ?? r.AllLedgerentries ?? r.Allledgerentries ?? []);
+  const ledgerEntries = parseList(r.LEDGERENTRIES ?? r.LedgerEntries ?? r.Ledgerentries ?? []);
+
+  // Merge: add ledgerEntries items that aren't already in allEntries (by ledger name)
+  const seen = new Set(allEntries.map(e => e.name));
+  const extra = ledgerEntries.filter(e => !seen.has(e.name));
+
+  return [...allEntries, ...extra.map((e, i) => ({ ...e, index: allEntries.length + i }))];
 }
 
 // Save AllLedgerEntries for a voucher to voucher_ledger_entries table
