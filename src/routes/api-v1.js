@@ -55,13 +55,21 @@ async function verifyCompanyOwnership(req, res, companyGuid) {
 // V2: also returns financialYear label (e.g. "2025-2026") for direct DB queries
 export async function resolveFYDates(companyGuid, from, to, fyParam) {
   // If explicit financialYear label passed (e.g. "2025-2026"), look up its dates
+  // If BOTH fy + from/to are passed: use custom date range but keep FY label for stock/ledger lookups
   if (fyParam) {
     try {
       const { rows } = await query(
         'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND fin_year=$2 LIMIT 1',
         [companyGuid, fyParam]
       );
-      if (rows[0]) return { from: rows[0].begin_date, to: rows[0].end_date, financialYear: rows[0].fin_year };
+      if (rows[0]) {
+        // Use custom from/to if provided (date picker selection), otherwise use full FY range
+        return {
+          from: from || rows[0].begin_date,
+          to:   to   || rows[0].end_date,
+          financialYear: rows[0].fin_year
+        };
+      }
     } catch {}
   }
   if (from && to) {
