@@ -1401,8 +1401,25 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     } else {
       // Historical FY: compute opening from closing using stock transaction formula
       // Opening(FY N) = Closing(FY N) − NET(inward − outward value during FY N)
-      // Closing(FY N) = latestOpening (= stock at start of CURRENT FY = end of previous FY)
-      const fyClosing = latestOpening;
+      // Closing(FY N) = latestOpening − NET(all FY movements between FY N end and current FY start)
+      // This chains correctly backwards for multiple historical FYs
+      const currentFYStart = actualCurrentFY.split('-')[0] + '-04-01';
+      const { rows: intermRows } = await query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN type='inward'  THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS inward_val,
+          COALESCE(SUM(CASE WHEN type='outward' THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS outward_val
+        FROM (
+          SELECT DISTINCT ON (stock_guid, voucher_guid, COALESCE(warehouse,''), type)
+            stock_guid, voucher_guid, warehouse, type, qty, rate, value
+          FROM stock_transactions
+          WHERE company_guid = $1 AND date > $2 AND date < $3
+          ORDER BY stock_guid, voucher_guid, COALESCE(warehouse,''), type, synced_at DESC
+        ) AS deduped
+      `, [companyGuid, fyTo, currentFYStart]);
+      const intermInward  = parseFloat(intermRows[0]?.inward_val  || 0);
+      const intermOutward = parseFloat(intermRows[0]?.outward_val || 0);
+      const intermNet = intermInward - intermOutward; // net increase in INTERMEDIATE FYs
+      const fyClosing = latestOpening - intermNet; // correct closing for this historical FY
       const { rows: stxFYRows } = await query(`
         SELECT
           COALESCE(SUM(CASE WHEN type='inward'  THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS inward_val,
