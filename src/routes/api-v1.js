@@ -1463,13 +1463,91 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     // For Balance Sheet + Trial Balance
     const income   = allLedgers.filter(l => l.parent && /Income|Revenue|Sales/i.test(l.parent) && toAmount(l) > 0);
     const expenses = allLedgers.filter(l => l.parent && /Expense|Purchase/i.test(l.parent) && toAmount(l) > 0);
-    const assets   = allLedgers.filter(l => isDr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
-    const liab     = allLedgers.filter(l => isCr(l) && toAmount(l) > 0).sort((a, b) => toAmount(b) - toAmount(a)).slice(0, 20);
+    // ── BALANCE SHEET — Group-level totals matching Tally BS display ──
+    // P&L groups (income/expense) are excluded — only Balance Sheet groups shown
+    // P&L groups excluded from Balance Sheet (their net flows into P&L A/c)
+    const PL_GROUPS = new Set([
+      'Sales Accounts','Purchase Accounts','Direct Expenses','Direct Incomes',
+      'Indirect Expenses','Indirect Incomes',
+      // 'Stock-in-Hand' is NOT excluded — stock IS a balance sheet item (Current Assets)
+    ]);
+    // Build group parent map from DB
+    const { rows: groupRows } = await query(
+      `SELECT name, parent FROM groups WHERE company_guid=$1`, [companyGuid]
+    );
+    const grpParentMap = {}; // name → parent
+    for (const g of groupRows) grpParentMap[g.name] = g.parent || null;
+
+    // Find top-level BS group for a given group name (traverse up 4 levels max)
+    function topBSGroup(grp) {
+      if (!grp || PL_GROUPS.has(grp)) return null;
+      let cur = grp.trim();
+      for (let i = 0; i < 4; i++) {
+        const par = (grpParentMap[cur] || grpParentMap[' ' + cur] || '').trim();
+        if (!par) {
+          // Reached root — 'Primary' is Tally's internal root, maps to Profit & Loss A/c
+          return cur === 'Primary' ? 'Profit & Loss A/c' : cur;
+        }
+        if (PL_GROUPS.has(par)) return null;
+        if (par === 'Primary') return 'Profit & Loss A/c'; // P&L A/c subtree
+        cur = par;
+      }
+      return cur;
+    }
+
+    // Aggregate ledger fy_signed by top-level BS group
+    const bsGroupTotals = {};
+    for (const l of allLedgers) {
+      const topGrp = topBSGroup(l.parent);
+      if (!topGrp) continue; // skip P&L ledgers
+      if (!bsGroupTotals[topGrp]) bsGroupTotals[topGrp] = 0;
+      bsGroupTotals[topGrp] += parseFloat(l.fy_signed || 0);
+    }
+    // Add Stock-in-Hand (closing stock) to Current Assets in BS
+    // Stock is a BS item but doesn't have ledger entries in our system — comes from stock_fy_valuation
+    if (closingStock > 0) {
+      bsGroupTotals['Current Assets'] = (bsGroupTotals['Current Assets'] || 0) - closingStock; // Dr = Asset (negative signed)
+    }
+
+    // Adjust Profit & Loss A/c to include current year net profit/loss
+    // The P&L A/c ledger's fy_signed = opening balance only (no closing entries in our system)
+    // Raw net profit/loss for this FY:
+    const rawNetPL = (sales - purchase + directIncome - directExpenses + indirectIncome - indirectExpenses
+                     + closingStock - openingStock); // positive = profit, negative = loss
+    if (bsGroupTotals['Profit & Loss A/c'] !== undefined) {
+      // Add current year P&L to the opening balance to get BS balance
+      bsGroupTotals['Profit & Loss A/c'] += rawNetPL; // Cr balance increases with profit, decreases with loss
+    }
+
+    // Cr groups → Liabilities (Capital & Liabilities side)
+    // Dr groups → Assets side
+    const bsLiabilities = Object.entries(bsGroupTotals)
+      .filter(([, v]) => v > 0.01)
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount);
+    const bsAssets = Object.entries(bsGroupTotals)
+      .filter(([, v]) => v < -0.01)
+      .map(([name, amount]) => ({ name, amount: Math.abs(amount) }))
+      .sort((a, b) => b.amount - a.amount);
+    let totalLiab   = bsLiabilities.reduce((s, g) => s + g.amount, 0);
+    let totalAssets = bsAssets.reduce((s, g) => s + g.amount, 0);
+    // Add balancing figure (Tally's 'Difference in Opening Balances') if BS doesn't balance
+    const bsDiff = totalLiab - totalAssets;
+    if (bsDiff > 0.01) {
+      bsAssets.push({ name: 'Difference in Opening Balances', amount: bsDiff });
+      totalAssets += bsDiff;
+    } else if (bsDiff < -0.01) {
+      bsLiabilities.push({ name: 'Difference in Opening Balances', amount: Math.abs(bsDiff) });
+      totalLiab += Math.abs(bsDiff);
+    }
+
+    // Trial Balance — individual ledgers
     const tb       = allLedgers.filter(l => toAmount(l) > 0).sort((a, b) => (a.parent || '').localeCompare(b.parent || '') || a.name.localeCompare(b.name)).slice(0, 100);
-    const totalAssets = assets.reduce((s, l) => s + toAmount(l), 0);
-    const totalLiab   = liab.reduce((s, l)   => s + toAmount(l), 0);
     const totalDebit  = tb.filter(l => isDr(l)).reduce((s, l) => s + toAmount(l), 0);
     const totalCredit = tb.filter(l => isCr(l)).reduce((s, l) => s + toAmount(l), 0);
+    // Legacy (not used in BS anymore)
+    const assets = bsAssets;
+    const liab   = bsLiabilities;
 
     res.json({ success: true, data: {
       financial_year: financialYear, from: fyFrom, to: fyTo,
@@ -1495,8 +1573,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         totalExpenses: purchase + directExpenses + indirectExpenses,
       },
       bs: {
-        assets:       assets.map(mapLed),
-        liabilities:  liab.map(mapLed),
+        assets:       bsAssets,       // group-level totals
+        liabilities:  bsLiabilities,  // group-level totals
         totalAssets, totalLiabilities: totalLiab,
       },
       trialBalance: {
