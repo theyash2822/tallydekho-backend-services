@@ -134,7 +134,9 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       } else if (xml === 'StockValuation.xml') {
         await processStockFyValuation(records, companyGuid);
       } else if (xml === 'StockFYBalance.xml') {
-        await processStockFyBalance(records, companyGuid);
+        // DISABLED: $ClosingValue returns wrong values for historical dates in Tally TDL
+        // Keep handler registered but skip processing until proper TDL solution found
+        console.log('[DB] StockFYBalance: skipping (historical date query returns wrong values from Tally)');
       } else if (xml === 'LedgerOpeningBalance.xml') {
         await processLedgerFyBalances(records, companyGuid);
       } else if (xml === 'StockCategory.xml') {
@@ -1206,7 +1208,7 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'StockValuation.xml') {
       await processStockFyValuation(records, companyGuid);
     } else if (xml === 'StockFYBalance.xml') {
-      await processStockFyBalance(records, companyGuid);
+      console.log('[DB] StockFYBalance: skipping (historical date query returns wrong values from Tally)');
     } else if (xml === 'VoucherInventoryDetail.xml') {
       await processVoucherInventoryItems(records, companyGuid);
       const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
