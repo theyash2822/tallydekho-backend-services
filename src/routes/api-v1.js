@@ -1496,12 +1496,42 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     }
 
     // Aggregate ledger fy_signed by top-level BS group
-    const bsGroupTotals = {};
+    // bsGroupTotals = current period balance (anchor + movements)
+    const bsGroupTotals   = {}; // { groupName: current_signed }
+    // bsGroupOpenings = opening balance only (from anchor, no movements)
+    const bsGroupOpenings = {}; // { groupName: opening_signed }
     for (const l of allLedgers) {
       const topGrp = topBSGroup(l.parent);
       if (!topGrp) continue; // skip P&L ledgers
-      if (!bsGroupTotals[topGrp]) bsGroupTotals[topGrp] = 0;
-      bsGroupTotals[topGrp] += parseFloat(l.fy_signed || 0);
+      if (!bsGroupTotals[topGrp])   bsGroupTotals[topGrp]   = 0;
+      if (!bsGroupOpenings[topGrp]) bsGroupOpenings[topGrp] = 0;
+      bsGroupTotals[topGrp]   += parseFloat(l.fy_signed || 0);
+      // Opening = just the anchor (from ledger_fy_balances), no movements
+      const anchor = parseFloat(l.fy_signed || 0) - 0; // fy_signed already includes anchor+movements
+      // Recompute opening from anchor: anchor is the ledger opening at FY start
+      const openingBal = l.fy_signed !== undefined
+        ? (parseFloat(l.fy_signed) - 0) // we can't easily separate anchor here, use next approach
+        : 0;
+      bsGroupOpenings[topGrp] += 0; // will compute separately below
+    }
+    // Compute group openings from allLedgers using raw opening balance fields
+    // The `anchor` portion of fy_signed = CASE ... END portion (without VLE sum)
+    // We re-query the opening anchors:
+    const { rows: openingRows } = await query(`
+      SELECT l.name, l.parent, l.balance_type, l.opening_balance as direct_ob,
+             COALESCE(lfb.opening_balance, l.opening_balance, 0)::numeric as ob,
+             COALESCE(lfb.balance_type, l.balance_type, 'Dr') as ob_type
+      FROM ledgers l
+      LEFT JOIN ledger_fy_balances lfb
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
+      WHERE l.company_guid = $1
+    `, [companyGuid, financialYear]);
+    for (const row of openingRows) {
+      const topGrp = topBSGroup(row.parent);
+      if (!topGrp) continue;
+      if (!bsGroupOpenings[topGrp]) bsGroupOpenings[topGrp] = 0;
+      const signed = row.ob_type === 'Dr' ? -Math.abs(parseFloat(row.ob)) : Math.abs(parseFloat(row.ob));
+      bsGroupOpenings[topGrp] += signed;
     }
     // Add Stock-in-Hand (closing stock) to Current Assets in BS
     // Stock is a BS item but doesn't have ledger entries in our system — comes from stock_fy_valuation
@@ -1523,11 +1553,19 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     // Dr groups → Assets side
     const bsLiabilities = Object.entries(bsGroupTotals)
       .filter(([, v]) => v > 0.01)
-      .map(([name, amount]) => ({ name, amount }))
+      .map(([name, amount]) => ({
+        name,
+        amount,                                   // current period balance
+        opening: Math.abs(bsGroupOpenings[name] || 0),  // opening balance at FY start
+      }))
       .sort((a, b) => b.amount - a.amount);
     const bsAssets = Object.entries(bsGroupTotals)
       .filter(([, v]) => v < -0.01)
-      .map(([name, amount]) => ({ name, amount: Math.abs(amount) }))
+      .map(([name, amount]) => ({
+        name,
+        amount: Math.abs(amount),                 // current period balance
+        opening: Math.abs(bsGroupOpenings[name] || 0), // opening balance at FY start
+      }))
       .sort((a, b) => b.amount - a.amount);
     let totalLiab   = bsLiabilities.reduce((s, g) => s + g.amount, 0);
     let totalAssets = bsAssets.reduce((s, g) => s + g.amount, 0);
