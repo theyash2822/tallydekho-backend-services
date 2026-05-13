@@ -1355,8 +1355,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     // This gives EXACT Tally opening/closing stock values using Tally's own costing method
     // Fallback chain:
     //   1. Use current FY valuation if available
-    //   2. If not, use PREVIOUS FY closing as current FY opening (correct accounting: prev closing = curr opening)
-    //   3. If neither, use 0
+    //   2. If not, use 0
+    // Per-FY stock valuation — StockValuation.xml stores separate rows per FY
     const { rows: fyValRows } = await query(`
       SELECT
         ABS(COALESCE(SUM(opening_value::float), 0)) AS opening_stock,
@@ -1369,77 +1369,19 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     let openingStock = 0;
     let closingStock = 0;
 
-    // Get latest synced stock valuation (Tally always returns CURRENT FY stock regardless of date range)
-    // So: opening_value = stock at start of CURRENT FY = closing of PREVIOUS FY
-    //     closing_value = stock as of sync date
-    const { rows: latestValRows } = await query(`
-      SELECT
-        ABS(COALESCE(SUM(opening_value::float), 0)) AS latest_opening,
-        ABS(COALESCE(SUM(closing_value::float), 0)) AS latest_closing,
-        MAX(financial_year) AS synced_fy
-      FROM stock_fy_valuation
-      WHERE company_guid = $1
-        AND synced_at = (SELECT MAX(synced_at) FROM stock_fy_valuation WHERE company_guid = $1)
-    `, [companyGuid]);
-    const latestOpening = parseFloat(latestValRows[0]?.latest_opening || 0);
-    const latestClosing = parseFloat(latestValRows[0]?.latest_closing || 0);
-    const syncedFY = latestValRows[0]?.synced_fy;
-
-    // Determine the ACTUAL current FY by today's date (April = new FY start in India)
-    const now = new Date();
-    const curYear = now.getFullYear();
-    const curMonth = now.getMonth() + 1;
-    const actualCurrentFY = curMonth >= 4 ? `${curYear}-${curYear+1}` : `${curYear-1}-${curYear}`;
-    const isCurrentFY = (financialYear === actualCurrentFY);
-
-    if (isCurrentFY) {
-      // Current FY: Tally's opening_value = stock at FY start, closing_value = stock today ✓
-      if (latestOpening > 0 || latestClosing > 0) {
-        openingStock = latestOpening;
-        closingStock = latestClosing;
-      }
+    if (hasFyValData) {
+      // ✓ Direct Tally values per FY — exact from StockValuation.xml
+      openingStock = parseFloat(fyValRows[0]?.opening_stock || 0);
+      closingStock = parseFloat(fyValRows[0]?.closing_stock || 0);
     } else {
-      // Historical FY: compute opening from closing using stock transaction formula
-      // Opening(FY N) = Closing(FY N) − NET(inward − outward value during FY N)
-      // Closing(FY N) = latestOpening − NET(all FY movements between FY N end and current FY start)
-      // This chains correctly backwards for multiple historical FYs
-      const currentFYStart = actualCurrentFY.split('-')[0] + '-04-01';
-      const { rows: intermRows } = await query(`
-        SELECT
-          COALESCE(SUM(CASE WHEN type='inward'  THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS inward_val,
-          COALESCE(SUM(CASE WHEN type='outward' THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS outward_val
-        FROM (
-          SELECT DISTINCT ON (stock_guid, voucher_guid, COALESCE(warehouse,''), type)
-            stock_guid, voucher_guid, warehouse, type, qty, rate, value
-          FROM stock_transactions
-          WHERE company_guid = $1 AND date > $2 AND date < $3
-          ORDER BY stock_guid, voucher_guid, COALESCE(warehouse,''), type, synced_at DESC
-        ) AS deduped
-      `, [companyGuid, fyTo, currentFYStart]);
-      const intermInward  = parseFloat(intermRows[0]?.inward_val  || 0);
-      const intermOutward = parseFloat(intermRows[0]?.outward_val || 0);
-      const intermNet = intermInward - intermOutward; // net increase in INTERMEDIATE FYs
-      const fyClosing = latestOpening - intermNet; // correct closing for this historical FY
-      const { rows: stxFYRows } = await query(`
-        SELECT
-          COALESCE(SUM(CASE WHEN type='inward'  THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS inward_val,
-          COALESCE(SUM(CASE WHEN type='outward' THEN COALESCE(NULLIF(value::float,0), qty::float * rate::float) ELSE 0 END), 0) AS outward_val
-        FROM (
-          -- Deduplicate: take one row per (stock, voucher, warehouse, type)
-          SELECT DISTINCT ON (stock_guid, voucher_guid, COALESCE(warehouse,''), type)
-            stock_guid, voucher_guid, warehouse, type, qty, rate, value
-          FROM stock_transactions
-          WHERE company_guid = $1 AND date >= $2 AND date <= $3
-          ORDER BY stock_guid, voucher_guid, COALESCE(warehouse,''), type, synced_at DESC
-        ) AS deduped
-      `, [companyGuid, fyFrom, fyTo]);
-      const inwardVal  = parseFloat(stxFYRows[0]?.inward_val  || 0);
-      const outwardVal = parseFloat(stxFYRows[0]?.outward_val || 0);
-      const netMovement = inwardVal - outwardVal; // positive = net increase in stock
-      closingStock = fyClosing;
-      openingStock = fyClosing - netMovement; // reverse: opening = closing - net increase
-      if (openingStock < 0) openingStock = 0; // safety floor
+      // Fallback: FY not yet synced — show 0
+      // User needs to sync the missing FY to get stock values
+      openingStock = 0;
+      closingStock = 0;
     }
+
+    // stock_fy_valuation now has per-FY data directly from Tally's StockValuation.xml
+    // openingStock and closingStock are set above — no further computation needed
 
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
     const grossProfit = (sales + directIncome + closingStock) - (purchase + directExpenses + openingStock);
