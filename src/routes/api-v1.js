@@ -1323,6 +1323,7 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
               AND vle.financial_year = $2
               AND v.date >= $3 AND v.date <= $4
               AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
+              AND v.voucher_type NOT ILIKE '%Order%'  -- exclude Sales Orders / Purchase Orders (non-P&L)
           ), 0) as fy_signed
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
@@ -1368,27 +1369,41 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     let openingStock = 0;
     let closingStock = 0;
 
-    if (hasFyValData) {
-      openingStock = parseFloat(fyValRows[0]?.opening_stock || 0);
-      closingStock = parseFloat(fyValRows[0]?.closing_stock || 0);
-    } else {
-      // Fallback: use LATEST available stock_fy_valuation data for this company
-      // Tally returns the current stock position regardless of the date range queried,
-      // so the latest synced data has: opening = actual current FY opening, closing = current stock value
-      const { rows: latestValRows } = await query(`
-        SELECT
-          ABS(COALESCE(SUM(opening_value::float), 0)) AS opening_stock,
-          ABS(COALESCE(SUM(closing_value::float), 0)) AS closing_stock
-        FROM stock_fy_valuation
-        WHERE company_guid = $1
-          AND synced_at = (SELECT MAX(synced_at) FROM stock_fy_valuation WHERE company_guid = $1)
-      `, [companyGuid]);
-      const latestOpening = parseFloat(latestValRows[0]?.opening_stock || 0);
-      const latestClosing = parseFloat(latestValRows[0]?.closing_stock || 0);
+    // Get latest synced stock valuation (Tally always returns CURRENT FY stock regardless of date range)
+    // So: opening_value = stock at start of CURRENT FY = closing of PREVIOUS FY
+    //     closing_value = stock as of sync date
+    const { rows: latestValRows } = await query(`
+      SELECT
+        ABS(COALESCE(SUM(opening_value::float), 0)) AS latest_opening,
+        ABS(COALESCE(SUM(closing_value::float), 0)) AS latest_closing,
+        MAX(financial_year) AS synced_fy
+      FROM stock_fy_valuation
+      WHERE company_guid = $1
+        AND synced_at = (SELECT MAX(synced_at) FROM stock_fy_valuation WHERE company_guid = $1)
+    `, [companyGuid]);
+    const latestOpening = parseFloat(latestValRows[0]?.latest_opening || 0);
+    const latestClosing = parseFloat(latestValRows[0]?.latest_closing || 0);
+    const syncedFY = latestValRows[0]?.synced_fy;
+
+    // Determine the ACTUAL current FY by today's date (April = new FY start in India)
+    const now = new Date();
+    const curYear = now.getFullYear();
+    const curMonth = now.getMonth() + 1;
+    const actualCurrentFY = curMonth >= 4 ? `${curYear}-${curYear+1}` : `${curYear-1}-${curYear}`;
+    const isCurrentFY = (financialYear === actualCurrentFY);
+
+    if (isCurrentFY) {
+      // Current FY: Tally's opening_value = stock at FY start, closing_value = stock today ✓
       if (latestOpening > 0 || latestClosing > 0) {
         openingStock = latestOpening;
         closingStock = latestClosing;
       }
+    } else {
+      // Historical FY: Tally's opening_value from latest sync = start of CURRENT FY = end of LAST FY
+      // So: latestOpening = closing stock of the previous FY
+      // Opening stock of historical FY is not available → 0
+      openingStock = 0;
+      closingStock = latestOpening; // = stock at start of current FY = closing of previous FY
     }
 
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
