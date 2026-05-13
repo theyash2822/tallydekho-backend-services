@@ -1336,13 +1336,20 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const isCr = (l) => parseFloat(l.fy_signed || 0) >= 0;
     const mapLed = (l) => ({ name: l.name, parent: l.parent, amount: toAmount(l) });
 
-    // P&L group buckets — use anchored regex to avoid 'Direct' matching inside 'Indirect'
-    const salesLeds       = allLedgers.filter(l => l.parent && /^Sales Accounts$/i.test(l.parent.trim()) && toAmount(l) > 0);
-    const purchaseLeds    = allLedgers.filter(l => l.parent && /^Purchase Accounts$/i.test(l.parent.trim()) && toAmount(l) > 0);
-    const directExpLeds   = allLedgers.filter(l => l.parent && /^Direct Expenses?$/i.test(l.parent.trim()) && toAmount(l) > 0);
-    const directIncLeds   = allLedgers.filter(l => l.parent && /^Direct Incomes?$/i.test(l.parent.trim()) && toAmount(l) > 0);
-    const indirectExpLeds = allLedgers.filter(l => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim()) && toAmount(l) > 0);
-    const indirectIncLeds = allLedgers.filter(l => l.parent && /^Indirect Incomes?$/i.test(l.parent.trim()) && toAmount(l) > 0);
+    // P&L group buckets — use SIGN of fy_signed (Dr vs Cr) to classify correctly
+    // Key rule: a ledger's Dr/Cr balance for the period determines if it's income or expense
+    // e.g., Indirect Expense ledger with Cr balance = Indirect Income (reversed/refunded)
+    // This matches Tally's P&L logic exactly
+    const salesLeds       = allLedgers.filter(l => l.parent && /^Sales Accounts$/i.test(l.parent.trim())        && isCr(l) && toAmount(l) > 0);
+    const purchaseLeds    = allLedgers.filter(l => l.parent && /^Purchase Accounts$/i.test(l.parent.trim())     && isDr(l) && toAmount(l) > 0);
+    const directExpLeds   = allLedgers.filter(l => l.parent && /^Direct Expenses?$/i.test(l.parent.trim())      && isDr(l) && toAmount(l) > 0);
+    const directIncLeds   = allLedgers.filter(l => l.parent && (/^Direct Incomes?$/i.test(l.parent.trim())      && isCr(l)
+                                                                || /^Direct Expenses?$/i.test(l.parent.trim())  && isCr(l)) // Cr-balance expense = income
+                                                && toAmount(l) > 0);
+    const indirectExpLeds = allLedgers.filter(l => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim())    && isDr(l) && toAmount(l) > 0);
+    const indirectIncLeds = allLedgers.filter(l => l.parent && (/^Indirect Incomes?$/i.test(l.parent.trim())    && isCr(l)
+                                                                || /^Indirect Expenses?$/i.test(l.parent.trim()) && isCr(l)) // Cr-balance expense = income
+                                                && toAmount(l) > 0);
 
     const sales           = salesLeds.reduce((s, l)       => s + toAmount(l), 0);
     const purchase        = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
