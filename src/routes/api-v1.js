@@ -1336,7 +1336,10 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
 
     // Stock values — use stock_fy_valuation table (populated from StockValuation.xml)
     // This gives EXACT Tally opening/closing stock values using Tally's own costing method
-    // Fallback: 0 if no FY-specific data yet (user needs to sync once after this update)
+    // Fallback chain:
+    //   1. Use current FY valuation if available
+    //   2. If not, use PREVIOUS FY closing as current FY opening (correct accounting: prev closing = curr opening)
+    //   3. If neither, use 0
     const { rows: fyValRows } = await query(`
       SELECT
         ABS(COALESCE(SUM(opening_value::float), 0)) AS opening_stock,
@@ -1344,10 +1347,47 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
       FROM stock_fy_valuation
       WHERE company_guid = $1 AND financial_year = $2
     `, [companyGuid, financialYear]);
-    const hasFyValData = (fyValRows[0]?.opening_stock > 0 || fyValRows[0]?.closing_stock > 0);
-    let openingStock = hasFyValData ? parseFloat(fyValRows[0]?.opening_stock || 0) : 0;
-    let closingStock = hasFyValData ? parseFloat(fyValRows[0]?.closing_stock || 0) : 0;
-    // If no FY valuation data: opening=0, closing=0 (user must sync once to populate)
+    const hasFyValData = (parseFloat(fyValRows[0]?.opening_stock || 0) > 0 || parseFloat(fyValRows[0]?.closing_stock || 0) > 0);
+
+    let openingStock = 0;
+    let closingStock = 0;
+
+    if (hasFyValData) {
+      openingStock = parseFloat(fyValRows[0]?.opening_stock || 0);
+      closingStock = parseFloat(fyValRows[0]?.closing_stock || 0);
+    } else {
+      // Fallback: use previous FY closing as current FY opening
+      // Previous FY: year part before '-' minus 1, e.g. '2026-2027' → '2025-2026'
+      const parts = financialYear ? financialYear.split('-') : [];
+      if (parts.length === 2) {
+        const prevFY = `${parseInt(parts[0]) - 1}-${parseInt(parts[0])}`;
+        const { rows: prevFYRows } = await query(`
+          SELECT ABS(COALESCE(SUM(closing_value::float), 0)) AS closing_stock
+          FROM stock_fy_valuation
+          WHERE company_guid = $1 AND financial_year = $2
+        `, [companyGuid, prevFY]);
+        const prevClosing = parseFloat(prevFYRows[0]?.closing_stock || 0);
+        // Opening of current FY = closing of previous FY (standard accounting)
+        openingStock = prevClosing;
+        // Closing of current FY = prev closing + net stock movement this FY
+        // Compute from stock_transactions for current FY (best effort)
+        const { rows: currStxRows } = await query(`
+          SELECT
+            COALESCE(SUM(CASE WHEN type='inward'  THEN qty::float * rate::float ELSE 0 END), 0) AS inward_val,
+            COALESCE(SUM(CASE WHEN type='outward' THEN qty::float * rate::float ELSE 0 END), 0) AS outward_val,
+            COUNT(*) as txn_count
+          FROM stock_transactions WHERE company_guid = $1 AND financial_year = $2
+        `, [companyGuid, financialYear]);
+        if (parseInt(currStxRows[0]?.txn_count || 0) > 0 && prevClosing > 0) {
+          const inwardVal  = parseFloat(currStxRows[0]?.inward_val  || 0);
+          const outwardVal = parseFloat(currStxRows[0]?.outward_val || 0);
+          closingStock = prevClosing + inwardVal - outwardVal;
+          if (closingStock < 0) closingStock = prevClosing; // sanity guard
+        } else {
+          closingStock = openingStock; // no txn data — assume no change
+        }
+      }
+    }
 
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
     const grossProfit = (sales + directIncome + closingStock) - (purchase + directExpenses + openingStock);
