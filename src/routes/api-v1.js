@@ -1580,9 +1580,29 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     }
 
     // Trial Balance — individual ledgers
-    const tb       = allLedgers.filter(l => toAmount(l) > 0).sort((a, b) => (a.parent || '').localeCompare(b.parent || '') || a.name.localeCompare(b.name)).slice(0, 100);
-    const totalDebit  = tb.filter(l => isDr(l)).reduce((s, l) => s + toAmount(l), 0);
-    const totalCredit = tb.filter(l => isCr(l)).reduce((s, l) => s + toAmount(l), 0);
+    // Trial Balance — GROUP-level totals (all groups including P&L)
+    // Uses the same topBSGroup function but includes ALL groups (P&L + BS)
+    const tbGroupTotals = {};
+    for (const l of allLedgers) {
+      // For TB: use the direct parent group (not top-level BS group)
+      // This gives the standard Tally TB view: Sales Accounts, Purchase Accounts, Current Assets, etc.
+      const grp = l.parent || 'Unclassified';
+      if (!tbGroupTotals[grp]) tbGroupTotals[grp] = 0;
+      tbGroupTotals[grp] += parseFloat(l.fy_signed || 0);
+    }
+    // Each group: if net Dr → debit entry, if net Cr → credit entry
+    const tbEntries = Object.entries(tbGroupTotals)
+      .filter(([, v]) => Math.abs(v) > 0.01)
+      .map(([name, signed]) => ({
+        name,
+        debit:  signed < 0 ? Math.abs(signed) : 0, // Dr balance
+        credit: signed > 0 ? signed : 0,             // Cr balance
+        amount: Math.abs(signed),
+      }))
+      .sort((a, b) => b.amount - a.amount);
+    const totalDebit  = tbEntries.reduce((s, e) => s + e.debit,  0);
+    const totalCredit = tbEntries.reduce((s, e) => s + e.credit, 0);
+    const tb = tbEntries; // backward compat alias
     // Legacy (not used in BS anymore)
     const assets = bsAssets;
     const liab   = bsLiabilities;
@@ -1616,10 +1636,7 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         totalAssets, totalLiabilities: totalLiab,
       },
       trialBalance: {
-        ledgers: tb.map(l => ({ name: l.name, parent: l.parent,
-          debit:  isDr(l) ? toAmount(l) : 0,
-          credit: isCr(l) ? toAmount(l) : 0,
-        })),
+        ledgers: tbEntries, // group-level: [{name, debit, credit, amount}]
         totalDebit, totalCredit,
       },
     }});
