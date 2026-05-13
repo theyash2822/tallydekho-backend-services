@@ -985,6 +985,15 @@ async function processLedgerTransactions(data, companyGuid) {
   try {
     await client.query('BEGIN');
 
+    // Clear existing items for all vouchers in this batch (idempotent re-sync)
+    const uniqueGuids = [...new Set(data.map(r => r.Guid || r.GUID).filter(Boolean))];
+    if (uniqueGuids.length > 0) {
+      await client.query(
+        `DELETE FROM voucher_items WHERE company_guid=$1 AND voucher_guid = ANY($2::text[])`,
+        [companyGuid, uniqueGuids]
+      );
+    }
+
     // Group by voucher GUID to compute totals
     const voucherAmounts = {}; // guid → total amount
     let itemsSaved = 0;
@@ -1215,7 +1224,7 @@ async function processAllVoucher(data, companyGuid) {
     console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}`);
     // Post-process: backfill gst_voucher_details from CGST/SGST ledger entries
     // This fixes cases where Tally's $$GSTTaxableValue returns 0 but ledger entries have real amounts
-    await query(`
+    await dbQuery(`
       UPDATE gst_voucher_details gvd
       SET cgst_amount=sub.cgst, sgst_amount=sub.sgst, igst_amount=sub.igst, taxable_amount=sub.taxable
       FROM (
