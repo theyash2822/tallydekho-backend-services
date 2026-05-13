@@ -133,6 +133,8 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
         await processStockOpeningBalance(records, companyGuid);
       } else if (xml === 'StockValuation.xml') {
         await processStockFyValuation(records, companyGuid);
+      } else if (xml === 'StockFYBalance.xml') {
+        await processStockFyBalance(records, companyGuid);
       } else if (xml === 'LedgerOpeningBalance.xml') {
         await processLedgerFyBalances(records, companyGuid);
       } else if (xml === 'StockCategory.xml') {
@@ -937,6 +939,90 @@ async function processStockOpeningBalance(data, companyGuid) {
   }
 }
 
+// processStockFyBalance — stores stock value AT A SPECIFIC DATE (from=to=single date)
+// Used for FY opening (date = FY_start - 1) and FY closing (date = FY_end)
+// Maps to stock_fy_valuation: if date is FY_end → update closing_value; if date is FY_start-1 → update opening_value
+async function processStockFyBalance(data, companyGuid) {
+  if (!data || data.length === 0) return;
+
+  const financialYear = data[0]?._FINANCIAL_YEAR;
+  if (!financialYear) {
+    console.warn('[DB] StockFyBalance: no financial_year on records — skipping');
+    return;
+  }
+
+  // Determine if this is an OPENING query (date = FY_start - 1) or CLOSING query (date = FY_end)
+  // We detect by comparing FROM_DATE to FY boundaries
+  const fromDate = data[0]?.FROM_DATE || data[0]?.from_date || '';
+  const fyYear   = financialYear; // e.g. '2025-2026'
+  const fyStart  = fyYear.split('-')[0] + '0401'; // e.g. '20250401'
+  const fyEnd    = (parseInt(fyYear.split('-')[0]) + 1) + '0331'; // e.g. '20260331'
+  const isClosingQuery = (fromDate === fyEnd);
+  const isOpeningQuery = (fromDate !== fyEnd); // any date before FY start
+
+  const now = Math.floor(Date.now() / 1000);
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+
+      const closeQty = parseFloat(String(r.ClosingQty  || r.CLOSINGQTY  || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const closeRate= parseFloat(String(r.ClosingRate || r.CLOSINGRATE || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const rawVal   = String(r.ClosingValue || r.CLOSINGVALUE || 0).replace('(-)', '-');
+      const closeVal = parseFloat(rawVal.replace(/[^0-9.-]/g, '')) * (rawVal.includes('-') ? -1 : 1) || 0;
+      const guid     = r.Guid || r.GUID || null;
+
+      try {
+        if (isClosingQuery) {
+          // Update or insert closing_value for this FY
+          await client.query(`
+            INSERT INTO stock_fy_valuation
+              (company_guid, financial_year, stock_name, stock_guid, closing_qty, closing_rate, closing_value, synced_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (company_guid, financial_year, stock_name)
+            DO UPDATE SET
+              closing_qty   = EXCLUDED.closing_qty,
+              closing_rate  = EXCLUDED.closing_rate,
+              closing_value = EXCLUDED.closing_value,
+              synced_at     = EXCLUDED.synced_at`,
+            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now]
+          );
+        } else {
+          // Opening query: store as NEXT FY's opening
+          // date = FY_start - 1 day → this is the opening of financialYear
+          await client.query(`
+            INSERT INTO stock_fy_valuation
+              (company_guid, financial_year, stock_name, stock_guid, opening_qty, opening_rate, opening_value, synced_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (company_guid, financial_year, stock_name)
+            DO UPDATE SET
+              opening_qty   = EXCLUDED.opening_qty,
+              opening_rate  = EXCLUDED.opening_rate,
+              opening_value = EXCLUDED.opening_value,
+              synced_at     = EXCLUDED.synced_at`,
+            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now]
+          );
+        }
+        saved++;
+      } catch (e) {
+        console.warn('[DB] StockFyBalance upsert failed:', e.message, name);
+      }
+    }
+
+    await client.query('COMMIT');
+    console.log(`[DB] StockFyBalance: saved ${saved}/${data.length} for ${companyGuid} FY ${financialYear} type=${isClosingQuery?'closing':'opening'}`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[DB] StockFyBalance failed:', e.message);
+  } finally {
+    client.release();
+  }
+}
+
 // processStockFyValuation — stores FY-specific opening/closing stock VALUES from Tally
 // Source: StockValuation.xml (per FY, uses Tally's own costing method: FIFO/weighted avg)
 // These are the exact values Tally shows in its P&L — no computation needed on our side
@@ -1119,6 +1205,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processStockOpeningBalance(records, companyGuid);
     } else if (xml === 'StockValuation.xml') {
       await processStockFyValuation(records, companyGuid);
+    } else if (xml === 'StockFYBalance.xml') {
+      await processStockFyBalance(records, companyGuid);
     } else if (xml === 'VoucherInventoryDetail.xml') {
       await processVoucherInventoryItems(records, companyGuid);
       const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
