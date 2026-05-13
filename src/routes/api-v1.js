@@ -1339,8 +1339,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     // Fallback: 0 if no FY-specific data yet (user needs to sync once after this update)
     const { rows: fyValRows } = await query(`
       SELECT
-        COALESCE(SUM(opening_value::float), 0) AS opening_stock,
-        COALESCE(SUM(closing_value::float), 0) AS closing_stock
+        ABS(COALESCE(SUM(opening_value::float), 0)) AS opening_stock,
+        ABS(COALESCE(SUM(closing_value::float), 0)) AS closing_stock
       FROM stock_fy_valuation
       WHERE company_guid = $1 AND financial_year = $2
     `, [companyGuid, financialYear]);
