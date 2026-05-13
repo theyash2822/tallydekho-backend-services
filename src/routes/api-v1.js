@@ -1336,23 +1336,48 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const isCr = (l) => parseFloat(l.fy_signed || 0) >= 0;
     const mapLed = (l) => ({ name: l.name, parent: l.parent, amount: toAmount(l) });
 
-    // P&L group buckets — use SIGN of fy_signed (Dr vs Cr) to classify correctly
-    // Key rule: a ledger's Dr/Cr balance for the period determines if it's income or expense
-    // e.g., Indirect Expense ledger with Cr balance = Indirect Income (reversed/refunded)
-    // This matches Tally's P&L logic exactly
-    const salesLeds       = allLedgers.filter(l => l.parent && /^Sales Accounts$/i.test(l.parent.trim())        && isCr(l) && toAmount(l) > 0);
-    const purchaseLeds    = allLedgers.filter(l => l.parent && /^Purchase Accounts$/i.test(l.parent.trim())     && isDr(l) && toAmount(l) > 0);
-    const directExpLeds   = allLedgers.filter(l => l.parent && /^Direct Expenses?$/i.test(l.parent.trim())      && isDr(l) && toAmount(l) > 0);
-    const directIncLeds   = allLedgers.filter(l => l.parent && (/^Direct Incomes?$/i.test(l.parent.trim())      && isCr(l)
-                                                                || /^Direct Expenses?$/i.test(l.parent.trim())  && isCr(l)) // Cr-balance expense = income
-                                                && toAmount(l) > 0);
-    const indirectExpLeds = allLedgers.filter(l => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim())    && isDr(l) && toAmount(l) > 0);
-    const indirectIncLeds = allLedgers.filter(l => l.parent && (/^Indirect Incomes?$/i.test(l.parent.trim())    && isCr(l)
-                                                                || /^Indirect Expenses?$/i.test(l.parent.trim()) && isCr(l)) // Cr-balance expense = income
-                                                && toAmount(l) > 0);
+    // P&L group classification — FULL Tally-standard Dr/Cr logic
+    // Rule: the Dr/Cr SIGN of fy_signed determines which side of P&L the ledger belongs to
+    // NOT just its parent group. Cross-side balances are reclassified automatically.
+    //
+    // Sales Accounts:     Cr balance → Sales      | Dr balance → Sales Return (reduces Sales)
+    // Purchase Accounts:  Dr balance → Purchase   | Cr balance → Purchase Return (reduces Purchase)
+    // Direct Expenses:    Dr balance → Dir Exp    | Cr balance → Dir Income (reversed expense)
+    // Direct Incomes:     Cr balance → Dir Inc    | Dr balance → Dir Exp (reversed income)
+    // Indirect Expenses:  Dr balance → Indir Exp  | Cr balance → Indir Income (reversed expense)
+    // Indirect Incomes:   Cr balance → Indir Inc  | Dr balance → Indir Exp (reversed income)
+
+    const isSalesGroup    = (l) => l.parent && /^Sales Accounts$/i.test(l.parent.trim());
+    const isPurchGroup    = (l) => l.parent && /^Purchase Accounts$/i.test(l.parent.trim());
+    const isDirExpGroup   = (l) => l.parent && /^Direct Expenses?$/i.test(l.parent.trim());
+    const isDirIncGroup   = (l) => l.parent && /^Direct Incomes?$/i.test(l.parent.trim());
+    const isIndirExpGroup = (l) => l.parent && /^Indirect Expenses?$/i.test(l.parent.trim());
+    const isIndirIncGroup = (l) => l.parent && /^Indirect Incomes?$/i.test(l.parent.trim());
+
+    // Sales = Cr-balance Sales + any Cr-balance income groups crossing into sales
+    const salesLeds       = allLedgers.filter(l => isSalesGroup(l) && isCr(l) && toAmount(l) > 0);
+    // Purchase = Dr-balance Purchase (Cr-balance = purchase return, reduces purchase)
+    const purchaseLeds    = allLedgers.filter(l => isPurchGroup(l) && isDr(l) && toAmount(l) > 0);
+    // Purchase reduction from Cr-balance purchase accounts
+    const purchReturnLeds = allLedgers.filter(l => isPurchGroup(l) && isCr(l) && toAmount(l) > 0);
+    // Direct Expenses = Dr-balance Direct Exp + Dr-balance Direct Inc (reversed income)
+    const directExpLeds   = allLedgers.filter(l => toAmount(l) > 0 && isDr(l) &&
+      (isDirExpGroup(l) || isDirIncGroup(l)));
+    // Direct Income = Cr-balance Direct Inc + Cr-balance Direct Exp (reversed expense)
+    const directIncLeds   = allLedgers.filter(l => toAmount(l) > 0 && isCr(l) &&
+      (isDirIncGroup(l) || isDirExpGroup(l)));
+    // Indirect Expenses = Dr-balance Indir Exp + Dr-balance Indir Inc (reversed income)
+    const indirectExpLeds = allLedgers.filter(l => toAmount(l) > 0 && isDr(l) &&
+      (isIndirExpGroup(l) || isIndirIncGroup(l)));
+    // Indirect Income = Cr-balance Indir Inc + Cr-balance Indir Exp (reversed expense)
+    const indirectIncLeds = allLedgers.filter(l => toAmount(l) > 0 && isCr(l) &&
+      (isIndirIncGroup(l) || isIndirExpGroup(l)));
 
     const sales           = salesLeds.reduce((s, l)       => s + toAmount(l), 0);
-    const purchase        = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
+    // Net purchase = gross purchase - purchase returns (Cr-balance purchase accounts)
+    const purchaseGross   = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
+    const purchaseReturn  = purchReturnLeds.reduce((s, l) => s + toAmount(l), 0);
+    const purchase        = purchaseGross - purchaseReturn; // net purchase
     const directExpenses  = directExpLeds.reduce((s, l)   => s + toAmount(l), 0);
     const directIncome    = directIncLeds.reduce((s, l)   => s + toAmount(l), 0);
     const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmount(l), 0);
