@@ -1373,15 +1373,55 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const indirectIncLeds = allLedgers.filter(l => toAmount(l) > 0 && isCr(l) &&
       (isIndirIncGroup(l) || isIndirExpGroup(l)));
 
-    const sales           = salesLeds.reduce((s, l)       => s + toAmount(l), 0);
-    // Net purchase = gross purchase - purchase returns (Cr-balance purchase accounts)
-    const purchaseGross   = purchaseLeds.reduce((s, l)    => s + toAmount(l), 0);
-    const purchaseReturn  = purchReturnLeds.reduce((s, l) => s + toAmount(l), 0);
-    const purchase        = purchaseGross - purchaseReturn; // net purchase
-    const directExpenses  = directExpLeds.reduce((s, l)   => s + toAmount(l), 0);
-    const directIncome    = directIncLeds.reduce((s, l)   => s + toAmount(l), 0);
-    const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmount(l), 0);
-    const indirectIncome  = indirectIncLeds.reduce((s, l) => s + toAmount(l), 0);
+    // ── Compute GROUP NETS (Tally uses group-level netting, not per-ledger classification) ──
+    // Each group: sum all signed fy_signed values, then classify by the sign of the NET
+
+    // Sales: net Cr = Sales revenue; net Dr = Sales Return (reduces sales)
+    const salesNet = allLedgers
+      .filter(l => isSalesGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const sales = salesNet > 0 ? salesNet : 0; // Cr = Sales
+    // Net Dr sales would be unusual — leave as 0 for now (rare edge case)
+
+    // Purchase: net Dr = Purchase; net Cr = Purchase Return (net purchase)
+    const purchNet = allLedgers
+      .filter(l => isPurchGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const purchase = purchNet < 0 ? Math.abs(purchNet) : 0; // Dr = Purchase
+
+    // Direct Expenses: net Dr = expense; net Cr = income (reversed expense)
+    const dirExpNet = allLedgers
+      .filter(l => isDirExpGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const dirExpFromGroup  = dirExpNet < 0 ? Math.abs(dirExpNet) : 0;
+    const dirIncFromExpGrp = dirExpNet > 0 ? dirExpNet : 0;
+
+    // Direct Incomes: net Cr = income; net Dr = expense (reversed income)
+    const dirIncNet = allLedgers
+      .filter(l => isDirIncGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const dirIncFromGroup  = dirIncNet > 0 ? dirIncNet : 0;
+    const dirExpFromIncGrp = dirIncNet < 0 ? Math.abs(dirIncNet) : 0;
+
+    // Indirect Expenses: net Dr = expense; net Cr = indirect income (reversed expense)
+    const indirExpNet = allLedgers
+      .filter(l => isIndirExpGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const indirExpFromGroup  = indirExpNet < 0 ? Math.abs(indirExpNet) : 0;
+    const indirIncFromExpGrp = indirExpNet > 0 ? indirExpNet : 0;
+
+    // Indirect Incomes: net Cr = income; net Dr = expense (reversed income)
+    const indirIncNet = allLedgers
+      .filter(l => isIndirIncGroup(l))
+      .reduce((s, l) => s + parseFloat(l.fy_signed || 0), 0);
+    const indirIncFromGroup  = indirIncNet > 0 ? indirIncNet : 0;
+    const indirExpFromIncGrp = indirIncNet < 0 ? Math.abs(indirIncNet) : 0;
+
+    // Final P&L values (cross-group contributions merged)
+    const directExpenses   = dirExpFromGroup  + dirExpFromIncGrp;
+    const directIncome     = dirIncFromGroup  + dirIncFromExpGrp;
+    const indirectExpenses = indirExpFromGroup + indirExpFromIncGrp;
+    const indirectIncome   = indirIncFromGroup + indirIncFromExpGrp;
 
     // Stock values — use stock_fy_valuation table (populated from StockValuation.xml)
     // This gives EXACT Tally opening/closing stock values using Tally's own costing method
