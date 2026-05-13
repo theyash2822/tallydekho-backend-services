@@ -1306,8 +1306,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
 
-    // FY-derived balance per ledger: anchor + SUM(movements for this FY)
-    // This is correct per Tally FY guide: Balance = anchor + transactions. Never static.
+    // Ledger balance = FY anchor (opening at FY start) + SUM(movements within date range)
+    // fyFrom/fyTo filter voucher dates — supports both full FY and custom date range selection
     const { rows: allLedgers } = await query(`
       SELECT
         l.guid, l.name, l.parent, l.balance_type,
@@ -1318,14 +1318,17 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         + COALESCE((
             SELECT SUM(vle.amount)
             FROM voucher_ledger_entries vle
+            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
             WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
               AND vle.financial_year = $2
+              AND v.date >= $3 AND v.date <= $4
+              AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
           ), 0) as fy_signed
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
         ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
       WHERE l.company_guid = $1
-    `, [companyGuid, financialYear]);
+    `, [companyGuid, financialYear, fyFrom, fyTo]);
 
     const toAmount = (l) => Math.abs(parseFloat(l.fy_signed || 0));
     const isDr = (l) => parseFloat(l.fy_signed || 0) < 0;
