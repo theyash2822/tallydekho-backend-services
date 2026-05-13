@@ -1334,32 +1334,20 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const indirectExpenses= indirectExpLeds.reduce((s, l) => s + toAmount(l), 0);
     const indirectIncome  = indirectIncLeds.reduce((s, l) => s + toAmount(l), 0);
 
-    // Stock values — use FY-specific stock transaction data if available.
-    // Opening Stock = SUM of inward stock VALUE before FY start (i.e., from previous FY closing)
-    // Closing Stock = Opening + net inward - net outward for this FY
-    // Fallback: use stocks master only if stock_transactions exist for this FY.
-    const { rows: stxRows } = await query(`
+    // Stock values — use stock_fy_valuation table (populated from StockValuation.xml)
+    // This gives EXACT Tally opening/closing stock values using Tally's own costing method
+    // Fallback: 0 if no FY-specific data yet (user needs to sync once after this update)
+    const { rows: fyValRows } = await query(`
       SELECT
-        COALESCE(SUM(CASE WHEN type='inward'  THEN qty::float * rate::float ELSE 0 END), 0) AS inward_val,
-        COALESCE(SUM(CASE WHEN type='outward' THEN qty::float * rate::float ELSE 0 END), 0) AS outward_val,
-        COUNT(*) as txn_count
-      FROM stock_transactions WHERE company_guid = $1 AND financial_year = $2
+        COALESCE(SUM(opening_value::float), 0) AS opening_stock,
+        COALESCE(SUM(closing_value::float), 0) AS closing_stock
+      FROM stock_fy_valuation
+      WHERE company_guid = $1 AND financial_year = $2
     `, [companyGuid, financialYear]);
-    const hasFYStockData = parseInt(stxRows[0]?.txn_count || 0) > 0;
-    let openingStock = 0;
-    let closingStock = 0;
-    if (hasFYStockData) {
-      // Derive from stock transactions
-      const { rows: masterStock } = await query(`
-        SELECT COALESCE(SUM(opening_qty::float * opening_rate::float), 0) AS opening_stock
-        FROM stocks WHERE company_guid = $1
-      `, [companyGuid]);
-      openingStock = parseFloat(masterStock[0]?.opening_stock || 0);
-      const inwardVal  = parseFloat(stxRows[0]?.inward_val  || 0);
-      const outwardVal = parseFloat(stxRows[0]?.outward_val || 0);
-      closingStock = openingStock + inwardVal - outwardVal;
-    }
-    // If no FY stock data: opening=0, closing=0 (better than wrong all-time values)
+    const hasFyValData = (fyValRows[0]?.opening_stock > 0 || fyValRows[0]?.closing_stock > 0);
+    let openingStock = hasFyValData ? parseFloat(fyValRows[0]?.opening_stock || 0) : 0;
+    let closingStock = hasFyValData ? parseFloat(fyValRows[0]?.closing_stock || 0) : 0;
+    // If no FY valuation data: opening=0, closing=0 (user must sync once to populate)
 
     // Gross Profit = (Sales + Direct Income + Closing Stock) - (Purchase + Direct Expenses + Opening Stock)
     const grossProfit = (sales + directIncome + closingStock) - (purchase + directExpenses + openingStock);

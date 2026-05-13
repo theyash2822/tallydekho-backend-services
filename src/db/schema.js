@@ -644,6 +644,26 @@ export async function initSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_pin_hash TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS biometric_enabled BOOLEAN DEFAULT FALSE;
 
+      -- stock_fy_valuation — FY-specific opening/closing stock VALUES direct from Tally
+      -- Source: StockValuation.xml (per FY, uses Tally's internal costing: FIFO/avg)
+      -- This is the source of truth for P&L Opening Stock and Closing Stock
+      CREATE TABLE IF NOT EXISTS stock_fy_valuation (
+        id             BIGSERIAL PRIMARY KEY,
+        company_guid   TEXT NOT NULL,
+        financial_year TEXT NOT NULL,
+        stock_name     TEXT NOT NULL,
+        stock_guid     TEXT,
+        opening_qty    NUMERIC(15,4) DEFAULT 0,
+        opening_rate   NUMERIC(15,4) DEFAULT 0,
+        opening_value  NUMERIC(15,4) DEFAULT 0,
+        closing_qty    NUMERIC(15,4) DEFAULT 0,
+        closing_rate   NUMERIC(15,4) DEFAULT 0,
+        closing_value  NUMERIC(15,4) DEFAULT 0,
+        synced_at      BIGINT,
+        UNIQUE(company_guid, financial_year, stock_name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sfv_company_fy ON stock_fy_valuation(company_guid, financial_year);
+
       -- Push tokens — Expo push notification tokens per user device
       CREATE TABLE IF NOT EXISTS push_tokens (
         id         BIGSERIAL PRIMARY KEY,

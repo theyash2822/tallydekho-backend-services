@@ -131,6 +131,8 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
         await processCurrencies(records, companyGuid);
       } else if (xml === 'StockOpeningBalance.xml') {
         await processStockOpeningBalance(records, companyGuid);
+      } else if (xml === 'StockValuation.xml') {
+        await processStockFyValuation(records, companyGuid);
       } else if (xml === 'LedgerOpeningBalance.xml') {
         await processLedgerFyBalances(records, companyGuid);
       } else if (xml === 'StockCategory.xml') {
@@ -909,6 +911,73 @@ async function processStockOpeningBalance(data, companyGuid) {
   }
 }
 
+// processStockFyValuation — stores FY-specific opening/closing stock VALUES from Tally
+// Source: StockValuation.xml (per FY, uses Tally's own costing method: FIFO/weighted avg)
+// These are the exact values Tally shows in its P&L — no computation needed on our side
+async function processStockFyValuation(data, companyGuid) {
+  if (!data || data.length === 0) return;
+
+  const financialYear = data[0]?._FINANCIAL_YEAR;
+  if (!financialYear) {
+    console.warn('[DB] StockFyValuation: no financial_year on records — skipping');
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    let saved = 0;
+
+    for (const r of data) {
+      const name = r.Name || r.NAME || '';
+      if (!name) continue;
+
+      const openQty   = parseFloat(String(r.OpeningQty   || r.OPENINGQTY   || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const openRate  = parseFloat(String(r.OpeningRate  || r.OPENINGRATE  || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const openVal   = parseFloat(String(r.OpeningValue || r.OPENINGVALUE || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const closeQty  = parseFloat(String(r.ClosingQty   || r.CLOSINGQTY   || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const closeRate = parseFloat(String(r.ClosingRate  || r.CLOSINGRATE  || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const closeVal  = parseFloat(String(r.ClosingValue || r.CLOSINGVALUE || 0).replace(/[^0-9.-]/g, '')) || 0;
+      const guid      = r.Guid || r.GUID || null;
+
+      try {
+        await client.query(
+          `INSERT INTO stock_fy_valuation
+            (company_guid, financial_year, stock_name, stock_guid,
+             opening_qty, opening_rate, opening_value,
+             closing_qty, closing_rate, closing_value, synced_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (company_guid, financial_year, stock_name)
+           DO UPDATE SET
+             stock_guid    = EXCLUDED.stock_guid,
+             opening_qty   = EXCLUDED.opening_qty,
+             opening_rate  = EXCLUDED.opening_rate,
+             opening_value = EXCLUDED.opening_value,
+             closing_qty   = EXCLUDED.closing_qty,
+             closing_rate  = EXCLUDED.closing_rate,
+             closing_value = EXCLUDED.closing_value,
+             synced_at     = EXCLUDED.synced_at`,
+          [companyGuid, financialYear, name, guid,
+           openQty, openRate, openVal,
+           closeQty, closeRate, closeVal, now]
+        );
+        saved++;
+      } catch (e) {
+        console.warn('[DB] StockFyValuation upsert failed:', e.message, name);
+      }
+    }
+
+    await client.query('COMMIT');
+    console.log(`[DB] StockFyValuation: saved ${saved}/${data.length} for ${companyGuid} FY ${financialYear}`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[DB] StockFyValuation failed:', e.message);
+  } finally {
+    client.release();
+  }
+}
+
 async function processLedgerTransactions(data, companyGuid) {
   // LedgerTransaction.xml: each record is a ledger line item for a voucher
   // Fields: Guid (voucher GUID), LedgerName, LedgerGuid, Amount, Date, AlterId
@@ -1013,6 +1082,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processLedgerTransactions(records, companyGuid);
     } else if (xml === 'StockOpeningBalance.xml') {
       await processStockOpeningBalance(records, companyGuid);
+    } else if (xml === 'StockValuation.xml') {
+      await processStockFyValuation(records, companyGuid);
     } else if (xml === 'VoucherInventoryDetail.xml') {
       await processVoucherInventoryItems(records, companyGuid);
       const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
