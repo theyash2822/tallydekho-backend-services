@@ -1035,11 +1035,10 @@ async function processOpeningBalanceDiff(data, companyGuid) {
   if (!data || data.length === 0) return;
   let netSigned = 0;
   for (const r of data) {
-    const val = parseFloat(String(r.SignedOpeningBalance || r.SIGNEDOPENINGBALANCE || 0).replace(/[^0-9.-]/g, '')) || 0;
-    // Preserve sign: negative = Dr, positive = Cr (as set in the TDL XML)
-    const rawStr = String(r.SignedOpeningBalance || r.SIGNEDOPENINGBALANCE || '0');
-    const isNeg  = rawStr.trim().startsWith('-');
-    netSigned += isNeg ? -Math.abs(val) : Math.abs(val);
+    // TDL returns signed values: negative = Dr, positive = Cr
+    // parseFloat preserves the sign directly from the numeric string
+    const val = parseFloat(String(r.SignedOpeningBalance || r.SIGNEDOPENINGBALANCE || '0').replace(/[^0-9.-]/g, '')) || 0;
+    netSigned += val;
   }
   // netSigned: positive = Cr dominates, negative = Dr dominates
   const diffAmount = Math.abs(netSigned);
@@ -1226,7 +1225,6 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     if (!byXml[xml]) byXml[xml] = [];
     byXml[xml].push(r);
   }
-
   for (const [xml, records] of Object.entries(byXml)) {
     if (records.length === 0) continue;
     const sample = records[0];
