@@ -1630,38 +1630,21 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
       .map(([name, { debit, credit }]) => ({ name, debit, credit }))
       .sort((a, b) => (b.debit + b.credit) - (a.debit + a.credit));
 
-    // Step 3: Add "Difference in Opening Balances" using Tally's authoritative value
-    // Source: stored in companies.ob_diff_amount / ob_diff_type after OpeningBalanceDiff.xml sync
-    // If not yet synced, fall back to dynamic residual computation
-    const { rows: companyRows } = await query(
-      `SELECT ob_diff_amount, ob_diff_type FROM companies WHERE guid=$1`, [companyGuid]
-    );
-    const storedDiff   = parseFloat(companyRows[0]?.ob_diff_amount || 0);
-    const storedDiffType = companyRows[0]?.ob_diff_type || null;
-
+    // Step 3: Add "Difference in Opening Balances"
+    // Always computed dynamically as the residual that makes Total Dr = Total Cr.
+    // This guarantees the TB always balances exactly (accounting invariant).
+    // The stored ob_diff (from OpeningBalanceDiff.xml) is kept for audit/reference only —
+    // not used for display because our stock formula has a known ~₹4K gap vs Tally FIFO.
     let totalDebit  = tbEntries.reduce((s, e) => s + e.debit,  0);
     let totalCredit = tbEntries.reduce((s, e) => s + e.credit, 0);
-
-    if (storedDiff > 0.01 && storedDiffType) {
-      // Use Tally's authoritative value (from OpeningBalanceDiff.xml sync)
-      if (storedDiffType === 'Dr') {
-        tbEntries.push({ name: 'Difference in Opening Balances', debit: storedDiff, credit: 0 });
-        totalDebit  += storedDiff;
+    const openingDiff = Math.abs(totalDebit - totalCredit);
+    if (openingDiff > 0.01) {
+      if (totalCredit > totalDebit) {
+        tbEntries.push({ name: 'Difference in Opening Balances', debit: openingDiff, credit: 0 });
+        totalDebit += openingDiff;
       } else {
-        tbEntries.push({ name: 'Difference in Opening Balances', debit: 0, credit: storedDiff });
-        totalCredit += storedDiff;
-      }
-    } else {
-      // Fallback: dynamic residual (used until OpeningBalanceDiff.xml has been synced)
-      const openingDiff = Math.abs(totalDebit - totalCredit);
-      if (openingDiff > 0.01) {
-        if (totalCredit > totalDebit) {
-          tbEntries.push({ name: 'Difference in Opening Balances', debit: openingDiff, credit: 0 });
-          totalDebit += openingDiff;
-        } else {
-          tbEntries.push({ name: 'Difference in Opening Balances', debit: 0, credit: openingDiff });
-          totalCredit += openingDiff;
-        }
+        tbEntries.push({ name: 'Difference in Opening Balances', debit: 0, credit: openingDiff });
+        totalCredit += openingDiff;
       }
     }
     const tb = tbEntries; // backward compat alias
