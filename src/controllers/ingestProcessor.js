@@ -133,6 +133,8 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
         await processStockOpeningBalance(records, companyGuid);
       } else if (xml === 'StockValuation.xml') {
         await processStockFyValuation(records, companyGuid);
+      } else if (xml === 'OpeningBalanceDiff.xml') {
+        await processOpeningBalanceDiff(records, companyGuid);
       } else if (xml === 'StockFYBalance.xml') {
         // DISABLED: $ClosingValue returns wrong values for historical dates in Tally TDL
         // Keep handler registered but skip processing until proper TDL solution found
@@ -1025,6 +1027,34 @@ async function processStockFyBalance(data, companyGuid) {
   }
 }
 
+// processOpeningBalanceDiff — computes and stores the company-level "Difference in Opening Balances"
+// Source: OpeningBalanceDiff.xml (called ONCE per company with FROM_DATE = BOOKSFROM date)
+// Returns per-ledger signed opening balances at the company's first accounting date.
+// SUM of all signed values = Tally's "Difference in Opening Balances" (fixed, never changes across FYs).
+async function processOpeningBalanceDiff(data, companyGuid) {
+  if (!data || data.length === 0) return;
+  let netSigned = 0;
+  for (const r of data) {
+    const val = parseFloat(String(r.SignedOpeningBalance || r.SIGNEDOPENINGBALANCE || 0).replace(/[^0-9.-]/g, '')) || 0;
+    // Preserve sign: negative = Dr, positive = Cr (as set in the TDL XML)
+    const rawStr = String(r.SignedOpeningBalance || r.SIGNEDOPENINGBALANCE || '0');
+    const isNeg  = rawStr.trim().startsWith('-');
+    netSigned += isNeg ? -Math.abs(val) : Math.abs(val);
+  }
+  // netSigned: positive = Cr dominates, negative = Dr dominates
+  const diffAmount = Math.abs(netSigned);
+  const diffType   = netSigned < 0 ? 'Dr' : 'Cr';
+  try {
+    await query(
+      `UPDATE companies SET ob_diff_amount=$1, ob_diff_type=$2 WHERE guid=$3`,
+      [diffAmount, diffType, companyGuid]
+    );
+    console.log(`[DB] OpeningBalanceDiff: \u20b9${diffAmount.toLocaleString('en-IN')} ${diffType} (${data.length} ledgers summed)`);
+  } catch (err) {
+    console.error('[DB] OpeningBalanceDiff error:', err.message);
+  }
+}
+
 // processStockFyValuation — stores FY-specific opening/closing stock VALUES from Tally
 // Source: StockValuation.xml (per FY, uses Tally's own costing method: FIFO/weighted avg)
 // These are the exact values Tally shows in its P&L — no computation needed on our side
@@ -1234,6 +1264,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'LedgerOpeningBalance.xml') {
       // V2: Now actively processed into ledger_fy_balances table
       await processLedgerFyBalances(records, companyGuid);
+    } else if (xml === 'OpeningBalanceDiff.xml') {
+      await processOpeningBalanceDiff(records, companyGuid);
     } else if (xml === 'AllVoucher.xml') {
       // AllVoucher has header + inventory + ledger entries + bill allocations
       await processAllVoucher(records, companyGuid);
