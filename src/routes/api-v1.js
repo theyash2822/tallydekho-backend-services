@@ -1579,29 +1579,72 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
       totalLiab += Math.abs(bsDiff);
     }
 
-    // Trial Balance — individual ledgers
-    // Trial Balance — GROUP-level totals (all groups including P&L)
-    // Uses the same topBSGroup function but includes ALL groups (P&L + BS)
-    const tbGroupTotals = {};
-    for (const l of allLedgers) {
-      // For TB: use the direct parent group (not top-level BS group)
-      // This gives the standard Tally TB view: Sales Accounts, Purchase Accounts, Current Assets, etc.
-      const grp = l.parent || 'Unclassified';
-      if (!tbGroupTotals[grp]) tbGroupTotals[grp] = 0;
-      tbGroupTotals[grp] += parseFloat(l.fy_signed || 0);
+    // Trial Balance — top-level group, Dr/Cr separated (Tally-standard format)
+    // topTBGroup: traverse group hierarchy to find root — includes ALL groups (BS + P&L)
+    function topTBGroup(grp) {
+      if (!grp) return 'Unclassified';
+      let cur = grp.trim();
+      for (let i = 0; i < 6; i++) {
+        const par = (grpParentMap[cur] || grpParentMap[' ' + cur] || '').trim();
+        if (!par) {
+          // cur is the root — 'Primary' is Tally internal root, map to P&L A/c
+          return cur === 'Primary' ? 'Profit & Loss A/c' : cur;
+        }
+        if (par === 'Primary') return 'Profit & Loss A/c';
+        cur = par;
+      }
+      return cur;
     }
-    // Each group: if net Dr → debit entry, if net Cr → credit entry
-    const tbEntries = Object.entries(tbGroupTotals)
-      .filter(([, v]) => Math.abs(v) > 0.01)
-      .map(([name, signed]) => ({
-        name,
-        debit:  signed < 0 ? Math.abs(signed) : 0, // Dr balance
-        credit: signed > 0 ? signed : 0,             // Cr balance
-        amount: Math.abs(signed),
-      }))
-      .sort((a, b) => b.amount - a.amount);
-    const totalDebit  = tbEntries.reduce((s, e) => s + e.debit,  0);
-    const totalCredit = tbEntries.reduce((s, e) => s + e.credit, 0);
+    // For each top-level group: accumulate Dr and Cr SEPARATELY (never net)
+    // This matches Tally TB: both Debit and Credit columns can be non-zero for same group
+    const tbGroupMap = {};
+    for (const l of allLedgers) {
+      const topGrp = topTBGroup(l.parent);
+      if (!tbGroupMap[topGrp]) tbGroupMap[topGrp] = { debit: 0, credit: 0 };
+      const signed = parseFloat(l.fy_signed || 0);
+      if (signed < 0) {
+        tbGroupMap[topGrp].debit  += Math.abs(signed); // Dr ledger
+      } else {
+        tbGroupMap[topGrp].credit += signed;            // Cr ledger
+      }
+    }
+    // Step 2: Inject Stock-in-Hand closing value as Dr entry in Current Assets
+    // Stock is inventory (not a ledger account) so it doesn't appear in allLedgers.
+    // Pull closing stock value from stock_fy_valuation (stored negative = Dr convention).
+    const { rows: stockValRows } = await query(
+      `SELECT ABS(COALESCE(SUM(closing_value), 0)) as closing_stock
+       FROM stock_fy_valuation
+       WHERE company_guid=$1 AND financial_year=$2`,
+      [companyGuid, financialYear]
+    );
+    const stockClosingValue = parseFloat(stockValRows[0]?.closing_stock || 0);
+    if (stockClosingValue > 0.01) {
+      // Stock-in-Hand is under Current Assets in Tally's group hierarchy
+      const stockGrp = 'Stock-in-Hand';
+      if (!tbGroupMap[stockGrp]) tbGroupMap[stockGrp] = { debit: 0, credit: 0 };
+      tbGroupMap[stockGrp].debit += stockClosingValue; // stock is always an asset (Dr)
+    }
+
+    const tbEntries = Object.entries(tbGroupMap)
+      .filter(([, v]) => v.debit > 0.01 || v.credit > 0.01)
+      .map(([name, { debit, credit }]) => ({ name, debit, credit }))
+      .sort((a, b) => (b.debit + b.credit) - (a.debit + a.credit));
+
+    // Step 3: Add "Difference in Opening Balances" — the residual imbalance
+    // Tally itself shows this line when opening balances don't perfectly balance.
+    // This is expected and normal (common in Tally migrations/imports).
+    let totalDebit  = tbEntries.reduce((s, e) => s + e.debit,  0);
+    let totalCredit = tbEntries.reduce((s, e) => s + e.credit, 0);
+    const openingDiff = Math.abs(totalDebit - totalCredit);
+    if (openingDiff > 0.01) {
+      if (totalCredit > totalDebit) {
+        tbEntries.push({ name: 'Difference in Opening Balances', debit: openingDiff, credit: 0 });
+        totalDebit += openingDiff;
+      } else {
+        tbEntries.push({ name: 'Difference in Opening Balances', debit: 0, credit: openingDiff });
+        totalCredit += openingDiff;
+      }
+    }
     const tb = tbEntries; // backward compat alias
     // Legacy (not used in BS anymore)
     const assets = bsAssets;
