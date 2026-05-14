@@ -1045,7 +1045,7 @@ async function processOpeningBalanceDiff(data, companyGuid) {
   const diffAmount = Math.abs(netSigned);
   const diffType   = netSigned < 0 ? 'Dr' : 'Cr';
   try {
-    await query(
+    await dbQuery(
       `UPDATE companies SET ob_diff_amount=$1, ob_diff_type=$2 WHERE guid=$3`,
       [diffAmount, diffType, companyGuid]
     );
