@@ -1279,18 +1279,36 @@ router.get('/reports/financial', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
+    // Use from/to params sent by the frontend (selected FY dates)
+    // Fall back to most recent 12 months if no range provided
+    const fromDate = req.query.from || null;
+    const toDate   = req.query.to   || null;
+    const params   = [companyGuid];
+    let dateClause = '';
+    if (fromDate && toDate) {
+      params.push(fromDate, toDate);
+      dateClause = `AND date >= $${params.length - 1} AND date <= $${params.length}`;
+    }
     const { rows } = await query(`
-      SELECT TO_CHAR(date::date,'Mon') as month, EXTRACT(MONTH FROM date::date) as mnum, EXTRACT(YEAR FROM date::date) as yr,
-        SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as revenue,
+      SELECT TO_CHAR(date::date,'Mon') as month,
+             TO_CHAR(date::date,'Mon YY') as month_label,
+             EXTRACT(MONTH FROM date::date) as mnum,
+             EXTRACT(YEAR  FROM date::date) as yr,
+        SUM(CASE WHEN voucher_type ILIKE '%Sales%' OR voucher_type ILIKE '%Sale%' THEN amount ELSE 0 END) as revenue,
         SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as expenses
-      FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-      GROUP BY TO_CHAR(date::date,'Mon'), EXTRACT(MONTH FROM date::date), EXTRACT(YEAR FROM date::date)
-      ORDER BY yr, mnum LIMIT 12
-    `, [companyGuid]);
+      FROM vouchers
+      WHERE company_guid=$1 AND is_cancelled=FALSE
+        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        ${dateClause}
+      GROUP BY TO_CHAR(date::date,'Mon'), TO_CHAR(date::date,'Mon YY'),
+               EXTRACT(MONTH FROM date::date), EXTRACT(YEAR FROM date::date)
+      ORDER BY yr, mnum
+      LIMIT 12
+    `, params);
     res.json({ success: true, data: {
-      months:   rows.map(r => r.month),
-      revenue:  rows.map(r => parseFloat(r.revenue||0)),
-      expenses: rows.map(r => parseFloat(r.expenses||0)),
+      months:   rows.map(r => r.month_label || r.month),
+      revenue:  rows.map(r => parseFloat(r.revenue  || 0)),
+      expenses: rows.map(r => parseFloat(r.expenses || 0)),
     }});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
