@@ -1916,8 +1916,9 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     // Check if company has GSTIN (India-specific)
-    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
-    const isIndia = !!(co[0]?.gstin);
+    const { rows: co } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    // isIndia: GSTIN present OR country/state indicates India
+    const isIndia = !!(co[0]?.gstin) || (co[0]?.country||'').toLowerCase().includes('india') || !!(co[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { total: 0, country_applicable: false, message: 'E-Way Bill is applicable only for India (GST-registered companies)' } });
 
     const { search = '', page = 1, limit = 30, from, to } = req.query;
@@ -1948,8 +1949,8 @@ router.get('/einvoice/pending', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
-    const isIndia = !!(co[0]?.gstin);
+    const { rows: co } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    const isIndia = !!(co[0]?.gstin) || (co[0]?.country||'').toLowerCase().includes('india') || !!(co[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'E-Invoice (IRN) is applicable only for India (GST-registered companies)' } });
     const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
     res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, pending_irn: rows.length } });
@@ -1976,8 +1977,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { from, to, type = 'GSTR-1' } = req.query;
   try {
-    const { rows: co } = await query('SELECT gstin FROM companies WHERE guid=$1', [companyGuid]);
-    const isIndia = !!(co[0]?.gstin);
+    const { rows: co } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    const isIndia = !!(co[0]?.gstin) || (co[0]?.country||'').toLowerCase().includes('india') || !!(co[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
     let vType = 'Sales';
