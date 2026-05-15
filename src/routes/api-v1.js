@@ -1992,17 +1992,53 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       || !!(coRows[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
-    let vType = 'Sales';
-    if (['GSTR-2A', 'GSTR-2B'].includes(String(type))) vType = 'Purchase';
+    const gstrTypeStr = String(type);
 
-    let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE`;
-    const params = [companyGuid, `%${vType}%`];
+    // GSTR-4 / GSTR-6 — not applicable for regular taxpayers
+    if (['GSTR-4', 'GSTR-6'].includes(gstrTypeStr)) {
+      return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: `${type} is applicable for Composition/ISD dealers only.` } });
+    }
+
+    // GSTR-3B — summary return (output tax vs input tax credit)
+    if (gstrTypeStr === 'GSTR-3B') {
+      const baseParams = [companyGuid];
+      let dateWhere = '';
+      let idx = 2;
+      if (from) { dateWhere += ` AND date >= $${idx++}`; baseParams.push(from); }
+      if (to)   { dateWhere += ` AND date <= $${idx++}`; baseParams.push(to); }
+      const [outRows, inRows] = await Promise.all([
+        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type IN ('Sales GST','Sales','Debit Note','Credit Note')${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type IN ('Purchase GST','Purchase')${dateWhere}`, baseParams),
+      ]);
+      const outwardSupply  = Math.abs(parseFloat(outRows[0]?.total || 0));
+      const inwardSupply   = Math.abs(parseFloat(inRows[0]?.total || 0));
+      const outputTax      = Math.round(outwardSupply * 0.18 * 100) / 100;  // approx 18% GST
+      const inputTaxCredit = Math.round(inwardSupply  * 0.18 * 100) / 100;
+      const netTaxPayable  = Math.max(0, outputTax - inputTaxCredit);
+      return res.json({
+        success: true, country_applicable: true, gstr_type: 'GSTR-3B',
+        data: [],
+        meta: { total: 0, gstr_type: 'GSTR-3B', is_summary: true },
+        summary: { outwardSupply, inwardSupply, outputTax, inputTaxCredit, netTaxPayable },
+      });
+    }
+
+    // GSTR-1 / GSTR-9 — outward supply (Sales)
+    // GSTR-2A / GSTR-2B — inward supply (Purchase)
+    const outwardTypes = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
+    const inwardTypes  = ['Purchase GST', 'Purchase'];
+    const isInward = ['GSTR-2A', 'GSTR-2B'].includes(gstrTypeStr);
+    const vTypes = isInward ? inwardTypes : outwardTypes;
+
+    const params = [companyGuid, vTypes];
+    let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number
+             FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
     let idx = 3;
     if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
-    q += ' ORDER BY date DESC LIMIT 100';
+    q += ' ORDER BY date DESC LIMIT 200';
     const { rows } = await query(q, params);
-    res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, gstr_type: type } });
+    res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, gstr_type: type, direction: isInward ? 'inward' : 'outward' } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
