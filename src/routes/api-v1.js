@@ -1995,7 +1995,7 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     let vType = 'Sales';
     if (['GSTR-2A', 'GSTR-2B'].includes(String(type))) vType = 'Purchase';
 
-    let q = `SELECT voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE`;
+    let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE`;
     const params = [companyGuid, `%${vType}%`];
     let idx = 3;
     if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
