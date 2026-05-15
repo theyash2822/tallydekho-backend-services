@@ -1994,9 +1994,37 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
 
     const gstrTypeStr = String(type);
 
-    // GSTR-4 / GSTR-6 — not applicable for regular taxpayers
-    if (['GSTR-4', 'GSTR-6'].includes(gstrTypeStr)) {
-      return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: `${type} is applicable for Composition/ISD dealers only.` } });
+    // GSTR-4: Composition dealers (quarterly) — Sales vouchers
+    // GSTR-6: ISD (Input Service Distributor) — Journal/ISD vouchers
+    // Show data if available; only show "not applicable" if ZERO relevant vouchers exist
+    if (gstrTypeStr === 'GSTR-4') {
+      const gstr4Types = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
+      let q4 = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
+      const p4 = [companyGuid, gstr4Types];
+      let i4 = 3;
+      if (from) { q4 += ` AND date >= $${i4++}`; p4.push(from); }
+      if (to)   { q4 += ` AND date <= $${i4++}`; p4.push(to); }
+      q4 += ' ORDER BY date DESC LIMIT 200';
+      const { rows: r4 } = await query(q4, p4);
+      if (r4.length === 0) {
+        return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: 'No composition dealer (GSTR-4) transactions found for this period.' } });
+      }
+      return res.json({ success: true, country_applicable: true, data: r4, meta: { total: r4.length, gstr_type: type, direction: 'outward' } });
+    }
+    if (gstrTypeStr === 'GSTR-6') {
+      // ISD vouchers are typically Journal entries for input credit distribution
+      const gstr6Types = ['Journal', 'Receipt', 'Payment'];
+      let q6 = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
+      const p6 = [companyGuid, gstr6Types];
+      let i6 = 3;
+      if (from) { q6 += ` AND date >= $${i6++}`; p6.push(from); }
+      if (to)   { q6 += ` AND date <= $${i6++}`; p6.push(to); }
+      q6 += ' ORDER BY date DESC LIMIT 200';
+      const { rows: r6 } = await query(q6, p6);
+      if (r6.length === 0) {
+        return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: 'No ISD (GSTR-6) transactions found for this period.' } });
+      }
+      return res.json({ success: true, country_applicable: true, data: r6, meta: { total: r6.length, gstr_type: type } });
     }
 
     // GSTR-3B — summary return (output tax vs input tax credit)
