@@ -1619,8 +1619,9 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     );
     const stockClosingValue = parseFloat(stockValRows[0]?.closing_stock || 0);
     if (stockClosingValue > 0.01) {
-      // Stock-in-Hand is under Current Assets in Tally's group hierarchy
-      const stockGrp = 'Stock-in-Hand';
+      // Stock-in-Hand is under Current Assets — use topTBGroup to correctly place it
+      // This matches Tally's TB where Stock-in-Hand rolls up into Current Assets Dr
+      const stockGrp = topTBGroup('Stock-in-Hand'); // resolves to 'Current Assets'
       if (!tbGroupMap[stockGrp]) tbGroupMap[stockGrp] = { debit: 0, credit: 0 };
       tbGroupMap[stockGrp].debit += stockClosingValue; // stock is always an asset (Dr)
     }
