@@ -1265,8 +1265,32 @@ router.post('/reports/trial-balance', authMiddleware, async (req, res) => {
         };
       });
 
-    const totalDebit  = rows.reduce((s, r) => s + parseFloat(r.debit_amount  || 0), 0);
-    const totalCredit = rows.reduce((s, r) => s + parseFloat(r.credit_amount || 0), 0);
+    let totalDebit  = rows.reduce((s, r) => s + parseFloat(r.debit_amount  || 0), 0);
+    let totalCredit = rows.reduce((s, r) => s + parseFloat(r.credit_amount || 0), 0);
+
+    // Compute "Difference in Opening Balances" — mirrors what Tally shows to reconcile
+    // any imbalance caused by incomplete/inconsistent LFB opening data.
+    const { rows: lfbBalance } = await query(`
+      SELECT
+        SUM(CASE WHEN balance_type='Dr' THEN opening_balance::numeric ELSE -opening_balance::numeric END) as net_opening
+      FROM ledger_fy_balances
+      WHERE company_guid = $1 AND financial_year = $2
+    `, [companyGuid, tbFyYear]);
+    const netOpening = parseFloat(lfbBalance[0]?.net_opening || 0); // negative = Cr excess, positive = Dr excess
+    const diffInOpening = Math.abs(netOpening);
+    if (diffInOpening > 0.01) {
+      const diffEntry = {
+        name: 'Difference in Opening Balances',
+        parent: 'Difference in Opening Balances',
+        balance_type: netOpening < 0 ? 'Dr' : 'Cr',  // if Cr excess → show as Dr to balance
+        closing_balance: diffInOpening,
+        debit_amount:  netOpening < 0 ? diffInOpening : 0,
+        credit_amount: netOpening >= 0 ? diffInOpening : 0,
+      };
+      rows.push(diffEntry);
+      totalDebit  += diffEntry.debit_amount;
+      totalCredit += diffEntry.credit_amount;
+    }
 
     res.json({
       status: true,
@@ -1274,6 +1298,7 @@ router.post('/reports/trial-balance', authMiddleware, async (req, res) => {
         ledgers: rows,
         from: fyFrom, to: fyTo,
         totals: { debit: totalDebit, credit: totalCredit },
+        difference_in_opening: diffInOpening > 0.01 ? { amount: diffInOpening, type: netOpening < 0 ? 'Dr' : 'Cr' } : null,
       },
     });
   } catch (err) {

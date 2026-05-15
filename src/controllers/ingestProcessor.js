@@ -187,7 +187,8 @@ async function processMasters(data, companyGuid) {
       const bal = r.CLOSINGBALANCE || r.OPENINGBALANCE || '0';
       const balStr = String(bal);
       const balNum = parseFloat(balStr.replace(/[^0-9.-]/g, '')) || 0;
-      const balType = balStr.includes('Cr') ? 'Cr' : 'Dr';
+      // Tally convention: positive balance = Cr, negative = Dr (same as LFB parsing)
+      const balType = balStr.includes('Cr') ? 'Cr' : (balStr.includes('Dr') ? 'Dr' : (balNum >= 0 ? 'Cr' : 'Dr'));
 
       try {
         await client.query(`
