@@ -1993,80 +1993,68 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
     const gstrTypeStr = String(type);
+    const SALES   = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
+    const PURCHASE = ['Purchase GST', 'Purchase'];
+    const JOURNAL  = ['Journal', 'Receipt', 'Payment'];
 
-    // GSTR-4: Composition dealers (quarterly) — Sales vouchers
-    // GSTR-6: ISD (Input Service Distributor) — Journal/ISD vouchers
-    // Show data if available; only show "not applicable" if ZERO relevant vouchers exist
-    if (gstrTypeStr === 'GSTR-4') {
-      const gstr4Types = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
-      let q4 = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
-      const p4 = [companyGuid, gstr4Types];
-      let i4 = 3;
-      if (from) { q4 += ` AND date >= $${i4++}`; p4.push(from); }
-      if (to)   { q4 += ` AND date <= $${i4++}`; p4.push(to); }
-      q4 += ' ORDER BY date DESC LIMIT 200';
-      const { rows: r4 } = await query(q4, p4);
-      if (r4.length === 0) {
-        return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: 'No composition dealer (GSTR-4) transactions found for this period.' } });
-      }
-      return res.json({ success: true, country_applicable: true, data: r4, meta: { total: r4.length, gstr_type: type, direction: 'outward' } });
-    }
-    if (gstrTypeStr === 'GSTR-6') {
-      // ISD vouchers are typically Journal entries for input credit distribution
-      const gstr6Types = ['Journal', 'Receipt', 'Payment'];
-      let q6 = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
-      const p6 = [companyGuid, gstr6Types];
-      let i6 = 3;
-      if (from) { q6 += ` AND date >= $${i6++}`; p6.push(from); }
-      if (to)   { q6 += ` AND date <= $${i6++}`; p6.push(to); }
-      q6 += ' ORDER BY date DESC LIMIT 200';
-      const { rows: r6 } = await query(q6, p6);
-      if (r6.length === 0) {
-        return res.json({ success: true, data: [], meta: { total: 0, gstr_type: type, not_applicable: true, message: 'No ISD (GSTR-6) transactions found for this period.' } });
-      }
-      return res.json({ success: true, country_applicable: true, data: r6, meta: { total: r6.length, gstr_type: type } });
-    }
+    // ── GSTR Config map: each form → which voucher types to query ─────────────
+    // All forms follow same pattern: show data if available, else empty with message
+    const GSTR_MAP = {
+      'GSTR-1':  { types: SALES,            label: 'Monthly Outward Supply' },
+      'GSTR-2A': { types: PURCHASE,         label: 'Auto-drafted Inward Supply' },
+      'GSTR-2B': { types: PURCHASE,         label: 'Locked Inward Supply' },
+      'GSTR-4':  { types: SALES,            label: 'Composition Quarterly Return' },
+      'GSTR-5':  { types: [...SALES, ...PURCHASE], label: 'Non-Resident Taxable Person' },
+      'GSTR-5A': { types: SALES,            label: 'OIDAR Services' },
+      'GSTR-6':  { types: JOURNAL,          label: 'Input Service Distributor' },
+      'GSTR-7':  { types: JOURNAL,          label: 'TDS under GST' },
+      'GSTR-8':  { types: SALES,            label: 'E-commerce Operator (TCS)' },
+      'GSTR-9':  { types: SALES,            label: 'Annual Return' },
+      'GSTR-10': { types: null,             label: 'Final Return (Cancellation)' }, // all vouchers
+      'GSTR-11': { types: PURCHASE,         label: 'UIN Holders (Embassies/UN)' },
+    };
 
-    // GSTR-3B — summary return (output tax vs input tax credit)
+    // ── GSTR-3B is a special summary return (not a voucher list) ─────────────
     if (gstrTypeStr === 'GSTR-3B') {
       const baseParams = [companyGuid];
-      let dateWhere = '';
-      let idx = 2;
-      if (from) { dateWhere += ` AND date >= $${idx++}`; baseParams.push(from); }
-      if (to)   { dateWhere += ` AND date <= $${idx++}`; baseParams.push(to); }
-      const [outRows, inRows] = await Promise.all([
-        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type IN ('Sales GST','Sales','Debit Note','Credit Note')${dateWhere}`, baseParams),
-        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type IN ('Purchase GST','Purchase')${dateWhere}`, baseParams),
+      let dateWhere = ''; let dIdx = 2;
+      if (from) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(from); }
+      if (to)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(to); }
+      const [outR, inR] = await Promise.all([
+        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Sales GST','Sales','Debit Note','Credit Note'])${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
       ]);
-      const outwardSupply  = Math.abs(parseFloat(outRows[0]?.total || 0));
-      const inwardSupply   = Math.abs(parseFloat(inRows[0]?.total || 0));
-      const outputTax      = Math.round(outwardSupply * 0.18 * 100) / 100;  // approx 18% GST
-      const inputTaxCredit = Math.round(inwardSupply  * 0.18 * 100) / 100;
+      const outwardSupply  = Math.abs(parseFloat(outR[0]?.total || 0));
+      const inwardSupply   = Math.abs(parseFloat(inR[0]?.total || 0));
+      const outputTax      = Math.round(outwardSupply  * 0.18 * 100) / 100;
+      const inputTaxCredit = Math.round(inwardSupply   * 0.18 * 100) / 100;
       const netTaxPayable  = Math.max(0, outputTax - inputTaxCredit);
-      return res.json({
-        success: true, country_applicable: true, gstr_type: 'GSTR-3B',
-        data: [],
-        meta: { total: 0, gstr_type: 'GSTR-3B', is_summary: true },
+      return res.json({ success: true, country_applicable: true, gstr_type: 'GSTR-3B', data: [],
+        meta: { total: 0, gstr_type: 'GSTR-3B', is_summary: true, label: 'Monthly Summary Return' },
         summary: { outwardSupply, inwardSupply, outputTax, inputTaxCredit, netTaxPayable },
       });
     }
 
-    // GSTR-1 / GSTR-9 — outward supply (Sales)
-    // GSTR-2A / GSTR-2B — inward supply (Purchase)
-    const outwardTypes = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
-    const inwardTypes  = ['Purchase GST', 'Purchase'];
-    const isInward = ['GSTR-2A', 'GSTR-2B'].includes(gstrTypeStr);
-    const vTypes = isInward ? inwardTypes : outwardTypes;
+    const cfg = GSTR_MAP[gstrTypeStr];
+    if (!cfg) return res.status(400).json({ success: false, error: { code: 'INVALID_GSTR', message: `Unknown GSTR type: ${gstrTypeStr}` } });
 
-    const params = [companyGuid, vTypes];
+    // Build query — null types means ALL vouchers (GSTR-10 final return)
+    const qParams = cfg.types ? [companyGuid, cfg.types] : [companyGuid];
+    const typeFilter = cfg.types ? 'AND voucher_type = ANY($2)' : '';
     let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number
-             FROM vouchers WHERE company_guid=$1 AND voucher_type = ANY($2) AND is_cancelled=FALSE`;
-    let idx = 3;
-    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
-    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
+             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ${typeFilter}`;
+    let qIdx = cfg.types ? 3 : 2;
+    if (from) { q += ` AND date >= $${qIdx++}`; qParams.push(from); }
+    if (to)   { q += ` AND date <= $${qIdx++}`; qParams.push(to); }
     q += ' ORDER BY date DESC LIMIT 200';
-    const { rows } = await query(q, params);
-    res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, gstr_type: type, direction: isInward ? 'inward' : 'outward' } });
+    const { rows } = await query(q, qParams);
+
+    if (rows.length === 0) {
+      return res.json({ success: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, not_applicable: true,
+        label: cfg.label, message: `No ${cfg.label} (${gstrTypeStr}) transactions found for this period.` } });
+    }
+    res.json({ success: true, country_applicable: true, data: rows,
+      meta: { total: rows.length, gstr_type: gstrTypeStr, label: cfg.label } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
