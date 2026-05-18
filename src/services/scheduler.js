@@ -83,7 +83,7 @@ async function runPaymentReminderJob() {
           WHERE bo.company_guid IN (
             SELECT guid FROM companies WHERE user_id=$1
           )
-          AND DATE(TO_TIMESTAMP(bo.due_date::bigint / 1000)) = $2::date
+          AND DATE(TO_TIMESTAMP(bo.due_date::bigint / 1000)) = ($2)::date
           AND bo.amount >= $3
           AND bo.ledger_name NOT IN (${buildExclusions(reminder.exceptions)})
           LIMIT 50
