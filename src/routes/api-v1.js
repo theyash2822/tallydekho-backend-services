@@ -2022,9 +2022,12 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       let dateWhere = ''; let dIdx = 2;
       if (fyFrom) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(fyFrom); }
       if (fyTo)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(fyTo); }
+      // Outward: exclusion approach — catches custom Tally types (e.g. 'Iphone')
+      // Inline the exclusion list as SQL literal to avoid parameter index shifting
+      const NON_SALES_LITERAL = `ARRAY['Purchase GST','Purchase','Journal','Receipt','Payment','Contra','Sales Order','Voucher']`;
       const [outR, inR] = await Promise.all([
-        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Sales GST','Sales','Debit Note','Credit Note'])${dateWhere}`, baseParams),
-        query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
       ]);
       const outwardSupply  = Math.abs(parseFloat(outR[0]?.total || 0));
       const inwardSupply   = Math.abs(parseFloat(inR[0]?.total || 0));
