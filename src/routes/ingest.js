@@ -42,7 +42,8 @@ router.post('/desktop/init-sync', async (req, res) => {
     if (companies && companies.length > 0) {
       // Mark companies not in current sync as inactive (universal approach - never delete)
       const activeGuids = companies.map(c => c.guid).filter(Boolean);
-      const ph = activeGuids.map((_, i) => `$${i + 3}`).join(',');
+      const ph         = activeGuids.map((_, i) => `$${i + 3}`).join(','); // for deactivate: $1=userId, $2=deviceId, $3+=guids
+      const phActivate  = activeGuids.map((_, i) => `$${i + 2}`).join(','); // for activate: $1=userId, $2+=guids
       // Deactivate removed companies
       await query(
         `UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2 AND guid NOT IN (${ph})`,
@@ -50,7 +51,7 @@ router.post('/desktop/init-sync', async (req, res) => {
       ).catch(() => {});
       // Activate current companies
       await query(
-        `UPDATE companies SET is_active = TRUE WHERE user_id = $1 AND guid IN (${ph})`,
+        `UPDATE companies SET is_active = TRUE WHERE user_id = $1 AND guid IN (${phActivate})`,
         [userId, ...activeGuids]
       ).catch(() => {});
     }
@@ -332,7 +333,7 @@ router.post('/ingest/complete', async (req, res) => {
             AND lfb.ledger_name = vle.ledger_name
             AND lfb.financial_year = vle.financial_year
           WHERE vle.company_guid = $1
-            AND v.synced_at > lfb.synced_at  -- voucher newer than the FY anchor
+            AND to_timestamp(v.synced_at) > lfb.synced_at  -- voucher newer than FY anchor (cast bigint epoch → timestamp)
             AND vle.financial_year IS NOT NULL
         `, [companyGuid]);
 
