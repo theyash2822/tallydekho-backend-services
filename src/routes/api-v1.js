@@ -1994,48 +1994,57 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
     const gstrTypeStr = String(type);
+    const SALES    = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
     const PURCHASE = ['Purchase GST', 'Purchase'];
     const JOURNAL  = ['Journal', 'Receipt', 'Payment', 'Contra'];
-    // Known non-sales types — anything NOT in this list is treated as outward supply (handles custom Tally types like 'Iphone')
+    // NON_SALES used only for GSTR-1 exclusion (catches custom Tally types like 'Iphone')
     const NON_SALES = [...PURCHASE, ...JOURNAL, 'Sales Order', 'Voucher'];
 
-    // ── GSTR Config map: each form → which voucher types to query ─────────────
-    // useExclude:true → query uses NOT IN (NON_SALES) to catch custom voucher types
+    // ── GSTR Config map ───────────────────────────────────────────────────────
+    // useExclude:true  → NOT IN (NON_SALES) — only used for GSTR-1 to catch custom types
+    // types: [...]     → exact IN filter for that tab's voucher category
+    // types: null      → no type filter (all vouchers)
     const GSTR_MAP = {
-      'GSTR-1':  { useExclude: true,        label: 'Monthly Outward Supply' },
-      'GSTR-2A': { types: PURCHASE,         label: 'Auto-drafted Inward Supply' },
-      'GSTR-2B': { types: PURCHASE,         label: 'Locked Inward Supply' },
-      'GSTR-4':  { useExclude: true,        label: 'Composition Quarterly Return' },
-      'GSTR-5':  { types: null,              label: 'Non-Resident Taxable Person' },
-      'GSTR-5A': { useExclude: true,         label: 'OIDAR Services' },
-      'GSTR-6':  { types: JOURNAL,          label: 'Input Service Distributor' },
-      'GSTR-7':  { types: JOURNAL,          label: 'TDS under GST' },
-      'GSTR-8':  { useExclude: true,        label: 'E-commerce Operator (TCS)' },
-      'GSTR-9':  { useExclude: true,         label: 'Annual Return' },
-      'GSTR-10': { types: null,             label: 'Final Return (Cancellation)' }, // all vouchers
-      'GSTR-11': { types: PURCHASE,         label: 'UIN Holders (Embassies/UN)' },
+      'GSTR-1':  { useExclude: true,              label: 'Monthly Outward Supply' },
+      'GSTR-2A': { types: PURCHASE,               label: 'Auto-drafted Inward Supply' },
+      'GSTR-2B': { types: PURCHASE,               label: 'Locked Inward Supply' },
+      'GSTR-4':  { types: SALES,                  label: 'Composition Quarterly Return' },
+      'GSTR-5':  { types: [...SALES, ...PURCHASE], label: 'Non-Resident Taxable Person' },
+      'GSTR-5A': { types: SALES,                  label: 'OIDAR Services' },
+      'GSTR-6':  { types: JOURNAL,                label: 'Input Service Distributor' },
+      'GSTR-7':  { types: JOURNAL,                label: 'TDS under GST' },
+      'GSTR-8':  { types: SALES,                  label: 'E-commerce Operator (TCS)' },
+      'GSTR-9':  { types: [...SALES, ...PURCHASE], label: 'Annual Return' },
+      'GSTR-10': { types: null,                   label: 'Final Return (Cancellation)' },
+      'GSTR-11': { types: PURCHASE,               label: 'UIN Holders (Embassies/UN)' },
     };
 
-    // ── GSTR-3B is a special summary return (not a voucher list) ─────────────
+    // ── GSTR-3B: summary card + full voucher list (outward + inward) ───────────
     if (gstrTypeStr === 'GSTR-3B') {
       const baseParams = [companyGuid];
       let dateWhere = ''; let dIdx = 2;
       if (fyFrom) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(fyFrom); }
       if (fyTo)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(fyTo); }
-      // Outward: exclusion approach — catches custom Tally types (e.g. 'Iphone')
-      // Inline the exclusion list as SQL literal to avoid parameter index shifting
       const NON_SALES_LITERAL = `ARRAY['Purchase GST','Purchase','Journal','Receipt','Payment','Contra','Sales Order','Voucher']`;
-      const [outR, inR] = await Promise.all([
+      const voucherCols = 'id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number';
+      const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
         query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
         query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
+        query(`SELECT ${voucherCols} FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere} ORDER BY date DESC LIMIT 500`, baseParams),
+        query(`SELECT ${voucherCols} FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere} ORDER BY date DESC LIMIT 500`, baseParams),
       ]);
-      const outwardSupply  = Math.abs(parseFloat(outR[0]?.total || 0));
-      const inwardSupply   = Math.abs(parseFloat(inR[0]?.total || 0));
+      const outwardSupply  = Math.abs(parseFloat(outSumR.rows[0]?.total || 0));
+      const inwardSupply   = Math.abs(parseFloat(inSumR.rows[0]?.total || 0));
       const outputTax      = Math.round(outwardSupply  * 0.18 * 100) / 100;
       const inputTaxCredit = Math.round(inwardSupply   * 0.18 * 100) / 100;
       const netTaxPayable  = Math.max(0, outputTax - inputTaxCredit);
-      return res.json({ success: true, country_applicable: true, gstr_type: 'GSTR-3B', data: [],
-        meta: { total: 0, gstr_type: 'GSTR-3B', is_summary: true, label: 'Monthly Summary Return' },
+      // Combine outward + inward, sort by date desc
+      const allVouchers = [...outVouR.rows, ...inVouR.rows]
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+      return res.json({
+        success: true, country_applicable: true, gstr_type: 'GSTR-3B',
+        data: allVouchers,
+        meta: { total: allVouchers.length, gstr_type: 'GSTR-3B', is_summary: true, label: 'Monthly Summary Return' },
         summary: { outwardSupply, inwardSupply, outputTax, inputTaxCredit, netTaxPayable },
       });
     }
