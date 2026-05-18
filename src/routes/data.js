@@ -976,14 +976,12 @@ router.post('/gst-summary', authMiddleware, async (req, res) => {
 // ─── Alerts endpoint ─────────────────────────────────────────────────────────
 // GET /alerts — real-time compliance + IRN + EWB alert counts for dashboard & sales screen
 router.get('/alerts', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.query;
+  const { companyGuid, fy } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const now = new Date();
-    const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
-    const from = `${fyYear}-04-01`;
-    const to   = `${fyYear + 1}-03-31`;
+    // Use selectedFY from client — fall back to current real-world FY
+    const { from, to } = await resolveFYDates(companyGuid, null, null, fy);
 
     const [
       pendingIRN, pendingEWB, expiredEWB,
@@ -1056,6 +1054,24 @@ router.get('/alerts', authMiddleware, async (req, res) => {
     const cnCount      = parseInt(creditNotes.rows[0]?.count || 0);
     const unmatchedCnt = parseInt(unmatched.rows[0]?.count || 0);
 
+    // GST filing percentage — months with at least 1 IRN-enabled sales invoice vs months elapsed in FY
+    const gstFilingRows = await query(`
+      SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
+      FROM vouchers
+      WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+        AND (irn IS NOT NULL AND irn != '')
+        AND date BETWEEN $2 AND $3
+    `, [companyGuid, from, to]).catch(() => ({ rows: [{ filed_months: 0 }] }));
+    const now = new Date();
+    const fyFrom = new Date(from);
+    const monthsInFY  = 12;
+    const monthsElapsed = Math.max(1, Math.min(
+      Math.ceil((now - fyFrom) / (30 * 24 * 60 * 60 * 1000)), monthsInFY
+    ));
+    const filedMonths = parseInt(gstFilingRows.rows[0]?.filed_months || 0);
+    const gstPercent  = Math.min(100, Math.round((filedMonths / monthsElapsed) * 100));
+    const gstStatus   = gstPercent >= 100 ? 'Filed' : gstPercent > 0 ? 'Partial' : 'Pending';
+
     // Build alerts array (only show non-zero)
     const alerts = [
       irnCount > 0 && {
@@ -1102,6 +1118,7 @@ router.get('/alerts', authMiddleware, async (req, res) => {
         outstandingAmount: recAmount,
         creditNotesCount:  cnCount,
         unmatchedGSTCount: unmatchedCnt,
+        gstPercent, gstStatus, gstFiledMonths: filedMonths, gstTotalMonths: monthsElapsed,
         alerts,
         totalAlerts: alerts.length,
       },
