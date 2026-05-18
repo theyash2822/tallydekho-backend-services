@@ -1982,8 +1982,9 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from, to, type = 'GSTR-1' } = req.query;
+  const { from, to, type = 'GSTR-1', fy } = req.query;
   try {
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to, fy);
     const { rows: userRows } = await query('SELECT country FROM users WHERE id=$1', [req.user.userId]);
     const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
     const isIndia = (userRows[0]?.country || '').toLowerCase().includes('india')
@@ -2018,8 +2019,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     if (gstrTypeStr === 'GSTR-3B') {
       const baseParams = [companyGuid];
       let dateWhere = ''; let dIdx = 2;
-      if (from) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(from); }
-      if (to)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(to); }
+      if (fyFrom) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(fyFrom); }
+      if (fyTo)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(fyTo); }
       const [outR, inR] = await Promise.all([
         query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Sales GST','Sales','Debit Note','Credit Note'])${dateWhere}`, baseParams),
         query(`SELECT ROUND(COALESCE(SUM(amount),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
@@ -2044,8 +2045,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number
              FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ${typeFilter}`;
     let qIdx = cfg.types ? 3 : 2;
-    if (from) { q += ` AND date >= $${qIdx++}`; qParams.push(from); }
-    if (to)   { q += ` AND date <= $${qIdx++}`; qParams.push(to); }
+    if (fyFrom) { q += ` AND date >= $${qIdx++}`; qParams.push(fyFrom); }
+    if (fyTo)   { q += ` AND date <= $${qIdx++}`; qParams.push(fyTo); }
     q += ' ORDER BY date DESC LIMIT 200';
     const { rows } = await query(q, qParams);
 
