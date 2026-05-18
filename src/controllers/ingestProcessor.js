@@ -207,15 +207,16 @@ async function processMasters(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
             email=EXCLUDED.email, address=EXCLUDED.address,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, alter_id=EXCLUDED.alter_id,
-            synced_at=EXCLUDED.synced_at
+            synced_at=EXCLUDED.synced_at,
+            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name
         `, [
           guid, companyGuid, name, parent,
           r.ALIAS || r.LANGUAGENAME2 || null,
@@ -228,6 +229,8 @@ async function processMasters(data, companyGuid) {
           Math.abs(balNum), balType,
           parseInt(r.AlterId || r.ALTERID || 0),
           now(),
+          r.GSTREGISTRATIONTYPE || r.Gstregistrationtype || r.GSTRegistrationType || null,
+          r.LEDSTATENAME || r.LedStateName || r.STATENAME || null,
         ]);
         saved++;
       } catch (e) {
@@ -610,15 +613,16 @@ async function processFullLedger(data, companyGuid) {
       try {
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
-            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
             email=EXCLUDED.email, address=EXCLUDED.address,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, is_revenue=EXCLUDED.is_revenue,
-            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
+            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
@@ -632,6 +636,8 @@ async function processFullLedger(data, companyGuid) {
           Math.abs(balNum), balType,
           !!(r.ISREVENUE === 'Yes' || r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
           parseInt(r.ALTERID || r.AlterId || 0), now(),
+          r.GSTREGISTRATIONTYPE || r.Gstregistrationtype || r.GSTRegistrationType || null,
+          r.LEDSTATENAME || r.LedStateName || r.StateName || null,
         ]);
         saved++;
       } catch (e) { console.warn('[DB] FullLedger insert failed:', e.message); }
