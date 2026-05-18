@@ -1994,23 +1994,24 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
     const gstrTypeStr = String(type);
-    const SALES   = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
     const PURCHASE = ['Purchase GST', 'Purchase'];
-    const JOURNAL  = ['Journal', 'Receipt', 'Payment'];
+    const JOURNAL  = ['Journal', 'Receipt', 'Payment', 'Contra'];
+    // Known non-sales types — anything NOT in this list is treated as outward supply (handles custom Tally types like 'Iphone')
+    const NON_SALES = [...PURCHASE, ...JOURNAL, 'Sales Order', 'Voucher'];
 
     // ── GSTR Config map: each form → which voucher types to query ─────────────
-    // All forms follow same pattern: show data if available, else empty with message
+    // useExclude:true → query uses NOT IN (NON_SALES) to catch custom voucher types
     const GSTR_MAP = {
-      'GSTR-1':  { types: SALES,            label: 'Monthly Outward Supply' },
+      'GSTR-1':  { useExclude: true,        label: 'Monthly Outward Supply' },
       'GSTR-2A': { types: PURCHASE,         label: 'Auto-drafted Inward Supply' },
       'GSTR-2B': { types: PURCHASE,         label: 'Locked Inward Supply' },
-      'GSTR-4':  { types: SALES,            label: 'Composition Quarterly Return' },
-      'GSTR-5':  { types: [...SALES, ...PURCHASE], label: 'Non-Resident Taxable Person' },
-      'GSTR-5A': { types: SALES,            label: 'OIDAR Services' },
+      'GSTR-4':  { useExclude: true,        label: 'Composition Quarterly Return' },
+      'GSTR-5':  { types: null,              label: 'Non-Resident Taxable Person' },
+      'GSTR-5A': { useExclude: true,         label: 'OIDAR Services' },
       'GSTR-6':  { types: JOURNAL,          label: 'Input Service Distributor' },
       'GSTR-7':  { types: JOURNAL,          label: 'TDS under GST' },
-      'GSTR-8':  { types: SALES,            label: 'E-commerce Operator (TCS)' },
-      'GSTR-9':  { types: SALES,            label: 'Annual Return' },
+      'GSTR-8':  { useExclude: true,        label: 'E-commerce Operator (TCS)' },
+      'GSTR-9':  { useExclude: true,         label: 'Annual Return' },
       'GSTR-10': { types: null,             label: 'Final Return (Cancellation)' }, // all vouchers
       'GSTR-11': { types: PURCHASE,         label: 'UIN Holders (Embassies/UN)' },
     };
@@ -2039,12 +2040,26 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     const cfg = GSTR_MAP[gstrTypeStr];
     if (!cfg) return res.status(400).json({ success: false, error: { code: 'INVALID_GSTR', message: `Unknown GSTR type: ${gstrTypeStr}` } });
 
-    // Build query — null types means ALL vouchers (GSTR-10 final return)
-    const qParams = cfg.types ? [companyGuid, cfg.types] : [companyGuid];
-    const typeFilter = cfg.types ? 'AND voucher_type = ANY($2)' : '';
+    // Build query:
+    //   useExclude → NOT IN (NON_SALES) catches custom Tally types (e.g. 'Iphone')
+    //   types array → exact IN list for purchase/journal tabs
+    //   null types  → no type filter (GSTR-10 final return = all vouchers)
+    let qParams, typeFilter, qIdx;
+    if (cfg.useExclude) {
+      qParams    = [companyGuid, NON_SALES];
+      typeFilter = 'AND voucher_type != ALL($2)';
+      qIdx       = 3;
+    } else if (cfg.types) {
+      qParams    = [companyGuid, cfg.types];
+      typeFilter = 'AND voucher_type = ANY($2)';
+      qIdx       = 3;
+    } else {
+      qParams    = [companyGuid];
+      typeFilter = '';
+      qIdx       = 2;
+    }
     let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number
              FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ${typeFilter}`;
-    let qIdx = cfg.types ? 3 : 2;
     if (fyFrom) { q += ` AND date >= $${qIdx++}`; qParams.push(fyFrom); }
     if (fyTo)   { q += ` AND date <= $${qIdx++}`; qParams.push(fyTo); }
     q += ' ORDER BY date DESC LIMIT 200';
