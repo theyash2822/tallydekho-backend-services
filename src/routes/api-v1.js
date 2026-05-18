@@ -1978,6 +1978,68 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
 // GST REPORTS — India only
 // ══════════════════════════════════════════════════════════════════════════════
 
+// ─── GET /reports/gst-summary ────────────────────────────────────────────────
+router.get('/reports/gst-summary', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user?.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+
+    const baseParams = [companyGuid];
+    let dateWhere = ''; let dIdx = 2;
+    if (fyFrom) { dateWhere += ` AND v.date >= $${dIdx++}`; baseParams.push(fyFrom); }
+    if (fyTo)   { dateWhere += ` AND v.date <= $${dIdx++}`; baseParams.push(fyTo); }
+
+    const NON_SALES_LIT = `ARRAY['Purchase GST','Purchase','Journal','Receipt','Payment','Contra','Sales Order','Voucher']`;
+
+    const [outR, inR, unmatchedR] = await Promise.all([
+      // GST Collected = sum of (cgst+sgst+igst) on outward sales
+      query(`SELECT
+               COALESCE(SUM(g.cgst_amount),0) as cgst,
+               COALESCE(SUM(g.sgst_amount),0) as sgst,
+               COALESCE(SUM(g.igst_amount),0) as igst,
+               COALESCE(SUM(g.taxable_amount),0) as taxable
+             FROM vouchers v
+             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             AND v.voucher_type != ALL(${NON_SALES_LIT})${dateWhere}`, baseParams),
+      // ITC = sum of (cgst+sgst+igst) on inward purchases
+      query(`SELECT
+               COALESCE(SUM(g.cgst_amount),0) as cgst,
+               COALESCE(SUM(g.sgst_amount),0) as sgst,
+               COALESCE(SUM(g.igst_amount),0) as igst,
+               COALESCE(SUM(g.taxable_amount),0) as taxable
+             FROM vouchers v
+             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
+      // Unmatched = GSTR-2A eligible purchases (from registered suppliers) without IRN
+      query(`SELECT COUNT(*) as cnt
+             FROM vouchers v
+             INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
+             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])
+             AND l.gstin IS NOT NULL AND l.gstin != ''
+             AND (v.irn IS NULL OR v.irn = '')${dateWhere}`, baseParams),
+    ]);
+
+    const o = outR.rows[0];
+    const i = inR.rows[0];
+    const gstCollected  = Math.round((parseFloat(o.cgst) + parseFloat(o.sgst) + parseFloat(o.igst)) * 100) / 100;
+    const itcBalance    = Math.round((parseFloat(i.cgst) + parseFloat(i.sgst) + parseFloat(i.igst)) * 100) / 100;
+    const netPayable    = Math.max(0, Math.round((gstCollected - itcBalance) * 100) / 100);
+    const unmatchedCount = parseInt(unmatchedR.rows[0]?.cnt || 0);
+
+    res.json({ success: true,
+      summary: { gstCollected, itcBalance, netPayable, unmatchedCount,
+        outwardTaxable: Math.round(parseFloat(o.taxable) * 100) / 100,
+        inwardTaxable:  Math.round(parseFloat(i.taxable) * 100) / 100,
+      }
+    });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -2050,7 +2112,9 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                        COALESCE(g.sgst_amount, 0) as sgst_amount,
                        COALESCE(g.igst_amount, 0) as igst_amount,
                        g.gst_reg_type, g.place_of_supply,
-                       l.gstin as party_gstin
+                       l.gstin as party_gstin,
+                       v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                       CASE WHEN l.gstin IS NOT NULL AND l.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
                FROM vouchers v
                INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
                LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
@@ -2085,9 +2149,11 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
         COALESCE(g.cgst_amount, 0) as cgst_amount,
         COALESCE(g.sgst_amount, 0) as sgst_amount,
         COALESCE(g.igst_amount, 0) as igst_amount,
-        g.gst_reg_type, g.place_of_supply`;
-      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
-      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
+        g.gst_reg_type, g.place_of_supply,
+        v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+        CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type`;
+      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
+      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
       const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
         query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
         query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
@@ -2141,9 +2207,12 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                     COALESCE(g.cgst_amount, 0) as cgst_amount,
                     COALESCE(g.sgst_amount, 0) as sgst_amount,
                     COALESCE(g.igst_amount, 0) as igst_amount,
-                    g.gst_reg_type, g.place_of_supply
+                    g.gst_reg_type, g.place_of_supply,
+                    v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                    CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
              FROM vouchers v
              LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+             LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid
              WHERE v.company_guid=$1 AND v.is_cancelled=FALSE ${typeFilter}`;
     if (fyFrom) { q += ` AND v.date >= $${qIdx++}`; qParams.push(fyFrom); }
     if (fyTo)   { q += ` AND v.date <= $${qIdx++}`; qParams.push(fyTo); }

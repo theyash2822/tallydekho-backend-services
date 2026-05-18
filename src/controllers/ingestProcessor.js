@@ -815,15 +815,21 @@ async function processGSTDetails(data, companyGuid) {
       const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
       if (!voucherGuid) continue;
       try {
+        const isInterstate = r.IsInterState === 'Yes' || r.ISINTERSTATE === 'Yes' || r.ISINTERSTATE === 'YES';
+        const isRcm        = r.IsRCMApplicable === 'Yes' || r.ISRCMAPPLICABLE === 'Yes' || r.ISRCMAPPLICABLE === 'YES';
+        const exportType   = r.ExportType || r.EXPORTTYPE || null;
+        const isSez        = r.IsSEZParty === 'Yes' || r.ISSEZPARTY === 'Yes' || r.ISSEZPARTY === 'YES';
         await client.query(`
           INSERT INTO gst_voucher_details
-            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
           ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
             voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
             taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
             sgst_amount=EXCLUDED.sgst_amount, igst_amount=EXCLUDED.igst_amount,
-            irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+            irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
+            is_interstate=EXCLUDED.is_interstate, is_rcm=EXCLUDED.is_rcm,
+            export_type=EXCLUDED.export_type, is_sez=EXCLUDED.is_sez
         `, [
           voucherGuid, companyGuid,
           r.VOUCHERNUMBER  || r.VoucherNumber  || null,
@@ -838,12 +844,59 @@ async function processGSTDetails(data, companyGuid) {
           n(r.IGSTAMOUNT    ?? r.IGSTAmount    ?? r.IGST_AMOUNT),
           r.IRN || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
+          isInterstate, isRcm, exportType, isSez,
         ]);
         saved++;
       } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
     }
     await client.query('COMMIT');
     console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);
+    // Post-process: update vouchers classification from gst_voucher_details
+    try {
+      // Mark is_interstate on gst_voucher_details (IGST only = interstate)
+      await query(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_guid = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [companyGuid]);
+      // Mark is_rcm on gst_voucher_details from Tally data
+      // (already set during insert from r.IsRCMApplicable)
+      // Populate vouchers.is_export
+      await query(`UPDATE vouchers v SET is_export = true
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.igst_amount > 0 AND v.voucher_type_parent = 'Sales' AND v.company_guid = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_guid = v.company_guid
+          AND l.gstin IS NOT NULL AND l.gstin != ''
+        )`, [companyGuid]);
+      // Populate vouchers.is_sez from gst_voucher_details.is_sez
+      await query(`UPDATE vouchers v SET is_sez = true
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.is_sez = true AND v.company_guid = $1`, [companyGuid]);
+      // Populate vouchers.is_reverse_charge from gst_voucher_details.is_rcm
+      await query(`UPDATE vouchers v SET is_reverse_charge = true
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.is_rcm = true AND v.company_guid = $1`, [companyGuid]);
+      // Update gst_section for sales
+      await query(`UPDATE vouchers v SET gst_section =
+        CASE
+          WHEN v.is_export THEN 'Export'
+          WHEN v.is_sez THEN 'SEZ'
+          WHEN EXISTS (SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_guid = v.company_guid AND l.gstin IS NOT NULL AND l.gstin != '') THEN
+            CASE WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.igst_amount > 0 AND g.cgst_amount = 0) THEN 'B2B Interstate' ELSE 'B2B' END
+          ELSE 'B2C'
+        END
+        WHERE v.company_guid = $1 AND v.voucher_type_parent IN ('Sales', 'Credit Note', 'Debit Note') AND v.is_cancelled = false`, [companyGuid]);
+      // Update gst_section for purchases
+      await query(`UPDATE vouchers v SET gst_section =
+        CASE
+          WHEN v.is_reverse_charge THEN 'RCM'
+          WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.igst_amount > 0 AND g.cgst_amount = 0) THEN 'ITC Interstate'
+          WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.cgst_amount > 0) THEN 'ITC'
+          ELSE 'ITC'
+        END
+        WHERE v.company_guid = $1 AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false`, [companyGuid]);
+      console.log(`[DB] GSTDetails: voucher gst_section updated for ${companyGuid}`);
+    } catch (pe) { console.warn('[DB] GSTDetails post-process voucher update failed:', pe.message); }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
   finally { client.release(); }
 }
