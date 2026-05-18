@@ -2113,7 +2113,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                        COALESCE(g.igst_amount, 0) as igst_amount,
                        g.gst_reg_type, g.place_of_supply,
                        l.gstin as party_gstin,
-                       v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                       v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                       g.is_nil_rated, g.is_exempt,
                        CASE WHEN l.gstin IS NOT NULL AND l.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
                FROM vouchers v
                INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
@@ -2150,7 +2151,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
         COALESCE(g.sgst_amount, 0) as sgst_amount,
         COALESCE(g.igst_amount, 0) as igst_amount,
         g.gst_reg_type, g.place_of_supply,
-        v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+        v.party_gstin, v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
+        g.is_nil_rated, g.is_exempt,
         CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type`;
       const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
       const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
@@ -2208,7 +2210,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                     COALESCE(g.sgst_amount, 0) as sgst_amount,
                     COALESCE(g.igst_amount, 0) as igst_amount,
                     g.gst_reg_type, g.place_of_supply,
-                    v.gst_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                    v.party_gstin, v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
+                    g.is_nil_rated, g.is_exempt,
                     CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
              FROM vouchers v
              LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid

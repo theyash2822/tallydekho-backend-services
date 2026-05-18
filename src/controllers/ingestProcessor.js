@@ -825,17 +825,21 @@ async function processGSTDetails(data, companyGuid) {
         const isRcm        = r.IsRCMApplicable === 'Yes' || r.ISRCMAPPLICABLE === 'Yes' || r.ISRCMAPPLICABLE === 'YES';
         const exportType   = r.ExportType || r.EXPORTTYPE || null;
         const isSez        = r.IsSEZParty === 'Yes' || r.ISSEZPARTY === 'Yes' || r.ISSEZPARTY === 'YES';
+        const partyGstin   = r.PartyGSTIN || r.PARTYGSTIN || null;
+        const isNilRated   = r.IsNilRated === 'Yes' || r.ISNILRATED === 'Yes';
+        const isExempt     = r.IsExempt === 'Yes' || r.ISEXEMPT === 'Yes';
         await client.query(`
           INSERT INTO gst_voucher_details
-            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez, party_gstin, is_nil_rated, is_exempt)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
           ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
             voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
             taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
             sgst_amount=EXCLUDED.sgst_amount, igst_amount=EXCLUDED.igst_amount,
             irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
             is_interstate=EXCLUDED.is_interstate, is_rcm=EXCLUDED.is_rcm,
-            export_type=EXCLUDED.export_type, is_sez=EXCLUDED.is_sez
+            export_type=EXCLUDED.export_type, is_sez=EXCLUDED.is_sez,
+            party_gstin=EXCLUDED.party_gstin, is_nil_rated=EXCLUDED.is_nil_rated, is_exempt=EXCLUDED.is_exempt
         `, [
           voucherGuid, companyGuid,
           r.VOUCHERNUMBER  || r.VoucherNumber  || null,
@@ -851,6 +855,7 @@ async function processGSTDetails(data, companyGuid) {
           r.IRN || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
           isInterstate, isRcm, exportType, isSez,
+          partyGstin, isNilRated, isExempt,
         ]);
         saved++;
       } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
@@ -902,6 +907,35 @@ async function processGSTDetails(data, companyGuid) {
         END
         WHERE v.company_guid = $1 AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false`, [companyGuid]);
       console.log(`[DB] GSTDetails: voucher gst_section updated for ${companyGuid}`);
+      // Populate vouchers.party_gstin from gst_voucher_details
+      await query(`
+        UPDATE vouchers v SET party_gstin = g.party_gstin
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.party_gstin IS NOT NULL AND g.party_gstin != ''
+        AND (v.party_gstin IS NULL OR v.party_gstin = '')
+        AND v.company_guid = $1
+      `, [companyGuid]);
+      // Update gstr3b_section on vouchers
+      await query(`
+        UPDATE vouchers v SET gstr3b_section =
+          CASE
+            WHEN v.voucher_type_parent IN ('Sales','Credit Note','Debit Note') THEN
+              CASE
+                WHEN v.is_export OR v.is_sez THEN '3.1(b)'
+                WHEN g.is_nil_rated THEN '3.1(c)'
+                WHEN v.is_reverse_charge THEN '3.1(d)'
+                ELSE '3.1(a)'
+              END
+            WHEN v.voucher_type_parent = 'Purchase' THEN
+              CASE WHEN v.is_reverse_charge THEN '3.1(d) RCM' ELSE '4A ITC' END
+            ELSE NULL
+          END
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND v.company_guid = $1 AND v.is_cancelled = false
+      `, [companyGuid]);
+      console.log(`[DB] GSTDetails: party_gstin + gstr3b_section updated for ${companyGuid}`);
     } catch (pe) { console.warn('[DB] GSTDetails post-process voucher update failed:', pe.message); }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
   finally { client.release(); }
