@@ -1035,13 +1035,14 @@ router.get('/alerts', authMiddleware, async (req, res) => {
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
 
-      // GST unmatched invoices (missing HSN or GSTIN)
+      // GST unmatched invoices: B2B sales (amount >= 10000) missing party GSTIN
       query(
         `SELECT COUNT(*) as count FROM vouchers
          WHERE company_guid=$1
-           AND voucher_type ILIKE '%Sales%'
+           AND voucher_type_parent = 'Sales'
            AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
-           AND (party_gstin IS NULL OR party_gstin = '' OR hsn_code IS NULL OR hsn_code = '')`,
+           AND amount >= 10000
+           AND (party_gstin IS NULL OR party_gstin = '')`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
     ]);
@@ -1054,12 +1055,14 @@ router.get('/alerts', authMiddleware, async (req, res) => {
     const cnCount      = parseInt(creditNotes.rows[0]?.count || 0);
     const unmatchedCnt = parseInt(unmatched.rows[0]?.count || 0);
 
-    // GST filing percentage — months with at least 1 IRN-enabled sales invoice vs months elapsed in FY
+    // GST filing percentage — months with at least 1 sales GST voucher in FY vs months elapsed
+    // (proxy for active filing months since we don't have portal filing status)
     const gstFilingRows = await query(`
       SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
       FROM vouchers
-      WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
-        AND (irn IS NOT NULL AND irn != '')
+      WHERE company_guid=$1
+        AND voucher_type_parent = 'Sales'
+        AND is_cancelled = FALSE
         AND date BETWEEN $2 AND $3
     `, [companyGuid, from, to]).catch(() => ({ rows: [{ filed_months: 0 }] }));
     const now = new Date();
