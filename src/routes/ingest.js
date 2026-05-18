@@ -11,6 +11,20 @@ const socketService = { notifySynced: (...args) => _socketService?.notifySynced(
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
+function normalizeGstType(raw) {
+  if (!raw) return 'Regular';
+  const s = raw.toLowerCase();
+  if (s.includes('composition')) return 'Composition';
+  if (s.includes('non-resident') || s.includes('nonresident') || s.includes('nrtp')) return 'NonResident';
+  if (s.includes('oidar')) return 'OIDAR';
+  if (s.includes('isd') || s.includes('input service distributor')) return 'ISD';
+  if (s.includes('tds')) return 'TDS_Deductor';
+  if (s.includes('ecommerce') || s.includes('e-commerce') || s.includes('tcs')) return 'Ecommerce_Operator';
+  if (s.includes('uin')) return 'UIN';
+  if (s.includes('cancel')) return 'Cancelled';
+  return 'Regular';
+}
+
 // POST /desktop/init-sync
 router.post('/desktop/init-sync', async (req, res) => {
   const deviceId = req.headers['device-id'];
@@ -64,16 +78,18 @@ router.post('/desktop/init-sync', async (req, res) => {
 
         try {
           await query(`
-            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active, gst_taxpayer_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10)
             ON CONFLICT (guid) DO UPDATE SET
               user_id = EXCLUDED.user_id, device_id = EXCLUDED.device_id,
               name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
               gstin = EXCLUDED.gstin, fy_start = EXCLUDED.fy_start,
               fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at,
-              is_active = TRUE
+              is_active = TRUE,
+              gst_taxpayer_type = EXCLUDED.gst_taxpayer_type
           `, [c.guid, userId, deviceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
-              c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now()]);
+              c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now(),
+              normalizeGstType(c.GSTREGISTRATIONTYPE || c.GstRegistrationType || c.TAXPAYERTYPE || c.TaxpayerType || null)]);
           console.log(`[DB] Company saved: ${c.name || c.guid}`);
 
           // Store all financial years for this company

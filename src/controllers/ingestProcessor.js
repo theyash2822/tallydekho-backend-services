@@ -68,6 +68,21 @@ const now = () => Math.floor(Date.now() / 1000);
 
 // V2: Optionally store raw records before processing (TALLY_STORE_RAW=true env var)
 const STORE_RAW = process.env.TALLY_STORE_RAW === 'true';
+
+// Derive parent voucher type from custom Tally voucher type name
+function deriveVoucherTypeParent(voucherType) {
+  if (!voucherType) return voucherType;
+  const vt = voucherType.toLowerCase();
+  if (vt.includes('credit note') || vt.includes('sales return')) return 'Credit Note';
+  if (vt.includes('debit note') || vt.includes('purchase return')) return 'Debit Note';
+  if (vt.includes('sales') || vt.includes('invoice') || vt.includes('retail')) return 'Sales';
+  if (vt.includes('purchase')) return 'Purchase';
+  if (vt.includes('journal') || vt.includes('adjustment')) return 'Journal';
+  if (vt.includes('payment')) return 'Payment';
+  if (vt.includes('receipt')) return 'Receipt';
+  if (vt.includes('contra')) return 'Contra';
+  return voucherType;
+}
 async function maybeStoreRaw(records, companyGuid, streamName) {
   if (!STORE_RAW || !records?.length) return;
   const client = await getClient();
@@ -330,25 +345,26 @@ async function processVouchers(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
-            voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
-            voucher_type   = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
-            date           = COALESCE(EXCLUDED.date, vouchers.date),
-            party_name     = COALESCE(EXCLUDED.party_name, vouchers.party_name),
-            party_guid     = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
-            amount         = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
-            narration      = COALESCE(EXCLUDED.narration, vouchers.narration),
-            reference      = COALESCE(EXCLUDED.reference, vouchers.reference),
-            is_cancelled   = EXCLUDED.is_cancelled,
-            alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
-            raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
-            financial_year = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
-            synced_at      = EXCLUDED.synced_at
+            voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+            voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
+            voucher_type_parent = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
+            date                = COALESCE(EXCLUDED.date, vouchers.date),
+            party_name          = COALESCE(EXCLUDED.party_name, vouchers.party_name),
+            party_guid          = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
+            amount              = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
+            narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
+            reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
+            is_cancelled        = EXCLUDED.is_cancelled,
+            alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
+            raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
+            synced_at           = EXCLUDED.synced_at
         `, [
-          guid, companyGuid, voucherNumber, voucherType, date,
+          guid, companyGuid, voucherNumber, voucherType, deriveVoucherTypeParent(voucherType), date,
           // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml
           r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
           partyGuid,
@@ -1337,26 +1353,27 @@ async function processAllVoucher(data, companyGuid) {
       }
       try {
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
-            voucher_number = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
-            voucher_type   = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
-            date           = COALESCE(EXCLUDED.date, vouchers.date),
-            party_name     = COALESCE(EXCLUDED.party_name, vouchers.party_name),
-            party_guid     = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
-            amount         = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
-            narration      = COALESCE(EXCLUDED.narration, vouchers.narration),
-            reference      = COALESCE(EXCLUDED.reference, vouchers.reference),
-            is_cancelled   = EXCLUDED.is_cancelled,
-            alter_id       = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
-            raw_data       = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
-            financial_year = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
-            synced_at      = EXCLUDED.synced_at
+            voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+            voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
+            voucher_type_parent = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
+            date                = COALESCE(EXCLUDED.date, vouchers.date),
+            party_name          = COALESCE(EXCLUDED.party_name, vouchers.party_name),
+            party_guid          = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
+            amount              = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
+            narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
+            reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
+            is_cancelled        = EXCLUDED.is_cancelled,
+            alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
+            raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
+            synced_at           = EXCLUDED.synced_at
         `, [
           guid, companyGuid,
           r.VOUCHERNUMBER || r.VoucherNumber || null,
-          voucherType, date,
+          voucherType, deriveVoucherTypeParent(voucherType), date,
           r.PARTYNAME || r.PartyName || r.PARTYLEDGERNAME || null,
           partyGuid,
           amount,

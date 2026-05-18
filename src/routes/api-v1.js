@@ -1986,19 +1986,41 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to, fy);
     const { rows: userRows } = await query('SELECT country FROM users WHERE id=$1', [req.user.userId]);
-    const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: coRows } = await query('SELECT gstin, state, country, gst_taxpayer_type FROM companies WHERE guid=$1', [companyGuid]);
     const isIndia = (userRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.gstin)
       || (coRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'GST reports are applicable only for India (GST-registered companies)' } });
 
+    const gstTaxpayerType = coRows[0]?.gst_taxpayer_type || 'Regular';
     const gstrTypeStr = String(type);
     const SALES    = ['Sales GST', 'Sales', 'Debit Note', 'Credit Note'];
     const PURCHASE = ['Purchase GST', 'Purchase'];
     const JOURNAL  = ['Journal', 'Receipt', 'Payment', 'Contra'];
     // NON_SALES used only for GSTR-1 exclusion (catches custom Tally types like 'Iphone')
     const NON_SALES = [...PURCHASE, ...JOURNAL, 'Sales Order', 'Voucher'];
+
+    // ── Role-gated tabs: only show data if company has matching GST role ───────
+    const ROLE_GATED_TABS = {
+      'GSTR-4':  'Composition',
+      'GSTR-5':  'NonResident',
+      'GSTR-5A': 'OIDAR',
+      'GSTR-6':  'ISD',
+      'GSTR-7':  'TDS_Deductor',
+      'GSTR-8':  'Ecommerce_Operator',
+      'GSTR-10': 'Cancelled',
+      'GSTR-11': 'UIN',
+    };
+
+    // Return empty immediately if company doesn't have the required GST role
+    if (ROLE_GATED_TABS[gstrTypeStr] && ROLE_GATED_TABS[gstrTypeStr] !== gstTaxpayerType) {
+      return res.json({
+        success: true, country_applicable: true,
+        data: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
+          message: `${gstrTypeStr} is not applicable for this company's GST registration type (${gstTaxpayerType})` }
+      });
+    }
 
     // ── GSTR Config map ───────────────────────────────────────────────────────
     // useExclude:true  → NOT IN (NON_SALES) — only used for GSTR-1 to catch custom types
@@ -2011,9 +2033,6 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       'GSTR-4':  { types: SALES,                  label: 'Composition Quarterly Return' },
       'GSTR-5':  { types: [...SALES, ...PURCHASE], label: 'Non-Resident Taxable Person' },
       'GSTR-5A': { types: SALES,                  label: 'OIDAR Services' },
-      // GSTR-6/7 require specific ISD/TDS-tagged entries — regular Journal/Payment/Contra
-      // entries are NOT ISD distributions or GST-TDS deductions. Return empty to avoid
-      // showing misleading data. If company is ISD/TDS registrant, Tally TDL needed.
       'GSTR-6':  { types: [],                     label: 'Input Service Distributor' },
       'GSTR-7':  { types: [],                     label: 'TDS under GST' },
       'GSTR-8':  { types: SALES,                  label: 'E-commerce Operator (TCS)' },
@@ -2022,19 +2041,58 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       'GSTR-11': { types: PURCHASE,               label: 'UIN Holders (Embassies/UN)' },
     };
 
+    // ── GSTR-2A / GSTR-2B: JOIN ledgers to filter only registered supplier purchases ──
+    if (gstrTypeStr === 'GSTR-2A' || gstrTypeStr === 'GSTR-2B') {
+      let q2 = `SELECT v.id, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration, v.irn, v.ewb_number,
+                       v.voucher_type_parent,
+                       COALESCE(g.taxable_amount, 0) as taxable_amount,
+                       COALESCE(g.cgst_amount, 0) as cgst_amount,
+                       COALESCE(g.sgst_amount, 0) as sgst_amount,
+                       COALESCE(g.igst_amount, 0) as igst_amount,
+                       g.gst_reg_type, g.place_of_supply,
+                       l.gstin as party_gstin
+               FROM vouchers v
+               INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
+               LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+               WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+               AND v.voucher_type = ANY($2)
+               AND l.gstin IS NOT NULL AND l.gstin != ''`;
+      let q2Params = [companyGuid, PURCHASE];
+      let q2Idx = 3;
+      if (fyFrom) { q2 += ` AND v.date >= $${q2Idx++}`; q2Params.push(fyFrom); }
+      if (fyTo)   { q2 += ` AND v.date <= $${q2Idx++}`; q2Params.push(fyTo); }
+      q2 += ' ORDER BY v.date DESC LIMIT 500';
+      const { rows: rows2 } = await query(q2, q2Params);
+      if (rows2.length === 0) {
+        return res.json({ success: true, country_applicable: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
+          message: `No registered supplier purchase vouchers found for ${gstrTypeStr}` } });
+      }
+      return res.json({ success: true, country_applicable: true, data: rows2,
+        meta: { total: rows2.length, gstr_type: gstrTypeStr,
+          label: gstrTypeStr === 'GSTR-2A' ? 'Auto-drafted Inward Supply' : 'Locked ITC Statement' } });
+    }
+
     // ── GSTR-3B: summary card + full voucher list (outward + inward) ───────────
     if (gstrTypeStr === 'GSTR-3B') {
       const baseParams = [companyGuid];
       let dateWhere = ''; let dIdx = 2;
-      if (fyFrom) { dateWhere += ` AND date >= $${dIdx++}`; baseParams.push(fyFrom); }
-      if (fyTo)   { dateWhere += ` AND date <= $${dIdx++}`; baseParams.push(fyTo); }
+      if (fyFrom) { dateWhere += ` AND v.date >= $${dIdx++}`; baseParams.push(fyFrom); }
+      if (fyTo)   { dateWhere += ` AND v.date <= $${dIdx++}`; baseParams.push(fyTo); }
       const NON_SALES_LITERAL = `ARRAY['Purchase GST','Purchase','Journal','Receipt','Payment','Contra','Sales Order','Voucher']`;
-      const voucherCols = 'id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number';
+      const voucherCols = `v.id, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration, v.irn, v.ewb_number,
+        v.voucher_type_parent,
+        COALESCE(g.taxable_amount, 0) as taxable_amount,
+        COALESCE(g.cgst_amount, 0) as cgst_amount,
+        COALESCE(g.sgst_amount, 0) as sgst_amount,
+        COALESCE(g.igst_amount, 0) as igst_amount,
+        g.gst_reg_type, g.place_of_supply`;
+      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
+      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
       const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
-        query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
-        query(`SELECT ROUND(COALESCE(SUM(ABS(amount)),0)::numeric,2) as total FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
-        query(`SELECT ${voucherCols} FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere} ORDER BY date DESC LIMIT 500`, baseParams),
-        query(`SELECT ${voucherCols} FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere} ORDER BY date DESC LIMIT 500`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
+        query(`${outQ}${dateWhere} ORDER BY v.date DESC LIMIT 500`, baseParams),
+        query(`${inQ}${dateWhere} ORDER BY v.date DESC LIMIT 500`, baseParams),
       ]);
       const outwardSupply  = Math.abs(parseFloat(outSumR.rows[0]?.total || 0));
       const inwardSupply   = Math.abs(parseFloat(inSumR.rows[0]?.total || 0));
@@ -2062,22 +2120,34 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     let qParams, typeFilter, qIdx;
     if (cfg.useExclude) {
       qParams    = [companyGuid, NON_SALES];
-      typeFilter = 'AND voucher_type != ALL($2)';
+      typeFilter = 'AND v.voucher_type != ALL($2)';
       qIdx       = 3;
-    } else if (cfg.types) {
+    } else if (cfg.types && cfg.types.length > 0) {
       qParams    = [companyGuid, cfg.types];
-      typeFilter = 'AND voucher_type = ANY($2)';
+      typeFilter = 'AND v.voucher_type = ANY($2)';
       qIdx       = 3;
+    } else if (cfg.types && cfg.types.length === 0) {
+      // Empty array = return nothing (ISD/TDS requires special Tally setup)
+      return res.json({ success: true, country_applicable: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
+        label: cfg.label, message: `${cfg.label} (${gstrTypeStr}) requires specific Tally TDL setup. No data available.` } });
     } else {
       qParams    = [companyGuid];
       typeFilter = '';
       qIdx       = 2;
     }
-    let q = `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date, narration, irn, ewb_number
-             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE ${typeFilter}`;
-    if (fyFrom) { q += ` AND date >= $${qIdx++}`; qParams.push(fyFrom); }
-    if (fyTo)   { q += ` AND date <= $${qIdx++}`; qParams.push(fyTo); }
-    q += ' ORDER BY date DESC LIMIT 200';
+    let q = `SELECT v.id, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration, v.irn, v.ewb_number,
+                    v.voucher_type_parent,
+                    COALESCE(g.taxable_amount, 0) as taxable_amount,
+                    COALESCE(g.cgst_amount, 0) as cgst_amount,
+                    COALESCE(g.sgst_amount, 0) as sgst_amount,
+                    COALESCE(g.igst_amount, 0) as igst_amount,
+                    g.gst_reg_type, g.place_of_supply
+             FROM vouchers v
+             LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE ${typeFilter}`;
+    if (fyFrom) { q += ` AND v.date >= $${qIdx++}`; qParams.push(fyFrom); }
+    if (fyTo)   { q += ` AND v.date <= $${qIdx++}`; qParams.push(fyTo); }
+    q += ' ORDER BY v.date DESC LIMIT 200';
     const { rows } = await query(q, qParams);
 
     if (rows.length === 0) {
