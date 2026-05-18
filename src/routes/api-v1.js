@@ -1715,25 +1715,36 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: sales } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE`, [companyGuid]);
-    const { rows: purchase } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE`, [companyGuid]);
-    const outputGst = +(sales?.[0]?.v ?? 0) * 0.18;
-    const inputGst  = +(purchase?.[0]?.v ?? 0) * 0.18;
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const dateFilter = from && to ? ' AND date BETWEEN $2 AND $3' : '';
+    const baseParams = from && to ? [companyGuid, from, to] : [companyGuid];
 
-    // Count months with voucher activity (proxy for filed months)
-    const { rows: monthsData } = await query(`
-      SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
-      FROM vouchers
-      WHERE company_guid=$1 AND is_cancelled=FALSE
-        AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-    `, [companyGuid]).catch(() => ({ rows: [{ filed_months: 0 }] }));
-    const filedMonths = parseInt(monthsData?.[0]?.filed_months || 0);
+    const [salesRes, purchaseRes, monthsRes] = await Promise.all([
+      query(`SELECT COALESCE(SUM(ABS(g.cgst_amount + g.sgst_amount + g.igst_amount)),0) as tax,
+                    COALESCE(SUM(g.taxable_amount),0) as taxable
+             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_guid=v.company_guid
+             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Sales'${dateFilter}`, baseParams),
+      query(`SELECT COALESCE(SUM(ABS(g.cgst_amount + g.sgst_amount + g.igst_amount)),0) as tax,
+                    COALESCE(SUM(g.taxable_amount),0) as taxable
+             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_guid=v.company_guid
+             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Purchase'${dateFilter}`, baseParams),
+      query(`SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
+             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type_parent='Sales'
+             AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'${dateFilter}`, baseParams)
+        .catch(() => ({ rows: [{ filed_months: 0 }] })),
+    ]);
+
+    const outputGst   = parseFloat(salesRes.rows[0]?.tax    || 0);
+    const inputGst    = parseFloat(purchaseRes.rows[0]?.tax  || 0);
+    const salesAmt    = parseFloat(salesRes.rows[0]?.taxable || 0);
+    const purchaseAmt = parseFloat(purchaseRes.rows[0]?.taxable || 0);
+    const filedMonths = Math.min(parseInt(monthsRes.rows[0]?.filed_months || 0), 12);
 
     res.json({ success: true, data: {
       output_gst: outputGst, input_gst: inputGst,
       net_gst: outputGst - inputGst,
-      sales_taxable: +(sales?.[0]?.v ?? 0), purchase_taxable: +(purchase?.[0]?.v ?? 0),
-      filed_months: Math.min(filedMonths, 12),
+      sales_taxable: salesAmt, purchase_taxable: purchaseAmt,
+      filed_months: filedMonths,
     }});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
