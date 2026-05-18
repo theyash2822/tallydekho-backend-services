@@ -821,17 +821,18 @@ async function processGSTDetails(data, companyGuid) {
       const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
       if (!voucherGuid) continue;
       try {
-        const isInterstate = r.IsInterState === 'Yes' || r.ISINTERSTATE === 'Yes' || r.ISINTERSTATE === 'YES';
-        const isRcm        = r.IsRCMApplicable === 'Yes' || r.ISRCMAPPLICABLE === 'Yes' || r.ISRCMAPPLICABLE === 'YES';
-        const exportType   = r.ExportType || r.EXPORTTYPE || null;
-        const isSez        = r.IsSEZParty === 'Yes' || r.ISSEZPARTY === 'Yes' || r.ISSEZPARTY === 'YES';
-        const partyGstin   = r.PartyGSTIN || r.PARTYGSTIN || null;
-        const isNilRated   = r.IsNilRated === 'Yes' || r.ISNILRATED === 'Yes';
-        const isExempt     = r.IsExempt === 'Yes' || r.ISEXEMPT === 'Yes';
+        const isInterstate  = r.IsInterState === 'Yes' || r.ISINTERSTATE === 'Yes' || r.ISINTERSTATE === 'YES';
+        const isRcm          = r.IsRCMApplicable === 'Yes' || r.ISRCMAPPLICABLE === 'Yes' || r.ISRCMAPPLICABLE === 'YES';
+        const exportType     = r.ExportType || r.EXPORTTYPE || null;
+        const isSez          = r.IsSEZParty === 'Yes' || r.ISSEZPARTY === 'Yes' || r.ISSEZPARTY === 'YES';
+        const partyGstin     = r.PartyGSTIN || r.PARTYGSTIN || null;
+        const isNilRated     = r.IsNilRated === 'Yes' || r.ISNILRATED === 'Yes';
+        const isExempt       = r.IsExempt === 'Yes' || r.ISEXEMPT === 'Yes';
+        const itcEligibility = r.ITCEligibility || r.ITCELIGIBILITY || r.ItcEligibility || null;
         await client.query(`
           INSERT INTO gst_voucher_details
-            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez, party_gstin, is_nil_rated, is_exempt)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez, party_gstin, is_nil_rated, is_exempt, itc_eligibility)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
           ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
             voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
             taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
@@ -839,7 +840,8 @@ async function processGSTDetails(data, companyGuid) {
             irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
             is_interstate=EXCLUDED.is_interstate, is_rcm=EXCLUDED.is_rcm,
             export_type=EXCLUDED.export_type, is_sez=EXCLUDED.is_sez,
-            party_gstin=EXCLUDED.party_gstin, is_nil_rated=EXCLUDED.is_nil_rated, is_exempt=EXCLUDED.is_exempt
+            party_gstin=EXCLUDED.party_gstin, is_nil_rated=EXCLUDED.is_nil_rated, is_exempt=EXCLUDED.is_exempt,
+            itc_eligibility=EXCLUDED.itc_eligibility
         `, [
           voucherGuid, companyGuid,
           r.VOUCHERNUMBER  || r.VoucherNumber  || null,
@@ -856,6 +858,7 @@ async function processGSTDetails(data, companyGuid) {
           parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
           isInterstate, isRcm, exportType, isSez,
           partyGstin, isNilRated, isExempt,
+          itcEligibility,
         ]);
         saved++;
       } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
@@ -936,6 +939,39 @@ async function processGSTDetails(data, companyGuid) {
         AND v.company_guid = $1 AND v.is_cancelled = false
       `, [companyGuid]);
       console.log(`[DB] GSTDetails: party_gstin + gstr3b_section updated for ${companyGuid}`);
+      // Derive is_import from place_of_supply
+      await dbQuery(`
+        UPDATE vouchers v SET is_import = true
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND (g.place_of_supply = 'Outside India' OR g.place_of_supply = 'Other')
+        AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false
+        AND v.company_guid = $1
+      `, [companyGuid]);
+      // Also: Purchase with IGST and no party GSTIN = likely import from unregistered foreign supplier
+      await dbQuery(`
+        UPDATE vouchers v SET is_import = true
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.igst_amount > 0 AND g.cgst_amount = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM ledgers l
+          WHERE l.name = v.party_name AND l.company_guid = v.company_guid
+          AND l.gstin IS NOT NULL AND l.gstin != ''
+        )
+        AND v.voucher_type_parent = 'Purchase'
+        AND v.is_import = false AND v.is_cancelled = false
+        AND v.company_guid = $1
+      `, [companyGuid]);
+      // Populate vouchers.itc_eligibility from gst_voucher_details
+      await dbQuery(`
+        UPDATE vouchers v SET itc_eligibility = g.itc_eligibility
+        FROM gst_voucher_details g
+        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        AND g.itc_eligibility IS NOT NULL AND g.itc_eligibility != ''
+        AND v.company_guid = $1
+      `, [companyGuid]);
+      console.log(`[DB] GSTDetails: is_import + itc_eligibility propagated for ${companyGuid}`);
     } catch (pe) { console.warn('[DB] GSTDetails post-process voucher update failed:', pe.message); }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
   finally { client.release(); }

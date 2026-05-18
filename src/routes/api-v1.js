@@ -12,6 +12,7 @@ import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
+import { getGstTabsForVoucher, getClassificationReason } from '../utils/gstClassifier.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -2103,6 +2104,25 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       'GSTR-11': { types: PURCHASE,               label: 'UIN Holders (Embassies/UN)' },
     };
 
+    // ── Helper: group vouchers by calendar month ─────────────────────────────
+    function groupVouchersByMonth(rows) {
+      const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const monthMap = new Map();
+      const groups = [];
+      const sorted = [...rows].sort((a, b) => new Date(a.date) - new Date(b.date));
+      for (const row of sorted) {
+        const d = new Date(row.date);
+        const monthKey = isNaN(d.getTime()) ? 'Unknown' : `${monthNames[d.getMonth()]} ${d.getFullYear()}`;
+        if (!monthMap.has(monthKey)) {
+          monthMap.set(monthKey, []);
+          groups.push({ month: monthKey, voucherCount: 0, vouchers: monthMap.get(monthKey) });
+        }
+        monthMap.get(monthKey).push(row);
+      }
+      groups.forEach(g => g.voucherCount = g.vouchers.length);
+      return groups;
+    }
+
     // ── GSTR-2A / GSTR-2B: JOIN ledgers to filter only registered supplier purchases ──
     if (gstrTypeStr === 'GSTR-2A' || gstrTypeStr === 'GSTR-2B') {
       let q2 = `SELECT v.id, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration, v.irn, v.ewb_number,
@@ -2115,7 +2135,18 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                        l.gstin as party_gstin,
                        v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
                        g.is_nil_rated, g.is_exempt,
-                       CASE WHEN l.gstin IS NOT NULL AND l.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
+                       v.itc_eligibility,
+                       CASE WHEN l.gstin IS NOT NULL AND l.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type,
+                       COALESCE(
+                         (SELECT STRING_AGG(DISTINCT vle.ledger_name, ', ' ORDER BY vle.ledger_name)
+                          FROM voucher_ledger_entries vle
+                          WHERE vle.voucher_guid = v.guid
+                          AND (vle.ledger_name ILIKE '%cgst%' OR vle.ledger_name ILIKE '%sgst%'
+                            OR vle.ledger_name ILIKE '%igst%' OR vle.ledger_name ILIKE '%cess%'
+                            OR vle.ledger_name ILIKE '%tds%' OR vle.ledger_name ILIKE '%tcs%'
+                            OR vle.ledger_name ILIKE '%reverse charge%' OR vle.ledger_name ILIKE '%rcm%')
+                         ), ''
+                       ) as gst_ledger_names
                FROM vouchers v
                INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
                LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
@@ -2129,11 +2160,17 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       q2 += ' ORDER BY v.date DESC LIMIT 500';
       const { rows: rows2 } = await query(q2, q2Params);
       if (rows2.length === 0) {
-        return res.json({ success: true, country_applicable: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
+        return res.json({ success: true, country_applicable: true, data: [], groups: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
           message: `No registered supplier purchase vouchers found for ${gstrTypeStr}` } });
       }
-      return res.json({ success: true, country_applicable: true, data: rows2,
-        meta: { total: rows2.length, gstr_type: gstrTypeStr,
+      const mappedRows2 = rows2.map(row => ({
+        ...row,
+        classification_reason: getClassificationReason(row, gstrTypeStr),
+        gst_tabs: getGstTabsForVoucher(row, gstTaxpayerType),
+      }));
+      const groups2 = groupVouchersByMonth(mappedRows2);
+      return res.json({ success: true, country_applicable: true, data: mappedRows2, groups: groups2,
+        meta: { total: mappedRows2.length, gstr_type: gstrTypeStr,
           label: gstrTypeStr === 'GSTR-2A' ? 'Auto-drafted Inward Supply' : 'Locked ITC Statement' } });
     }
 
@@ -2153,7 +2190,18 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
         g.gst_reg_type, g.place_of_supply,
         v.party_gstin, v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
         g.is_nil_rated, g.is_exempt,
-        CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type`;
+        v.itc_eligibility,
+        CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type,
+        COALESCE(
+          (SELECT STRING_AGG(DISTINCT vle.ledger_name, ', ' ORDER BY vle.ledger_name)
+           FROM voucher_ledger_entries vle
+           WHERE vle.voucher_guid = v.guid
+           AND (vle.ledger_name ILIKE '%cgst%' OR vle.ledger_name ILIKE '%sgst%'
+             OR vle.ledger_name ILIKE '%igst%' OR vle.ledger_name ILIKE '%cess%'
+             OR vle.ledger_name ILIKE '%tds%' OR vle.ledger_name ILIKE '%tcs%'
+             OR vle.ledger_name ILIKE '%reverse charge%' OR vle.ledger_name ILIKE '%rcm%')
+          ), ''
+        ) as gst_ledger_names`;
       const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
       const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
       const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
@@ -2167,12 +2215,19 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       const outputTax      = Math.round(outwardSupply  * 0.18 * 100) / 100;
       const inputTaxCredit = Math.round(inwardSupply   * 0.18 * 100) / 100;
       const netTaxPayable  = Math.max(0, outputTax - inputTaxCredit);
-      // Combine outward + inward, sort by date desc
+      // Combine outward + inward, sort by date desc, map with classification_reason + gst_tabs
       const allVouchers = [...outVouR.rows, ...inVouR.rows]
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+        .map(row => ({
+          ...row,
+          classification_reason: getClassificationReason(row, 'GSTR-3B'),
+          gst_tabs: getGstTabsForVoucher(row, gstTaxpayerType),
+        }));
+      const groups3b = groupVouchersByMonth(allVouchers);
       return res.json({
         success: true, country_applicable: true, gstr_type: 'GSTR-3B',
         data: allVouchers,
+        groups: groups3b,
         meta: { total: allVouchers.length, gstr_type: 'GSTR-3B', is_summary: true, label: 'Monthly Summary Return' },
         summary: { outwardSupply, inwardSupply, outputTax, inputTaxCredit, netTaxPayable },
       });
@@ -2212,7 +2267,18 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                     g.gst_reg_type, g.place_of_supply,
                     v.party_gstin, v.gst_section, v.gstr3b_section, v.is_export, v.is_sez, v.is_reverse_charge,
                     g.is_nil_rated, g.is_exempt,
-                    CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type
+                    v.itc_eligibility,
+                    CASE WHEN l2.gstin IS NOT NULL AND l2.gstin != '' THEN 'Registered' ELSE 'Unregistered' END as party_registration_type,
+                    COALESCE(
+                      (SELECT STRING_AGG(DISTINCT vle.ledger_name, ', ' ORDER BY vle.ledger_name)
+                       FROM voucher_ledger_entries vle
+                       WHERE vle.voucher_guid = v.guid
+                       AND (vle.ledger_name ILIKE '%cgst%' OR vle.ledger_name ILIKE '%sgst%'
+                         OR vle.ledger_name ILIKE '%igst%' OR vle.ledger_name ILIKE '%cess%'
+                         OR vle.ledger_name ILIKE '%tds%' OR vle.ledger_name ILIKE '%tcs%'
+                         OR vle.ledger_name ILIKE '%reverse charge%' OR vle.ledger_name ILIKE '%rcm%')
+                      ), ''
+                    ) as gst_ledger_names
              FROM vouchers v
              LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
              LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid
@@ -2220,13 +2286,19 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     if (fyFrom) { q += ` AND v.date >= $${qIdx++}`; qParams.push(fyFrom); }
     if (fyTo)   { q += ` AND v.date <= $${qIdx++}`; qParams.push(fyTo); }
     q += ' ORDER BY v.date DESC LIMIT 200';
-    const { rows } = await query(q, qParams);
+    const { rows: rawRows } = await query(q, qParams);
 
-    if (rows.length === 0) {
-      return res.json({ success: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, not_applicable: true,
+    if (rawRows.length === 0) {
+      return res.json({ success: true, data: [], groups: [], meta: { total: 0, gstr_type: gstrTypeStr, not_applicable: true,
         label: cfg.label, message: `No ${cfg.label} (${gstrTypeStr}) transactions found for this period.` } });
     }
-    res.json({ success: true, country_applicable: true, data: rows,
+    const rows = rawRows.map(row => ({
+      ...row,
+      classification_reason: getClassificationReason(row, gstrTypeStr),
+      gst_tabs: getGstTabsForVoucher(row, gstTaxpayerType),
+    }));
+    const groupsMain = groupVouchersByMonth(rows);
+    res.json({ success: true, country_applicable: true, data: rows, groups: groupsMain,
       meta: { total: rows.length, gstr_type: gstrTypeStr, label: cfg.label } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
