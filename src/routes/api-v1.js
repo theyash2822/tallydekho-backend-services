@@ -2011,8 +2011,11 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       'GSTR-4':  { types: SALES,                  label: 'Composition Quarterly Return' },
       'GSTR-5':  { types: [...SALES, ...PURCHASE], label: 'Non-Resident Taxable Person' },
       'GSTR-5A': { types: SALES,                  label: 'OIDAR Services' },
-      'GSTR-6':  { types: JOURNAL,                label: 'Input Service Distributor' },
-      'GSTR-7':  { types: JOURNAL,                label: 'TDS under GST' },
+      // GSTR-6/7 require specific ISD/TDS-tagged entries — regular Journal/Payment/Contra
+      // entries are NOT ISD distributions or GST-TDS deductions. Return empty to avoid
+      // showing misleading data. If company is ISD/TDS registrant, Tally TDL needed.
+      'GSTR-6':  { types: [],                     label: 'Input Service Distributor' },
+      'GSTR-7':  { types: [],                     label: 'TDS under GST' },
       'GSTR-8':  { types: SALES,                  label: 'E-commerce Operator (TCS)' },
       'GSTR-9':  { types: [...SALES, ...PURCHASE], label: 'Annual Return' },
       'GSTR-10': { types: null,                   label: 'Final Return (Cancellation)' },
