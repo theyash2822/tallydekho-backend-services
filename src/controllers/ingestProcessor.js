@@ -865,11 +865,11 @@ async function processGSTDetails(data, companyGuid) {
     // Post-process: update vouchers classification from gst_voucher_details
     try {
       // Mark is_interstate on gst_voucher_details (IGST only = interstate)
-      await query(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_guid = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [companyGuid]);
+      await dbQuery(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_guid = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [companyGuid]);
       // Mark is_rcm on gst_voucher_details from Tally data
       // (already set during insert from r.IsRCMApplicable)
       // Populate vouchers.is_export
-      await query(`UPDATE vouchers v SET is_export = true
+      await dbQuery(`UPDATE vouchers v SET is_export = true
         FROM gst_voucher_details g
         WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
         AND g.igst_amount > 0 AND v.voucher_type_parent = 'Sales' AND v.company_guid = $1
@@ -878,17 +878,17 @@ async function processGSTDetails(data, companyGuid) {
           AND l.gstin IS NOT NULL AND l.gstin != ''
         )`, [companyGuid]);
       // Populate vouchers.is_sez from gst_voucher_details.is_sez
-      await query(`UPDATE vouchers v SET is_sez = true
+      await dbQuery(`UPDATE vouchers v SET is_sez = true
         FROM gst_voucher_details g
         WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
         AND g.is_sez = true AND v.company_guid = $1`, [companyGuid]);
       // Populate vouchers.is_reverse_charge from gst_voucher_details.is_rcm
-      await query(`UPDATE vouchers v SET is_reverse_charge = true
+      await dbQuery(`UPDATE vouchers v SET is_reverse_charge = true
         FROM gst_voucher_details g
         WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
         AND g.is_rcm = true AND v.company_guid = $1`, [companyGuid]);
       // Update gst_section for sales
-      await query(`UPDATE vouchers v SET gst_section =
+      await dbQuery(`UPDATE vouchers v SET gst_section =
         CASE
           WHEN v.is_export THEN 'Export'
           WHEN v.is_sez THEN 'SEZ'
@@ -898,7 +898,7 @@ async function processGSTDetails(data, companyGuid) {
         END
         WHERE v.company_guid = $1 AND v.voucher_type_parent IN ('Sales', 'Credit Note', 'Debit Note') AND v.is_cancelled = false`, [companyGuid]);
       // Update gst_section for purchases
-      await query(`UPDATE vouchers v SET gst_section =
+      await dbQuery(`UPDATE vouchers v SET gst_section =
         CASE
           WHEN v.is_reverse_charge THEN 'RCM'
           WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.igst_amount > 0 AND g.cgst_amount = 0) THEN 'ITC Interstate'
@@ -908,7 +908,7 @@ async function processGSTDetails(data, companyGuid) {
         WHERE v.company_guid = $1 AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false`, [companyGuid]);
       console.log(`[DB] GSTDetails: voucher gst_section updated for ${companyGuid}`);
       // Populate vouchers.party_gstin from gst_voucher_details
-      await query(`
+      await dbQuery(`
         UPDATE vouchers v SET party_gstin = g.party_gstin
         FROM gst_voucher_details g
         WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
@@ -917,7 +917,7 @@ async function processGSTDetails(data, companyGuid) {
         AND v.company_guid = $1
       `, [companyGuid]);
       // Update gstr3b_section on vouchers
-      await query(`
+      await dbQuery(`
         UPDATE vouchers v SET gstr3b_section =
           CASE
             WHEN v.voucher_type_parent IN ('Sales','Credit Note','Debit Note') THEN
