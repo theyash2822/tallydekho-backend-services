@@ -988,10 +988,13 @@ router.get('/alerts', authMiddleware, async (req, res) => {
       outstandingRec, creditNotes, unmatched,
       ewbGenerated, irnGenerated
     ] = await Promise.all([
-      // Invoices needing IRN (≥₹50K sales, no IRN)
+      // Invoices needing IRN (≥₹50K sales, no IRN) — exclude Orders/Delivery Notes/Quotations
       query(
         `SELECT COUNT(*) as count FROM vouchers
          WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+           AND voucher_type NOT ILIKE '%Order%'
+           AND voucher_type NOT ILIKE '%Delivery%'
+           AND voucher_type NOT ILIKE '%Quotation%'
            AND amount >= 50000
            AND (irn IS NULL OR irn = '')
            AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
@@ -1003,6 +1006,9 @@ router.get('/alerts', authMiddleware, async (req, res) => {
       query(
         `SELECT COUNT(*) as count FROM vouchers
          WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+           AND voucher_type NOT ILIKE '%Order%'
+           AND voucher_type NOT ILIKE '%Delivery%'
+           AND voucher_type NOT ILIKE '%Quotation%'
            AND amount >= 50000
            AND (ewb_number IS NULL OR ewb_number = '')
            AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,

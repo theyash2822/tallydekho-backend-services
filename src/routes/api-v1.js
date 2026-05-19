@@ -1936,7 +1936,7 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
       query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Pending: Sales >= 50K without EWB
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Expiring within 24h
       query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_guid=$1 AND valid_till BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`, [companyGuid])
@@ -1975,6 +1975,36 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
 });
 
 // GET /api/ewaybills — country-aware: only relevant for India (GSTIN present)
+// GET /api/ewaybills/pending — sales invoices ≥₹50K without EWB (pending generation)
+router.get('/ewaybills/pending', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { search = '', page = 1, limit = 100 } = req.query;
+    const offset = (parseInt(page)-1)*parseInt(limit);
+    const { rows } = await query(
+      `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE
+         AND voucher_type ILIKE '%Sales%'
+         AND voucher_type NOT ILIKE '%Order%'
+         AND voucher_type NOT ILIKE '%Delivery%'
+         AND voucher_type NOT ILIKE '%Quotation%'
+         AND amount >= 50000
+         AND (ewb_number IS NULL OR ewb_number='')
+         AND date BETWEEN $2 AND $3
+         AND (party_name ILIKE $4 OR voucher_number ILIKE $4)
+       ORDER BY date DESC LIMIT $5 OFFSET $6`,
+      [companyGuid, from, to, `%${search}%`, parseInt(limit), offset]
+    );
+    const { rows: cnt } = await query(
+      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3`,
+      [companyGuid, from, to]
+    );
+    res.json({ success: true, data: rows.map(r => ({ ...r, ewb_status: 'pending' })), meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 router.get('/ewaybills', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -2023,7 +2053,7 @@ router.get('/einvoice/status', authMiddleware, async (req, res) => {
     const [generatedRow, pendingRow, cancelledRow, errorRow] = await Promise.all([
       query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn_cancelled=TRUE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
@@ -2054,7 +2084,8 @@ router.get('/einvoice/pending', authMiddleware, async (req, res) => {
       || (coRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'E-Invoice (IRN) is applicable only for India (GST-registered companies)' } });
-    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 100`, [companyGuid, from, to]);
     res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, pending_irn: rows.length } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
