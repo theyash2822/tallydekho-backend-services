@@ -437,7 +437,7 @@ async function processVouchers(data, companyGuid) {
             narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
             reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
             is_cancelled        = EXCLUDED.is_cancelled,
-            is_optional         = EXCLUDED.is_optional,
+            is_optional         = EXCLUDED.is_optional OR vouchers.is_optional,
             alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
