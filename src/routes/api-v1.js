@@ -1716,7 +1716,7 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const dateFilter = from && to ? ' AND date BETWEEN $2 AND $3' : '';
+    const dateFilter = from && to ? ' AND v.date BETWEEN $2 AND $3' : '';
     const baseParams = from && to ? [companyGuid, from, to] : [companyGuid];
 
     const [salesRes, purchaseRes, monthsRes] = await Promise.all([
@@ -1730,7 +1730,7 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
              WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Purchase'${dateFilter}`, baseParams),
       query(`SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
              FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type_parent='Sales'
-             AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'${dateFilter}`, baseParams)
+             AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'${from && to ? ' AND date BETWEEN $2 AND $3' : ''}`, baseParams)
         .catch(() => ({ rows: [{ filed_months: 0 }] })),
     ]);
 
