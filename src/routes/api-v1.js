@@ -3188,16 +3188,19 @@ router.get('/reports/other-taxes/summary', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { rows } = await query(`
       SELECT tax_type,
              COUNT(DISTINCT voucher_guid) AS voucher_count,
              SUM(tax_amount)              AS total_tax_amount,
-             MAX(voucher_date)            AS last_transaction_date
+             MAX(COALESCE(NULLIF(voucher_date,''), financial_year)) AS last_transaction_date
       FROM tax_transactions
-      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3
+      WHERE company_guid=$1
+        AND (voucher_date BETWEEN $2 AND $3
+          OR (financial_year = $4 AND (voucher_date IS NULL OR voucher_date = '')))
       GROUP BY tax_type
       ORDER BY total_tax_amount DESC
-    `, [companyGuid, from, to]);
+    `, [companyGuid, from, to, financialYear]);
     res.json({
       success: true,
       data: rows.map(r => ({
@@ -3224,16 +3227,20 @@ router.get('/reports/other-taxes/transactions', authMiddleware, async (req, res)
     const params = [companyGuid, from, to];
     let typeFilter = '';
     if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
+    const { financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const fyParam = params.length + 1;
+    const fyParams = [...params, financialYear];
+    const fyFilter = ` OR (financial_year = $${fyParam} AND (voucher_date IS NULL OR voucher_date = ''))`;
     const { rows } = await query(`
       SELECT * FROM tax_transactions
-      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
-      ORDER BY voucher_date DESC
+      WHERE company_guid=$1 AND (voucher_date BETWEEN $2 AND $3${typeFilter}${fyFilter})
+      ORDER BY COALESCE(NULLIF(voucher_date,''), financial_year) DESC
       LIMIT ${parseInt(limit)} OFFSET ${offset}
-    `, params);
+    `, fyParams);
     const { rows: cnt } = await query(`
       SELECT COUNT(*) AS c FROM tax_transactions
-      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
-    `, params);
+      WHERE company_guid=$1 AND (voucher_date BETWEEN $2 AND $3${typeFilter}${fyFilter})
+    `, fyParams);
     res.json({
       success: true,
       data: rows,
