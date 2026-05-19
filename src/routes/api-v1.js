@@ -2001,6 +2001,35 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
 // E-INVOICE (IRN) — India GST only
 // ══════════════════════════════════════════════════════════════════════════════
 
+// GET /api/einvoice/status — summary counts for e-invoice compliance screen
+router.get('/einvoice/status', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const [generatedRow, pendingRow, cancelledRow, errorRow] = await Promise.all([
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn_cancelled=TRUE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      query(`SELECT COUNT(*) as c FROM e_invoice_details WHERE company_guid=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyGuid])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        generated_count:  parseInt(generatedRow.rows[0]?.c  || 0),
+        pending_count:    parseInt(pendingRow.rows[0]?.c    || 0),
+        cancelled_count:  parseInt(cancelledRow.rows[0]?.c  || 0),
+        error_count:      parseInt(errorRow.rows[0]?.c      || 0),
+      },
+    });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 router.get('/einvoice/pending', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -2023,8 +2052,15 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE ORDER BY date DESC LIMIT 50`, [companyGuid]);
-    res.json({ success: true, data: rows, meta: { total: rows.length } });
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { page = 1, limit = 50, search = '' } = req.query;
+    const offset = (parseInt(page)-1)*parseInt(limit);
+    const { rows } = await query(
+      `SELECT * FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND (party_name ILIKE $4 OR voucher_number ILIKE $4) ORDER BY date DESC LIMIT $5 OFFSET $6`,
+      [companyGuid, from, to, `%${search}%`, parseInt(limit), offset]
+    );
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]);
+    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
