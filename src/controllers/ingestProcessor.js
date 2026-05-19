@@ -406,7 +406,7 @@ async function processVouchers(data, companyGuid) {
       const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.VoucherType || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
       const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes' || r.ISCANCELLED === true);
-      const isOptional    = (r.isOptional === '1' || r.isOptional === 1 || r.ISOPTIONAL === 'Yes' || r.IsOptional === 'Yes');
+      const isOptional    = !!(r.ISOPTIONAL === 1 || r.ISOPTIONAL === '1' || r.isOptional === 1 || r.isOptional === '1' || r.IsOptional === 'Yes' || r.ISOPTIONAL === 'Yes');
       const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
 
       // Calculate amount from ledger entries (positive = debit side)
