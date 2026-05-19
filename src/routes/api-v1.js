@@ -3177,4 +3177,114 @@ router.post('/auth/change-email', authMiddleware, async (req, res) => {
   }
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// Other Taxes Routes
+// ────────────────────────────────────────────────────────────────────────────
+
+// GET /reports/other-taxes/summary
+router.get('/reports/other-taxes/summary', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { rows } = await query(`
+      SELECT tax_type,
+             COUNT(DISTINCT voucher_guid) AS voucher_count,
+             SUM(tax_amount)              AS total_tax_amount,
+             MAX(voucher_date)            AS last_transaction_date
+      FROM tax_transactions
+      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3
+      GROUP BY tax_type
+      ORDER BY total_tax_amount DESC
+    `, [companyGuid, from, to]);
+    res.json({
+      success: true,
+      data: rows.map(r => ({
+        taxType:             r.tax_type,
+        voucherCount:        parseInt(r.voucher_count),
+        totalTaxAmount:      parseFloat(r.total_tax_amount || 0),
+        lastTransactionDate: r.last_transaction_date,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /reports/other-taxes/transactions
+router.get('/reports/other-taxes/transactions', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { taxType, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const params = [companyGuid, from, to];
+    let typeFilter = '';
+    if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
+    const { rows } = await query(`
+      SELECT * FROM tax_transactions
+      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
+      ORDER BY voucher_date DESC
+      LIMIT ${parseInt(limit)} OFFSET ${offset}
+    `, params);
+    const { rows: cnt } = await query(`
+      SELECT COUNT(*) AS c FROM tax_transactions
+      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
+    `, params);
+    res.json({
+      success: true,
+      data: rows,
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page) },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /reports/other-taxes/late-challans
+router.get('/reports/other-taxes/late-challans', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { taxType } = req.query;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const params = [companyGuid, from, to];
+    let typeFilter = '';
+    if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
+    const { rows } = await query(`
+      SELECT tax_type, return_period, challan_no, due_date, paid_date,
+             SUM(tax_amount) AS tax_amount,
+             EXTRACT(DAY FROM (COALESCE(paid_date::date, NOW()::date) - due_date::date)) AS late_days
+      FROM tax_transactions
+      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
+        AND due_date IS NOT NULL
+        AND COALESCE(paid_date::date, NOW()::date) > due_date::date
+      GROUP BY tax_type, return_period, challan_no, due_date, paid_date
+      ORDER BY late_days DESC
+      LIMIT 5
+    `, params);
+    res.json({ success: true, data: rows, has_challan_data: rows.length > 0 });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /reports/other-taxes/backfill — one-time migration endpoint
+router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
+    const count = await backfillTaxTransactions(companyGuid);
+    res.json({ success: true, data: { processed: count } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 export default router;

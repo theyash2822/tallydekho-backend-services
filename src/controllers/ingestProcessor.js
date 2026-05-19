@@ -1,6 +1,79 @@
 // Ingest processor — PostgreSQL version
 // Handles: masters (ledgers, stocks), vouchers, stock transactions
 import { getClient, query as dbQuery } from '../db/schema.js';
+import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
+
+// ── Tax Extraction ────────────────────────────────────────────────────────────
+// Extract and save tax transactions from voucher ledger entries.
+// Called after voucher + ledger entries are committed. Never throws — isolates
+// tax extraction failures from the main sync.
+async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRow) {
+  try {
+    const { rows: lines } = await dbQuery(
+      `SELECT vle.ledger_name, vle.amount, vle.dr_cr, l.parent, l.nature
+       FROM voucher_ledger_entries vle
+       LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       WHERE vle.voucher_guid = $1 AND vle.company_guid = $2`,
+      [voucherGuid, companyGuid]
+    );
+
+    for (const line of lines) {
+      const taxType = classifyTaxLedger({
+        ledgerName:   line.ledger_name,
+        ledgerParent: line.parent || '',
+        ledgerGroup:  line.nature || '',
+      });
+      if (!taxType) continue;
+
+      const nature = inferTransactionNature(voucherRow.voucher_type || '', line.ledger_name);
+
+      await dbQuery(`
+        INSERT INTO tax_transactions (
+          company_guid, voucher_guid, voucher_alter_id,
+          voucher_number, voucher_type, voucher_date,
+          party_ledger_name, tax_type, tax_ledger_name,
+          tax_ledger_parent, tax_amount, transaction_nature,
+          financial_year, narration
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        ON CONFLICT (company_guid, voucher_guid, tax_type, tax_ledger_name, voucher_alter_id)
+        DO UPDATE SET
+          tax_amount   = EXCLUDED.tax_amount,
+          voucher_date = EXCLUDED.voucher_date,
+          synced_at    = NOW()
+      `, [
+        companyGuid, voucherGuid, 0,
+        voucherRow.voucher_number, voucherRow.voucher_type, voucherRow.date,
+        voucherRow.party_name, taxType, line.ledger_name,
+        line.parent || null, Math.abs(parseFloat(line.amount) || 0),
+        nature, voucherRow.financial_year, voucherRow.narration,
+      ]);
+    }
+  } catch (e) {
+    // Never break sync on tax extraction failure
+    console.warn('[TaxExtract] error for', voucherGuid, e.message);
+  }
+}
+
+// Backfill all existing vouchers for a company → extract tax transactions.
+// Call once per company after deploying this feature.
+export async function backfillTaxTransactions(companyGuid) {
+  const { rows: vouchers } = await dbQuery(
+    'SELECT guid, voucher_number, voucher_type, date, party_name, financial_year, narration FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE',
+    [companyGuid]
+  );
+  for (const v of vouchers) {
+    await extractAndSaveTaxTransactions(v.guid, companyGuid, {
+      voucher_number: v.voucher_number,
+      voucher_type:   v.voucher_type,
+      date:           v.date,
+      party_name:     v.party_name,
+      financial_year: v.financial_year,
+      narration:      v.narration,
+    });
+  }
+  console.log(`[TaxBackfill] Processed ${vouchers.length} vouchers for ${companyGuid}`);
+  return vouchers.length;
+}
 
 // Normalize Tally date: '20240401' → '2024-04-01'
 // Recursively search an object (parsing JSON strings) for any of the target keys
@@ -322,6 +395,7 @@ async function processVouchers(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
+    const voucherRowsForTax = []; // Collect for post-commit tax extraction
 
     for (const r of data) {
       const guid = r.GUID || r.Guid || r.guid || '';
@@ -381,6 +455,17 @@ async function processVouchers(data, companyGuid) {
           r._FINANCIAL_YEAR || null,
         ]);
         saved++;
+        voucherRowsForTax.push({
+          guid,
+          row: {
+            voucher_number: voucherNumber,
+            voucher_type:   voucherType,
+            date,
+            party_name:     r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
+            financial_year: r._FINANCIAL_YEAR || null,
+            narration:      r.Narration || r.NARRATION || r.narration || null,
+          },
+        });
 
         // Ledger line items — use parseLedgerEntries with correct Dr/Cr from amount sign
         const parsedLedgerEntries = parseLedgerEntries(r);
@@ -419,6 +504,12 @@ async function processVouchers(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Vouchers: saved ${saved}/${data.length} for ${companyGuid}`);
+
+    // Tax extraction — runs after COMMIT so ledger entries are visible
+    // Never blocks or throws; failures are logged only
+    for (const { guid: vGuid, row } of voucherRowsForTax) {
+      await extractAndSaveTaxTransactions(vGuid, companyGuid, row);
+    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Vouchers transaction failed:', e.message);
