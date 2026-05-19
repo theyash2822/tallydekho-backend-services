@@ -986,7 +986,7 @@ router.get('/alerts', authMiddleware, async (req, res) => {
     const [
       pendingIRN, pendingEWB, expiredEWB,
       outstandingRec, creditNotes, unmatched,
-      ewbGenerated, irnGenerated
+      ewbGenerated, irnGenerated, otherTaxRow
     ] = await Promise.all([
       // Invoices needing IRN (≥₹50K sales, no IRN) — exclude Orders/Delivery Notes/Quotations
       query(
@@ -1068,6 +1068,13 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND date BETWEEN $2 AND $3`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
+      // Other tax transactions (from tax_transactions table)
+      query(
+        `SELECT COUNT(DISTINCT voucher_guid) as cnt, COALESCE(SUM(tax_amount),0) as total, tax_type
+         FROM tax_transactions WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3
+         GROUP BY tax_type ORDER BY total DESC LIMIT 1`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [] })),
     ]);
 
     const irnCount        = parseInt(pendingIRN.rows[0]?.count  || 0);
@@ -1144,6 +1151,9 @@ router.get('/alerts', authMiddleware, async (req, res) => {
         expiredEWBCount:   ewbExpired,
         ewbGeneratedCount: ewbGeneratedCnt,
         irnGeneratedCount: irnGeneratedCnt,
+        otherTaxCount:     parseInt(otherTaxRow.rows[0]?.cnt || 0),
+        otherTaxTotal:     parseFloat(otherTaxRow.rows[0]?.total || 0),
+        otherTaxTopType:   otherTaxRow.rows[0]?.tax_type || null,
         outstandingCount:  recCount,
         outstandingAmount: recAmount,
         creditNotesCount:  cnCount,
