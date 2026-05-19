@@ -406,6 +406,7 @@ async function processVouchers(data, companyGuid) {
       const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.VoucherType || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
       const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes' || r.ISCANCELLED === true);
+      const isOptional    = (r.isOptional === '1' || r.isOptional === 1 || r.ISOPTIONAL === 'Yes' || r.IsOptional === 'Yes');
       const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
 
       // Calculate amount from ledger entries (positive = debit side)
@@ -422,8 +423,8 @@ async function processVouchers(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
@@ -436,6 +437,7 @@ async function processVouchers(data, companyGuid) {
             narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
             reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
             is_cancelled        = EXCLUDED.is_cancelled,
+            is_optional         = EXCLUDED.is_optional,
             alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
@@ -449,6 +451,7 @@ async function processVouchers(data, companyGuid) {
           r.Narration || r.NARRATION || r.narration || null,
           r.Reference || r.REFERENCE || r.reference || null,
           isCancelled,
+          isOptional,
           parseInt(r.AlterId || r.ALTERID || 0),
           JSON.stringify(r).slice(0, 10000),
           now(),
