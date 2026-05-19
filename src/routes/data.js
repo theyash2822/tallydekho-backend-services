@@ -985,7 +985,8 @@ router.get('/alerts', authMiddleware, async (req, res) => {
 
     const [
       pendingIRN, pendingEWB, expiredEWB,
-      outstandingRec, creditNotes, unmatched
+      outstandingRec, creditNotes, unmatched,
+      ewbGenerated, irnGenerated
     ] = await Promise.all([
       // Invoices needing IRN (≥₹50K sales, no IRN)
       query(
@@ -1045,11 +1046,29 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND (party_gstin IS NULL OR party_gstin = '')`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
+      // EWB generated: vouchers with ewb_number populated
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1 AND is_cancelled=FALSE
+           AND ewb_number IS NOT NULL AND ewb_number != ''
+           AND date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+      // IRN generated: vouchers with irn populated
+      query(
+        `SELECT COUNT(*) as count FROM vouchers
+         WHERE company_guid=$1 AND is_cancelled=FALSE
+           AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE
+           AND date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
     ]);
 
-    const irnCount     = parseInt(pendingIRN.rows[0]?.count || 0);
-    const ewbCount     = parseInt(pendingEWB.rows[0]?.count || 0);
-    const ewbExpired   = parseInt(expiredEWB.rows[0]?.count || 0);
+    const irnCount        = parseInt(pendingIRN.rows[0]?.count  || 0);
+    const ewbCount        = parseInt(pendingEWB.rows[0]?.count  || 0);
+    const ewbExpired      = parseInt(expiredEWB.rows[0]?.count  || 0);
+    const ewbGeneratedCnt = parseInt(ewbGenerated.rows[0]?.count || 0);
+    const irnGeneratedCnt = parseInt(irnGenerated.rows[0]?.count || 0);
     const recCount     = parseInt(outstandingRec.rows[0]?.count || 0);
     const recAmount    = parseFloat(outstandingRec.rows[0]?.amount || 0);
     const cnCount      = parseInt(creditNotes.rows[0]?.count || 0);
@@ -1117,6 +1136,8 @@ router.get('/alerts', authMiddleware, async (req, res) => {
         pendingIRNCount:   irnCount,
         pendingEWBCount:   ewbCount,
         expiredEWBCount:   ewbExpired,
+        ewbGeneratedCount: ewbGeneratedCnt,
+        irnGeneratedCount: irnGeneratedCnt,
         outstandingCount:  recCount,
         outstandingAmount: recAmount,
         creditNotesCount:  cnCount,
