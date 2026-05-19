@@ -1928,7 +1928,7 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const [integRow, generatedRow, pendingRow, expiringRow, errorRow, transportRow] = await Promise.all([
+    const [integRow, generatedRow, pendingRow, expiringRow, errorRow, transportRow, dailyRow] = await Promise.all([
       // Integration status
       query(`SELECT status FROM integrations WHERE company_guid=$1 AND type='ewb' LIMIT 1`, [companyGuid])
         .catch(() => ({ rows: [] })),
@@ -1947,7 +1947,18 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
       // Transport mode breakdown
       query(`SELECT COALESCE(sub_supply_type, 'Road') as mode, COUNT(*) as cnt FROM e_way_bill_details WHERE company_guid=$1 GROUP BY sub_supply_type`, [companyGuid])
         .catch(() => ({ rows: [] })),
+      // Daily counts for bar chart (last 30 days within FY)
+      query(`SELECT date as day, COUNT(*) as cnt FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3 GROUP BY date ORDER BY date`, [companyGuid, from, to])
+        .catch(() => ({ rows: [] })),
     ]);
+    const dailyMap = new Map(dailyRow.rows.map(r => [r.day, parseInt(r.cnt)]));
+    // Build 30-day array ending today
+    const today = new Date(); const dailyCounts = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(today); d.setDate(today.getDate() - i);
+      const key = d.toISOString().split('T')[0];
+      dailyCounts.push(dailyMap.get(key) || 0);
+    }
     res.json({
       success: true,
       data: {
@@ -1957,6 +1968,7 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
         expiring_count:   parseInt(expiringRow.rows[0]?.c  || 0),
         error_count:      parseInt(errorRow.rows[0]?.c     || 0),
         transport_breakdown: transportRow.rows.map(r => ({ mode: r.mode, count: parseInt(r.cnt) })),
+        daily_counts: dailyCounts,
       },
     });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
