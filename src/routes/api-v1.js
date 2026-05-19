@@ -1921,6 +1921,47 @@ router.get('/kpi/loans-ods', authMiddleware, async (req, res) => {
 // E-WAY BILLS — with country-aware logic
 // ══════════════════════════════════════════════════════════════════════════════
 
+// GET /api/ewaybills/status — summary: integration status + EWB counts
+router.get('/ewaybills/status', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const [integRow, generatedRow, pendingRow, expiringRow, errorRow, transportRow] = await Promise.all([
+      // Integration status
+      query(`SELECT status FROM integrations WHERE company_guid=$1 AND type='ewb' LIMIT 1`, [companyGuid])
+        .catch(() => ({ rows: [] })),
+      // Generated: vouchers with ewb_number from Tally
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      // Pending: Sales >= 50K without EWB
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      // Expiring within 24h
+      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_guid=$1 AND valid_till BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`, [companyGuid])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      // Errors
+      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_guid=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyGuid])
+        .catch(() => ({ rows: [{ c: 0 }] })),
+      // Transport mode breakdown
+      query(`SELECT COALESCE(sub_supply_type, 'Road') as mode, COUNT(*) as cnt FROM e_way_bill_details WHERE company_guid=$1 GROUP BY sub_supply_type`, [companyGuid])
+        .catch(() => ({ rows: [] })),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        integration_connected: integRow.rows[0]?.status === 'connected',
+        generated_count:  parseInt(generatedRow.rows[0]?.c || 0),
+        pending_count:    parseInt(pendingRow.rows[0]?.c   || 0),
+        expiring_count:   parseInt(expiringRow.rows[0]?.c  || 0),
+        error_count:      parseInt(errorRow.rows[0]?.c     || 0),
+        transport_breakdown: transportRow.rows.map(r => ({ mode: r.mode, count: parseInt(r.cnt) })),
+      },
+    });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 // GET /api/ewaybills — country-aware: only relevant for India (GSTIN present)
 router.get('/ewaybills', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
