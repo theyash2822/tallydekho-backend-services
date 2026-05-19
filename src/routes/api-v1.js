@@ -1977,9 +1977,10 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
       || !!(coRows[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { total: 0, country_applicable: false, message: 'E-Way Bill is applicable only for India (GST-registered companies)' } });
 
+    // Only return vouchers that have an EWB number (generated from Tally or portal)
     const { search = '', page = 1, limit = 30, from, to } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND is_cancelled=FALSE AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
     const params = [companyGuid, `%${search}%`];
     let idx = 3;
     if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
@@ -1987,11 +1988,11 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
     q += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND is_cancelled=FALSE`, [companyGuid]);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != ''`, [companyGuid]);
     res.json({
       success: true, country_applicable: true,
-      data: rows.map(r => ({ ...r, ewb_status: r.ewb_number ? 'generated' : 'pending' })),
-      meta: { total: parseInt(cnt[0].c), page: parseInt(page), pending_count: rows.filter(r => !r.ewb_number).length }
+      data: rows.map(r => ({ ...r, ewb_status: 'generated' })),
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
     });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
