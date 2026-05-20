@@ -401,6 +401,22 @@ router.post('/ingest/complete', async (req, res) => {
 
     console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
 
+    // Backfill tax_transactions.voucher_date from vouchers where it's null
+    // Handles cases where tax extraction ran before the voucher date was stored
+    try {
+      const { rowCount } = await query(`
+        UPDATE tax_transactions tt
+        SET voucher_date = v.date
+        FROM vouchers v
+        WHERE v.guid = tt.voucher_guid
+          AND v.company_guid = tt.company_guid
+          AND tt.company_guid = $1
+          AND (tt.voucher_date IS NULL OR tt.voucher_date = '')
+          AND v.date IS NOT NULL AND v.date != ''
+      `, [companyGuid]);
+      if (rowCount > 0) console.log(`[INGEST] Backfilled ${rowCount} tax_transaction dates from vouchers`);
+    } catch (e) { console.warn('[INGEST] Tax date backfill failed (non-fatal):', e.message); }
+
     if (userId) {
       try { socketService.notifySynced(userId, companyGuid); } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }

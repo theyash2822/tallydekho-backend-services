@@ -38,7 +38,8 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
         ON CONFLICT (company_guid, voucher_guid, tax_type, tax_ledger_name, voucher_alter_id)
         DO UPDATE SET
           tax_amount   = EXCLUDED.tax_amount,
-          voucher_date = EXCLUDED.voucher_date,
+          -- Never overwrite a real date with null (use COALESCE to keep existing date if new value is null)
+          voucher_date = COALESCE(EXCLUDED.voucher_date, tax_transactions.voucher_date),
           synced_at    = NOW()
       `, [
         companyGuid, voucherGuid, 0,
