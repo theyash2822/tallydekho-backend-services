@@ -981,7 +981,7 @@ router.get('/alerts', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     // Use selectedFY from client — fall back to current real-world FY
-    const { from, to } = await resolveFYDates(companyGuid, null, null, fy);
+    const { from, to, financialYear } = await resolveFYDates(companyGuid, null, null, fy);
 
     const [
       pendingIRN, pendingEWB, expiredEWB,
@@ -1068,12 +1068,15 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND date BETWEEN $2 AND $3`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
-      // Other tax transactions (from tax_transactions table)
+      // Other tax transactions — with FY fallback for null-date rows (same pattern as transactions endpoint)
       query(
         `SELECT COUNT(DISTINCT voucher_guid) as cnt, COALESCE(SUM(tax_amount),0) as total, tax_type
-         FROM tax_transactions WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3
+         FROM tax_transactions
+         WHERE company_guid=$1
+           AND (voucher_date BETWEEN $2 AND $3
+             OR (financial_year = $4 AND (voucher_date IS NULL OR voucher_date = '')))
          GROUP BY tax_type ORDER BY total DESC LIMIT 1`,
-        [companyGuid, from, to]
+        [companyGuid, from, to, financialYear]
       ).catch(() => ({ rows: [] })),
     ]);
 
