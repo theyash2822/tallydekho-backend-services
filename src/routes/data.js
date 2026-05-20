@@ -1001,7 +1001,7 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND (irn IS NULL OR irn = '')
            AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
            AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
-           AND date >= '2020-10-01'`,  -- IRN applicable from Oct 2020 only
+           AND date >= '2020-10-01'`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
 
@@ -1015,7 +1015,7 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND amount >= 50000
            AND (ewb_number IS NULL OR ewb_number = '')
            AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
-           AND date >= '2018-04-01'`,  -- EWB applicable from Apr 2018 only
+           AND date >= '2018-04-01'`,
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
 
