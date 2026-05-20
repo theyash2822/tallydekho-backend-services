@@ -287,9 +287,11 @@ router.post('/dashboard', authMiddleware, requirePaired, async (req, res) => {
       query(`SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent = 'Sundry Debtors') AND closing_balance != 0`, [companyGuid]),
       query(`SELECT SUM(ABS(closing_balance)) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent = 'Sundry Creditors') AND closing_balance != 0`, [companyGuid]),
       // Pending IRN — sales invoices ≥₹50K without IRN
-      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn = '') AND (irn_cancelled IS NULL OR irn_cancelled = FALSE) AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
+      // IRN applicable from Oct 2020 — earlier invoices never need IRN
+      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (irn IS NULL OR irn = '') AND (irn_cancelled IS NULL OR irn_cancelled = FALSE) AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
       // Pending EWB — sales invoices without EWB number
-      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number = '') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
+      // EWB applicable from Apr 2018 — earlier invoices never need EWB
+      query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number = '') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
       // Credit notes count this FY
       query(`SELECT COUNT(*) as v FROM vouchers WHERE company_guid=$1 AND (voucher_type ILIKE '%Credit%' OR voucher_type ILIKE '%Debit%') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]).catch(() => ({ rows: [{ v: 0 }] })),
     ]);
@@ -998,7 +1000,8 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND amount >= 50000
            AND (irn IS NULL OR irn = '')
            AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
-           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
+           AND date >= '2020-10-01'`,  -- IRN applicable from Oct 2020 only
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
 
@@ -1011,7 +1014,8 @@ router.get('/alerts', authMiddleware, async (req, res) => {
            AND voucher_type NOT ILIKE '%Quotation%'
            AND amount >= 50000
            AND (ewb_number IS NULL OR ewb_number = '')
-           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3`,
+           AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
+           AND date >= '2018-04-01'`,  -- EWB applicable from Apr 2018 only
         [companyGuid, from, to]
       ).catch(() => ({ rows: [{ count: 0 }] })),
 
