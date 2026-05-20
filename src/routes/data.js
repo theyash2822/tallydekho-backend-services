@@ -1050,7 +1050,8 @@ router.get('/alerts', authMiddleware, async (req, res) => {
       query(
         `SELECT COUNT(*) as count FROM vouchers
          WHERE company_guid=$1
-           AND voucher_type_parent = 'Sales'
+           AND voucher_type ILIKE '%Sales%'
+           AND voucher_type NOT ILIKE '%Order%'
            AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
            AND amount >= 10000
            AND (party_gstin IS NULL OR party_gstin = '')`,
@@ -1100,7 +1101,9 @@ router.get('/alerts', authMiddleware, async (req, res) => {
       SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
       FROM vouchers
       WHERE company_guid=$1
-        AND voucher_type_parent = 'Sales'
+        AND voucher_type ILIKE '%Sales%'
+        AND voucher_type NOT ILIKE '%Order%'
+        AND voucher_type NOT ILIKE '%Purchase%'
         AND is_cancelled = FALSE
         AND date BETWEEN $2 AND $3
     `, [companyGuid, from, to]).catch(() => ({ rows: [{ filed_months: 0 }] }));

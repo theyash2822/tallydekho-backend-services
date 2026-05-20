@@ -1728,8 +1728,12 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
                     COALESCE(SUM(g.taxable_amount),0) as taxable
              FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_guid=v.company_guid
              WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Purchase'${dateFilter}`, baseParams),
+      // Use voucher_type ILIKE '%Sales%' (not strict parent='Sales') — covers Tally types classified as 'Voucher' parent
       query(`SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
-             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type_parent='Sales'
+             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE
+             AND voucher_type ILIKE '%Sales%'
+             AND voucher_type NOT ILIKE '%Order%'
+             AND voucher_type NOT ILIKE '%Purchase%'
              AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'${from && to ? ' AND date BETWEEN $2 AND $3' : ''}`, baseParams)
         .catch(() => ({ rows: [{ filed_months: 0 }] })),
     ]);
