@@ -2336,8 +2336,11 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
              OR vle.ledger_name ILIKE '%reverse charge%' OR vle.ledger_name ILIKE '%rcm%')
           ), ''
         ) as gst_ledger_names`;
-      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})`;
-      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])`;
+      // GST relevance filter: only include vouchers that have GST details OR are explicitly flagged.
+      // This removes pre-GST era vouchers (e.g. 2017-18 before July 2017) that have no gst_voucher_details.
+      const gstRelevanceFilter = `AND (v.is_gst_relevant = TRUE OR g.voucher_guid IS NOT NULL)`;
+      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL}) ${gstRelevanceFilter}`;
+      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase']) ${gstRelevanceFilter}`;
       const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
         query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
         query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
@@ -2417,7 +2420,8 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
              FROM vouchers v
              LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
              LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid
-             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE ${typeFilter}`;
+             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE ${typeFilter}
+             AND (v.is_gst_relevant = TRUE OR g.voucher_guid IS NOT NULL)`;
     if (fyFrom) { q += ` AND v.date >= $${qIdx++}`; qParams.push(fyFrom); }
     if (fyTo)   { q += ` AND v.date <= $${qIdx++}`; qParams.push(fyTo); }
     q += ' ORDER BY v.date DESC LIMIT 200';
