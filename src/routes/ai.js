@@ -227,15 +227,14 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
 
 export default router;
 
-// ── POST /ai/help — AI Help Chat using OpenAI GPT ────────────────────────────
+// ── POST /ai/help — AI Help Chat using Groq (llama-3.1-8b-instant) ────────────
 router.post('/help', authMiddleware, async (req, res) => {
   const { message, history = [] } = req.body || {};
   if (!message) return res.status(400).json({ success: false, error: { code: 'MISSING_MESSAGE', message: 'message required' } });
 
-  const OPENAI_KEY = process.env.OPENAI_API_KEY;
-  if (!OPENAI_KEY) {
-    // Fallback: return a helpful static response
-    return res.json({ success: true, data: { reply: "I'm the TallyDekho assistant. I can help with syncing, invoices, ledgers, stocks, and reports. Please try asking about a specific feature." } });
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) {
+    return res.json({ success: true, data: { reply: "I'm the TallyDekho assistant. I can help with syncing, invoices, ledgers, stocks, and reports. Please ask about a specific feature." } });
   }
 
   try {
@@ -255,19 +254,20 @@ Keep answers concise and practical. If the question is not about TallyDekho or a
       { role: 'user', content: message },
     ];
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-4o-mini', messages, max_tokens: 400, temperature: 0.7 }),
+      headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'llama-3.1-8b-instant', messages, max_tokens: 400, temperature: 0.7 }),
+      signal: AbortSignal.timeout(10000),
     });
 
-    if (!response.ok) throw new Error(`OpenAI error: ${response.status}`);
+    if (!response.ok) throw new Error(`Groq error: ${response.status}`);
     const data = await response.json();
     const reply = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response. Please try again.';
     res.json({ success: true, data: { reply } });
   } catch (err) {
     console.error('[AI Help]', err.message);
-    res.json({ success: true, data: { reply: 'I\'m having trouble right now. For immediate help, check the FAQ section above or contact support.' } });
+    res.json({ success: true, data: { reply: "I'm having trouble right now. For immediate help, check the FAQ section above or contact support." } });
   }
 });
 
