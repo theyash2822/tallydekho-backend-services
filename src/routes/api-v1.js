@@ -2632,255 +2632,92 @@ router.get('/sync-history', authMiddleware, async (req, res) => {
   }
 });
 
-// ── AI Insights (proxy to /app/ai/ai-insights) ──────────────────────────────
+// ── AI Insights imports ──────────────────────────────────────────────────────
+import {
+  computeInsightMetrics, generateGroqNarration, generateRulesRecommendations,
+  getCachedInsights, setCachedInsights, ensureCacheTables,
+  computeHistoricalSummary, currentFYLabel, currentMonthKey,
+} from '../services/aiInsights.js';
+
+// Ensure cache tables exist on startup (no-op if already created)
+ensureCacheTables().catch(e => console.warn('[AI Insights] ensureCacheTables:', e.message));
+
+// ── AI Insights — Current FY (live analytics + monthly cached LLM narration) ─
 router.get('/ai/insights', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const nowStr = new Date().toISOString().split('T')[0];
+    const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const isCurrentFY = (financialYear === currentFYLabel());
+    const monthKey    = currentMonthKey();
 
-    const [
-      monthlyRows,        // revenue + expenses by month
-      topSuppliersRows,   // top 5 suppliers by spend
-      topCustomersRows,   // top 5 customers by revenue
-      stockoutRows,       // low / out-of-stock items
-      receivablesRows,    // overdue receivables aging
-    ] = await Promise.all([
-
-      // ─ Monthly revenue + expenses (full FY) ─
-      query(`
-        SELECT
-          TO_CHAR(date::date, 'Mon YY') AS lbl,
-          EXTRACT(YEAR  FROM date::date)::int AS yr,
-          EXTRACT(MONTH FROM date::date)::int AS mn,
-          COALESCE(SUM(CASE WHEN voucher_type ILIKE '%Sales%'
-            AND voucher_type NOT ILIKE '%Order%'
-            AND voucher_type NOT ILIKE '%Purchase%' THEN ABS(amount) ELSE 0 END), 0) AS revenue,
-          COALESCE(SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN ABS(amount) ELSE 0 END), 0) AS expenses
-        FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
-          AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-          AND date BETWEEN $2 AND $3
-        GROUP BY lbl, yr, mn ORDER BY yr, mn
-      `, [companyGuid, from, to]),
-
-      // ─ Top 5 suppliers by purchase spend (this FY) ─
-      query(`
-        SELECT party_name, SUM(ABS(amount)) AS total_spend, COUNT(*) AS txns
-        FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
-          AND voucher_type ILIKE '%Purchase%'
-          AND party_name IS NOT NULL AND party_name != ''
-          AND date BETWEEN $2 AND $3
-        GROUP BY party_name ORDER BY total_spend DESC LIMIT 5
-      `, [companyGuid, from, to]),
-
-      // ─ Top 5 customers by revenue (this FY) ─
-      query(`
-        SELECT party_name, SUM(ABS(amount)) AS total_rev, COUNT(*) AS txns
-        FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
-          AND voucher_type ILIKE '%Sales%'
-          AND voucher_type NOT ILIKE '%Order%'
-          AND party_name IS NOT NULL AND party_name != ''
-          AND date BETWEEN $2 AND $3
-        GROUP BY party_name ORDER BY total_rev DESC LIMIT 5
-      `, [companyGuid, from, to]),
-
-      // ─ Stockout / low-stock items ─
-      query(`
-        SELECT name, closing_qty, reorder_level, unit
-        FROM stocks
-        WHERE company_guid=$1
-          AND reorder_level > 0 AND closing_qty <= reorder_level
-        ORDER BY closing_qty ASC LIMIT 8
-      `, [companyGuid]),
-
-      // ─ Receivables aging (from ledgers; DR balance = amount owed to us) ─
-      query(`
-        SELECT
-          SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
-                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                   AND ($1::date - b.due_date::date) BETWEEN 0  AND 30  THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_0_30,
-          SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
-                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                   AND ($1::date - b.due_date::date) BETWEEN 31 AND 60  THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_31_60,
-          SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
-                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                   AND ($1::date - b.due_date::date) > 60              THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_61plus,
-          SUM(ABS(b.pending_amount)) AS total
-        FROM bill_outstanding b
-        WHERE b.company_guid=$2 AND b.pending_amount > 0
-          AND b.bill_type NOT ILIKE '%Cr%'
-      `, [nowStr, companyGuid]),
-    ]);
-
-    // ─ Build revenue forecast: actual months + 3-month moving avg projection ─
-    const months = monthlyRows.rows;
-    const forecastData = months.map(r => ({
-      month:    r.lbl,
-      actual:   parseFloat(r.revenue),
-      expenses: parseFloat(r.expenses),
-    }));
-    // Add 3 forecast months using 3-month moving average of last 3 actual months
-    if (months.length >= 2) {
-      const last3 = forecastData.slice(-Math.min(3, forecastData.length)).map(d => d.actual);
-      const avg   = last3.reduce((s, v) => s + v, 0) / last3.length;
-      const lastRow = months[months.length - 1];
-      for (let i = 1; i <= 3; i++) {
-        const nm = ((lastRow.mn - 1 + i) % 12) + 1;
-        const ny = lastRow.yr + Math.floor((lastRow.mn - 1 + i) / 12);
-        const d = new Date(ny, nm - 1, 1);
-        const lbl = d.toLocaleString('en-IN', { month: 'short', year: '2-digit' });
-        const growthFactor = 1 + (i * 0.02); // slight upward bias
-        forecastData.push({ month: lbl, actual: null, expenses: null, forecast: Math.round(avg * growthFactor) });
+    // ── Step 1: Check cache (current FY only, monthly TTL) ────────────────────
+    if (isCurrentFY) {
+      const cached = await getCachedInsights(companyGuid, monthKey);
+      if (cached) {
+        return res.json({ success: true, data: { ...cached, fromCache: true, isCurrentFY } });
       }
     }
-    // Backfill forecast for actual months using moving avg
-    for (let i = 0; i < forecastData.length; i++) {
-      if (forecastData[i].forecast !== undefined) continue;
-      const window = forecastData.slice(Math.max(0, i - 2), i + 1).map(d => d.actual || 0);
-      forecastData[i].forecast = Math.round(window.reduce((s, v) => s + v, 0) / window.length);
+
+    // ── Step 2: Compute SQL analytics ─────────────────────────────────────────
+    const metrics = await computeInsightMetrics(companyGuid, from, to);
+    const { forecastData, expenseWithSpike, receivablesAging,
+            topSuppliers, topCustomers, stockout, summary, llmPayload } = metrics;
+
+    // ── Step 3: Generate recommendations (Groq LLM or rules fallback) ─────────
+    let recommendations = null;
+    if (isCurrentFY) {
+      recommendations = await generateGroqNarration(llmPayload, financialYear);
+    }
+    if (!recommendations) {
+      recommendations = generateRulesRecommendations(metrics);
     }
 
-    // ─ Expense spike detection ─
-    const expenseData = forecastData
-      .filter(d => d.expenses !== null)
-      .map(d => ({ month: d.month, amount: d.expenses || 0 }));
-    const avgExpense = expenseData.length
-      ? expenseData.reduce((s, d) => s + d.amount, 0) / expenseData.length : 0;
-    const expenseWithSpike = expenseData.map(d => ({
-      ...d,
-      isSpike: avgExpense > 0 && d.amount > avgExpense * 1.3,
-    }));
+    const responseData = {
+      revenueForecast:  isCurrentFY ? forecastData : forecastData.filter(d => d.actual !== null), // no forecast for historical
+      expenseData:      expenseWithSpike,
+      receivablesAging,
+      topSuppliers,
+      topCustomers,
+      stockout,
+      recommendations,
+      summary,
+      isCurrentFY,
+      financialYear,
+      aiNarrated: isCurrentFY && !!process.env.GROQ_API_KEY,
+    };
 
-    // ─ Receivables aging ─
-    const rec = receivablesRows.rows[0] || {};
-    const recTotal = parseFloat(rec.total || 0);
-    const bucket030   = parseFloat(rec.bucket_0_30   || 0);
-    const bucket3160  = parseFloat(rec.bucket_31_60  || 0);
-    const bucket61    = parseFloat(rec.bucket_61plus || 0);
-    const receivablesAging = recTotal > 0 ? [
-      { label: '0–30 Days',  amount: bucket030,  pct: Math.round((bucket030  / recTotal) * 100) },
-      { label: '31–60 Days', amount: bucket3160, pct: Math.round((bucket3160 / recTotal) * 100) },
-      { label: '61+ Days',   amount: bucket61,   pct: Math.round((bucket61   / recTotal) * 100) },
-    ] : [];
-
-    // ─ Top suppliers ─
-    const totalSpend = topSuppliersRows.rows.reduce((s, r) => s + parseFloat(r.total_spend), 0);
-    const topSuppliers = topSuppliersRows.rows.map(r => ({
-      name:  r.party_name,
-      spend: parseFloat(r.total_spend),
-      pct:   totalSpend > 0 ? Math.round((parseFloat(r.total_spend) / totalSpend) * 100) : 0,
-      txns:  parseInt(r.txns),
-    }));
-
-    // ─ Top customers ─
-    const totalRev = topCustomersRows.rows.reduce((s, r) => s + parseFloat(r.total_rev), 0);
-    const topCustomers = topCustomersRows.rows.map(r => ({
-      name:  r.party_name,
-      revenue: parseFloat(r.total_rev),
-      pct:   totalRev > 0 ? Math.round((parseFloat(r.total_rev) / totalRev) * 100) : 0,
-      txns:  parseInt(r.txns),
-    }));
-
-    // ─ Stockout risk ─
-    const stockout = stockoutRows.rows.map(r => ({
-      item:     r.name,
-      qty:      parseFloat(r.closing_qty),
-      reorder:  parseFloat(r.reorder_level),
-      unit:     r.unit || '',
-      critical: parseFloat(r.closing_qty) <= 0,
-    }));
-
-    // ─ AI Recommendations (generated from real data) ─
-    const recommendations = [];
-    // Stock alerts
-    const criticalStock = stockout.filter(s => s.critical);
-    const lowStock = stockout.filter(s => !s.critical && s.qty <= s.reorder * 0.5);
-    criticalStock.slice(0, 2).forEach(s => recommendations.push({
-      icon: 'alert-circle-outline',
-      text: `${s.item} is out of stock. Reorder immediately (min ${s.reorder} ${s.unit}).`,
-      severity: 'critical',
-    }));
-    lowStock.slice(0, 2).forEach(s => recommendations.push({
-      icon: 'layers-outline',
-      text: `${s.item} is critically low (${s.qty} ${s.unit} left, reorder at ${s.reorder}).`,
-      severity: 'warning',
-    }));
-    // Receivables alert
-    if (recTotal > 0 && bucket61 / recTotal > 0.3) {
-      recommendations.push({
-        icon: 'card-outline',
-        text: `${Math.round((bucket61 / recTotal) * 100)}% of receivables are overdue 60+ days. Follow up with customers.`,
-        severity: 'warning',
-      });
-    }
-    // Vendor concentration
-    if (topSuppliers.length > 0 && topSuppliers[0].pct > 50) {
-      recommendations.push({
-        icon: 'business-outline',
-        text: `${topSuppliers[0].pct}% of purchases from ${topSuppliers[0].name} alone. Consider diversifying vendors.`,
-        severity: 'info',
-      });
-    }
-    // Expense spike
-    const spikeMonths = expenseWithSpike.filter(d => d.isSpike);
-    if (spikeMonths.length > 0) {
-      const latest = spikeMonths[spikeMonths.length - 1];
-      recommendations.push({
-        icon: 'trending-up-outline',
-        text: `Expense spike detected in ${latest.month} — ₹${(latest.amount/100000).toFixed(1)}L vs avg ₹${(avgExpense/100000).toFixed(1)}L. Review purchases.`,
-        severity: 'info',
-      });
-    }
-    // Revenue trend
-    if (forecastData.length >= 2) {
-      const lastActual  = [...forecastData].filter(d => d.actual !== null).pop();
-      const prevActual  = [...forecastData].filter(d => d.actual !== null).slice(-2, -1)[0];
-      if (lastActual && prevActual && prevActual.actual > 0) {
-        const growthPct = Math.round(((lastActual.actual - prevActual.actual) / prevActual.actual) * 100);
-        if (Math.abs(growthPct) >= 10) {
-          recommendations.push({
-            icon: growthPct > 0 ? 'rocket-outline' : 'arrow-down-outline',
-            text: `Revenue ${growthPct > 0 ? 'grew' : 'declined'} ${Math.abs(growthPct)}% from ${prevActual.month} to ${lastActual.month}.`,
-            severity: growthPct > 0 ? 'success' : 'warning',
-          });
-        }
-      }
-    }
-    // Fallback if no recommendations
-    if (recommendations.length === 0 && forecastData.length > 0) {
-      recommendations.push({
-        icon: 'checkmark-circle-outline',
-        text: 'No critical alerts. Business operations appear healthy for the selected period.',
-        severity: 'success',
-      });
+    // ── Step 4: Cache result (current FY only) ─────────────────────────────────
+    if (isCurrentFY) {
+      await setCachedInsights(companyGuid, monthKey, llmPayload, responseData);
     }
 
-    res.json({
-      success: true,
-      data: {
-        revenueForecast: forecastData,
-        expenseData:     expenseWithSpike,
-        receivablesAging,
-        topSuppliers,
-        topCustomers,
-        stockout,
-        recommendations,
-        summary: {
-          totalRevenue:  forecastData.filter(d => d.actual !== null).reduce((s, d) => s + (d.actual || 0), 0),
-          totalExpenses: expenseData.reduce((s, d) => s + d.amount, 0),
-          totalReceivables: recTotal,
-          stockoutCount: stockout.length,
-        },
-      },
-    });
+    return res.json({ success: true, data: { ...responseData, fromCache: false } });
+
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
+
+// ── AI Insights — Historical FY (deterministic, no LLM, no forecasting) ────────────
+router.get('/ai/insights/history/:fy', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const financialYear = req.params.fy; // e.g. '2025-2026'
+  if (!financialYear || !/^\d{4}-\d{4}$/.test(financialYear)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_FY', message: 'fy must be like 2025-2026' } });
+  }
+  // Block current FY — use /ai/insights for that
+  if (financialYear === currentFYLabel()) {
+    return res.status(400).json({ success: false, error: { code: 'USE_CURRENT_ENDPOINT', message: 'Use /ai/insights for current FY' } });
+  }
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, null, null, financialYear);
+    const summary = await computeHistoricalSummary(companyGuid, financialYear, from, to);
+    return res.json({ success: true, data: summary });
+  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
 
 // POST /api/admin/backfill-gst — Recompute gst_voucher_details from ledger entries (CGST/SGST/IGST)
 router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
