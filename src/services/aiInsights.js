@@ -41,7 +41,7 @@ export function currentMonthKey() {
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 1 — SQL Analytics Engine (deterministic, runs always)
 // ─────────────────────────────────────────────────────────────────────────────
-export async function computeInsightMetrics(companyGuid, from, to) {
+export async function computeInsightMetrics(companyGuid, from, to, financialYear = '') {
   const nowStr = new Date().toISOString().split('T')[0];
 
   const [monthlyRows, topSuppliersRows, topCustomersRows, stockoutRows, receivablesRows] =

@@ -2661,7 +2661,7 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
     }
 
     // ── Step 2: Compute SQL analytics ─────────────────────────────────────────
-    const metrics = await computeInsightMetrics(companyGuid, from, to);
+    const metrics = await computeInsightMetrics(companyGuid, from, to, financialYear);
     const { forecastData, expenseWithSpike, receivablesAging,
             topSuppliers, topCustomers, stockout, summary, llmPayload } = metrics;
 
