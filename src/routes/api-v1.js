@@ -2702,10 +2702,13 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
       query(`
         SELECT
           SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
+                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
                    AND ($1::date - b.due_date::date) BETWEEN 0  AND 30  THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_0_30,
           SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
+                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
                    AND ($1::date - b.due_date::date) BETWEEN 31 AND 60  THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_31_60,
           SUM(CASE WHEN b.due_date IS NOT NULL AND b.due_date != ''
+                   AND b.due_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
                    AND ($1::date - b.due_date::date) > 60              THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_61plus,
           SUM(ABS(b.pending_amount)) AS total
         FROM bill_outstanding b
