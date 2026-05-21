@@ -199,35 +199,57 @@ export async function computeInsightMetrics(companyGuid, from, to) {
   const totalRevenue  = forecastData.filter(d => d.actual !== null).reduce((s, d) => s + (d.actual || 0), 0);
   const totalExpenses = expenseData.reduce((s, d) => s + d.amount, 0);
 
-  return {
-    forecastData,
-    expenseWithSpike,
-    receivablesAging,
-    topSuppliers,
-    topCustomers,
-    stockout,
-    summary: { totalRevenue, totalExpenses, totalReceivables: recTotal, stockoutCount: stockout.length },
-    // Compact payload for LLM (never send raw rows)
-    llmPayload: {
-      monthlyRevenueTrend:    forecastData.filter(d => d.actual !== null).map(d => Math.round(d.actual)),
-      monthlyExpenseTrend:    expenseData.map(d => Math.round(d.amount)),
-      totalRevenue:           Math.round(totalRevenue),
-      totalExpenses:          Math.round(totalExpenses),
-      netProfit:              Math.round(totalRevenue - totalExpenses),
-      expenseSpikeMonths:     expenseWithSpike.filter(d => d.isSpike).map(d => d.month),
-      criticalStockItems:     stockout.filter(s => s.critical).length,
-      lowStockItems:          stockout.filter(s => !s.critical).length,
-      criticalStockNames:     stockout.filter(s => s.critical).slice(0, 3).map(s => s.item),
-      overdueReceivablesPct:  recTotal > 0 ? Math.round((bucket61 / recTotal) * 100) : 0,
-      totalReceivables:       Math.round(recTotal),
-      topCustomerName:        topCustomers[0]?.name || null,
-      topCustomerPct:         topCustomers[0]?.pct  || 0,
-      topSupplierName:        topSuppliers[0]?.name || null,
-      topSupplierPct:         topSuppliers[0]?.pct  || 0,
-      dataMonths:             forecastData.filter(d => d.actual !== null).length,
+  // ── Helpers for enriched LLM payload ─────────────────────────────────────
+  const fmt = n => `₹${(n/100000).toFixed(1)}L`;
+  const actualMonthsData = forecastData.filter(d => d.actual !== null);
+  const spikeMonthsData  = expenseWithSpike.filter(d => d.isSpike);
+  const revenueContext   = actualMonthsData.length >= 2 ? (() => {
+    const last  = actualMonthsData[actualMonthsData.length - 1];
+    const prev  = actualMonthsData[actualMonthsData.length - 2];
+    const delta = last.actual - prev.actual;
+    return `${delta >= 0 ? 'Up' : 'Down'} ${fmt(Math.abs(delta))} from ${prev.month} to ${last.month}`;
+  })() : 'Insufficient data';
+
+  const llmPayload = {
+    financialYear,
+    dataMonths:        actualMonthsData.length,
+    totalRevenue:      fmt(totalRevenue),
+    totalExpenses:     fmt(totalExpenses),
+    netProfit:         fmt(totalRevenue - totalExpenses),
+    profitMarginPct:   totalRevenue > 0 ? Math.round(((totalRevenue - totalExpenses) / totalRevenue) * 100) : 0,
+    revenueContext,
+    monthlyRevenue:    actualMonthsData.map(d => ({ month: d.month, revenue: fmt(d.actual) })),
+    expenseSpikes:     spikeMonthsData.map(d => ({
+      month: d.month, amount: fmt(d.amount),
+      vsAvg: `avg ${fmt(avgExpense)}`, excessPct: Math.round(((d.amount - avgExpense) / avgExpense) * 100),
+    })),
+    overdueReceivables: {
+      total: fmt(recTotal),
+      overdue60Plus: fmt(bucket61),
+      overdue60PlusPct: recTotal > 0 ? Math.round((bucket61 / recTotal) * 100) : 0,
+      overdue31to60: fmt(bucket3160),
+      current0to30: fmt(bucket030),
     },
-    bucket61, recTotal,
-    avgExpense,
+    topCustomers: topCustomers.slice(0, 3).map(c => ({
+      name: c.name, revenue: fmt(c.revenue), shareOfTotalPct: c.pct, transactions: c.txns,
+    })),
+    topSuppliers: topSuppliers.slice(0, 3).map(s => ({
+      name: s.name, spend: fmt(s.spend), shareOfTotalPct: s.pct, transactions: s.txns,
+    })),
+    criticalStock: stockout.filter(s => s.critical).slice(0, 4).map(s => ({
+      item: s.item, qty: s.qty, reorderLevel: s.reorder, unit: s.unit,
+    })),
+    lowStock: stockout.filter(s => !s.critical).slice(0, 3).map(s => ({
+      item: s.item, qty: s.qty, reorderLevel: s.reorder, unit: s.unit,
+    })),
+  };
+
+  return {
+    forecastData, expenseWithSpike, receivablesAging,
+    topSuppliers, topCustomers, stockout,
+    summary: { totalRevenue, totalExpenses, totalReceivables: recTotal, stockoutCount: stockout.length },
+    llmPayload,
+    bucket61, recTotal, avgExpense,
   };
 }
 
@@ -237,28 +259,53 @@ export async function computeInsightMetrics(companyGuid, from, to) {
 export async function generateGroqNarration(llmPayload, financialYear) {
   if (!GROQ_API_KEY) return null;
 
-  const systemPrompt = `You are a concise business analyst for an Indian SME accounting app called TallyDekho.
-Analyze the provided business metrics and return ONLY a JSON array of 3 to 5 actionable recommendations.
+  const systemPrompt = `You are an elite business advisor embedded inside TallyDekho, a Tally Prime sync app used by Indian SMEs.
+Your job: analyze real accounting data and generate 4-5 recommendations that are SPECIFIC, DATA-DRIVEN, and have DIRECT BUSINESS IMPACT.
 
-Format — return ONLY this JSON array, no other text:
+Return ONLY a valid JSON array. No markdown, no explanation, no code blocks. Just the array:
 [
-  {"icon": "icon-name", "text": "recommendation text under 120 chars", "severity": "critical|warning|info|success"}
+  {"icon": "icon-name", "text": "your recommendation", "severity": "critical|warning|info|success"}
 ]
 
-Allowed icon names (Ionicons): alert-circle-outline, card-outline, business-outline, trending-up-outline, layers-outline, rocket-outline, checkmark-circle-outline, arrow-down-outline, people-outline, wallet-outline
+Allowed Ionicons: alert-circle-outline, card-outline, business-outline, trending-up-outline, layers-outline, rocket-outline, checkmark-circle-outline, arrow-down-outline, people-outline, wallet-outline, time-outline, analytics-outline
 
-Rules:
-- Observations like "revenue grew X%" are NOT recommendations — give advice instead
-- Be specific and actionable (what to do, not what happened)
-- Use Indian business context (lakhs/crores, payment terms, GST)
-- severity: critical = immediate action required, warning = needs attention, info = observation/tip, success = positive note
-- If all looks healthy, give 2-3 growth/optimization tips`;
+SEVERITY GUIDE:
+- critical = immediate action, cash/stock at risk
+- warning = attention needed within a week
+- info = optimization opportunity
+- success = positive signal worth noting
+
+GOLDEN RULES — follow every single one:
+1. ALWAYS mention actual names and amounts from the data. Never say "a customer" when you have "Raj Traders (₹1.8L)".
+2. NEVER state what happened as advice. "Revenue grew" is an observation. "Chase this growth by expanding to X" is advice.
+3. Every recommendation must answer: "If I do this, what will improve in my business?"
+4. Use Indian business language: lakhs, crores, GST, payment terms, festive season, Q1/Q2/Q3/Q4.
+5. If receivables overdue: name the bucket amount + suggest collecting before month-end.
+6. If stock critical: name the item + say reorder NOW before you lose sales.
+7. If one customer is >40% of revenue: flag concentration risk with the name.
+8. If profit margin is healthy: give a growth tip (expand, upsell, new market).
+9. If expense spike: name the month + suggest reviewing that category.
+10. Keep each recommendation under 140 characters.
+
+EXAMPLES OF BAD vs GOOD:
+❌ BAD: "42% of receivables are overdue. Follow up with customers."
+✅ GOOD: "₹1.8L stuck in 60+ day receivables. Contact your top overdue parties before month-end to free working capital."
+
+❌ BAD: "Revenue trend appears positive."
+✅ GOOD: "Sales up 3 months in a row — consider offering credit terms to your top 2 customers to accelerate volume."
+
+❌ BAD: "Critical stock levels detected."
+✅ GOOD: "JBL Speaker is out of stock. Reorder immediately — every day of stockout = lost sales."
+
+❌ BAD: "Vendor concentration risk."
+✅ GOOD: "68% of purchases from Sharma Enterprises alone. Add 1-2 backup suppliers to avoid supply disruption."`;
 
   const userMsg = `Financial Year: ${financialYear}
-Metrics:
+
+Business Data:
 ${JSON.stringify(llmPayload, null, 2)}
 
-Return 3-5 actionable recommendations as a JSON array.`;
+Generate 4-5 world-class, data-specific, impactful recommendations. Return ONLY the JSON array.`;
 
   try {
     const resp = await fetch(GROQ_ENDPOINT, {
