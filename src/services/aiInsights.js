@@ -460,12 +460,17 @@ export async function ensureCacheTables() {
 export async function getCachedInsights(companyGuid, monthKey) {
   try {
     const { rows } = await query(
-      `SELECT ai_output_json, generated_at FROM ai_insights_cache
+      `SELECT ai_output_json, generated_at, valid_until FROM ai_insights_cache
        WHERE company_guid=$1 AND month_key=$2
          AND valid_until > NOW() LIMIT 1`,
       [companyGuid, monthKey]
     );
-    return rows[0]?.ai_output_json || null;
+    if (!rows[0]) return null;
+    // Inject cache timestamps into the payload so the UI can show the disclaimer
+    const data = rows[0].ai_output_json;
+    data._cacheGeneratedAt = rows[0].generated_at;
+    data._cacheValidUntil  = rows[0].valid_until;
+    return data;
   } catch { return null; }
 }
 

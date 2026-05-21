@@ -2693,6 +2693,12 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
       await setCachedInsights(companyGuid, monthKey, llmPayload, responseData);
     }
 
+    // Add cache timestamps for UI disclaimer
+    const now       = new Date();
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    responseData._cacheGeneratedAt = now.toISOString();
+    responseData._cacheValidUntil  = nextMonth.toISOString();
+
     return res.json({ success: true, data: { ...responseData, fromCache: false } });
 
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
