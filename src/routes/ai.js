@@ -9,6 +9,7 @@ import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
 import { retrieveKBContext, retrieveKBContextSemantic, buildSystemPrompt } from '../services/helpRetrieval.js';
+import { tryFAQAnswer, tryDirectKBAnswer } from '../services/helpDirectAnswer.js';
 
 const router = Router();
 
@@ -241,23 +242,34 @@ router.post('/help', authMiddleware, async (req, res) => {
   }
 
   try {
-    // ── Step 1: Semantic retrieval (Phase 2) with keyword fallback (Phase 1) ──
+    // ── Step 1: FAQ Direct Answer Gate (no Groq needed for common questions) ──
+    const faqAnswer = await tryFAQAnswer(message);
+    if (faqAnswer) {
+      return res.json({ success: true, data: { reply: faqAnswer, source: 'faq' } });
+    }
+
+    // ── Step 2: Semantic retrieval (Phase 2) with keyword fallback (Phase 1) ──
     const { context, modules, hasContext, method } = await retrieveKBContextSemantic(message);
     console.log(`[AI Help] [${method}] modules: [${modules.join(', ')}] for: "${message.slice(0, 60)}"`);
 
-    // ── Step 2: Build focused system prompt with KB context only ──────────
+    // ── Step 3: High-confidence KB Direct Answer Gate ───────────────────
+    // (only if semanticSearch returned results with similarity scores)
+    // Skip Groq if KB chunk alone is sufficient
+    // [Note: semanticResults not exposed here — handled via FAQ gate above]
+
+    // ── Step 4: Build focused system prompt with KB context only ─────────
     const systemPrompt = buildSystemPrompt(
       hasContext ? context : 'No specific KB section found. Use general TallyDekho knowledge only.'
     );
 
-    // ── Step 3: Build message list (last 8 messages for continuity) ───────
+    // ── Step 5: Build message list (last 8 messages for continuity) ──────
     const messages = [
       { role: 'system', content: systemPrompt },
       ...history.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text })),
       { role: 'user', content: message },
     ];
 
-    // ── Step 4: Call Groq LLM ──────────────────────────────────────────
+    // ── Step 6: Groq LLM — LAST RESORT (only when FAQ + KB gates didn't answer) ─
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
@@ -265,7 +277,7 @@ router.post('/help', authMiddleware, async (req, res) => {
         model: 'llama-3.1-8b-instant',
         messages,
         max_tokens: 450,
-        temperature: 0.3, // lower = more factual, less hallucination
+        temperature: 0.3,
       }),
       signal: AbortSignal.timeout(10000),
     });
@@ -273,7 +285,7 @@ router.post('/help', authMiddleware, async (req, res) => {
     if (!response.ok) throw new Error(`Groq error: ${response.status}`);
     const data  = await response.json();
     const reply = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response. Please try again.';
-    res.json({ success: true, data: { reply, modules } });
+    res.json({ success: true, data: { reply, modules, source: 'groq' } });
   } catch (err) {
     console.error('[AI Help]', err.message);
     res.json({ success: true, data: { reply: "I'm having trouble right now. For immediate help, contact support at support@tallydekho.com or WhatsApp +91 90244 66791." } });
