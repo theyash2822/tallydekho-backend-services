@@ -8,7 +8,7 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
-import { retrieveKBContext, buildSystemPrompt } from '../services/helpRetrieval.js';
+import { retrieveKBContext, retrieveKBContextSemantic, buildSystemPrompt } from '../services/helpRetrieval.js';
 
 const router = Router();
 
@@ -241,9 +241,9 @@ router.post('/help', authMiddleware, async (req, res) => {
   }
 
   try {
-    // ── Step 1: Route intent + retrieve relevant KB sections ───────────────
-    const { context, modules, hasContext } = retrieveKBContext(message);
-    console.log(`[AI Help] intent modules: [${modules.join(', ')}] for: "${message.slice(0, 60)}"`);
+    // ── Step 1: Semantic retrieval (Phase 2) with keyword fallback (Phase 1) ──
+    const { context, modules, hasContext, method } = await retrieveKBContextSemantic(message);
+    console.log(`[AI Help] [${method}] modules: [${modules.join(', ')}] for: "${message.slice(0, 60)}"`);
 
     // ── Step 2: Build focused system prompt with KB context only ──────────
     const systemPrompt = buildSystemPrompt(

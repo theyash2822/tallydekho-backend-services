@@ -11,6 +11,7 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { semanticSearch, isKBIndexed } from './helpEmbeddings.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
@@ -224,7 +225,38 @@ export function retrieveKBContext(question) {
     context:     sections.join('\n\n'),
     modules:     topModules.map(m => m.id),
     hasContext:  sections.length > 0,
+    method:      'keyword',
   };
+}
+
+// ─── Phase 2 Retrieval (semantic search via pgvector) ───────────────────────
+// Uses vector similarity search first; falls back to keyword if unavailable
+export async function retrieveKBContextSemantic(question) {
+  const kbReady = await isKBIndexed();
+
+  if (kbReady) {
+    try {
+      const results = await semanticSearch(question, 5);
+      const seen = new Set();
+      const sections = [];
+      const modules  = [];
+
+      for (const row of results) {
+        // No hard threshold — in a bounded product KB, nearest neighbour is always relevant
+        sections.push(`--- ${row.section.toUpperCase().replace(/_/g, ' ')} ---\n${row.content}`);
+        if (!seen.has(row.section)) { seen.add(row.section); modules.push(row.section); }
+      }
+
+      if (sections.length > 0) {
+        return { context: sections.join('\n\n'), modules, hasContext: true, method: 'semantic' };
+      }
+    } catch (err) {
+      console.warn('[KB] Semantic search failed, falling back to keywords:', err.message);
+    }
+  }
+
+  // Phase 1 fallback
+  return { ...retrieveKBContext(question), method: 'keyword-fallback' };
 }
 
 // ─── System Prompt Builder ─────────────────────────────────────────────────────
