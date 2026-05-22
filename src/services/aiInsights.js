@@ -591,7 +591,7 @@ export async function computeHistoricalSummary(companyGuid, financialYear, from,
   }
 
   const summaryObj = {
-    highlights,
+    recommendations: highlights, // align key name with current-FY contract
     topSuppliers,
     topCustomers,
     receivablesAging,
