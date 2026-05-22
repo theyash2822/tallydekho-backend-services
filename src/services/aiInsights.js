@@ -537,68 +537,28 @@ export async function computeHistoricalSummary(companyGuid, financialYear, from,
   } catch {}
 
   // Compute fresh
-  const metrics = await computeInsightMetrics(companyGuid, from, to);
-  const { forecastData, expenseWithSpike, avgExpense, topSuppliers, topCustomers,
-          stockout, receivablesAging, summary, bucket61, recTotal } = metrics;
+  const metrics = await computeInsightMetrics(companyGuid, from, to, financialYear);
+  const { forecastData, expenseWithSpike, topSuppliers, topCustomers,
+          stockout, receivablesAging, summary } = metrics;
 
-  // Build deterministic rule-based highlights (no forecasting language)
-  const highlights = [];
+  // ── Use the full rules engine (isCurrentFY=false) for retrospective wording ─────────────
+  // This gives: stock alerts, receivables, vendor/customer concentration,
+  // expense spike, revenue trend — all with retrospective language
+  const recommendations = generateRulesRecommendations(metrics, false);
 
-  // Best revenue month
-  const actualMonths = forecastData.filter(d => d.actual !== null);
-  if (actualMonths.length > 0) {
-    const best = actualMonths.reduce((a, b) => a.actual > b.actual ? a : b);
-    highlights.push({
-      icon: 'trending-up-outline',
-      text: `Highest sales recorded in ${best.month} — ₹${(best.actual/100000).toFixed(1)}L.`,
-      type: 'revenue',
-    });
-  }
-
-  // Expense spikes
-  const spikes = expenseWithSpike.filter(d => d.isSpike);
-  spikes.slice(0, 2).forEach(s => highlights.push({
-    icon: 'warning-outline',
-    text: `Expense spike in ${s.month} — ₹${(s.amount/100000).toFixed(1)}L vs avg ₹${(avgExpense/100000).toFixed(1)}L.`,
-    type: 'expense',
-  }));
-
-  // Receivables observation (no predictive language)
-  if (recTotal > 0 && bucket61 / recTotal > 0.25) {
-    highlights.push({
-      icon: 'card-outline',
-      text: `${Math.round((bucket61 / recTotal) * 100)}% of receivables were overdue 60+ days during this period.`,
-      type: 'receivables',
-    });
-  }
-
-  // Top customer concentration
-  if (topCustomers.length > 0 && topCustomers[0].pct >= 30) {
-    highlights.push({
-      icon: 'people-outline',
-      text: `${topCustomers[0].name} contributed ${topCustomers[0].pct}% of total revenue.`,
-      type: 'customers',
-    });
-  }
-
-  // Critical stock events
-  if (stockout.filter(s => s.critical).length > 0) {
-    highlights.push({
-      icon: 'layers-outline',
-      text: `${stockout.filter(s => s.critical).length} items reached critical stock levels during this period.`,
-      type: 'stock',
-    });
-  }
+  // ── Revenue trend: actual months only (no forecast dots for closed FY) ────────────
+  const revenueForecast = forecastData.filter(d => d.actual !== null);
 
   const summaryObj = {
-    recommendations: highlights, // align key name with current-FY contract
+    recommendations,          // full rules-based retrospective recommendations with severity
+    revenueForecast,          // actual months only — key matches current-FY contract
+    expenseData: expenseWithSpike, // key matches current-FY contract
     topSuppliers,
     topCustomers,
     receivablesAging,
     stockout,
     summary,
-    forecastData: null, // no forecasting for historical
-    isHistorical: true,
+    isCurrentFY: false,       // explicit flag for client
     financialYear,
   };
 
