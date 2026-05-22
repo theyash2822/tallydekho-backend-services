@@ -2668,10 +2668,10 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
     // ── Step 3: Generate recommendations (Groq LLM or rules fallback) ─────────
     let recommendations = null;
     if (isCurrentFY) {
-      recommendations = await generateGroqNarration(llmPayload, financialYear);
+      recommendations = await generateGroqNarration(llmPayload, financialYear, isCurrentFY);
     }
     if (!recommendations) {
-      recommendations = generateRulesRecommendations(metrics);
+      recommendations = generateRulesRecommendations(metrics, isCurrentFY);
     }
 
     const responseData = {

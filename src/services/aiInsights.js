@@ -256,10 +256,15 @@ export async function computeInsightMetrics(companyGuid, from, to, financialYear
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 2A — Groq LLM Narration (current FY only, monthly cached)
 // ─────────────────────────────────────────────────────────────────────────────
-export async function generateGroqNarration(llmPayload, financialYear) {
+export async function generateGroqNarration(llmPayload, financialYear, isCurrentFY = true) {
   if (!GROQ_API_KEY) return null;
 
+  const fyContext = isCurrentFY
+    ? `This is the CURRENT ACTIVE financial year (${financialYear}). Give FORWARD-LOOKING actionable advice — what the business owner should DO NOW to improve.`
+    : `This is a CLOSED HISTORICAL financial year (${financialYear}). This year is OVER. Give RETROSPECTIVE observations only — what happened, what can be learned, what to do differently NEXT year. NEVER say "maintain", "follow up now", "act today", or any present-tense action for a closed year.`;
+
   const systemPrompt = `You are an elite business advisor embedded inside TallyDekho, a Tally Prime sync app used by Indian SMEs.
+Context: ${fyContext}
 Your job: analyze real accounting data and generate 4-5 recommendations that are SPECIFIC, DATA-DRIVEN, and have DIRECT BUSINESS IMPACT.
 
 Return ONLY a valid JSON array. No markdown, no explanation, no code blocks. Just the array:
@@ -350,78 +355,107 @@ Generate 4-5 world-class, data-specific, impactful recommendations. Return ONLY 
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 2B — Rules Engine Fallback (used when Groq unavailable)
 // ─────────────────────────────────────────────────────────────────────────────
-export function generateRulesRecommendations(metrics) {
-  const { stockout, topSuppliers, expenseWithSpike, avgExpense,
-          bucket61, recTotal, forecastData } = metrics;
+export function generateRulesRecommendations(metrics, isCurrentFY = true) {
+  const { stockout, topSuppliers, topCustomers, expenseWithSpike, avgExpense,
+          bucket61, recTotal, forecastData, llmPayload } = metrics;
+  const fy = llmPayload?.financialYear || '';
   const recommendations = [];
 
-  // Critical stock
+  // ─ Stock alerts (same regardless of FY) ──────────────────────────────
   stockout.filter(s => s.critical).slice(0, 2).forEach(s => recommendations.push({
     icon: 'alert-circle-outline',
-    text: `${s.item} is out of stock. Reorder immediately (min ${s.reorder} ${s.unit}).`,
+    text: isCurrentFY
+      ? `${s.item} is out of stock. Reorder immediately (min ${s.reorder} ${s.unit}).`
+      : `${s.item} reached zero stock in ${fy}. Ensure reorder process is in place.`,
     severity: 'critical',
   }));
 
-  // Low stock
   stockout.filter(s => !s.critical && s.qty <= s.reorder * 0.5).slice(0, 2).forEach(s => recommendations.push({
     icon: 'layers-outline',
-    text: `${s.item} is critically low — ${s.qty} ${s.unit} left (reorder at ${s.reorder}).`,
+    text: isCurrentFY
+      ? `${s.item} is critically low — ${s.qty} ${s.unit} left (reorder at ${s.reorder}).`
+      : `${s.item} had low stock levels in ${fy}. Review reorder policies.`,
     severity: 'warning',
   }));
 
-  // Receivables overdue
+  // ─ Receivables ─────────────────────────────────────────────
   if (recTotal > 0 && bucket61 / recTotal > 0.3) {
+    const pct = Math.round((bucket61 / recTotal) * 100);
+    const fmt = n => `₹${(n/100000).toFixed(1)}L`;
     recommendations.push({
       icon: 'card-outline',
-      text: `${Math.round((bucket61 / recTotal) * 100)}% of receivables overdue 60+ days. Follow up with customers.`,
+      text: isCurrentFY
+        ? `${pct}% of receivables (${fmt(bucket61)}) overdue 60+ days. Chase payments before month-end.`
+        : `${pct}% of receivables in ${fy} aged beyond 60 days. Tighten credit policy this year.`,
       severity: 'warning',
     });
   }
 
-  // Vendor concentration
+  // ─ Vendor concentration ────────────────────────────────────
   if (topSuppliers.length > 0 && topSuppliers[0].pct > 50) {
     recommendations.push({
       icon: 'business-outline',
-      text: `${topSuppliers[0].pct}% of purchases from ${topSuppliers[0].name}. Consider diversifying vendors.`,
+      text: isCurrentFY
+        ? `${topSuppliers[0].pct}% of purchases from ${topSuppliers[0].name}. Add backup suppliers to reduce risk.`
+        : `${topSuppliers[0].pct}% of ${fy} purchases came from ${topSuppliers[0].name}. High dependency noted.`,
       severity: 'info',
     });
   }
 
-  // Expense spike
+  // ─ Customer concentration ──────────────────────────────────
+  if (topCustomers && topCustomers.length > 0 && topCustomers[0].pct > 40) {
+    recommendations.push({
+      icon: 'people-outline',
+      text: isCurrentFY
+        ? `${topCustomers[0].name} is ${topCustomers[0].pct}% of revenue. Expand to new customers to de-risk.`
+        : `${topCustomers[0].name} contributed ${topCustomers[0].pct}% of ${fy} revenue. Customer concentration was high.`,
+      severity: 'info',
+    });
+  }
+
+  // ─ Expense spike ───────────────────────────────────────────────
   const spikeMonths = expenseWithSpike.filter(d => d.isSpike);
   if (spikeMonths.length > 0) {
     const latest = spikeMonths[spikeMonths.length - 1];
     recommendations.push({
       icon: 'trending-up-outline',
-      text: `Expense spike in ${latest.month} — ₹${(latest.amount/100000).toFixed(1)}L vs avg ₹${(avgExpense/100000).toFixed(1)}L. Review purchases.`,
+      text: isCurrentFY
+        ? `Expense spike in ${latest.month} — ₹${(latest.amount/100000).toFixed(1)}L vs avg ₹${(avgExpense/100000).toFixed(1)}L. Review category-wise purchases.`
+        : `Expense spike in ${latest.month} (${fy}) was ₹${(latest.amount/100000).toFixed(1)}L vs avg ₹${(avgExpense/100000).toFixed(1)}L. Identify root cause for future planning.`,
       severity: 'info',
     });
   }
 
-  // Revenue trend — only with ≥4 months, softer wording
+  // ─ Revenue trend — current FY: forward advice; historical FY: retrospective ─
   const actualMonths = forecastData.filter(d => d.actual !== null);
   if (actualMonths.length >= 4) {
     const last = actualMonths[actualMonths.length - 1];
     const prev = actualMonths[actualMonths.length - 2];
-    if (prev.actual > 50000) { // min denominator ₹50K to avoid % explosion
+    if (prev.actual > 50000) {
       const growthPct = Math.round(((last.actual - prev.actual) / prev.actual) * 100);
       if (Math.abs(growthPct) >= 15) {
         recommendations.push({
           icon:     growthPct > 0 ? 'rocket-outline' : 'arrow-down-outline',
-          text:     growthPct > 0
-            ? `Revenue trending upward over recent months. Maintain sales momentum.`
-            : `Revenue declined in ${last.month}. Review sales pipeline and follow up on pending orders.`,
+          text:     isCurrentFY
+            ? (growthPct > 0
+                ? `Revenue up ${growthPct}% in ${last.month}. Offer credit terms to top customers to accelerate this momentum.`
+                : `Revenue dropped ${Math.abs(growthPct)}% in ${last.month}. Review your sales pipeline and follow up on pending orders.`)
+            : (growthPct > 0
+                ? `Revenue grew ${growthPct}% from ${prev.month} to ${last.month} in ${fy}. Strong close to the year.`
+                : `Revenue declined ${Math.abs(growthPct)}% from ${prev.month} to ${last.month} in ${fy}. Worth analysing what drove the dip.`),
           severity: growthPct > 0 ? 'success' : 'warning',
         });
       }
     }
   }
 
-  // Healthy fallback
+  // ─ Healthy fallback ─────────────────────────────────────────────
   if (recommendations.length === 0) {
     recommendations.push({
       icon:     'checkmark-circle-outline',
-      text:     'No critical alerts. Business operations appear healthy for the selected period.',
+      text:     isCurrentFY
+        ? 'No critical alerts. Business operations appear healthy for the current period.'
+        : `${fy} showed healthy business operations. No major issues detected.`,
       severity: 'success',
     });
   }
