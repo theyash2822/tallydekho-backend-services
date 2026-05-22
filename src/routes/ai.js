@@ -8,6 +8,7 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
+import { retrieveKBContext, buildSystemPrompt } from '../services/helpRetrieval.js';
 
 const router = Router();
 
@@ -227,7 +228,9 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
 
 export default router;
 
-// ── POST /ai/help — AI Help Chat using Groq (llama-3.1-8b-instant) ────────────
+// ── POST /ai/help — AI Help Chat with KB Retrieval + Groq ─────────────────
+// Architecture: Intent Router → KB Retrieval → Focused Context → Groq LLM
+// Token target: 500–1200 tokens/query (not 3000–10000 for full KB stuffing)
 router.post('/help', authMiddleware, async (req, res) => {
   const { message, history = [] } = req.body || {};
   if (!message) return res.status(400).json({ success: false, error: { code: 'MISSING_MESSAGE', message: 'message required' } });
@@ -238,36 +241,42 @@ router.post('/help', authMiddleware, async (req, res) => {
   }
 
   try {
-    const systemPrompt = `You are TallyDekho's expert help assistant. TallyDekho is a mobile app that syncs with Tally Prime accounting software. Help users with:
-- Syncing data from Tally to TallyDekho
-- Creating invoices, vouchers, purchase orders
-- Reading ledger statements and balances
-- Managing stock and warehouses
-- Generating PDF invoices
-- Understanding GST, EWB, E-Invoice features
-- Settings configuration
-Keep answers concise and practical. If the question is not about TallyDekho or accounting, politely redirect to the topic.`;
+    // ── Step 1: Route intent + retrieve relevant KB sections ───────────────
+    const { context, modules, hasContext } = retrieveKBContext(message);
+    console.log(`[AI Help] intent modules: [${modules.join(', ')}] for: "${message.slice(0, 60)}"`);
 
+    // ── Step 2: Build focused system prompt with KB context only ──────────
+    const systemPrompt = buildSystemPrompt(
+      hasContext ? context : 'No specific KB section found. Use general TallyDekho knowledge only.'
+    );
+
+    // ── Step 3: Build message list (last 8 messages for continuity) ───────
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...history.slice(-6).map((h) => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text })),
+      ...history.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text })),
       { role: 'user', content: message },
     ];
 
+    // ── Step 4: Call Groq LLM ──────────────────────────────────────────
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'llama-3.1-8b-instant', messages, max_tokens: 400, temperature: 0.7 }),
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages,
+        max_tokens: 450,
+        temperature: 0.3, // lower = more factual, less hallucination
+      }),
       signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) throw new Error(`Groq error: ${response.status}`);
-    const data = await response.json();
+    const data  = await response.json();
     const reply = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response. Please try again.';
-    res.json({ success: true, data: { reply } });
+    res.json({ success: true, data: { reply, modules } });
   } catch (err) {
     console.error('[AI Help]', err.message);
-    res.json({ success: true, data: { reply: "I'm having trouble right now. For immediate help, check the FAQ section above or contact support." } });
+    res.json({ success: true, data: { reply: "I'm having trouble right now. For immediate help, contact support at support@tallydekho.com or WhatsApp +91 90244 66791." } });
   }
 });
 
