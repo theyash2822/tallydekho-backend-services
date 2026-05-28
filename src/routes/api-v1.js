@@ -812,7 +812,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') as date,
         wq.created_at,
         wq.tally_voucher_number as voucher_number,
-        NULL as amount,
+        wq.amount as amount,
         NULL as guid
       FROM write_queue wq
       WHERE wq.company_guid = $1
