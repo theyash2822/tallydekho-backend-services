@@ -906,21 +906,22 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
   const narration = `${adjustmentReason}${adjustmentDirection ? ' - ' + adjustmentDirection : ''}${note ? ' | ' + note : ''}`;
 
   // ── Build Stock Journal XML ──────────────────────────────────────────────────
-  // Increase → INVENTORYENTRIESIN.LIST (stock enters)
-  // Reduce   → INVENTORYENTRIESOUT.LIST (stock leaves)
+  // Increase → INVENTORYENTRIESIN.LIST: positive qty
+  // Reduce   → INVENTORYENTRIESOUT.LIST: NEGATIVE qty (Tally requires this)
+  const signedQty = isIncrease ? qty : -qty;
   const batchXml = `<BATCHALLOCATIONS.LIST>
     <BATCHNAME>Primary Batch</BATCHNAME>
     <GODOWNNAME>${godown}</GODOWNNAME>
-    <ACTUALQTY>${qty}</ACTUALQTY>
-    <BILLEDQTY>${qty}</BILLEDQTY>
+    <ACTUALQTY>${signedQty}</ACTUALQTY>
+    <BILLEDQTY>${signedQty}</BILLEDQTY>
     <AMOUNT>0</AMOUNT>
   </BATCHALLOCATIONS.LIST>`;
 
   const entryTag = isIncrease ? 'INVENTORYENTRIESIN.LIST' : 'INVENTORYENTRIESOUT.LIST';
   const entryXml = `<${entryTag}>
     <STOCKITEMNAME>${stockName}</STOCKITEMNAME>
-    <ACTUALQTY>${qty}</ACTUALQTY>
-    <BILLEDQTY>${qty}</BILLEDQTY>
+    <ACTUALQTY>${signedQty}</ACTUALQTY>
+    <BILLEDQTY>${signedQty}</BILLEDQTY>
     <RATE>0</RATE>
     <AMOUNT>0</AMOUNT>
     ${batchXml}
