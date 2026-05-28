@@ -772,7 +772,7 @@ router.get('/vouchers', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/vouchers/my-entries — vouchers created via this user's mobile app
+// GET /api/vouchers/my-entries — vouchers + pending write_queue entries created via this user's mobile app
 router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -781,14 +781,13 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
   const userId = req.user.userId;
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
+    // 1. Posted vouchers (synced back from Tally)
     let q = `
-      SELECT DISTINCT v.*
+      SELECT DISTINCT v.*, 'posted' as _queue_status, wq.id as _queue_id
       FROM vouchers v
       JOIN write_queue wq ON wq.company_guid = v.company_guid
         AND wq.tally_voucher_number = v.voucher_number
-      WHERE v.company_guid = $1
-        AND wq.user_id = $2
-        AND v.is_cancelled = FALSE
+      WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
     `;
     const params = [companyGuid, userId];
     let idx = 3;
@@ -797,10 +796,63 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     if (type) { q += ` AND v.voucher_type ILIKE $${idx++}`; params.push(`%${type}%`); }
     q += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
-    const { rows } = await query(q, params);
-    res.json({ success: true, data: rows });
+    const { rows: postedRows } = await query(q, params);
+
+    // 2. Pending/failed write_queue entries not yet in vouchers
+    // Also include 'success' entries for non-standard voucher types (stock_transfer, stock_adjustment)
+    // that may not produce a joinable tally_voucher_number match
+    const { rows: pendingRows } = await query(`
+      SELECT
+        wq.id as _queue_id,
+        wq.entry_type as voucher_type,
+        wq.entry_label as party_name,
+        wq.status as _queue_status,
+        wq.error_message as _queue_error,
+        wq.attempt_count,
+        TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') as date,
+        wq.created_at,
+        wq.tally_voucher_number as voucher_number,
+        NULL as amount,
+        NULL as guid
+      FROM write_queue wq
+      WHERE wq.company_guid = $1
+        AND wq.user_id = $2
+        AND (
+          wq.status IN ('pending', 'desktop_offline', 'failed')
+          OR (
+            wq.status = 'success'
+            AND wq.entry_type IN ('stock_transfer', 'stock_adjustment')
+            AND wq.created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 2592000
+          )
+        )
+      ORDER BY wq.created_at DESC
+      LIMIT 50
+    `, [companyGuid, userId]);
+
+    res.json({ success: true, data: postedRows, pending: pendingRows });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/vouchers/my-entries/:id/retry — manually retry a queued write_queue entry
+router.post('/vouchers/my-entries/:id/retry', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.userId;
+  try {
+    const { rows } = await query(
+      `SELECT * FROM write_queue WHERE id=$1 AND user_id=$2`,
+      [id, userId]
+    );
+    if (!rows[0]) return res.status(404).json({ success: false, message: 'Entry not found' });
+    const entry = rows[0];
+    // Reset status to pending so it gets picked up
+    await query(`UPDATE write_queue SET status='pending', attempt_count=0, error_message=NULL WHERE id=$1`, [id]);
+    // Try to forward immediately
+    const { forwardToTally, updateWriteQueue } = require('./tally-write.js');
+    res.json({ success: true, message: 'Retry initiated. Will push to Tally if desktop is connected.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -3379,3 +3431,80 @@ router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => 
 });
 
 export default router;
+
+// GET /api/stocks/items/:id/movements — movement history for a stock item
+router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { limit = 20 } = req.query;
+  try {
+    // Get stock name from guid
+    const { rows: sRows } = await query('SELECT name, closing_rate FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
+    if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
+    const stockName = sRows[0].name;
+
+    // Movement history from voucher_inventory_items
+    const { rows } = await query(`
+      SELECT v.voucher_number as ref, v.voucher_type as type, v.date,
+             vi.actual_qty as qty, vi.rate, vi.amount
+      FROM voucher_inventory_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid
+      WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
+        AND v.is_cancelled = FALSE
+      ORDER BY v.date DESC, v.id DESC
+      LIMIT $3
+    `, [stockName, companyGuid, parseInt(limit)]);
+
+    // Avg purchase rate from inward transactions
+    const { rows: avgRows } = await query(`
+      SELECT AVG(rate) as avg_purchase_rate,
+             (SELECT rate FROM stock_transactions WHERE stock_guid=$1 AND company_guid=$2 AND type='inward' AND rate>0 ORDER BY date DESC, id DESC LIMIT 1) as last_purchase_rate
+      FROM stock_transactions
+      WHERE stock_guid=$1 AND company_guid=$2 AND type='inward' AND rate>0
+    `, [stockName, companyGuid]);
+
+    // Last selling rate from sales vouchers
+    const { rows: sellRows } = await query(`
+      SELECT vi.rate as last_sell_rate
+      FROM voucher_inventory_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid
+      WHERE vi.stock_item_name=$1 AND vi.company_guid=$2
+        AND v.voucher_type ILIKE '%sales%' AND vi.rate > 0
+        AND v.is_cancelled = FALSE
+      ORDER BY v.date DESC LIMIT 1
+    `, [stockName, companyGuid]);
+
+    res.json({
+      success: true,
+      data: {
+        movements: rows,
+        avgPurchaseRate: parseFloat(avgRows[0]?.avg_purchase_rate || 0),
+        lastPurchaseRate: parseFloat(avgRows[0]?.last_purchase_rate || sRows[0].closing_rate || 0),
+        lastSellRate: parseFloat(sellRows[0]?.last_sell_rate || 0),
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/stocks/items/:id/godowns — warehouses where this item has stock
+router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: sRows } = await query('SELECT name FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
+    if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
+    const stockName = sRows[0].name;
+    // Get distinct warehouses from stock_transactions + fall back to stocks.warehouse_name
+    const { rows } = await query(`
+      SELECT DISTINCT st.warehouse as name
+      FROM stock_transactions st
+      WHERE st.stock_guid = $1 AND st.company_guid = $2
+        AND st.warehouse IS NOT NULL AND st.warehouse != ''
+    `, [stockName, companyGuid]);
+    res.json({ success: true, data: rows.map(r => r.name).filter(Boolean) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});

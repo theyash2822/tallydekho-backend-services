@@ -225,9 +225,9 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       } else if (xml === 'OpeningBalanceDiff.xml') {
         await processOpeningBalanceDiff(records, companyGuid);
       } else if (xml === 'StockFYBalance.xml') {
-        // DISABLED: $ClosingValue returns wrong values for historical dates in Tally TDL
-        // Keep handler registered but skip processing until proper TDL solution found
-        console.log('[DB] StockFYBalance: skipping (historical date query returns wrong values from Tally)');
+        await processStockFyBalance(records, companyGuid);
+        // After saving FY balance, apply current FY closing_qty to stocks table
+        await applyCurrentFyClosingQty(companyGuid);
       } else if (xml === 'LedgerOpeningBalance.xml') {
         await processLedgerFyBalances(records, companyGuid);
       } else if (xml === 'StockCategory.xml') {
@@ -553,8 +553,12 @@ async function processStockTransactions(data, companyGuid) {
       const value  = Math.abs(amount) > 0 ? Math.abs(amount) : Math.abs(qty) * rate;
       // Determine direction: negative qty = outward (sales/issue), positive = inward (purchase/receipt)
       // Also check VOUCHERTYPENAME for explicit direction
+      // For Stock Journal transfers: DestinationGodownName is set ONLY on the source (outward) batch entry.
+      // The target (inward) batch entry has empty DestinationGodownName. This is how we distinguish them,
+      // because $$IsInwards:$ActualQty at batch level always returns True (qty is always positive).
       const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
-      const isOutward = qty < 0 || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery');
+      const destGodown = (r.DestinationGodownName || r.DESTINATIONGODOWNNAME || '').trim();
+      const isOutward = qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery');
       const type = isOutward ? 'outward' : 'inward';
       // Normalize warehouse — treat empty string same as NULL to avoid duplicate key issues
       const warehouse = r.GODOWNNAME || r.GodownName || null;
@@ -1249,6 +1253,35 @@ async function processStockOpeningBalance(data, companyGuid) {
 // processStockFyBalance — stores stock value AT A SPECIFIC DATE (from=to=single date)
 // Used for FY opening (date = FY_start - 1) and FY closing (date = FY_end)
 // Maps to stock_fy_valuation: if date is FY_end → update closing_value; if date is FY_start-1 → update opening_value
+// Apply the CURRENT FY closing_qty from stock_fy_valuation → stocks.closing_qty
+// Uses the most recent FY that has closing data (highest fin_year)
+async function applyCurrentFyClosingQty(companyGuid) {
+  try {
+    // Find current FY (closest to today that has data)
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const result = await dbQuery(`
+      UPDATE stocks s
+      SET closing_qty   = fv.closing_qty,
+          closing_rate  = COALESCE(NULLIF(fv.closing_rate, 0), s.closing_rate),
+          closing_value = ABS(fv.closing_value)
+      FROM (
+        SELECT DISTINCT ON (stock_name)
+          stock_name, closing_qty, closing_rate, closing_value
+        FROM stock_fy_valuation
+        WHERE company_guid = $1
+          AND closing_qty IS NOT NULL
+          AND closing_qty > 0
+        ORDER BY stock_name, financial_year DESC
+      ) fv
+      WHERE s.name = fv.stock_name
+        AND s.company_guid = $1
+    `, [companyGuid]);
+    console.log(`[DB] applyCurrentFyClosingQty: updated ${result.rowCount} stocks for ${companyGuid}`);
+  } catch (e) {
+    console.error('[DB] applyCurrentFyClosingQty failed:', e.message);
+  }
+}
+
 async function processStockFyBalance(data, companyGuid) {
   if (!data || data.length === 0) return;
 
@@ -1549,7 +1582,8 @@ async function processRecords(data, companyGuid, userId, deviceId) {
     } else if (xml === 'StockValuation.xml') {
       await processStockFyValuation(records, companyGuid);
     } else if (xml === 'StockFYBalance.xml') {
-      console.log('[DB] StockFYBalance: skipping (historical date query returns wrong values from Tally)');
+      await processStockFyBalance(records, companyGuid);
+      await applyCurrentFyClosingQty(companyGuid);
     } else if (xml === 'VoucherInventoryDetail.xml') {
       await processVoucherInventoryItems(records, companyGuid);
       const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);

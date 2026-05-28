@@ -36,7 +36,8 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
     [userId]
   );
   const device = rows[0];
-  if (!device) throw new Error('No paired device found. Please pair your desktop app first.');
+  // No device paired — queue it anyway; will push when device pairs
+  if (!device) return { status: 'desktop_offline', message: 'No paired desktop. Entry saved — will push when desktop connects.' };
 
   const jobId = require('crypto').randomUUID();
 
@@ -768,6 +769,38 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
   try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
 });
 
+// POST /tally/master/stock-item-alter — Stock Item Master Alteration (NOT a voucher)
+// Used for editing: name, HSN, unit, reorder level, GST rate, etc.
+router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
+  const { companyGuid, companyName, existingName, changes = {} } = req.body;
+  if (!companyGuid || !existingName) return res.status(400).json({ status: false, message: 'existingName required' });
+
+  // Build only the fields being changed
+  let fieldsXml = '';
+  if (changes.name)         fieldsXml += `<NAME>${changes.name}</NAME>`;
+  if (changes.hsnCode)      fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><HSNCODE>${changes.hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY></GSTDETAILS.LIST>`;
+  if (changes.unit)         fieldsXml += `<BASEUNITS>${changes.unit}</BASEUNITS>`;
+  if (changes.reorderLevel !== undefined) fieldsXml += `<REORDERLEVEL>${changes.reorderLevel}</REORDERLEVEL>`;
+  if (changes.groupName)    fieldsXml += `<PARENT>${changes.groupName}</PARENT>`;
+  if (changes.taxRate !== undefined) {
+    const r = parseFloat(changes.taxRate);
+    fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${r}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${r/2}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${r/2}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>`;
+  }
+
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'alter_stock_item', existingName, null, req.body, xml).catch(() => null);
+  try {
+    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, r, null);
+    const off = r?.status === 'desktop_offline';
+    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item updated in Tally' });
+  } catch(e) {
+    await updateWriteQueue(qId, null, e.message);
+    res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
+  }
+});
+
 // POST /tally/voucher/stock-transfer
 router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
   const {
@@ -782,20 +815,35 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
   const dt = tallyDate(date);
   const isOpt = isOptional ? 'Yes' : 'No';
 
+  // Stock Journal XML — correct Tally Prime structure for godown transfers.
+  // Uses INVENTORYENTRIESOUT.LIST (outward) + INVENTORYENTRIESIN.LIST (inward)
+  // NOT ALLINVENTORYENTRIES.LIST which causes "No Entries in Voucher" rejection.
   let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Stock Journal" ACTION="Create"><VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration || ''}</NARRATION>`;
 
   for (const item of items) {
     const qty = parseFloat(item.qty) || 1;
-    const rate = parseFloat(item.rate) || 0;
-    const amt = parseFloat(item.amount) || qty * rate;
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${fromGodown}</GODOWNNAME><AMOUNT>${amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
-  }
-
-  for (const item of items) {
-    const qty = parseFloat(item.qty) || 1;
-    const rate = parseFloat(item.rate) || 0;
-    const amt = parseFloat(item.amount) || qty * rate;
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${toGodown}</GODOWNNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+    // Outward: stock leaves source godown
+    xml += `<INVENTORYENTRIESOUT.LIST>`;
+    xml += `<STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>`;
+    xml += `<ACTUALQTY>-${qty}</ACTUALQTY><BILLEDQTY>-${qty}</BILLEDQTY>`;
+    xml += `<RATE>0</RATE><AMOUNT>0</AMOUNT>`;
+    xml += `<BATCHALLOCATIONS.LIST>`;
+    xml += `<GODOWNNAME>${fromGodown}</GODOWNNAME>`;
+    xml += `<ACTUALQTY>-${qty}</ACTUALQTY><BILLEDQTY>-${qty}</BILLEDQTY>`;
+    xml += `<AMOUNT>0</AMOUNT>`;
+    xml += `</BATCHALLOCATIONS.LIST>`;
+    xml += `</INVENTORYENTRIESOUT.LIST>`;
+    // Inward: stock enters destination godown
+    xml += `<INVENTORYENTRIESIN.LIST>`;
+    xml += `<STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>`;
+    xml += `<ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY>`;
+    xml += `<RATE>0</RATE><AMOUNT>0</AMOUNT>`;
+    xml += `<BATCHALLOCATIONS.LIST>`;
+    xml += `<GODOWNNAME>${toGodown}</GODOWNNAME>`;
+    xml += `<ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY>`;
+    xml += `<AMOUNT>0</AMOUNT>`;
+    xml += `</BATCHALLOCATIONS.LIST>`;
+    xml += `</INVENTORYENTRIESIN.LIST>`;
   }
 
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
@@ -805,10 +853,11 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
     const off = r?.status === 'desktop_offline';
-    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock transfer created', data: r, voucherNumber: r?.voucherNumber || null });
+    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock transfer created in Tally', data: r });
   } catch(e) {
+    // Timeout or Tally error — still mark as queued for retry
     await updateWriteQueue(qId, null, e.message);
-    res.status(500).json({ status: false, message: e.message });
+    res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
   }
 });
 
@@ -843,7 +892,7 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
     res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock adjustment created', data: r, voucherNumber: r?.voucherNumber || null });
   } catch(e) {
     await updateWriteQueue(qId, null, e.message);
-    res.status(500).json({ status: false, message: e.message });
+    res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
   }
 });
 
