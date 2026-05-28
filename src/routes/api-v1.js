@@ -846,10 +846,11 @@ router.post('/vouchers/my-entries/:id/retry', authMiddleware, async (req, res) =
     );
     if (!rows[0]) return res.status(404).json({ success: false, message: 'Entry not found' });
     const entry = rows[0];
-    // Reset status to pending so it gets picked up
+    // Reset status to pending and respond immediately
     await query(`UPDATE write_queue SET status='pending', attempt_count=0, error_message=NULL WHERE id=$1`, [id]);
-    // Try to forward immediately
-    const { forwardToTally, updateWriteQueue } = require('./tally-write.js');
+    // Dynamically import and forward to Tally
+    const { retryOfflineEntries } = await import('./tally-write.js');
+    retryOfflineEntries(userId, entry.company_guid).catch(() => {});
     res.json({ success: true, message: 'Retry initiated. Will push to Tally if desktop is connected.' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

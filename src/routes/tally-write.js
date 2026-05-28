@@ -905,48 +905,13 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
   const dt        = tallyDate(date);
   const narration = `${adjustmentReason}${adjustmentDirection ? ' - ' + adjustmentDirection : ''}${note ? ' | ' + note : ''}`;
 
-  // ── Build Stock Journal XML ──────────────────────────────────────────────────
-  // Increase → INVENTORYENTRIESIN.LIST: positive qty
-  // Reduce   → INVENTORYENTRIESOUT.LIST: NEGATIVE qty (Tally requires this)
-  const signedQty = isIncrease ? qty : -qty;
-  const batchXml = `<BATCHALLOCATIONS.LIST>
-    <BATCHNAME>Primary Batch</BATCHNAME>
-    <GODOWNNAME>${godown}</GODOWNNAME>
-    <ACTUALQTY>${signedQty}</ACTUALQTY>
-    <BILLEDQTY>${signedQty}</BILLEDQTY>
-    <AMOUNT>0</AMOUNT>
-  </BATCHALLOCATIONS.LIST>`;
+  // ── Build Physical Stock XML ──────────────────────────────────────────────
+  // Physical Stock sets the ABSOLUTE final quantity in a godown.
+  // Tally does not require both IN/OUT to balance — it simply overrides the physical count.
+  // qtyAfter = qtyBefore + qtyChange (computed above)
+  const absQty = Math.max(0, qtyAfter); // never negative
 
-  const entryTag = isIncrease ? 'INVENTORYENTRIESIN.LIST' : 'INVENTORYENTRIESOUT.LIST';
-  const entryXml = `<${entryTag}>
-    <STOCKITEMNAME>${stockName}</STOCKITEMNAME>
-    <ACTUALQTY>${signedQty}</ACTUALQTY>
-    <BILLEDQTY>${signedQty}</BILLEDQTY>
-    <RATE>0</RATE>
-    <AMOUNT>0</AMOUNT>
-    ${batchXml}
-  </${entryTag}>`;
-
-  const xml = `<ENVELOPE>
-<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
-<BODY><IMPORTDATA>
-<REQUESTDESC>
-  <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
-</REQUESTDESC>
-<REQUESTDATA>
-<TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER VCHTYPE="Stock Journal" ACTION="Create">
-  <VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME>
-  <DATE>${dt}</DATE>
-  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <ISOPTIONAL>No</ISOPTIONAL>
-  <NARRATION>${narration}</NARRATION>
-  ${entryXml}
-</VOUCHER>
-</TALLYMESSAGE>
-</REQUESTDATA>
-</IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Physical Stock" ACTION="Create"><VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><ISOPTIONAL>No</ISOPTIONAL><NARRATION>${narration}</NARRATION><ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${stockName}</STOCKITEMNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><RATE>0</RATE><AMOUNT>0</AMOUNT><BATCHALLOCATIONS.LIST><GODOWNNAME>${godown}</GODOWNNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><AMOUNT>0</AMOUNT></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
   // ── Log to write_queue ───────────────────────────────────────────────────────
   const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})`;
