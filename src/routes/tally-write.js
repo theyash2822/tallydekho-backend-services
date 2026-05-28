@@ -1055,18 +1055,29 @@ router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
 // ── Auto-retry: called when desktop comes online ───────────────────────────────
 export async function retryOfflineEntries(userId, companyGuid) {
   try {
-    const { rows } = await query(
-      `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
-      [userId, companyGuid]
-    );
+    // companyGuid may be null when called on desktop reconnect — fetch ALL pending for this user
+    const { rows } = companyGuid
+      ? await query(
+          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          [userId, companyGuid]
+        )
+      : await query(
+          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          [userId]
+        );
     if (!rows.length) return;
     console.log(`[write_queue] auto-retry: ${rows.length} entries for user ${userId}`);
     for (const entry of rows) {
       if (!entry.xml) continue;
       try {
         await query(`UPDATE write_queue SET status='pending', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
-        const result = await forwardToTally(companyGuid, userId, entry.xml);
+        const result = await forwardToTally(entry.company_guid, userId, entry.xml);
         await updateWriteQueue(entry.id, result, null);
+        // Update stock_adjustment status if linked
+        if (entry.entry_type === 'stock_adjustment' && result?.status !== 'desktop_offline') {
+          const newStatus = (result?.status === 'desktop_offline') ? 'QUEUED' : 'PUSHED_TO_TALLY';
+          await query(`UPDATE stock_adjustments SET status=$1, tally_voucher_number=$2, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE write_queue_id=$3`, [newStatus, result?.voucherNumber || null, entry.id]).catch(() => {});
+        }
         console.log(`[write_queue] entry ${entry.id} (${entry.entry_type}: ${entry.entry_label}) → ${result?.status || 'done'}`);
       } catch (err) {
         await updateWriteQueue(entry.id, null, err.message);
