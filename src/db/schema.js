@@ -676,6 +676,31 @@ export async function initSchema() {
         UNIQUE(user_id, token)
       );
       CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);
+
+      -- Stock Adjustments audit trail (Stock Edit → Adjustment flow)
+      CREATE TABLE IF NOT EXISTS stock_adjustments (
+        id                   SERIAL PRIMARY KEY,
+        company_guid         TEXT NOT NULL,
+        user_id              INTEGER REFERENCES users(id),
+        stock_guid           TEXT NOT NULL,
+        stock_name           TEXT,
+        warehouse            TEXT,
+        adjustment_reason    TEXT NOT NULL,
+        adjustment_direction TEXT,
+        qty_before           NUMERIC(15,4),
+        adjustment_qty       NUMERIC(15,4) NOT NULL,
+        qty_change           NUMERIC(15,4) NOT NULL,
+        qty_after            NUMERIC(15,4),
+        note                 TEXT,
+        status               TEXT NOT NULL DEFAULT 'PENDING',
+        write_queue_id       INTEGER REFERENCES write_queue(id),
+        tally_voucher_number TEXT,
+        created_at           BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        updated_at           BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_sa_company ON stock_adjustments(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_sa_stock   ON stock_adjustments(stock_guid);
+      CREATE INDEX IF NOT EXISTS idx_sa_status  ON stock_adjustments(status);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

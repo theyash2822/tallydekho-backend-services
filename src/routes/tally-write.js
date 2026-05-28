@@ -862,37 +862,136 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
 });
 
 // POST /tally/voucher/stock-adjustment
+// Creates a Stock Journal in Tally for reason-based quantity adjustments.
+// Reasons: Damage, Shortage, Expired, Lost → outward (reduces stock)
+//          Excess → inward (increases stock)
+//          Correction + direction(Add/Reduce) → inward or outward
 router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, narration,
-    godown,
-    items = [],
-    isOptional = false,
+    companyGuid, companyName,
+    stockGuid, stockName,
+    warehouse,
+    adjustmentQty,
+    adjustmentReason,
+    adjustmentDirection,  // 'Add' | 'Reduce' — only for Correction
+    qtyBefore,
+    note,
+    date,
   } = req.body;
-  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
-  const dt = tallyDate(date);
-  const isOpt = isOptional ? 'Yes' : 'No';
 
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Physical Stock" ACTION="Create"><VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration || ''}</NARRATION>`;
-
-  for (const item of items) {
-    const qty = parseFloat(item.adjustedQty) || 0;
-    const rate = parseFloat(item.rate) || 0;
-    const amt = parseFloat(item.amount) || Math.abs(qty * rate);
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY><RATE>${rate}</RATE><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${godown || item.godown || 'Main Location'}</GODOWNNAME><AMOUNT>${-amt}</AMOUNT><ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  if (!companyGuid || !stockName || !adjustmentQty || !adjustmentReason) {
+    return res.status(400).json({ status: false, message: 'stockName, adjustmentQty, adjustmentReason required' });
   }
 
-  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
+  // ── Determine direction ─────────────────────────────────────────────────────
+  const REDUCE_REASONS = ['Damage', 'Shortage', 'Expired', 'Lost'];
+  const INCREASE_REASONS = ['Excess'];
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', godown || 'Stock Adjustment', null, req.body, xml).catch(() => null);
+  let isIncrease = false;
+  if (REDUCE_REASONS.includes(adjustmentReason)) {
+    isIncrease = false;
+  } else if (INCREASE_REASONS.includes(adjustmentReason)) {
+    isIncrease = true;
+  } else if (adjustmentReason === 'Correction') {
+    isIncrease = adjustmentDirection === 'Add';
+  } else {
+    return res.status(400).json({ status: false, message: 'Invalid adjustmentReason' });
+  }
+
+  const qty     = Math.abs(parseFloat(adjustmentQty));
+  const qtyChange = isIncrease ? qty : -qty;
+  const qtyAfter  = parseFloat(qtyBefore || 0) + qtyChange;
+  const godown    = warehouse || 'Main Location';
+  const dt        = tallyDate(date);
+  const narration = `${adjustmentReason}${adjustmentDirection ? ' - ' + adjustmentDirection : ''}${note ? ' | ' + note : ''}`;
+
+  // ── Build Stock Journal XML ──────────────────────────────────────────────────
+  // Increase → INVENTORYENTRIESIN.LIST (stock enters)
+  // Reduce   → INVENTORYENTRIESOUT.LIST (stock leaves)
+  const batchXml = `<BATCHALLOCATIONS.LIST>
+    <BATCHNAME>Primary Batch</BATCHNAME>
+    <GODOWNNAME>${godown}</GODOWNNAME>
+    <ACTUALQTY>${qty}</ACTUALQTY>
+    <BILLEDQTY>${qty}</BILLEDQTY>
+    <AMOUNT>0</AMOUNT>
+  </BATCHALLOCATIONS.LIST>`;
+
+  const entryTag = isIncrease ? 'INVENTORYENTRIESIN.LIST' : 'INVENTORYENTRIESOUT.LIST';
+  const entryXml = `<${entryTag}>
+    <STOCKITEMNAME>${stockName}</STOCKITEMNAME>
+    <ACTUALQTY>${qty}</ACTUALQTY>
+    <BILLEDQTY>${qty}</BILLEDQTY>
+    <RATE>0</RATE>
+    <AMOUNT>0</AMOUNT>
+    ${batchXml}
+  </${entryTag}>`;
+
+  const xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="Stock Journal" ACTION="Create">
+  <VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
+  <ISOPTIONAL>No</ISOPTIONAL>
+  <NARRATION>${narration}</NARRATION>
+  ${entryXml}
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  // ── Log to write_queue ───────────────────────────────────────────────────────
+  const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, null, req.body, xml).catch(() => null);
+
+  // ── Save audit record to stock_adjustments ───────────────────────────────────
+  const { rows: adjRows } = await query(`
+    INSERT INTO stock_adjustments
+      (company_guid, user_id, stock_guid, stock_name, warehouse, adjustment_reason,
+       adjustment_direction, qty_before, adjustment_qty, qty_change, qty_after, note, status, write_queue_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13)
+    RETURNING id
+  `, [
+    companyGuid, req.user.userId,
+    stockGuid || stockName, stockName, godown,
+    adjustmentReason, adjustmentDirection || null,
+    parseFloat(qtyBefore || 0), qty, qtyChange, qtyAfter,
+    note || null, qId || null,
+  ]).catch(() => ({ rows: [{}] }));
+  const adjustmentId = adjRows[0]?.id || null;
+
+  // ── Forward to Tally ─────────────────────────────────────────────────────────
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
+    // Update adjustment status
+    if (adjustmentId) {
+      const newStatus = (r?.status === 'desktop_offline' || (r?.message || '').includes('offline')) ? 'QUEUED' : 'PUSHED_TO_TALLY';
+      await query(`UPDATE stock_adjustments SET status=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`, [newStatus, adjustmentId]).catch(() => {});
+    }
     const off = r?.status === 'desktop_offline';
-    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock adjustment created', data: r, voucherNumber: r?.voucherNumber || null });
+    res.json({
+      status: true, queued: off, queueId: qId, adjustmentId,
+      message: off ? 'Saved. Will push to Tally when desktop connects.' : 'Stock adjustment created in Tally',
+      data: r, voucherNumber: r?.voucherNumber || null,
+    });
   } catch(e) {
     await updateWriteQueue(qId, null, e.message);
-    res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
+    if (adjustmentId) {
+      await query(`UPDATE stock_adjustments SET status='FAILED', error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`, [e.message, adjustmentId]).catch(() => {});
+    }
+    // Still return 200 — adjustment is saved, will retry
+    res.json({
+      status: true, queued: true, queueId: qId, adjustmentId,
+      message: 'Saved. Will push to Tally when desktop connects.',
+    });
   }
 });
 
