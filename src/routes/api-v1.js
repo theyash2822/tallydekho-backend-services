@@ -813,6 +813,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         wq.created_at,
         wq.tally_voucher_number as voucher_number,
         wq.amount as amount,
+        wq.payload as _payload,
         NULL as guid
       FROM write_queue wq
       WHERE wq.company_guid = $1
