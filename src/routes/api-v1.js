@@ -1245,6 +1245,23 @@ router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/units — distinct units of measure for this company
+router.get('/stocks/units', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(
+      `SELECT DISTINCT unit as name FROM stocks
+       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       ORDER BY unit ASC`,
+      [companyGuid]
+    );
+    res.json({ success: true, data: rows.map(r => r.name.trim()).filter(Boolean) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/stocks/groups — distinct stock group names for this company
 router.get('/stocks/groups', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
