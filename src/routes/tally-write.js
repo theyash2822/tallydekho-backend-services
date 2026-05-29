@@ -786,16 +786,24 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
   const { companyGuid, companyName, existingName, changes = {} } = req.body;
   if (!companyGuid || !existingName) return res.status(400).json({ status: false, message: 'existingName required' });
 
-  // Build only the fields being changed
+  // Build only the fields being changed.
+  // IMPORTANT: hsnCode + taxRate MUST be merged into ONE <GSTDETAILS.LIST> block.
+  // Two separate GSTDETAILS.LIST in the same STOCKITEM Alter causes Tally to
+  // throw "Duplicate Entry!" because it treats the second block as a new record.
   let fieldsXml = '';
   if (changes.name)         fieldsXml += `<NAME>${changes.name}</NAME>`;
-  if (changes.hsnCode)      fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><HSNCODE>${changes.hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY></GSTDETAILS.LIST>`;
   if (changes.unit)         fieldsXml += `<BASEUNITS>${changes.unit}</BASEUNITS>`;
   if (changes.reorderLevel !== undefined) fieldsXml += `<REORDERLEVEL>${changes.reorderLevel}</REORDERLEVEL>`;
   if (changes.groupName)    fieldsXml += `<PARENT>${changes.groupName}</PARENT>`;
-  if (changes.taxRate !== undefined) {
-    const r = parseFloat(changes.taxRate);
-    fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${r}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${r/2}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${r/2}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>`;
+  // Merge hsnCode + taxRate into a single GSTDETAILS.LIST
+  if (changes.hsnCode || changes.taxRate !== undefined) {
+    const hsn  = changes.hsnCode || '';
+    const rate = changes.taxRate !== undefined ? parseFloat(changes.taxRate) : null;
+    const rateXml = rate !== null
+      ? `<STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${rate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST>`
+      : '';
+    const hsnXml = hsn ? `<HSNCODE>${hsn}</HSNCODE>` : '';
+    fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM>${hsnXml}<TAXABILITY>Taxable</TAXABILITY>${rateXml}</GSTDETAILS.LIST>`;
   }
 
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
