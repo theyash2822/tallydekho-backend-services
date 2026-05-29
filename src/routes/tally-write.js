@@ -795,15 +795,20 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
   if (changes.unit)         fieldsXml += `<BASEUNITS>${changes.unit}</BASEUNITS>`;
   if (changes.reorderLevel !== undefined) fieldsXml += `<REORDERLEVEL>${changes.reorderLevel}</REORDERLEVEL>`;
   if (changes.groupName)    fieldsXml += `<PARENT>${changes.groupName}</PARENT>`;
-  // Merge hsnCode + taxRate into a single GSTDETAILS.LIST
+  // Merge hsnCode + taxRate into a single GSTDETAILS.LIST.
+  // Use today's date as APPLICABLEFROM so Tally adds a new effective rule
+  // that overrides the old one (hardcoded 20170701 gets ignored by Tally if already exists).
   if (changes.hsnCode || changes.taxRate !== undefined) {
     const hsn  = changes.hsnCode || '';
     const rate = changes.taxRate !== undefined ? parseFloat(changes.taxRate) : null;
+    // Format today as YYYYMMDD for Tally
+    const today = new Date();
+    const applicableFrom = `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
     const rateXml = rate !== null
       ? `<STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${rate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST>`
       : '';
     const hsnXml = hsn ? `<HSNCODE>${hsn}</HSNCODE>` : '';
-    fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM>${hsnXml}<TAXABILITY>Taxable</TAXABILITY>${rateXml}</GSTDETAILS.LIST>`;
+    fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>${applicableFrom}</APPLICABLEFROM>${hsnXml}<TAXABILITY>Taxable</TAXABILITY>${rateXml}</GSTDETAILS.LIST>`;
   }
 
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
