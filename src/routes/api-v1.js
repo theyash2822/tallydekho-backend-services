@@ -821,7 +821,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
           wq.status IN ('pending', 'processing', 'desktop_offline', 'failed')
           OR (
             wq.status = 'success'
-            AND wq.entry_type IN ('stock_transfer', 'stock_adjustment')
+            AND wq.entry_type IN ('stock_transfer', 'stock_adjustment', 'alter_stock_item', 'item', 'warehouse', 'party')
             AND wq.created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 2592000
           )
         )
