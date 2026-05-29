@@ -1270,12 +1270,13 @@ router.get('/stocks/groups', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows } = await query(
-      `SELECT DISTINCT group_name as name FROM stocks
-       WHERE company_guid=$1 AND group_name IS NOT NULL AND group_name != ''
-       ORDER BY group_name ASC`,
+      `SELECT DISTINCT TRIM(group_name) as name FROM stocks
+       WHERE company_guid=$1 AND group_name IS NOT NULL AND TRIM(group_name) != ''
+         AND LOWER(TRIM(group_name)) != 'primary'
+       ORDER BY TRIM(group_name) ASC`,
       [companyGuid]
     );
-    res.json({ success: true, data: rows.map(r => r.name) });
+    res.json({ success: true, data: rows.map(r => r.name).filter(Boolean) });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
