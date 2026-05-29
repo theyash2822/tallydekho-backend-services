@@ -1244,6 +1244,23 @@ router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/groups — distinct stock group names for this company
+router.get('/stocks/groups', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(
+      `SELECT DISTINCT group_name as name FROM stocks
+       WHERE company_guid=$1 AND group_name IS NOT NULL AND group_name != ''
+       ORDER BY group_name ASC`,
+      [companyGuid]
+    );
+    res.json({ success: true, data: rows.map(r => r.name) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
