@@ -3431,8 +3431,6 @@ router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => 
   }
 });
 
-export default router;
-
 // GET /api/stocks/items/:id/movements — movement history for a stock item
 router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -3509,3 +3507,5 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
+
+export default router;
