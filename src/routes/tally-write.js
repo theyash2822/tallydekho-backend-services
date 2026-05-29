@@ -62,9 +62,12 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
 
 // ── Helper: log entry to write_queue ─────────────────────────────────────────
 const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml) => {
+  // Use 'processing' status so retryOfflineEntries won't grab this entry
+  // while forwardToTally is still in flight (prevents duplicate sends).
+  // Status will be updated to 'success', 'desktop_offline', or 'failed' after the attempt.
   const { rows } = await query(
     `INSERT INTO write_queue (user_id, company_guid, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT)
      RETURNING id`,
     [userId, companyGuid, entryType, entryLabel, amount || null, JSON.stringify(payload), xml]
   );
@@ -76,15 +79,23 @@ const updateWriteQueue = async (id, result, error) => {
   if (!id) return;
   if (error) {
     await query(
-      `UPDATE write_queue SET status = CASE WHEN error_message ILIKE '%Desktop not connected%' OR error_message ILIKE '%desktop_offline%' THEN 'desktop_offline' ELSE 'failed' END,
+      `UPDATE write_queue SET status = CASE WHEN $2 ILIKE '%Desktop not connected%' OR $2 ILIKE '%desktop_offline%' OR $2 ILIKE '%not reachable%' THEN 'desktop_offline' ELSE 'failed' END,
        error_message = $2, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
-      [id, error]
+      [id, String(error)]
     );
   } else if (result?.status === 'desktop_offline' || (result?.message || '').includes('not connected')) {
     await query(
       `UPDATE write_queue SET status = 'desktop_offline', error_message = $2,
        attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
       [id, result?.message || 'Desktop offline']
+    );
+  } else if (result?.status === false) {
+    // Tally rejected the entry (LINEERROR or other Tally-side failure) — mark as failed, NOT success.
+    // This was the silent failure bug: Tally rejections were being marked 'success'.
+    await query(
+      `UPDATE write_queue SET status = 'failed', error_message = $2,
+       attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, result?.message || 'Tally rejected the entry']
     );
   } else {
     await query(
@@ -793,6 +804,10 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
+    if (r?.status === false) {
+      // Tally rejected (LINEERROR) — return error so mobile shows failure, not fake success
+      return res.status(422).json({ status: false, queued: false, queueId: qId, message: r?.message || 'Tally rejected the update. Check stock item name and fields.' });
+    }
     const off = r?.status === 'desktop_offline';
     res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item updated in Tally' });
   } catch(e) {
@@ -848,7 +863,9 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
 
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', `${fromGodown} → ${toGodown}`, null, req.body, xml).catch(() => null);
+  // Compute transfer value = sum of (qty × rate) for all items
+  const transferValue = items.reduce((sum, item) => sum + (parseFloat(item.qty) || 0) * (parseFloat(item.rate) || 0), 0);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', `${fromGodown} → ${toGodown}`, transferValue || null, req.body, xml).catch(() => null);
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
@@ -915,7 +932,9 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
 
   // ── Log to write_queue ───────────────────────────────────────────────────────
   const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, null, req.body, xml).catch(() => null);
+  // Compute adjustment value from rate if available
+  const adjValue = qty * (parseFloat(req.body.rate) || 0);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, adjValue || null, req.body, xml).catch(() => null);
 
   // ── Save audit record to stock_adjustments ───────────────────────────────────
   const { rows: adjRows } = await query(`
@@ -1002,10 +1021,14 @@ router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
     if (entry.status === 'success') return res.json({ status: true, message: 'Already pushed to Tally', alreadySuccess: true });
     if (!entry.xml) return res.status(400).json({ status: false, message: 'No XML stored for retry' });
 
-    await query(`UPDATE write_queue SET status='pending', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [id]);
+    // Mark as processing first to prevent retryOfflineEntries from racing
+    await query(`UPDATE write_queue SET status='processing', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [id]);
     const result = await forwardToTally(entry.company_guid, req.user.userId, entry.xml);
     await updateWriteQueue(id, result, null);
     const offline = result?.status === 'desktop_offline';
+    if (result?.status === false) {
+      return res.status(422).json({ status: false, message: result?.message || 'Tally rejected the entry' });
+    }
     res.json({
       status: true,
       queued: offline,
@@ -1019,16 +1042,46 @@ router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
 });
 
 // ── Auto-retry: called when desktop comes online ───────────────────────────────
+// Retry a single write_queue entry by id (used by /my-entries/:id/retry)
+export async function retrySingleEntry(entryId, userId) {
+  try {
+    const { rows } = await query(`SELECT * FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
+    const entry = rows[0];
+    if (!entry || !entry.xml) return { success: false, message: 'Entry not found or no XML' };
+    if (entry.status === 'success') return { success: true, alreadySuccess: true, message: 'Already pushed to Tally' };
+    // Mark as processing so retryOfflineEntries won't race
+    await query(`UPDATE write_queue SET status='processing', error_message=NULL, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entryId]);
+    const result = await forwardToTally(entry.company_guid, userId, entry.xml);
+    await updateWriteQueue(entryId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    return {
+      success: true,
+      queued: offline,
+      message: offline
+        ? 'Desktop offline. Entry queued.'
+        : result?.status === false
+          ? `Tally rejected: ${result.message}`
+          : 'Successfully pushed to Tally',
+    };
+  } catch (err) {
+    await updateWriteQueue(entryId, null, err.message).catch(() => {});
+    return { success: false, message: err.message };
+  }
+}
+
 export async function retryOfflineEntries(userId, companyGuid) {
   try {
     // companyGuid may be null when called on desktop reconnect — fetch ALL pending for this user
+    // Only retry 'desktop_offline' and 'failed' entries.
+    // Do NOT include 'pending' or 'processing' — those are actively being forwarded
+    // and picking them up here would cause duplicate entries in Tally.
     const { rows } = companyGuid
       ? await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
           [userId, companyGuid]
         )
       : await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','pending','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
           [userId]
         );
     if (!rows.length) return;

@@ -818,7 +818,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       WHERE wq.company_guid = $1
         AND wq.user_id = $2
         AND (
-          wq.status IN ('pending', 'desktop_offline', 'failed')
+          wq.status IN ('pending', 'processing', 'desktop_offline', 'failed')
           OR (
             wq.status = 'success'
             AND wq.entry_type IN ('stock_transfer', 'stock_adjustment')
@@ -846,12 +846,10 @@ router.post('/vouchers/my-entries/:id/retry', authMiddleware, async (req, res) =
     );
     if (!rows[0]) return res.status(404).json({ success: false, message: 'Entry not found' });
     const entry = rows[0];
-    // Reset status to pending and respond immediately
-    await query(`UPDATE write_queue SET status='pending', attempt_count=0, error_message=NULL WHERE id=$1`, [id]);
-    // Dynamically import and forward to Tally
-    const { retryOfflineEntries } = await import('./tally-write.js');
-    retryOfflineEntries(userId, entry.company_guid).catch(() => {});
-    res.json({ success: true, message: 'Retry initiated. Will push to Tally if desktop is connected.' });
+    // Use retrySingleEntry to safely push one entry without race conditions
+    const { retrySingleEntry } = await import('./tally-write.js');
+    const result = await retrySingleEntry(id, userId);
+    return res.json(result);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
