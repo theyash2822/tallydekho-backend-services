@@ -1248,6 +1248,7 @@ router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
 // GET /api/stocks/units — distinct units of measure for this company
 router.get('/stocks/units', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows } = await query(
@@ -1265,6 +1266,7 @@ router.get('/stocks/units', authMiddleware, async (req, res) => {
 // GET /api/stocks/groups — distinct stock group names for this company
 router.get('/stocks/groups', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows } = await query(
