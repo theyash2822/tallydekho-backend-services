@@ -1550,12 +1550,28 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     let closingStock = 0;
 
     if (hasFyValData) {
-      // ✓ Direct Tally values per FY — exact from StockValuation.xml
-      openingStock = parseFloat(fyValRows[0]?.opening_stock || 0);
-      closingStock = parseFloat(fyValRows[0]?.closing_stock || 0);
+      let rawOpening = parseFloat(fyValRows[0]?.opening_stock || 0);
+      const rawClosing = parseFloat(fyValRows[0]?.closing_stock || 0);
+
+      // For INCOMPLETE FY (current FY): StockValuation.xml returns current live stock for BOTH
+      // opening and closing (Tally can't know future closing). This causes opening = closing,
+      // which is wrong. Correct opening = previous FY's closing stock.
+      if (Math.abs(rawOpening - rawClosing) < 1.0) {
+        // opening ≈ closing → current/incomplete FY — fetch previous FY closing as opening
+        const [fyStartYear] = financialYear.split('-').map(Number);
+        const prevFY = `${fyStartYear - 1}-${fyStartYear}`;
+        const { rows: prevRows } = await query(`
+          SELECT ABS(COALESCE(SUM(closing_value::float), 0)) AS prev_closing
+          FROM stock_fy_valuation
+          WHERE company_guid=$1 AND financial_year=$2
+        `, [companyGuid, prevFY]);
+        const prevClosing = parseFloat(prevRows[0]?.prev_closing || 0);
+        if (prevClosing > 0) rawOpening = prevClosing;
+      }
+
+      openingStock = rawOpening;
+      closingStock = rawClosing;
     } else {
-      // Fallback: FY not yet synced — show 0
-      // User needs to sync the missing FY to get stock values
       openingStock = 0;
       closingStock = 0;
     }
