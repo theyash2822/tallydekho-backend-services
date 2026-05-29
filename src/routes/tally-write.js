@@ -769,8 +769,9 @@ router.post('/voucher/cancel', authMiddleware, async (req, res) => {
 });
 
 router.post('/master/stock-item', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, name, groupName = 'Primary', category = '', unit = 'Nos', openingQty = 0, openingRate = 0, hsnCode = '', igstRate = 0, cgstRate = 0, sgstRate = 0 } = req.body;
+  const { companyGuid, companyName, name, groupName, category = '', unit = 'Nos', openingQty = 0, openingRate = 0, hsnCode = '', igstRate = 0, cgstRate = 0, sgstRate = 0 } = req.body;
   if (!companyGuid || !name) return res.status(400).json({ status: false, message: 'name required' });
+  if (!groupName) return res.status(400).json({ status: false, message: 'groupName required — select a stock group from your Tally groups' });
   const openVal = parseFloat(openingQty) * parseFloat(openingRate);
   const gstAppl = (igstRate > 0 || cgstRate > 0) ? 'Applicable' : 'Not Applicable';
   const openXml = openingQty > 0 ? `<OPENINGBALANCE>${openingQty} ${unit}</OPENINGBALANCE><OPENINGRATE>${openingRate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '';
