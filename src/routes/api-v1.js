@@ -1157,7 +1157,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { search = '', category, page = 1, limit = 500 } = req.query; // Default 500 — most companies have < 1000 stock items
+  const { search = '', category, warehouse, page = 1, limit = 500 } = req.query; // Default 500
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
@@ -1169,7 +1169,9 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       q = `
         SELECT s.guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                s.reorder_level, s.closing_rate,
-               -- FY closing qty = opening stock qty + inward - outward up to fyTo
+               (SELECT st2.warehouse FROM stock_transactions st2
+                WHERE st2.company_guid = s.company_guid AND st2.stock_guid = s.name
+                ORDER BY st2.date DESC LIMIT 1) AS primary_warehouse,
                COALESCE(s.opening_qty, 0)
                + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
                - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) AS fy_closing_qty,
@@ -1189,13 +1191,25 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       `;
       params = [companyGuid, `%${search}%`, fyTo];
       if (category) { q = q.replace('GROUP BY', `AND s.category = $4 GROUP BY`); params.push(category); }
-      const { rows: allRows } = await query(q, params);
+      const { rows: rawRows } = await query(q, params);
+      // Warehouse filter: keep only items that have transactions in the selected warehouse
+      let allRows = rawRows;
+      if (warehouse) {
+        const { rows: whRows } = await query(
+          `SELECT DISTINCT stock_guid FROM stock_transactions WHERE company_guid=$1 AND warehouse=$2`,
+          [companyGuid, warehouse]
+        );
+        // stock_transactions.stock_guid stores stock NAME, not guid — match on s.name
+        const whSet = new Set(whRows.map(r => r.stock_guid));
+        allRows = rawRows.filter(r => whSet.has(r.name));
+      }
       // Apply pagination in JS after FY computation
       const totalRows = allRows.length;
       const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
         ...r,
-        closing_qty:   parseFloat(r.fy_closing_qty   || 0),
-        closing_value: parseFloat(r.fy_closing_value || 0),
+        closing_qty:      parseFloat(r.fy_closing_qty   || 0),
+        closing_value:    parseFloat(r.fy_closing_value || 0),
+        primary_warehouse: r.primary_warehouse || null,
       }));
       const totalValue  = allRows.reduce((s, r) => s + parseFloat(r.fy_closing_value || 0), 0);
       const lowStockCnt = allRows.filter(r => parseFloat(r.fy_closing_qty || 0) > 0 && parseFloat(r.fy_closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
@@ -1211,10 +1225,21 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     }
 
     // No FY param: serve stored closing_qty (current stock as of last sync)
-    q = `SELECT * FROM stocks WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR hsn ILIKE $2)`;
+    q = `SELECT s.*,
+      (SELECT st.warehouse FROM stock_transactions st
+       WHERE st.company_guid = s.company_guid AND st.stock_guid = s.name
+       ORDER BY st.date DESC LIMIT 1) AS primary_warehouse
+    FROM stocks s
+    WHERE s.company_guid=$1 AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)`;
     params = [companyGuid, `%${search}%`];
     idx = 3;
     if (category) { q += ` AND category = $${idx++}`; params.push(category); }
+    // Warehouse filter: stock_transactions.stock_guid stores stock NAME (not guid)
+    // so match on stocks.name, not stocks.guid
+    if (warehouse) {
+      q += ` AND name IN (SELECT DISTINCT stock_guid FROM stock_transactions WHERE company_guid=$${idx++} AND warehouse=$${idx++})`;
+      params.push(companyGuid, warehouse);
+    }
     q += ` ORDER BY closing_value DESC NULLS LAST, name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
@@ -1333,10 +1358,10 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
     const { rows: activity } = await query(
       `SELECT st.type, st.qty, st.warehouse, s.name as stock_name, v.voucher_number, v.date, v.voucher_type
        FROM stock_transactions st
-       LEFT JOIN stocks s ON s.guid = st.stock_guid AND s.company_guid = st.company_guid
+       LEFT JOIN stocks s ON s.name = st.stock_guid AND s.company_guid = st.company_guid
        LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
        WHERE st.company_guid=$1 AND st.warehouse=$2
-       ORDER BY v.date DESC, st.id DESC LIMIT 20`,
+       ORDER BY v.date DESC, st.id DESC LIMIT 500`,
       [companyGuid, whName]
     );
 
