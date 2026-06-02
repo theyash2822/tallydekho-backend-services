@@ -371,7 +371,7 @@ async function processStocks(data, companyGuid) {
           0, // closing_qty — will be set by stock transaction recompute
           0, // closing_rate
           0, // closing_value
-          parseTallyQty(r.REORDERLEVEL || 0),
+          parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseInt(r.ALTERID || r.AlterId || 0),
           now(),
         ]);
