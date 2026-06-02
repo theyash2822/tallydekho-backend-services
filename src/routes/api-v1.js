@@ -1175,13 +1175,13 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                (
                  SELECT ROUND(
                    COALESCE(SUM(ABS(stc.qty)), 0) /
-                   GREATEST(EXTRACT(EPOCH FROM (NOW() - MIN(stc.date))) / 86400.0, 1)
+                   GREATEST((NOW()::date - MIN(stc.date::date)), 1)
                  , 4)
                  FROM stock_transactions stc
                  WHERE stc.company_guid = s.company_guid
                    AND stc.stock_guid = s.name
                    AND stc.type = 'outward'
-                   AND stc.date >= NOW() - INTERVAL '90 days'
+                   AND stc.date::date >= (NOW() - INTERVAL '90 days')::date
                ) AS avg_daily_consumption,
                COALESCE(s.opening_qty, 0)
                + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
@@ -1244,13 +1244,13 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       (
         SELECT ROUND(
           COALESCE(SUM(ABS(stc.qty)), 0) /
-          GREATEST(EXTRACT(EPOCH FROM (NOW() - MIN(stc.date))) / 86400.0, 1)
+          GREATEST((NOW()::date - MIN(stc.date::date)), 1)
         , 4)
         FROM stock_transactions stc
         WHERE stc.company_guid = s.company_guid
           AND stc.stock_guid = s.name
           AND stc.type = 'outward'
-          AND stc.date >= NOW() - INTERVAL '90 days'
+          AND stc.date::date >= (NOW() - INTERVAL '90 days')::date
       ) AS avg_daily_consumption
     FROM stocks s
     WHERE s.company_guid=$1 AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)`;
