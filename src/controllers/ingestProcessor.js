@@ -115,6 +115,44 @@ function findNestedArray(obj, keys, depth = 0) {
   return [];
 }
 
+// Like findNestedArray but only returns arrays/items that are objects (not primitives like counts)
+// Searches through JSON strings too. Collects from ALL items in the input array.
+function findNestedArrayOfObjects(dataArr, keys, depth = 0) {
+  const results = [];
+  for (const item of (Array.isArray(dataArr) ? dataArr : [dataArr])) {
+    _collectObjects(item, keys, results, 0);
+  }
+  return results;
+}
+function _collectObjects(obj, keys, results, depth) {
+  if (!obj || depth > 10) return;
+  // Parse JSON strings
+  if (typeof obj === 'string' && (obj.startsWith('{') || obj.startsWith('['))) {
+    try { obj = JSON.parse(obj); } catch { return; }
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) _collectObjects(item, keys, results, depth + 1);
+    return;
+  }
+  if (typeof obj !== 'object') return;
+  for (const k of keys) {
+    if (obj[k] !== undefined) {
+      const v = obj[k];
+      if (Array.isArray(v)) {
+        const objs = v.filter(x => x && typeof x === 'object');
+        if (objs.length > 0) { results.push(...objs); return; } // found real records
+      } else if (v && typeof v === 'object') {
+        results.push(v); return;
+      }
+      // v is a primitive (e.g. count 71) — skip and keep searching
+    }
+  }
+  // Recurse into all values
+  for (const key of Object.keys(obj)) {
+    _collectObjects(obj[key], keys, results, depth + 1);
+  }
+}
+
 // Extract name from Tally record — handles both plain NAME and LANGUAGENAME.LIST multi-lang wrapper
 function tallyName(r) {
   if (r.NAME) return r.NAME;
@@ -328,10 +366,11 @@ async function processStocks(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
 
-    // StockItemFull.xml — same nested pattern. Search for STOCKITEM[].
+    // StockItemFull.xml — Tally Collection format wraps items in BODY.DATA.TALLYMESSAGE.STOCKITEM[]
+    // CMPINFO also has STOCKITEM as a numeric count — we must skip primitives and find the real array of objects.
     let expandedStockData = data;
-    if (data.length <= 3) {
-      const found = findNestedArray(data[0], ['STOCKITEM', 'StockItem', 'STOCKITEMREPORT']);
+    if (data.length <= 5) {
+      const found = findNestedArrayOfObjects(data, ['STOCKITEM', 'StockItem', 'STOCKITEMREPORT']);
       if (found.length > 0) {
         expandedStockData = found;
         console.log('[INGEST] Stocks expanded:', expandedStockData.length, 'items');
@@ -349,15 +388,15 @@ async function processStocks(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stocks (guid, company_guid, name, alias, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO stocks (guid, company_guid, name, alias, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, alias=EXCLUDED.alias, category=EXCLUDED.category,
             group_name=EXCLUDED.group_name, unit=EXCLUDED.unit, hsn=EXCLUDED.hsn,
             tax_rate=EXCLUDED.tax_rate, closing_qty=EXCLUDED.closing_qty,
             closing_rate=EXCLUDED.closing_rate, closing_value=EXCLUDED.closing_value,
-            reorder_level=EXCLUDED.reorder_level, alter_id=EXCLUDED.alter_id,
-            synced_at=EXCLUDED.synced_at
+            reorder_level=EXCLUDED.reorder_level, minimum_order_qty=EXCLUDED.minimum_order_qty,
+            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, name,
           r.OnlyAlias || r.ALIAS || null,
@@ -372,6 +411,7 @@ async function processStocks(data, companyGuid) {
           0, // closing_rate
           0, // closing_value
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
+          parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
           parseInt(r.ALTERID || r.AlterId || 0),
           now(),
         ]);
@@ -638,12 +678,14 @@ async function processGroupMasters(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO groups (guid, company_guid, name, parent, nature, is_revenue, is_debit_positive, is_primary, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          INSERT INTO groups (guid, company_guid, name, parent, nature, is_revenue, is_debit_positive, is_primary, reorder_level, minimum_order_qty, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, nature=EXCLUDED.nature,
             is_revenue=EXCLUDED.is_revenue, is_debit_positive=EXCLUDED.is_debit_positive,
-            is_primary=EXCLUDED.is_primary, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+            is_primary=EXCLUDED.is_primary, reorder_level=EXCLUDED.reorder_level,
+            minimum_order_qty=EXCLUDED.minimum_order_qty,
+            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
@@ -651,6 +693,8 @@ async function processGroupMasters(data, companyGuid) {
           !!(r.IsRevenue === 1 || r.IsRevenue === '1'),
           !!(r.IsDebitPositive === 1 || r.IsDebitPositive === '1'),
           !!(r.IsPrimary === 1 || r.IsPrimary === '1'),
+          parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
+          parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
           parseInt(r.AlterId || r.ALTERID || 0), now(),
         ]);
         saved++;

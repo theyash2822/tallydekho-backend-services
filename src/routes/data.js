@@ -196,6 +196,83 @@ router.post('/stock', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Reorder Queue ────────────────────────────────────────────────────────────
+// Returns items below effective reorder level with full item + group level detail
+router.post('/reorder-queue', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
+  const { companyGuid, fy } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    // Fetch all stocks with group-level reorder fallback via LEFT JOIN on groups
+    const { rows } = await query(`
+      SELECT
+        s.guid,
+        s.name                                    AS "itemName",
+        s.group_name                              AS "groupName",
+        s.closing_qty                             AS "currentQty",
+        s.reorder_level                           AS "itemReorderLevel",
+        s.minimum_order_qty                       AS "itemMinimumOrderQty",
+        COALESCE(g.reorder_level, 0)              AS "groupReorderLevel",
+        COALESCE(g.minimum_order_qty, 0)          AS "groupMinimumOrderQty",
+        COALESCE(
+          NULLIF(s.reorder_level, 0),
+          NULLIF(g.reorder_level, 0),
+          0
+        )                                         AS "effectiveReorderLevel",
+        COALESCE(
+          NULLIF(s.minimum_order_qty, 0),
+          NULLIF(g.minimum_order_qty, 0),
+          0
+        )                                         AS "effectiveMinimumOrderQty"
+      FROM stocks s
+      LEFT JOIN groups g ON g.company_guid = s.company_guid AND g.name = s.group_name
+      WHERE s.company_guid = $1
+        AND (
+          (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
+          OR
+          (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
+        )
+      ORDER BY s.closing_qty ASC, s.name ASC
+    `, [companyGuid]);
+
+    const items = rows.map(r => {
+      const currentQty           = parseFloat(r.currentQty || 0);
+      const effectiveReorderLevel     = parseFloat(r.effectiveReorderLevel || 0);
+      const effectiveMinimumOrderQty  = parseFloat(r.effectiveMinimumOrderQty || 0);
+
+      // Priority: CRITICAL = qty <= 0, HIGH = qty <= 25% of reorder, MEDIUM = otherwise
+      let priority = 'MEDIUM';
+      if (currentQty <= 0) priority = 'CRITICAL';
+      else if (effectiveReorderLevel > 0 && currentQty <= effectiveReorderLevel * 0.25) priority = 'HIGH';
+
+      // Suggested qty: bring stock up to 2x reorder level (or 1x min order qty minimum)
+      const suggestedQty = Math.max(
+        effectiveMinimumOrderQty,
+        effectiveReorderLevel > 0 ? (effectiveReorderLevel * 2) - currentQty : 0
+      );
+
+      return {
+        guid:                    r.guid,
+        itemName:                r.itemName,
+        groupName:               r.groupName,
+        currentQty,
+        itemReorderLevel:        parseFloat(r.itemReorderLevel || 0),
+        groupReorderLevel:       parseFloat(r.groupReorderLevel || 0),
+        effectiveReorderLevel,
+        itemMinimumOrderQty:     parseFloat(r.itemMinimumOrderQty || 0),
+        groupMinimumOrderQty:    parseFloat(r.groupMinimumOrderQty || 0),
+        effectiveMinimumOrderQty,
+        priority,
+        suggestedQty: Math.round(suggestedQty * 100) / 100,
+      };
+    });
+
+    res.json({ status: true, data: { items, totalCount: items.length } });
+  } catch (err) {
+    console.error('[ReorderQueue] Error:', err.message);
+    res.status(500).json({ status: false, message: 'Failed to fetch reorder queue' });
+  }
+});
+
 // ─── Vouchers ─────────────────────────────────────────────────────────────────
 router.post('/vouchers', authMiddleware, requirePaired, requireCompanySynced, async (req, res) => {
   const { companyGuid, voucherType, page = 1, pageSize = 50, searchText = '', fromDate, toDate, status } = req.body || {};

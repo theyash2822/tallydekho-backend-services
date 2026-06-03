@@ -1,0 +1,20 @@
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.*
+*.log
+*.db
+*.sqlite
+data/
+logs/
+src/__tests__/
+src/kb/
+
+# Sibling repos — never read these from inside td-backend
+../td-web-portal/
+../tallydekho-mobile-V4/
+../td-source/
+../td-website/
+../tallydekho-brain/

@@ -165,9 +165,10 @@ export async function initSchema() {
         closing_qty     DECIMAL(15,4) DEFAULT 0,
         closing_rate    DECIMAL(15,4) DEFAULT 0,
         closing_value   DECIMAL(15,4) DEFAULT 0,
-        reorder_level   DECIMAL(15,4) DEFAULT 0,
-        alter_id        INTEGER DEFAULT 0,
-        synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        reorder_level       DECIMAL(15,4) DEFAULT 0,
+        minimum_order_qty   DECIMAL(15,4) DEFAULT 0,
+        alter_id            INTEGER DEFAULT 0,
+        synced_at           BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         UNIQUE(guid, company_guid)
       );
 
@@ -299,9 +300,11 @@ export async function initSchema() {
         nature        TEXT,
         is_revenue    BOOLEAN DEFAULT FALSE,
         is_debit_positive BOOLEAN DEFAULT FALSE,
-        is_primary    BOOLEAN DEFAULT FALSE,
-        alter_id      INTEGER DEFAULT 0,
-        synced_at     BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        is_primary        BOOLEAN DEFAULT FALSE,
+        reorder_level     DECIMAL(15,4) DEFAULT 0,
+        minimum_order_qty DECIMAL(15,4) DEFAULT 0,
+        alter_id          INTEGER DEFAULT 0,
+        synced_at         BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         UNIQUE(guid, company_guid)
       );
 
@@ -643,6 +646,11 @@ export async function initSchema() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_enabled  BOOLEAN DEFAULT FALSE;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_pin_hash TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS biometric_enabled BOOLEAN DEFAULT FALSE;
+
+      -- Reorder queue fields migration
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
+      ALTER TABLE groups ADD COLUMN IF NOT EXISTS reorder_level     DECIMAL(15,4) DEFAULT 0;
+      ALTER TABLE groups ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
 
       -- stock_fy_valuation — FY-specific opening/closing stock VALUES direct from Tally
       -- Source: StockValuation.xml (per FY, uses Tally's internal costing: FIFO/avg)
