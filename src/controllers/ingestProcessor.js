@@ -642,9 +642,9 @@ async function processStockTransactions(data, companyGuid) {
   try {
     const result = await dbQuery(`
       UPDATE stocks s
-      SET closing_qty   = GREATEST(sub.net_qty, 0),
+      SET closing_qty   = sub.net_qty,
           closing_rate  = sub.last_rate,
-          closing_value = GREATEST(sub.net_qty, 0) * sub.last_rate
+          closing_value = sub.net_qty * sub.last_rate
       FROM (
         SELECT
           stock_guid, company_guid,
@@ -1284,7 +1284,7 @@ async function processStockOpeningBalance(data, companyGuid) {
        WHERE s.name = sub.stock_guid
          AND s.company_guid = sub.company_guid
          AND s.opening_qty = 0
-         AND sub.net_qty > 0`,
+         AND sub.net_qty != 0`,
       [companyGuid]
     );
 
@@ -1314,7 +1314,6 @@ async function applyCurrentFyClosingQty(companyGuid) {
         FROM stock_fy_valuation
         WHERE company_guid = $1
           AND closing_qty IS NOT NULL
-          AND closing_qty > 0
         ORDER BY stock_name, financial_year DESC
       ) fv
       WHERE s.name = fv.stock_name
