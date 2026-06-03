@@ -1281,6 +1281,72 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/negative-stock — Items with negative qty, with per-warehouse breakdown
+router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    // Per-warehouse net qty from transactions
+    const { rows } = await query(`
+      SELECT
+        s.guid,
+        s.name,
+        s.group_name,
+        s.unit,
+        COALESCE(s.closing_rate, 0) AS rate,
+        -- overall closing qty (from stocks table, already recomputed)
+        s.closing_qty AS total_qty,
+        -- per-warehouse breakdown: only warehouses with negative net qty
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'warehouse', COALESCE(NULLIF(wh.warehouse, ''), 'Main Location'),
+              'qty',        wh.net_qty
+            ) ORDER BY wh.net_qty ASC
+          ) FILTER (WHERE wh.net_qty IS NOT NULL),
+          '[]'
+        ) AS warehouses
+      FROM stocks s
+      -- compute per-warehouse net qty
+      LEFT JOIN (
+        SELECT
+          stock_guid,
+          company_guid,
+          COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
+          SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS net_qty
+        FROM stock_transactions
+        WHERE company_guid = $1 AND qty IS NOT NULL
+        GROUP BY stock_guid, company_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
+        HAVING SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) < 0
+      ) wh ON wh.stock_guid = s.name AND wh.company_guid = s.company_guid
+      WHERE s.company_guid = $1
+        AND s.closing_qty < 0
+      GROUP BY s.guid, s.name, s.group_name, s.unit, s.closing_rate, s.closing_qty
+      ORDER BY s.closing_qty ASC
+    `, [companyGuid]);
+
+    return res.json({
+      success: true,
+      data: {
+        items: rows.map(r => ({
+          id:         r.guid,
+          name:       r.name,
+          group:      r.group_name ?? '—',
+          unit:       r.unit ?? '',
+          rate:       parseFloat(r.rate || 0),
+          total_qty:  parseFloat(r.total_qty || 0),
+          warehouses: typeof r.warehouses === 'string' ? JSON.parse(r.warehouses) : (r.warehouses || []),
+        })),
+        total_negative: rows.length,
+      },
+      meta: { total: rows.length }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/stocks/fast-slow — Fast vs Slow moving items based on FY outward movement
 router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
