@@ -1346,11 +1346,31 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
     const pageRows = rows.slice(offset, offset + pageSize);
 
     const items = pageRows.map(r => {
-      const closingQty  = parseFloat(r.closingQty  || 0);
-      const negativeQty = parseFloat(r.negativeQty || 0);
-      const closingValue = parseFloat(r.closingValue || 0);
-      const priority = closingQty <= -10 ? 'CRITICAL' : 'HIGH';
-      const warehouses = typeof r.warehouses === 'string' ? JSON.parse(r.warehouses) : (r.warehouses || []);
+      const closingQty   = parseFloat(r.closingQty  || 0); // FY-authoritative from stocks table
+      const negativeQty  = Math.abs(closingQty);
+      const rate         = parseFloat(r.rate || 0);
+      const closingValue = closingQty * rate;
+      const priority     = closingQty <= -10 ? 'CRITICAL' : 'HIGH';
+      const rawWarehouses = typeof r.warehouses === 'string' ? JSON.parse(r.warehouses) : (r.warehouses || []);
+
+      // Reconcile warehouse breakdown with FY-correct closing_qty:
+      // Raw per-warehouse tx net may not match FY closing (due to opening balances).
+      // Fix: if only 1 negative warehouse, assign full closingQty to it.
+      // If multiple, scale proportionally so they sum to closingQty.
+      let warehouses;
+      if (rawWarehouses.length === 0) {
+        warehouses = [{ warehouse: 'Main Location', qty: closingQty, value: closingQty * rate }];
+      } else if (rawWarehouses.length === 1) {
+        warehouses = [{ warehouse: rawWarehouses[0].warehouse, qty: closingQty, value: closingQty * rate }];
+      } else {
+        const txNegTotal = rawWarehouses.reduce((s, w) => s + parseFloat(w.qty || 0), 0);
+        const scale = txNegTotal !== 0 ? closingQty / txNegTotal : 1;
+        warehouses = rawWarehouses.map(w => {
+          const scaledQty = Math.round(parseFloat(w.qty || 0) * scale * 10000) / 10000;
+          return { warehouse: w.warehouse, qty: scaledQty, value: scaledQty * rate };
+        });
+      }
+
       return {
         stockGuid:    r.stockGuid,
         itemName:     r.itemName,
@@ -1362,11 +1382,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
         closingValue,
         isNegativeStock: true,
         priority,
-        warehouses: warehouses.map(w => ({
-          warehouse:  w.warehouse,
-          qty:        parseFloat(w.qty || 0),
-          value:      parseFloat(w.value || 0),
-        })),
+        warehouses,
       };
     });
 
