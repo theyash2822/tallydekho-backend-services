@@ -1281,6 +1281,89 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/fast-slow — Fast vs Slow moving items based on FY outward movement
+router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+
+    // Fetch all stocks + their FY movement stats
+    const { rows } = await query(`
+      SELECT
+        s.guid, s.name, s.group_name, s.unit, s.category,
+        COALESCE(s.closing_rate, 0)  AS rate,
+        COALESCE(s.closing_qty, 0)   AS closing_qty,
+        COALESCE(s.closing_qty, 0) * COALESCE(s.closing_rate, 0) AS closing_value,
+        COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) AS total_outward_qty,
+        COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0) AS total_inward_qty,
+        COUNT(CASE WHEN st.type = 'outward' THEN 1 ELSE NULL END)::int AS outward_txn_count,
+        COUNT(st.id)::int AS total_txn_count,
+        ROUND(
+          COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
+          / GREATEST(($3::date - $2::date), 1)
+        , 4) AS avg_daily_outward
+      FROM stocks s
+      LEFT JOIN stock_transactions st
+        ON st.stock_guid = s.name
+       AND st.company_guid = s.company_guid
+       AND st.date::date >= $2::date
+       AND st.date::date <= $3::date
+      WHERE s.company_guid = $1
+      GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty
+      ORDER BY total_outward_qty DESC, s.name ASC
+    `, [companyGuid, fyFrom, fyTo]);
+
+    if (!rows.length) {
+      return res.json({ success: true, data: { fast: [], slow: [], financial_year: financialYear } });
+    }
+
+    // Items that had any outward movement in the FY
+    const active   = rows.filter(r => parseFloat(r.total_outward_qty) > 0);
+    const inactive = rows.filter(r => parseFloat(r.total_outward_qty) === 0);
+
+    // Among active items, top 50% by total_outward_qty = fast, bottom 50% = slow
+    const halfIdx = Math.ceil(active.length / 2);
+    const fastRaw  = active.slice(0, halfIdx);
+    const slowRaw  = [...active.slice(halfIdx), ...inactive];
+
+    const mapItem = (r, idx, tab) => ({
+      id:                 r.guid,
+      name:               r.name,
+      group:              r.group_name || '—',
+      unit:               r.unit       || '',
+      closing_qty:        parseFloat(r.closing_qty   || 0),
+      closing_value:      parseFloat(r.closing_value || 0),
+      total_outward_qty:  parseFloat(r.total_outward_qty || 0),
+      total_inward_qty:   parseFloat(r.total_inward_qty  || 0),
+      outward_txn_count:  parseInt(r.outward_txn_count   || 0),
+      total_txn_count:    parseInt(r.total_txn_count      || 0),
+      avg_daily_outward:  parseFloat(r.avg_daily_outward  || 0),
+      // Estimated days of stock remaining at current consumption rate
+      days_remaining:     parseFloat(r.avg_daily_outward) > 0
+                            ? Math.round(parseFloat(r.closing_qty) / parseFloat(r.avg_daily_outward))
+                            : null,
+      rank:               idx + 1,
+      tab,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        fast:           fastRaw.map((r, i) => mapItem(r, i, 'fast')),
+        slow:           slowRaw.map((r, i) => mapItem(r, i, 'slow')),
+        total_items:    rows.length,
+        active_items:   active.length,
+        inactive_items: inactive.length,
+        financial_year: financialYear,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
