@@ -1281,34 +1281,49 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/stocks/negative-stock — Items with negative qty, with per-warehouse breakdown
+// GET /api/stocks/negative-stock — Items with negative closing qty, warehouse breakdown, priority
+// Priority: CRITICAL = closingQty <= -10 | HIGH = closingQty < 0 && > -10
 router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+
+  const page     = Math.max(1, parseInt(req.query.page     || 1));
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize || 25)));
+  const offset   = (page - 1) * pageSize;
+  const warehouse = req.query.warehouse || null;
+
   try {
     // Per-warehouse net qty from transactions
+    let whFilter = '';
+    const params = [companyGuid];
+    if (warehouse) {
+      params.push(warehouse);
+      whFilter = `AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = $${params.length}`;
+    }
+
     const { rows } = await query(`
       SELECT
-        s.guid,
-        s.name,
-        s.group_name,
+        s.guid                       AS "stockGuid",
+        s.name                       AS "itemName",
+        s.group_name                 AS "groupName",
+        s.category,
         s.unit,
-        COALESCE(s.closing_rate, 0) AS rate,
-        -- overall closing qty (from stocks table, already recomputed)
-        s.closing_qty AS total_qty,
-        -- per-warehouse breakdown: only warehouses with negative net qty
+        COALESCE(s.closing_rate, 0)  AS rate,
+        s.closing_qty                AS "closingQty",
+        ABS(s.closing_qty)           AS "negativeQty",
+        COALESCE(s.closing_qty, 0) * COALESCE(s.closing_rate, 0) AS "closingValue",
         COALESCE(
           JSON_AGG(
             JSON_BUILD_OBJECT(
               'warehouse', COALESCE(NULLIF(wh.warehouse, ''), 'Main Location'),
-              'qty',        wh.net_qty
+              'qty',        wh.net_qty,
+              'value',      wh.net_qty * COALESCE(s.closing_rate, 0)
             ) ORDER BY wh.net_qty ASC
           ) FILTER (WHERE wh.net_qty IS NOT NULL),
           '[]'
         ) AS warehouses
       FROM stocks s
-      -- compute per-warehouse net qty
       LEFT JOIN (
         SELECT
           stock_guid,
@@ -1319,28 +1334,57 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
         WHERE company_guid = $1 AND qty IS NOT NULL
         GROUP BY stock_guid, company_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
         HAVING SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) < 0
+        ${whFilter}
       ) wh ON wh.stock_guid = s.name AND wh.company_guid = s.company_guid
       WHERE s.company_guid = $1
         AND s.closing_qty < 0
-      GROUP BY s.guid, s.name, s.group_name, s.unit, s.closing_rate, s.closing_qty
+      GROUP BY s.guid, s.name, s.group_name, s.category, s.unit, s.closing_rate, s.closing_qty
       ORDER BY s.closing_qty ASC
-    `, [companyGuid]);
+    `, params);
+
+    const total = rows.length;
+    const pageRows = rows.slice(offset, offset + pageSize);
+
+    const items = pageRows.map(r => {
+      const closingQty  = parseFloat(r.closingQty  || 0);
+      const negativeQty = parseFloat(r.negativeQty || 0);
+      const closingValue = parseFloat(r.closingValue || 0);
+      const priority = closingQty <= -10 ? 'CRITICAL' : 'HIGH';
+      const warehouses = typeof r.warehouses === 'string' ? JSON.parse(r.warehouses) : (r.warehouses || []);
+      return {
+        stockGuid:    r.stockGuid,
+        itemName:     r.itemName,
+        groupName:    r.groupName ?? '',
+        category:     r.category  ?? '',
+        unit:         r.unit      ?? '',
+        closingQty,
+        negativeQty,
+        closingValue,
+        isNegativeStock: true,
+        priority,
+        warehouses: warehouses.map(w => ({
+          warehouse:  w.warehouse,
+          qty:        parseFloat(w.qty || 0),
+          value:      parseFloat(w.value || 0),
+        })),
+      };
+    });
+
+    const totalNegativeQty = rows.reduce((s, r) => s + Math.abs(parseFloat(r.closingQty || 0)), 0);
+    const criticalCount    = rows.filter(r => parseFloat(r.closingQty) <= -10).length;
 
     return res.json({
       success: true,
       data: {
-        items: rows.map(r => ({
-          id:         r.guid,
-          name:       r.name,
-          group:      r.group_name ?? '—',
-          unit:       r.unit ?? '',
-          rate:       parseFloat(r.rate || 0),
-          total_qty:  parseFloat(r.total_qty || 0),
-          warehouses: typeof r.warehouses === 'string' ? JSON.parse(r.warehouses) : (r.warehouses || []),
-        })),
-        total_negative: rows.length,
+        summary: {
+          negativeItems:    total,
+          criticalItems:    criticalCount,
+          highItems:        total - criticalCount,
+          totalNegativeQty: Math.round(totalNegativeQty * 10000) / 10000,
+        },
+        items,
       },
-      meta: { total: rows.length }
+      pagination: { page, pageSize, total },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });

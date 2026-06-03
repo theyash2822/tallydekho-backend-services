@@ -147,3 +147,35 @@ Risks: None — safe guard added
 ---
 
 _Add new entries at top._
+
+## 2026-06-03 — Negative Stock Full Fix
+
+### Investigation Findings
+1. **XML source**: `StockItem.xml` has NO closing qty field. Closing qty is derived entirely from `StockTransaction.xml` movements.
+2. **XML field**: `ActualQty` in StockTransaction.xml — positive = inward, negative = outward. `DestinationGodownName` identifies transfer source.
+3. **Root cause 1**: `ingestProcessor.js` used `GREATEST(net_qty, 0)` clamping negative qty → 0 on every sync. Fixed.
+4. **Root cause 2**: `AND sub.net_qty > 0` and `AND closing_qty > 0` guards were also zeroing out negatives. Fixed.
+5. **Root cause 3**: `SimplifiedVoucher.xml` omits `DestinationGodownName` → both transfer entries stored as inward (+2 phantom stock). Fixed via zero-cost multi-godown detection.
+6. **Transfer direction bug**: MIN(id) was wrong guess for source. Fixed to MAX(id) = source (outward), MIN(id) = destination (inward). Backfilled 7 affected items.
+
+### Files Changed
+- `src/controllers/ingestProcessor.js`: Remove GREATEST clamp, fix net_qty > 0 guard, fix FY closing_qty > 0 guard, add Stock Journal transfer detection
+- `src/routes/api-v1.js`: New `GET /api/stocks/negative-stock` endpoint with priority, pagination, warehouse breakdown, summary stats
+
+### DB Changes
+- Backfilled 7 Stock Journal transfer items with correct inward/outward directions
+- 60 negative stock items now correctly stored (were all showing 0)
+- Balvan Super 1lit: Main Location = -18, Delhi = +1 (matches Tally)
+
+### API Response Shape
+```json
+{
+  "summary": { "negativeItems": N, "criticalItems": N, "highItems": N, "totalNegativeQty": N },
+  "items": [{ "stockGuid", "itemName", "groupName", "closingQty", "negativeQty", "isNegativeStock": true, "priority": "CRITICAL|HIGH", "warehouses": [...] }],
+  "pagination": { "page", "pageSize", "total" }
+}
+```
+
+### Priority Logic
+- CRITICAL: closingQty <= -10
+- HIGH: closingQty < 0 and > -10
