@@ -578,6 +578,37 @@ async function processStockTransactions(data, companyGuid) {
       );
     }
 
+    // ── Stock Journal transfer detection ──────────────────────────────────
+    // When SimplifiedVoucher.xml omits DestinationGodownName, both source and
+    // destination entries of a godown transfer are received with positive qty
+    // and rate=0/value=0, making them indistinguishable without extra context.
+    // Fix: group entries by (voucher, stockItem) and if all entries for that
+    // item within a Stock Journal have rate=0 AND count >= 2 across different
+    // godowns → it's a pure transfer (net=0). Mark the FIRST entry as outward.
+    const stockJournalTransferKeys = new Set();
+    const sjGroups = {};
+    for (const r of data) {
+      const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
+      // Include both explicit Stock Journal type AND entries with no voucher type
+      // (SimplifiedVoucher.xml omits VOUCHERTYPENAME — detect by zero-cost signature)
+      const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
+      if (!stockName) continue;
+      const rate = parseTallyRate(r.RATE || r.Rate || '0');
+      const rawAmt = parseFloat(r.AMOUNT ?? r.Amount ?? r.value ?? 0);
+      if (rate !== 0 || Math.abs(rawAmt || 0) !== 0) continue; // not zero-cost — skip
+      const key = `${r.GUID || r.Guid}|${stockName}`;
+      if (!sjGroups[key]) sjGroups[key] = [];
+      sjGroups[key].push({ r, rate, amount: Math.abs(rawAmt || 0) });
+    }
+    for (const [key, entries] of Object.entries(sjGroups)) {
+      // Transfer signature: same item in 2+ different godowns, all zero-cost
+      const godowns = new Set(entries.map(e => e.r.GODOWNNAME || e.r.GodownName || ''));
+      if (godowns.size >= 2) {
+        // Mark first entry (source godown) as outward; rest stay inward
+        stockJournalTransferKeys.add(`${key}|${entries[0].r.GODOWNNAME || entries[0].r.GodownName || ''}`);
+      }
+    }
+
     for (const r of data) {
       // StockTransaction.xml: Tally sends ALL keys uppercase
       const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
@@ -589,16 +620,15 @@ async function processStockTransactions(data, companyGuid) {
       const amount = isNaN(rawAmt) ? 0 : rawAmt;
       const rate   = parseTallyRate(r.RATE || r.Rate || '0');
       // Value = Tally's computed amount. If 0 or missing, fallback to qty * rate
-      // This ensures the formula Opening = Closing - NET(value) works correctly
       const value  = Math.abs(amount) > 0 ? Math.abs(amount) : Math.abs(qty) * rate;
       // Determine direction: negative qty = outward (sales/issue), positive = inward (purchase/receipt)
-      // Also check VOUCHERTYPENAME for explicit direction
-      // For Stock Journal transfers: DestinationGodownName is set ONLY on the source (outward) batch entry.
-      // The target (inward) batch entry has empty DestinationGodownName. This is how we distinguish them,
-      // because $$IsInwards:$ActualQty at batch level always returns True (qty is always positive).
+      // For Stock Journal transfers: DestinationGodownName is set ONLY on the source (outward) entry.
+      // If SimplifiedVoucher.xml omits it, fall back to transfer detection above.
       const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
       const destGodown = (r.DestinationGodownName || r.DESTINATIONGODOWNNAME || '').trim();
-      const isOutward = qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery');
+      const sjTransferKey = `${r.GUID || r.Guid}|${stockName}|${r.GODOWNNAME || r.GodownName || ''}`;
+      const isOutward = qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery')
+        || stockJournalTransferKeys.has(sjTransferKey);
       const type = isOutward ? 'outward' : 'inward';
       // Normalize warehouse — treat empty string same as NULL to avoid duplicate key issues
       const warehouse = r.GODOWNNAME || r.GodownName || null;
