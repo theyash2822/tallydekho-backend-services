@@ -629,8 +629,13 @@ async function processStockTransactions(data, companyGuid) {
       const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
       const destGodown = (r.DestinationGodownName || r.DESTINATIONGODOWNNAME || '').trim();
       const sjTransferKey = `${r.GUID || r.Guid}|${stockName}|${r.GODOWNNAME || r.GodownName || ''}`;
-      const isOutward = qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') || vtype.includes('delivery')
-        || stockJournalTransferKeys.has(sjTransferKey);
+      // purchase / receipt / debit note = always inward regardless of qty sign
+      const isForceInward = vtype.includes('purchase') || vtype.includes('receipt') || vtype.includes('debit note');
+      const isOutward = !isForceInward && (
+        qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') ||
+        vtype.includes('delivery') || vtype.includes('credit note') ||
+        stockJournalTransferKeys.has(sjTransferKey)
+      );
       const type = isOutward ? 'outward' : 'inward';
       // Normalize warehouse — treat empty string same as NULL to avoid duplicate key issues
       const warehouse = r.GODOWNNAME || r.GodownName || null;
@@ -697,6 +702,11 @@ async function processStockTransactions(data, companyGuid) {
   } catch (e) {
     console.error('[DB] Stock closing_qty update failed:', e.message);
   }
+
+  // After transaction recompute, apply FY valuation as authoritative override.
+  // stock_fy_valuation contains Tally's own closing balance (includes opening+movements)
+  // and must win over our all-time-transaction net (which ignores opening balance).
+  await applyCurrentFyClosingQty(companyGuid);
 }
 
 async function processGroupMasters(data, companyGuid) {
@@ -1339,7 +1349,7 @@ async function applyCurrentFyClosingQty(companyGuid) {
       UPDATE stocks s
       SET closing_qty   = fv.closing_qty,
           closing_rate  = COALESCE(NULLIF(fv.closing_rate, 0), s.closing_rate),
-          closing_value = ABS(fv.closing_value)
+          closing_value = fv.closing_qty * COALESCE(NULLIF(fv.closing_rate, 0), s.closing_rate, 0)
       FROM (
         SELECT DISTINCT ON (stock_name)
           stock_name, closing_qty, closing_rate, closing_value
