@@ -629,13 +629,16 @@ async function processStockTransactions(data, companyGuid) {
       const vtype = (r.VOUCHERTYPENAME || r.VoucherTypeName || '').toLowerCase();
       const destGodown = (r.DestinationGodownName || r.DESTINATIONGODOWNNAME || '').trim();
       const sjTransferKey = `${r.GUID || r.Guid}|${stockName}|${r.GODOWNNAME || r.GodownName || ''}`;
-      // purchase / receipt / debit note = always inward regardless of qty sign
-      const isForceInward = vtype.includes('purchase') || vtype.includes('receipt') || vtype.includes('debit note');
-      const isOutward = !isForceInward && (
-        qty < 0 || !!destGodown || vtype.includes('sales') || vtype.includes('issue') ||
-        vtype.includes('delivery') || vtype.includes('credit note') ||
+      // purchase / receipt = always inward (stock coming IN from supplier)
+      // debit note = purchase return = outward (stock going BACK to supplier) — correct as-is
+      // sales / delivery note = always outward
+      // credit note = sales return = inward (stock coming BACK from customer)
+      const isForceInward  = vtype.includes('purchase') || vtype.includes('receipt') || vtype.includes('credit note');
+      const isForceOutward = vtype.includes('sales') || vtype.includes('delivery note') || vtype.includes('debit note');
+      const isOutward = isForceOutward || (!isForceInward && (
+        qty < 0 || !!destGodown || vtype.includes('issue') ||
         stockJournalTransferKeys.has(sjTransferKey)
-      );
+      ));
       const type = isOutward ? 'outward' : 'inward';
       // Normalize warehouse — treat empty string same as NULL to avoid duplicate key issues
       const warehouse = r.GODOWNNAME || r.GodownName || null;
@@ -663,6 +666,31 @@ async function processStockTransactions(data, companyGuid) {
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
 
+    await client.query('COMMIT');
+    // Post-insert direction correction: join with vouchers table to fix
+    // Purchase/Receipt vouchers stored as 'outward' (SimplifiedVoucher.xml sends
+    // negative qty for purchase batch allocations, tripping the qty<0 check).
+    // This is the safety net for cases where VOUCHERTYPENAME is missing in the XML.
+    if (uniqueVoucherGuids.length > 0) {
+      await client.query(`
+        UPDATE stock_transactions st
+        SET type = CASE
+          WHEN v.voucher_type IN ('Purchase','Receipt','Credit Note') THEN 'inward'
+          WHEN v.voucher_type IN ('Sales','Delivery Note','Debit Note') THEN 'outward'
+          ELSE st.type
+        END
+        FROM vouchers v
+        WHERE st.voucher_guid = v.guid
+          AND st.company_guid = v.company_guid
+          AND st.company_guid = $1
+          AND st.voucher_guid = ANY($2::text[])
+          AND v.voucher_type IN ('Purchase','Receipt','Credit Note','Sales','Delivery Note','Debit Note')
+          AND (
+            (v.voucher_type IN ('Purchase','Receipt','Credit Note') AND st.type = 'outward') OR
+            (v.voucher_type IN ('Sales','Delivery Note','Debit Note') AND st.type = 'inward')
+          )
+      `, [companyGuid, uniqueVoucherGuids]);
+    }
     await client.query('COMMIT');
     console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}`);
   } catch (e) {
