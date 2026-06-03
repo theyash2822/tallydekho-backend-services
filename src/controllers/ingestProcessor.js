@@ -604,8 +604,10 @@ async function processStockTransactions(data, companyGuid) {
       // Transfer signature: same item in 2+ different godowns, all zero-cost
       const godowns = new Set(entries.map(e => e.r.GODOWNNAME || e.r.GodownName || ''));
       if (godowns.size >= 2) {
-        // Mark first entry (source godown) as outward; rest stay inward
-        stockJournalTransferKeys.add(`${key}|${entries[0].r.GODOWNNAME || entries[0].r.GodownName || ''}`);
+        // Tally SimplifiedVoucher.xml sends DESTINATION entry first, SOURCE entry last.
+        // Mark the LAST entry (highest index = source godown) as outward.
+        const srcEntry = entries[entries.length - 1];
+        stockJournalTransferKeys.add(`${key}|${srcEntry.r.GODOWNNAME || srcEntry.r.GodownName || ''}`);
       }
     }
 
