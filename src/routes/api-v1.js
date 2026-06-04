@@ -4008,7 +4008,6 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
             ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
             AND v.is_cancelled = FALSE
           WHERE st.company_guid = $1 AND st.stock_guid IN (${placeholders})
-            AND (${stCond.slice(1).join(' AND ') || 'TRUE'})
           ORDER BY st.date DESC, st.id DESC
         `, [companyGuid, ...itemNames]);
 
