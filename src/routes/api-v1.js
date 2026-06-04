@@ -4074,7 +4074,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
         AND v.is_cancelled = FALSE
       WHERE ${stWhere}
       GROUP BY v.guid, v.voucher_number, v.voucher_type, v.date, v.party_name, v.narration, v.reference, v.amount
-      ORDER BY v.date DESC, v.id DESC
+      ORDER BY v.date DESC, MIN(v.id) DESC
       LIMIT $${idx} OFFSET $${idx+1}
     `, [...params, lim, offset]);
 
