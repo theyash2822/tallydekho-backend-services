@@ -3809,11 +3809,12 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
   const {
     mode = 'chronological',  // chronological | by_item | by_document
     fy, from, to,
-    item,                    // item name search (ILIKE)
-    warehouse,               // warehouse/godown filter (ILIKE)
+    item,                    // item name(s) — comma-separated for multi
+    warehouse,               // warehouse(s) — comma-separated for multi
+    batch,                   // batch/serial search (ILIKE on batch_serial)
     type: mvType,            // inward | outward
     search,                  // text search on item name or voucher number
-    voucherType,             // filter by voucher_type
+    voucherType,             // voucher type(s) — comma-separated for multi
     page = '1', limit = '25',
   } = req.query;
 
@@ -3843,13 +3844,41 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
     if (from) { stCond.push(`st.date >= $${idx++}`); params.push(from); }
     if (to)   { stCond.push(`st.date <= $${idx++}`); params.push(to); }
 
-    // Item name / search
-    if (item)      { stCond.push(`st.stock_guid ILIKE $${idx++}`); params.push(`%${item}%`); }
-    if (warehouse) { stCond.push(`st.warehouse  ILIKE $${idx++}`); params.push(`%${warehouse}%`); }
+    // Item name(s) — comma-separated multi-value OR single
+    if (item) {
+      const items = String(item).split(',').map(s => s.trim()).filter(Boolean);
+      if (items.length === 1) {
+        stCond.push(`st.stock_guid ILIKE $${idx++}`); params.push(`%${items[0]}%`);
+      } else if (items.length > 1) {
+        stCond.push(`(${items.map(() => `st.stock_guid ILIKE $${idx++}`).join(' OR ')})`);
+        items.forEach(i => params.push(`%${i}%`));
+      }
+    }
+    // Warehouse(s) — comma-separated multi-value OR single
+    if (warehouse) {
+      const whs = String(warehouse).split(',').map(s => s.trim()).filter(Boolean);
+      if (whs.length === 1) {
+        stCond.push(`st.warehouse ILIKE $${idx++}`); params.push(`%${whs[0]}%`);
+      } else if (whs.length > 1) {
+        stCond.push(`(${whs.map(() => `st.warehouse ILIKE $${idx++}`).join(' OR ')})`);
+        whs.forEach(w => params.push(`%${w}%`));
+      }
+    }
+    // Batch / Serial
+    if (batch) { stCond.push(`st.batch_serial ILIKE $${idx++}`); params.push(`%${batch}%`); }
     if (mvType && ['inward','outward'].includes(mvType)) {
       stCond.push(`st.type = $${idx++}`); params.push(mvType);
     }
-    if (voucherType) { stCond.push(`st.voucher_type ILIKE $${idx++}`); params.push(`%${voucherType}%`); }
+    // VoucherType(s) — comma-separated multi-value OR single
+    if (voucherType) {
+      const vtypes = String(voucherType).split(',').map(s => s.trim()).filter(Boolean);
+      if (vtypes.length === 1) {
+        stCond.push(`st.voucher_type ILIKE $${idx++}`); params.push(`%${vtypes[0]}%`);
+      } else if (vtypes.length > 1) {
+        stCond.push(`(${vtypes.map(() => `st.voucher_type ILIKE $${idx++}`).join(' OR ')})`);
+        vtypes.forEach(v => params.push(`%${v}%`));
+      }
+    }
     // Full-text search across item name + voucher number (needs JOIN with vouchers)
     const hasSearch = !!search;
     if (hasSearch) {
