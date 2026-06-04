@@ -197,3 +197,12 @@ _Add new entries at top._
 ### Priority Logic
 - CRITICAL: closingQty <= -10
 - HIGH: closingQty < 0 and > -10
+
+## 2026-06-04 — Stock Ledger Endpoint
+
+### Changes
+- `src/routes/api-v1.js` — added `GET /api/stocks/ledger`
+  - Paginated, FY-aware (fy= param), date range (from/to), item search, warehouse, type filter
+  - Returns: entries[], warehouses[], summary (total, totalInQty, totalOutQty, totalValue), pagination
+  - Sources: voucher_inventory_items JOIN vouchers
+  - Company-scoped, auth-protected (verifyCompanyOwnership)

@@ -563,6 +563,10 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vouchers_fy    ON vouchers(company_guid, financial_year);
       CREATE INDEX IF NOT EXISTS idx_vle_fy         ON voucher_ledger_entries(company_guid, financial_year);
       CREATE INDEX IF NOT EXISTS idx_st_fy          ON stock_transactions(company_guid, financial_year);
+      CREATE INDEX IF NOT EXISTS idx_st_date         ON stock_transactions(company_guid, date);
+      CREATE INDEX IF NOT EXISTS idx_st_stock        ON stock_transactions(company_guid, stock_guid);
+      CREATE INDEX IF NOT EXISTS idx_st_voucher      ON stock_transactions(company_guid, voucher_guid);
+      CREATE INDEX IF NOT EXISTS idx_st_warehouse    ON stock_transactions(company_guid, warehouse);
 
       -- CTO Spec: batch_allocations — batch/expiry tracking per voucher line item
       -- Populated from VoucherInventoryDetail.xml batch allocation data

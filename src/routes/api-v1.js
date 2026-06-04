@@ -3799,103 +3799,366 @@ router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => 
   }
 });
 
-// GET /api/stocks/ledger — global paginated stock movement ledger (all items, FY-aware, filterable)
+// GET /api/stocks/ledger — Stock Ledger with 3 modes: chronological | by_item | by_document
+// Primary source: stock_transactions (direction-aware). Joined with vouchers + stocks.
+// Note: stock_transactions.stock_guid stores stock NAME (known schema quirk) — joined via name.
 router.get('/stocks/ledger', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
-  const { fy, from, to, item, warehouse, type, page = 1, limit = 30 } = req.query;
+  const {
+    mode = 'chronological',  // chronological | by_item | by_document
+    fy, from, to,
+    item,                    // item name search (ILIKE)
+    warehouse,               // warehouse/godown filter (ILIKE)
+    type: mvType,            // inward | outward
+    search,                  // text search on item name or voucher number
+    voucherType,             // filter by voucher_type
+    page = '1', limit = '25',
+  } = req.query;
+
+  const pg  = Math.max(1, parseInt(page));
+  const lim = Math.min(100, parseInt(limit) || 25);
+  const offset = (pg - 1) * lim;
+
+  // Validate mode
+  if (!['chronological', 'by_item', 'by_document'].includes(mode)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_MODE', message: 'mode must be chronological | by_item | by_document' } });
+  }
 
   try {
-    const conditions = ['vi.company_guid = $1', 'v.is_cancelled = FALSE'];
+    // ── Build shared WHERE conditions on stock_transactions (aliased st)
+    const stCond = [`st.company_guid = $1`];
     const params = [companyGuid];
     let idx = 2;
 
-    // FY date range (only when no custom from/to)
+    // Date / FY
     if (fy && !from && !to) {
-      const parts = fy.split('-');   // e.g. '2025-2026'
+      const parts = fy.split('-');
       if (parts.length === 2) {
-        conditions.push(`v.date >= $${idx++}`); params.push(`${parts[0]}-04-01`);
-        conditions.push(`v.date <= $${idx++}`); params.push(`${parts[1]}-03-31`);
+        stCond.push(`st.date >= $${idx++}`); params.push(`${parts[0]}-04-01`);
+        stCond.push(`st.date <= $${idx++}`); params.push(`${parts[1]}-03-31`);
       }
     }
-    if (from) { conditions.push(`v.date >= $${idx++}`); params.push(from); }
-    if (to)   { conditions.push(`v.date <= $${idx++}`); params.push(to); }
+    if (from) { stCond.push(`st.date >= $${idx++}`); params.push(from); }
+    if (to)   { stCond.push(`st.date <= $${idx++}`); params.push(to); }
 
-    // Item name search
-    if (item) { conditions.push(`vi.stock_item_name ILIKE $${idx++}`); params.push(`%${item}%`); }
+    // Item name / search
+    if (item)      { stCond.push(`st.stock_guid ILIKE $${idx++}`); params.push(`%${item}%`); }
+    if (warehouse) { stCond.push(`st.warehouse  ILIKE $${idx++}`); params.push(`%${warehouse}%`); }
+    if (mvType && ['inward','outward'].includes(mvType)) {
+      stCond.push(`st.type = $${idx++}`); params.push(mvType);
+    }
+    if (voucherType) { stCond.push(`st.voucher_type ILIKE $${idx++}`); params.push(`%${voucherType}%`); }
+    // Full-text search across item name + voucher number (needs JOIN with vouchers)
+    const hasSearch = !!search;
+    if (hasSearch) {
+      stCond.push(`(
+        st.stock_guid ILIKE $${idx}
+        OR EXISTS (
+          SELECT 1 FROM vouchers sv WHERE sv.guid = st.voucher_guid
+            AND sv.company_guid = $1 AND sv.voucher_number ILIKE $${idx}
+        )
+      )`);
+      params.push(`%${search}%`); idx++;
+    }
 
-    // Warehouse filter
-    if (warehouse) { conditions.push(`vi.godown_name ILIKE $${idx++}`); params.push(`%${warehouse}%`); }
+    const stWhere = stCond.join(' AND ');
 
-    // Voucher type filter
-    if (type) { conditions.push(`v.voucher_type ILIKE $${idx++}`); params.push(`%${type}%`); }
-
-    const where = conditions.join(' AND ');
-    const offset = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
-
-    // Total count + summary in one pass
-    const { rows: aggRows } = await query(`
+    // ── Summary (all modes share same summary aggregate)
+    const { rows: sumRows } = await query(`
       SELECT
-        COUNT(*) AS total,
-        SUM(CASE WHEN
-          v.voucher_type ILIKE '%purchase%' OR v.voucher_type ILIKE '%credit note%'
-          THEN ABS(vi.actual_qty) ELSE 0 END) AS total_in_qty,
-        SUM(CASE WHEN
-          v.voucher_type ILIKE '%sales%' OR v.voucher_type ILIKE '%debit note%'
-          THEN ABS(vi.actual_qty) ELSE 0 END) AS total_out_qty,
-        SUM(ABS(vi.amount)) AS total_value
-      FROM voucher_inventory_items vi
-      JOIN vouchers v ON v.guid = vi.voucher_guid
-      WHERE ${where}
+        COUNT(*)                                              AS total,
+        SUM(CASE WHEN st.type='inward'  THEN ABS(st.qty) ELSE 0 END) AS total_in,
+        SUM(CASE WHEN st.type='outward' THEN ABS(st.qty) ELSE 0 END) AS total_out,
+        SUM(ABS(COALESCE(st.value, st.qty * st.rate, 0)))   AS total_value
+      FROM stock_transactions st
+      WHERE ${stWhere}
     `, params);
 
-    // Paginated entries
-    const { rows: entries } = await query(`
+    const sum = sumRows[0];
+    const summary = {
+      entries:  parseInt(sum.total),
+      totalIn:  parseFloat(sum.total_in   || 0),
+      totalOut: parseFloat(sum.total_out  || 0),
+      value:    parseFloat(sum.total_value|| 0),
+    };
+
+    // ── Distinct warehouses for filter
+    const { rows: whRows } = await query(
+      `SELECT DISTINCT warehouse FROM stock_transactions
+       WHERE company_guid=$1 AND warehouse IS NOT NULL AND warehouse <> ''
+       ORDER BY warehouse`, [companyGuid]);
+    const warehouses = whRows.map(r => r.warehouse);
+
+    // ════════════════════════════════════════════════════════
+    // MODE: chronological
+    // ════════════════════════════════════════════════════════
+    if (mode === 'chronological') {
+      const { rows } = await query(`
+        SELECT
+          st.id              AS "transactionId",
+          st.date,
+          st.voucher_guid    AS "voucherGuid",
+          st.voucher_type    AS "voucherType",
+          CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END AS quantity,
+          st.type            AS "movementDirection",
+          st.rate            AS "unitCost",
+          COALESCE(st.value, st.qty * st.rate) AS value,
+          st.warehouse,
+          st.stock_guid      AS "itemName",
+          -- join stocks for guid + alias
+          s.guid             AS "stockGuid",
+          s.alias            AS sku,
+          s.unit,
+          -- join vouchers for document number + party + note
+          v.voucher_number   AS "documentNumber",
+          v.party_name       AS "partyName",
+          v.narration        AS note,
+          -- join voucher_inventory_items for batch
+          vi.batch_name      AS "batchSerial"
+        FROM stock_transactions st
+        LEFT JOIN stocks s
+          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+        LEFT JOIN vouchers v
+          ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+          AND v.is_cancelled = FALSE
+        LEFT JOIN LATERAL (
+          SELECT batch_name FROM voucher_inventory_items
+          WHERE voucher_guid = st.voucher_guid
+            AND company_guid = st.company_guid
+            AND stock_item_name = st.stock_guid
+          LIMIT 1
+        ) vi ON true
+        WHERE ${stWhere}
+        ORDER BY st.date DESC, st.id DESC
+        LIMIT $${idx} OFFSET $${idx+1}
+      `, [...params, lim, offset]);
+
+      // Normalise movementDirection to UPPER
+      const items = rows.map(r => ({
+        ...r,
+        movementDirection: (r.movementDirection || '').toUpperCase(),
+        postedBy: null,
+        balanceAfterTransaction: null,
+        time: null,
+      }));
+
+      return res.json({
+        success: true,
+        data: { mode, summary, warehouses, items,
+          pagination: { page: pg, pageSize: lim, total: summary.entries } },
+      });
+    }
+
+    // ════════════════════════════════════════════════════════
+    // MODE: by_item
+    // ════════════════════════════════════════════════════════
+    if (mode === 'by_item') {
+      // Step 1: Distinct items page
+      const { rows: itemRows } = await query(`
+        SELECT
+          st.stock_guid      AS item_name_key,
+          s.guid             AS "stockGuid",
+          st.stock_guid      AS "itemName",
+          s.alias            AS sku,
+          s.group_name       AS "groupName",
+          s.category,
+          s.unit,
+          s.closing_qty      AS "currentBalance",
+          COUNT(st.id)       AS rows_count,
+          MAX(st.rate)       AS latest_rate
+        FROM stock_transactions st
+        LEFT JOIN stocks s
+          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+        WHERE ${stWhere}
+        GROUP BY st.stock_guid, s.guid, s.alias, s.group_name, s.category, s.unit, s.closing_qty
+        ORDER BY st.stock_guid
+        LIMIT $${idx} OFFSET $${idx+1}
+      `, [...params, lim, offset]);
+
+      // Step 2: Total distinct items count
+      const { rows: cntRows } = await query(`
+        SELECT COUNT(DISTINCT st.stock_guid) AS total
+        FROM stock_transactions st
+        WHERE ${stWhere}
+      `, params);
+      const itemTotal = parseInt(cntRows[0].total);
+
+      // Step 3: Fetch transactions for those items
+      const itemNames = itemRows.map(r => r.item_name_key);
+      let txnsByItem = {};
+      if (itemNames.length > 0) {
+        const placeholders = itemNames.map((_, i) => `$${i + 2}`).join(',');
+        const { rows: txnRows } = await query(`
+          SELECT
+            st.id              AS "transactionId",
+            st.stock_guid      AS item_name_key,
+            st.date,
+            st.voucher_guid    AS "voucherGuid",
+            st.voucher_type    AS "voucherType",
+            CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END AS quantity,
+            st.type            AS "movementDirection",
+            st.rate,
+            COALESCE(st.value, st.qty * st.rate) AS value,
+            st.warehouse,
+            v.voucher_number   AS "docRef"
+          FROM stock_transactions st
+          LEFT JOIN vouchers v
+            ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+            AND v.is_cancelled = FALSE
+          WHERE st.company_guid = $1 AND st.stock_guid IN (${placeholders})
+            AND (${stCond.slice(1).join(' AND ') || 'TRUE'})
+          ORDER BY st.date DESC, st.id DESC
+        `, [companyGuid, ...itemNames]);
+
+        txnsByItem = txnRows.reduce((acc, t) => {
+          const key = t.item_name_key;
+          if (!acc[key]) acc[key] = [];
+          acc[key].push({
+            date:              t.date,
+            docRef:            t.docRef,
+            transactionId:     String(t.transactionId),
+            voucherGuid:       t.voucherGuid,
+            voucherType:       t.voucherType,
+            quantity:          parseFloat(t.quantity),
+            movementDirection: (t.movementDirection || '').toUpperCase(),
+            rate:              parseFloat(t.rate || 0),
+            value:             parseFloat(t.value || 0),
+            warehouse:         t.warehouse,
+            balance:           null,
+          });
+          return acc;
+        }, {});
+      }
+
+      const items = itemRows.map((r) => ({
+        stockGuid:      r.stockGuid,
+        itemName:       r.itemName,
+        sku:            r.sku || null,
+        groupName:      r.groupName || null,
+        category:       r.category || null,
+        unit:           r.unit || null,
+        rowsCount:      parseInt(r.rows_count),
+        currentBalance: parseFloat(r.currentBalance || 0),
+        latestRate:     parseFloat(r.latest_rate || 0),
+        transactions:   txnsByItem[r.item_name_key] || [],
+      }));
+
+      return res.json({
+        success: true,
+        data: { mode, summary, warehouses, items,
+          pagination: { page: pg, pageSize: lim, total: itemTotal } },
+      });
+    }
+
+    // ════════════════════════════════════════════════════════
+    // MODE: by_document
+    // ════════════════════════════════════════════════════════
+    // Step 1: Distinct vouchers page
+    const { rows: docRows } = await query(`
       SELECT
-        vi.id,
-        vi.stock_item_name,
-        vi.actual_qty,
-        vi.rate,
-        vi.amount,
-        vi.godown_name,
-        vi.batch_name,
-        vi.unit,
-        v.voucher_number,
-        v.voucher_type,
+        v.guid           AS "voucherGuid",
+        v.voucher_number AS "voucherNumber",
+        v.voucher_type   AS "voucherType",
         v.date,
-        v.guid AS voucher_guid
-      FROM voucher_inventory_items vi
-      JOIN vouchers v ON v.guid = vi.voucher_guid
-      WHERE ${where}
+        v.party_name     AS "partyName",
+        v.narration      AS note,
+        v.reference,
+        v.amount,
+        COUNT(st.id)     AS items_count,
+        MIN(st.warehouse) AS warehouse
+      FROM stock_transactions st
+      INNER JOIN vouchers v
+        ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+        AND v.is_cancelled = FALSE
+      WHERE ${stWhere}
+      GROUP BY v.guid, v.voucher_number, v.voucher_type, v.date, v.party_name, v.narration, v.reference, v.amount
       ORDER BY v.date DESC, v.id DESC
-      LIMIT $${idx++} OFFSET $${idx++}
-    `, [...params, parseInt(limit), offset]);
+      LIMIT $${idx} OFFSET $${idx+1}
+    `, [...params, lim, offset]);
 
-    // Distinct warehouses for filter list
-    const { rows: whRows } = await query(`
-      SELECT DISTINCT vi.godown_name
-      FROM voucher_inventory_items vi
-      JOIN vouchers v ON v.guid = vi.voucher_guid
-      WHERE vi.company_guid = $1 AND vi.godown_name IS NOT NULL AND vi.godown_name <> ''
-      ORDER BY vi.godown_name
-    `, [companyGuid]);
+    const { rows: docCntRows } = await query(`
+      SELECT COUNT(DISTINCT v.guid) AS total
+      FROM stock_transactions st
+      INNER JOIN vouchers v
+        ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+        AND v.is_cancelled = FALSE
+      WHERE ${stWhere}
+    `, params);
+    const docTotal = parseInt(docCntRows[0].total);
 
-    const agg = aggRows[0];
-    res.json({
+    // Step 2: Fetch stock lines for those vouchers
+    const vGuids = docRows.map(r => r.voucherGuid);
+    let linesByVoucher = {};
+    if (vGuids.length > 0) {
+      const phs = vGuids.map((_, i) => `$${i + 2}`).join(',');
+      const { rows: lineRows } = await query(`
+        SELECT
+          st.voucher_guid AS voucher_guid,
+          st.stock_guid   AS "itemName",
+          s.guid          AS "stockGuid",
+          s.alias         AS sku,
+          s.unit,
+          CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END AS quantity,
+          st.type         AS "movementDirection",
+          st.rate         AS "unitCost",
+          COALESCE(st.value, st.qty * st.rate) AS value,
+          st.warehouse,
+          vi.batch_name   AS "batchSerial"
+        FROM stock_transactions st
+        LEFT JOIN stocks s
+          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+        LEFT JOIN LATERAL (
+          SELECT batch_name FROM voucher_inventory_items
+          WHERE voucher_guid = st.voucher_guid
+            AND company_guid = st.company_guid
+            AND stock_item_name = st.stock_guid
+          LIMIT 1
+        ) vi ON true
+        WHERE st.company_guid = $1 AND st.voucher_guid IN (${phs})
+        ORDER BY st.id
+      `, [companyGuid, ...vGuids]);
+
+      linesByVoucher = lineRows.reduce((acc, l) => {
+        if (!acc[l.voucher_guid]) acc[l.voucher_guid] = [];
+        acc[l.voucher_guid].push({
+          stockGuid:        l.stockGuid || null,
+          itemName:         l.itemName,
+          sku:              l.sku  || null,
+          unit:             l.unit || null,
+          batchSerial:      l.batchSerial || null,
+          unitCost:         parseFloat(l.unitCost || 0),
+          quantity:         parseFloat(l.quantity),
+          movementDirection:(l.movementDirection || '').toUpperCase(),
+          value:            parseFloat(l.value || 0),
+          warehouse:        l.warehouse,
+          balance:          null,
+        });
+        return acc;
+      }, {});
+    }
+
+    const items = docRows.map((r) => ({
+      voucherGuid:   r.voucherGuid,
+      voucherType:   r.voucherType,
+      voucherNumber: r.voucherNumber,
+      date:          r.date,
+      warehouse:     r.warehouse || null,
+      itemsCount:    parseInt(r.items_count),
+      amount:        parseFloat(r.amount || 0),
+      partyName:     r.partyName || null,
+      reference:     r.reference || null,
+      note:          r.note || null,
+      stockLines:    linesByVoucher[r.voucherGuid] || [],
+    }));
+
+    return res.json({
       success: true,
-      data: {
-        entries,
-        warehouses: whRows.map(r => r.godown_name),
-        summary: {
-          total: parseInt(agg.total),
-          totalInQty:  parseFloat(agg.total_in_qty  || 0),
-          totalOutQty: parseFloat(agg.total_out_qty || 0),
-          totalValue:  parseFloat(agg.total_value   || 0),
-        },
-        pagination: { page: parseInt(page), limit: parseInt(limit), total: parseInt(agg.total) },
-      },
+      data: { mode, summary, warehouses, items,
+        pagination: { page: pg, pageSize: lim, total: docTotal } },
     });
+
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
