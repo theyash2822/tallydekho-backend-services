@@ -3146,6 +3146,29 @@ router.get('/ai/insights/history/:fy', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
+// POST /api/admin/backfill-stock-voucher-types — One-time fix: populate NULL voucher_type in stock_transactions from vouchers table
+// Root cause: SimplifiedVoucher.xml omits VOUCHERTYPENAME, leaving voucher_type = NULL — breaks transaction type filter
+router.post('/admin/backfill-stock-voucher-types', authMiddleware, async (req, res) => {
+  const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rowCount } = await query(`
+      UPDATE stock_transactions st
+      SET voucher_type = v.voucher_type
+      FROM vouchers v
+      WHERE st.voucher_guid = v.guid
+        AND st.company_guid = v.company_guid
+        AND st.company_guid = $1
+        AND (st.voucher_type IS NULL OR st.voucher_type = '')
+        AND v.voucher_type IS NOT NULL AND v.voucher_type != ''
+    `, [companyGuid]);
+    res.json({ success: true, data: { updated: rowCount, message: `Backfilled voucher_type for ${rowCount} stock_transactions` } });
+  } catch (e) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
 // POST /api/admin/backfill-gst — Recompute gst_voucher_details from ledger entries (CGST/SGST/IGST)
 router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
   const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
@@ -3869,15 +3892,41 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
     if (mvType && ['inward','outward'].includes(mvType)) {
       stCond.push(`st.type = $${idx++}`); params.push(mvType);
     }
-    // VoucherType(s) — comma-separated multi-value OR single
+    // VoucherType(s) — comma-separated multi-value.
+    // ROOT CAUSE FIX: stock_transactions.voucher_type is NULL when SimplifiedVoucher.xml is the
+    // sync source (it omits VOUCHERTYPENAME). So we must fall back to the vouchers table.
+    // Also maps user-facing labels ("Sales Invoice") to Tally parent types ("Sales") for
+    // reliability across custom Tally voucher type names.
     if (voucherType) {
       const vtypes = String(voucherType).split(',').map(s => s.trim()).filter(Boolean);
-      if (vtypes.length === 1) {
-        stCond.push(`st.voucher_type ILIKE $${idx++}`); params.push(`%${vtypes[0]}%`);
-      } else if (vtypes.length > 1) {
-        stCond.push(`(${vtypes.map(() => `st.voucher_type ILIKE $${idx++}`).join(' OR ')})`);
-        vtypes.forEach(v => params.push(`%${v}%`));
-      }
+      const vtypeParentMap = {
+        'sales invoice':    'Sales',
+        'purchase invoice': 'Purchase',
+        'credit note':      'Credit Note',
+        'debit note':       'Debit Note',
+        'journal':          'Journal',
+        'stock journal':    'Stock Journal',
+        'receipt':          'Receipt',
+        'payment':          'Payment',
+      };
+      const vConditions = vtypes.map(v => {
+        const likeIdx = idx++;
+        params.push(`%${v}%`);
+        const parentType = vtypeParentMap[v.toLowerCase()];
+        let inner = `vf.voucher_type ILIKE $${likeIdx}`;
+        if (parentType) {
+          const pIdx = idx++;
+          params.push(parentType);
+          inner += ` OR vf.voucher_type_parent = $${pIdx}`;
+        }
+        // Check st.voucher_type first (fast path), then fall back to vouchers table
+        return `(st.voucher_type ILIKE $${likeIdx} OR EXISTS (
+          SELECT 1 FROM vouchers vf
+          WHERE vf.guid = st.voucher_guid AND vf.company_guid = $1
+          AND (${inner})
+        ))`;
+      });
+      stCond.push(vtypes.length === 1 ? vConditions[0] : `(${vConditions.join(' OR ')})`);
     }
     // Full-text search across item name + voucher number (needs JOIN with vouchers)
     const hasSearch = !!search;

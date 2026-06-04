@@ -691,6 +691,23 @@ async function processStockTransactions(data, companyGuid) {
           )
       `, [companyGuid, uniqueVoucherGuids]);
     }
+    // Backfill voucher_type from vouchers table where NULL.
+    // SimplifiedVoucher.xml omits VOUCHERTYPENAME, leaving stock_transactions.voucher_type = NULL.
+    // This causes the transaction type filter to return no results.
+    if (uniqueVoucherGuids.length > 0) {
+      await client.query(`
+        UPDATE stock_transactions st
+        SET voucher_type = v.voucher_type
+        FROM vouchers v
+        WHERE st.voucher_guid = v.guid
+          AND st.company_guid = v.company_guid
+          AND st.company_guid = $1
+          AND st.voucher_guid = ANY($2::text[])
+          AND (st.voucher_type IS NULL OR st.voucher_type = '')
+          AND v.voucher_type IS NOT NULL AND v.voucher_type != ''
+      `, [companyGuid, uniqueVoucherGuids]);
+    }
+
     await client.query('COMMIT');
     console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}`);
   } catch (e) {
