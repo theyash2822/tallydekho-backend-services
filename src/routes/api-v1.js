@@ -1302,32 +1302,25 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
     let allRows;
 
     if (fyRequested) {
-      // ── FY-specific path: compute closing qty from transactions up to fyTo ──
+      // ── FY-specific path: use stock_fy_valuation for authoritative per-FY closing qty ──
+      // stocks.opening_qty is the current-FY opening, NOT all-time; computing from it is wrong for past FYs.
       const { rows: itemRows } = await query(`
         SELECT
-          s.guid                      AS "stockGuid",
-          s.name                      AS "itemName",
-          s.group_name                AS "groupName",
+          s.guid                                        AS "stockGuid",
+          sfv.stock_name                               AS "itemName",
+          s.group_name                                 AS "groupName",
           s.category,
           s.unit,
-          COALESCE(s.closing_rate, 0) AS rate,
-          COALESCE(s.opening_qty, 0)
-            + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
-            - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
-            AS "fyClosingQty"
-        FROM stocks s
-        LEFT JOIN stock_transactions st
-          ON st.stock_guid = s.name AND st.company_guid = s.company_guid
-          AND st.qty IS NOT NULL AND st.date <= $2
-        WHERE s.company_guid = $1
-        GROUP BY s.guid, s.name, s.group_name, s.category, s.unit, s.closing_rate, s.opening_qty
-        HAVING (
-          COALESCE(s.opening_qty, 0)
-          + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
-          - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
-        ) < 0
-        ORDER BY "fyClosingQty" ASC
-      `, [companyGuid, fyTo]);
+          COALESCE(sfv.closing_rate, s.closing_rate, 0) AS rate,
+          sfv.closing_qty                              AS "fyClosingQty"
+        FROM stock_fy_valuation sfv
+        JOIN stocks s
+          ON s.name = sfv.stock_name AND s.company_guid = sfv.company_guid
+        WHERE sfv.company_guid = $1
+          AND sfv.financial_year = $2
+          AND sfv.closing_qty < 0
+        ORDER BY sfv.closing_qty ASC
+      `, [companyGuid, financialYear]);
 
       // Per-warehouse breakdown for FY — filtered to same FY date range
       const stockNames = itemRows.map(r => r.itemName);
