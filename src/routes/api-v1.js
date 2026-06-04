@@ -3799,6 +3799,108 @@ router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => 
   }
 });
 
+// GET /api/stocks/ledger — global paginated stock movement ledger (all items, FY-aware, filterable)
+router.get('/stocks/ledger', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+
+  const { fy, from, to, item, warehouse, type, page = 1, limit = 30 } = req.query;
+
+  try {
+    const conditions = ['vi.company_guid = $1', 'v.is_cancelled = FALSE'];
+    const params = [companyGuid];
+    let idx = 2;
+
+    // FY date range (only when no custom from/to)
+    if (fy && !from && !to) {
+      const parts = fy.split('-');   // e.g. '2025-2026'
+      if (parts.length === 2) {
+        conditions.push(`v.date >= $${idx++}`); params.push(`${parts[0]}-04-01`);
+        conditions.push(`v.date <= $${idx++}`); params.push(`${parts[1]}-03-31`);
+      }
+    }
+    if (from) { conditions.push(`v.date >= $${idx++}`); params.push(from); }
+    if (to)   { conditions.push(`v.date <= $${idx++}`); params.push(to); }
+
+    // Item name search
+    if (item) { conditions.push(`vi.stock_item_name ILIKE $${idx++}`); params.push(`%${item}%`); }
+
+    // Warehouse filter
+    if (warehouse) { conditions.push(`vi.godown_name ILIKE $${idx++}`); params.push(`%${warehouse}%`); }
+
+    // Voucher type filter
+    if (type) { conditions.push(`v.voucher_type ILIKE $${idx++}`); params.push(`%${type}%`); }
+
+    const where = conditions.join(' AND ');
+    const offset = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
+
+    // Total count + summary in one pass
+    const { rows: aggRows } = await query(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN
+          v.voucher_type ILIKE '%purchase%' OR v.voucher_type ILIKE '%credit note%'
+          THEN ABS(vi.actual_qty) ELSE 0 END) AS total_in_qty,
+        SUM(CASE WHEN
+          v.voucher_type ILIKE '%sales%' OR v.voucher_type ILIKE '%debit note%'
+          THEN ABS(vi.actual_qty) ELSE 0 END) AS total_out_qty,
+        SUM(ABS(vi.amount)) AS total_value
+      FROM voucher_inventory_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid
+      WHERE ${where}
+    `, params);
+
+    // Paginated entries
+    const { rows: entries } = await query(`
+      SELECT
+        vi.id,
+        vi.stock_item_name,
+        vi.actual_qty,
+        vi.rate,
+        vi.amount,
+        vi.godown_name,
+        vi.batch_name,
+        vi.unit,
+        v.voucher_number,
+        v.voucher_type,
+        v.date,
+        v.guid AS voucher_guid
+      FROM voucher_inventory_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid
+      WHERE ${where}
+      ORDER BY v.date DESC, v.id DESC
+      LIMIT $${idx++} OFFSET $${idx++}
+    `, [...params, parseInt(limit), offset]);
+
+    // Distinct warehouses for filter list
+    const { rows: whRows } = await query(`
+      SELECT DISTINCT vi.godown_name
+      FROM voucher_inventory_items vi
+      JOIN vouchers v ON v.guid = vi.voucher_guid
+      WHERE vi.company_guid = $1 AND vi.godown_name IS NOT NULL AND vi.godown_name <> ''
+      ORDER BY vi.godown_name
+    `, [companyGuid]);
+
+    const agg = aggRows[0];
+    res.json({
+      success: true,
+      data: {
+        entries,
+        warehouses: whRows.map(r => r.godown_name),
+        summary: {
+          total: parseInt(agg.total),
+          totalInQty:  parseFloat(agg.total_in_qty  || 0),
+          totalOutQty: parseFloat(agg.total_out_qty || 0),
+          totalValue:  parseFloat(agg.total_value   || 0),
+        },
+        pagination: { page: parseInt(page), limit: parseInt(limit), total: parseInt(agg.total) },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/stocks/items/:id/movements — movement history for a stock item
 router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;

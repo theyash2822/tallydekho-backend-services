@@ -4,6 +4,24 @@ Format: Date | Task | Files Changed | Behavior Changed | Tested | Risks
 
 ---
 
+## 2026-06-04 | Fix: Negative Stock FY Filtering
+
+**Task:** Negative stock screen showing no data when a non-current FY was selected from dashboard.
+
+**Root Cause:** FY path in `/api/stocks/negative-stock` was computing `stocks.opening_qty + transactions up to fyTo`. But `stocks.opening_qty` is the current-FY opening balance, not an all-time initial balance. For past FYs this double-counted transactions → result was positive/zero → no items shown.
+
+**Files Changed:**
+- `src/routes/api-v1.js` — FY path now JOINs `stock_fy_valuation` on `(company_guid, financial_year)` and uses `sfv.closing_qty` directly (Tally's authoritative per-FY closing qty)
+
+**Behavior Changed:**
+- Negative stock screen now correctly shows FY-specific negative items for ALL financial years
+- Tested: 2023-24 (1 item), 2024-25 (3 items), 2025-26 (4 items), 2026-27 (4 items) — all correct
+
+**Tested:** ✅ API tested via curl with 4 FYs
+**Risks:** None — warehouse path unchanged; only FY query source changed
+
+---
+
 ## 2026-06-03 | Reorder Queue — MINIMUMORDERQTY + Group Reorder + API
 
 **Task:** Add MINIMUMORDERQTY sync, group-level reorder fallback, and full reorder queue API.
