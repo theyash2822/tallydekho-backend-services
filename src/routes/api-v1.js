@@ -3893,37 +3893,18 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
       stCond.push(`st.type = $${idx++}`); params.push(mvType);
     }
     // VoucherType(s) — comma-separated multi-value.
-    // ROOT CAUSE FIX: stock_transactions.voucher_type is NULL when SimplifiedVoucher.xml is the
-    // sync source (it omits VOUCHERTYPENAME). So we must fall back to the vouchers table.
-    // Also maps user-facing labels ("Sales Invoice") to Tally parent types ("Sales") for
-    // reliability across custom Tally voucher type names.
+    // Uses actual Tally voucher type names (e.g. 'Sales GST', 'Purchase GST') returned by the
+    // /stocks/ledger voucherTypes field. The backfill + sync fix keeps st.voucher_type populated.
+    // EXISTS fallback on vouchers table handles any residual NULL rows.
     if (voucherType) {
       const vtypes = String(voucherType).split(',').map(s => s.trim()).filter(Boolean);
-      const vtypeParentMap = {
-        'sales invoice':    'Sales',
-        'purchase invoice': 'Purchase',
-        'credit note':      'Credit Note',
-        'debit note':       'Debit Note',
-        'journal':          'Journal',
-        'stock journal':    'Stock Journal',
-        'receipt':          'Receipt',
-        'payment':          'Payment',
-      };
       const vConditions = vtypes.map(v => {
         const likeIdx = idx++;
         params.push(`%${v}%`);
-        const parentType = vtypeParentMap[v.toLowerCase()];
-        let inner = `vf.voucher_type ILIKE $${likeIdx}`;
-        if (parentType) {
-          const pIdx = idx++;
-          params.push(parentType);
-          inner += ` OR vf.voucher_type_parent = $${pIdx}`;
-        }
-        // Check st.voucher_type first (fast path), then fall back to vouchers table
         return `(st.voucher_type ILIKE $${likeIdx} OR EXISTS (
           SELECT 1 FROM vouchers vf
           WHERE vf.guid = st.voucher_guid AND vf.company_guid = $1
-          AND (${inner})
+          AND vf.voucher_type ILIKE $${likeIdx}
         ))`;
       });
       stCond.push(vtypes.length === 1 ? vConditions[0] : `(${vConditions.join(' OR ')})`);
@@ -3968,6 +3949,13 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
        WHERE company_guid=$1 AND warehouse IS NOT NULL AND warehouse <> ''
        ORDER BY warehouse`, [companyGuid]);
     const warehouses = whRows.map(r => r.warehouse);
+
+    // ── Distinct voucher types for filter (dynamic — Tally companies use custom names like 'Sales GST')
+    const { rows: vtRows } = await query(
+      `SELECT DISTINCT voucher_type FROM stock_transactions
+       WHERE company_guid=$1 AND voucher_type IS NOT NULL AND voucher_type <> ''
+       ORDER BY voucher_type`, [companyGuid]);
+    const voucherTypes = vtRows.map(r => r.voucher_type);
 
     // ════════════════════════════════════════════════════════
     // MODE: chronological
@@ -4024,7 +4012,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
 
       return res.json({
         success: true,
-        data: { mode, summary, warehouses, items,
+        data: { mode, summary, warehouses, voucherTypes, items,
           pagination: { page: pg, pageSize: lim, total: summary.entries } },
       });
     }
@@ -4124,7 +4112,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
 
       return res.json({
         success: true,
-        data: { mode, summary, warehouses, items,
+        data: { mode, summary, warehouses, voucherTypes, items,
           pagination: { page: pg, pageSize: lim, total: itemTotal } },
       });
     }
@@ -4232,7 +4220,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
 
     return res.json({
       success: true,
-      data: { mode, summary, warehouses, items,
+      data: { mode, summary, warehouses, voucherTypes, items,
         pagination: { page: pg, pageSize: lim, total: docTotal } },
     });
 
