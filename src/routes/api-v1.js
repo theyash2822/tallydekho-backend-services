@@ -1196,7 +1196,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
           AND st.date <= $3
         WHERE s.company_guid = $1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
-        GROUP BY s.guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+        GROUP BY s.guid, s.company_guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                  s.reorder_level, s.closing_rate, s.opening_qty
         ORDER BY fy_closing_value DESC NULLS LAST, s.name
       `;
