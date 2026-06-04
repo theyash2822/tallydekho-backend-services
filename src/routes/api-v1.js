@@ -1192,7 +1192,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                  - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
                ) AS fy_closing_value
         FROM stocks s
-        LEFT JOIN stock_transactions st ON st.stock_guid = s.guid AND st.company_guid = s.company_guid
+        LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_guid = s.company_guid
           AND st.date <= $3
         WHERE s.company_guid = $1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
