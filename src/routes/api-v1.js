@@ -1192,8 +1192,12 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                  - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
                ) AS fy_closing_value
         FROM stocks s
+        -- Physical Stock vouchers are Tally stock-count/audit entries (absolute qty, not a movement).
+        -- Exclude from FY running qty calc to prevent cumulative inflation.
+        -- TODO: future — model Physical Stock as absolute stock count event (last count wins, movements apply on top)
         LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_guid = s.company_guid
           AND st.date <= $3
+          AND st.voucher_type != 'Physical Stock'
         WHERE s.company_guid = $1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
         GROUP BY s.guid, s.company_guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
@@ -1336,6 +1340,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
             AND qty IS NOT NULL
             AND date <= $2
             AND stock_guid = ANY($3)
+            AND voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse movement totals
           GROUP BY stock_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
         `, [companyGuid, fyTo, stockNames]);
         whRows = whResult.rows;
@@ -1391,6 +1396,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
                  SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS net_qty
           FROM stock_transactions
           WHERE company_guid = $1 AND qty IS NOT NULL
+            AND voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse movement totals
           GROUP BY stock_guid, company_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
           ${whFilter}
         ) wh ON wh.stock_guid = s.name AND wh.company_guid = s.company_guid
@@ -1494,6 +1500,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
        AND st.company_guid = s.company_guid
        AND st.date::date >= $2::date
        AND st.date::date <= $3::date
+       AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from velocity calculation
       WHERE s.company_guid = $1
       GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty
       ORDER BY total_outward_qty DESC, s.name ASC
@@ -1607,6 +1614,7 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
         COUNT(DISTINCT st.stock_guid) as skus
        FROM warehouses w
        LEFT JOIN stock_transactions st ON st.warehouse = w.name AND st.company_guid = w.company_guid
+         AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse net qty
        WHERE w.company_guid=$1
        GROUP BY w.guid, w.name, w.parent, w.address
        ORDER BY w.name`,
