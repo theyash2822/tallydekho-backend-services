@@ -1316,6 +1316,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
           s.group_name                                 AS "groupName",
           s.category,
           s.unit,
+          COALESCE(s.sku, s.alias, '')                  AS sku,
           COALESCE(sfv.closing_rate, s.closing_rate, 0) AS rate,
           sfv.closing_qty                              AS "fyClosingQty"
         FROM stock_fy_valuation sfv
@@ -1379,6 +1380,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
           s.group_name                 AS "groupName",
           s.category,
           s.unit,
+          COALESCE(s.sku, s.alias, '') AS sku,
           COALESCE(s.closing_rate, 0)  AS rate,
           s.closing_qty                AS "closingQty",
           COALESCE(
@@ -1447,7 +1449,8 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
         });
       }
 
-      return { stockGuid, itemName, groupName, category, unit, closingQty, negativeQty, closingValue, rate, isNegativeStock: true, priority, warehouses };
+      const sku = r.sku || '';
+      return { stockGuid, itemName, groupName, category, unit, sku, closingQty, negativeQty, closingValue, rate, isNegativeStock: true, priority, warehouses };
     });
 
     const totalNegativeQty = allRows.reduce((s, r) => s + Math.abs(r.closingQty), 0);
@@ -1503,7 +1506,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
        AND st.date::date <= $3::date
        AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from velocity calculation
       WHERE s.company_guid = $1
-      GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty
+      GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty, s.sku, s.alias
       ORDER BY total_outward_qty DESC, s.name ASC
     `, [companyGuid, fyFrom, fyTo]);
 
@@ -1523,6 +1526,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     const mapItem = (r, idx, tab) => ({
       id:                 r.guid,
       name:               r.name,
+      sku:                r.sku || r.alias || '',
       group:              r.group_name || '—',
       unit:               r.unit       || '',
       closing_qty:        parseFloat(r.closing_qty   || 0),
