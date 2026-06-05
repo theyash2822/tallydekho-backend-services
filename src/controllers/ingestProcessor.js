@@ -1316,7 +1316,7 @@ async function processStockOpeningBalance(data, companyGuid) {
     // Aggregate: total opening per stock (sum across all warehouses)
     const totals = {}; // name → { qty, rate, val }
     for (const r of data) {
-      const name = r.Name || r.NAME || '';
+      const name = tallyName(r);  // use tallyName() to handle array values from xml2js
       if (!name) continue;
       const qty = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
       if (isNaN(qty)) continue;
@@ -1341,7 +1341,7 @@ async function processStockOpeningBalance(data, companyGuid) {
     // Uses synthetic voucher_guid='opening_balance' + warehouse to satisfy unique constraint
     // ON CONFLICT DO UPDATE = re-sync safe (idempotent)
     for (const r of data) {
-      const name      = r.Name || r.NAME || '';
+      const name      = tallyName(r);  // handles array Name values
       const warehouse = r.GodownName || r.GODOWNNAME || r.GODOWN || 'Main Location';
       const qty       = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
       const rate      = parseFloat(r.OpeningRate    || r.OPENINGRATE    || 0);
