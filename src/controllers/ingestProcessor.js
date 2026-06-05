@@ -1301,34 +1301,69 @@ async function processBillOutstanding(data, companyGuid) {
 }
 
 async function processStockOpeningBalance(data, companyGuid) {
-  // StockOpeningBalance.xml: Name, OpeningBalance (numeric), OpeningRate, OpeningValue
+  // StockOpeningBalance.xml: per-warehouse opening balance per stock item
+  // Fields: Name (stock), GodownName (warehouse), OpeningBalance (qty), OpeningRate, OpeningValue
+  // Strategy:
+  //   1. Aggregate total opening_qty per stock → UPDATE stocks
+  //   2. Insert per-warehouse rows into stock_transactions (type=inward, voucher_guid='opening_balance')
+  //      so warehouse breakdown works for items with no voucher movements
   const client = await getClient();
   try {
     await client.query('BEGIN');
     let updated = 0;
+    let txInserted = 0;
 
+    // Aggregate: total opening per stock (sum across all warehouses)
+    const totals = {}; // name → { qty, rate, val }
     for (const r of data) {
       const name = r.Name || r.NAME || '';
       if (!name) continue;
+      const qty = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
+      if (isNaN(qty)) continue;
+      if (!totals[name]) totals[name] = { qty: 0, rate: 0, val: 0 };
+      totals[name].qty += qty;
+      totals[name].rate = parseFloat(r.OpeningRate || r.OPENINGRATE || 0);
+      totals[name].val += parseFloat(r.OpeningValue || r.OPENINGVALUE || 0);
+    }
 
-      const openQty  = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
-      const openRate = parseFloat(r.OpeningRate    || r.OPENINGRATE    || 0);
-      const openVal  = parseFloat(r.OpeningValue   || r.OPENINGVALUE   || 0);
-
-      if (isNaN(openQty)) continue;
-
+    // Step 1: Update stocks.opening_qty with totals
+    for (const [name, { qty, rate }] of Object.entries(totals)) {
       try {
         const result = await client.query(
-          `UPDATE stocks SET opening_qty = $1, opening_rate = $2
-           WHERE name = $3 AND company_guid = $4`,
-          [openQty, openRate, name, companyGuid]
+          `UPDATE stocks SET opening_qty = $1, opening_rate = $2 WHERE name = $3 AND company_guid = $4`,
+          [qty, rate, name, companyGuid]
         );
         if (result.rowCount > 0) updated++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+      } catch (e) { console.warn('[DB] StockOpening stocks update failed:', e.message); }
+    }
+
+    // Step 2: Insert per-warehouse stock_transactions for opening balance
+    // Uses synthetic voucher_guid='opening_balance' + warehouse to satisfy unique constraint
+    // ON CONFLICT DO UPDATE = re-sync safe (idempotent)
+    for (const r of data) {
+      const name      = r.Name || r.NAME || '';
+      const warehouse = r.GodownName || r.GODOWNNAME || r.GODOWN || 'Main Location';
+      const qty       = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
+      const rate      = parseFloat(r.OpeningRate    || r.OPENINGRATE    || 0);
+      const value     = parseFloat(r.OpeningValue   || r.OPENINGVALUE   || 0);
+      if (!name || isNaN(qty) || qty === 0) continue;
+
+      // synthetic voucher_guid unique per stock+warehouse for ON CONFLICT
+      const syntheticGuid = `opening_balance_${warehouse}`;
+      try {
+        await client.query(`
+          INSERT INTO stock_transactions
+            (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, financial_year, synced_at)
+          VALUES ($1,$2,$3,'Opening Balance','2000-01-01',$4,$5,$6,'inward',$7,NULL,${now()})
+          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO UPDATE SET
+            qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
+        `, [name, companyGuid, syntheticGuid, Math.abs(qty), rate, Math.abs(value), warehouse]);
+        txInserted++;
+      } catch (e) { console.warn('[DB] StockOpening tx insert failed:', e.message, name, warehouse); }
     }
 
     await client.query('COMMIT');
-    console.log(`[DB] StockOpening: updated ${updated}/${data.length} for ${companyGuid}`);
+    console.log(`[DB] StockOpening: updated ${updated} stocks, ${txInserted} warehouse tx rows for ${companyGuid}`);
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockOpening failed:', e.message);
