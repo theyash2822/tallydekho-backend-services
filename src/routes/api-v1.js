@@ -1487,6 +1487,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     const { rows } = await query(`
       SELECT
         s.guid, s.name, s.group_name, s.unit, s.category,
+        COALESCE(s.sku, s.alias, '') AS sku,
         COALESCE(s.closing_rate, 0)  AS rate,
         COALESCE(s.closing_qty, 0)   AS closing_qty,
         COALESCE(s.closing_qty, 0) * COALESCE(s.closing_rate, 0) AS closing_value,
