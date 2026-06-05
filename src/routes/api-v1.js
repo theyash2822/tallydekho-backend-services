@@ -4295,22 +4295,30 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/stocks/items/:id/godowns — warehouses where this item has stock
+// GET /api/stocks/items/:id/godowns — warehouses where this item has stock, with net qty
 router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: sRows } = await query('SELECT name FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
+    const { rows: sRows } = await query('SELECT name, closing_qty FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
-    const stockName = sRows[0].name;
-    // Get distinct warehouses from stock_transactions + fall back to stocks.warehouse_name
+    const stockName  = sRows[0].name;
+    const totalQty   = parseFloat(sRows[0].closing_qty || 0);
+    // Net qty per warehouse from stock_transactions
     const { rows } = await query(`
-      SELECT DISTINCT st.warehouse as name
+      SELECT
+        st.warehouse                                                            AS name,
+        SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) AS qty
       FROM stock_transactions st
       WHERE st.stock_guid = $1 AND st.company_guid = $2
         AND st.warehouse IS NOT NULL AND st.warehouse != ''
+        AND st.voucher_type != 'Physical Stock'
+      GROUP BY st.warehouse
+      HAVING SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) != 0
+      ORDER BY qty DESC
     `, [stockName, companyGuid]);
-    res.json({ success: true, data: rows.map(r => r.name).filter(Boolean) });
+    const warehouses = rows.map(r => ({ name: r.name, qty: parseFloat(r.qty) })).filter(r => r.name);
+    res.json({ success: true, data: { warehouses, totalQty } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
