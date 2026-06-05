@@ -2089,7 +2089,7 @@ async function processBatchAllocations(data, companyGuid) {
           r.STOCKITEMGUID || r.StockItemGuid || null,
           batchName,
           r.EXPIRYDATE || r.ExpiryDate || null,
-          r.MFGDATE    || r.MfgDate    || null,
+          r.MANUFACTURINGDATE || r.ManufacturingDate || r.MFGDATE || r.MfgDate || null,
           qty, rate,
           r.GODOWNNAME || r.GodownName || null,
           fy,
