@@ -1198,6 +1198,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_guid = s.company_guid
           AND st.date <= $3
           AND st.voucher_type != 'Physical Stock'
+          AND COALESCE(st.voucher_type, '') != 'Opening Balance'
         WHERE s.company_guid = $1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
         GROUP BY s.guid, s.company_guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,

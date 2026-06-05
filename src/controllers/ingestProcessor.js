@@ -1372,7 +1372,11 @@ async function processStockOpeningBalance(data, companyGuid) {
     client.release();
   }
 
-  // Recompute closing_qty = opening_qty + net transactions
+  // Recompute closing_qty = opening_qty + net real movements
+  // IMPORTANT: exclude 'Opening Balance' rows — those are synthetic rows created by
+  // processStockOpeningBalance for warehouse breakdown. Including them would double-count
+  // since opening_qty is already set from the same source.
+  const OB_EXCL = `qty IS NOT NULL AND qty::text != 'NaN' AND COALESCE(voucher_type,'') != 'Opening Balance' AND COALESCE(voucher_type,'') != 'Physical Stock'`;
   try {
     await dbQuery(`
       UPDATE stocks s
@@ -1382,20 +1386,20 @@ async function processStockOpeningBalance(data, companyGuid) {
         SELECT stock_guid, company_guid,
                SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
         FROM stock_transactions
-        WHERE company_guid = $1 AND qty IS NOT NULL AND qty::text != 'NaN'
+        WHERE company_guid = $1 AND ${OB_EXCL}
         GROUP BY stock_guid, company_guid
       ) sub
       WHERE s.name = sub.stock_guid AND s.company_guid = sub.company_guid AND s.company_guid = $1
     `, [companyGuid]);
 
-    // Stocks with opening but no transactions: closing = opening
+    // Stocks with opening but no real transactions: closing = opening
     await dbQuery(
       `UPDATE stocks SET closing_qty = opening_qty
        WHERE company_guid = $1 AND closing_qty = 0 AND opening_qty > 0`,
       [companyGuid]
     );
 
-    // Stocks with transactions but no opening: closing = net transactions only
+    // Stocks with real transactions but no opening: closing = net movements only
     await dbQuery(
       `UPDATE stocks s
        SET closing_qty = sub.net_qty
@@ -1403,7 +1407,7 @@ async function processStockOpeningBalance(data, companyGuid) {
          SELECT stock_guid, company_guid,
                 SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
          FROM stock_transactions
-         WHERE company_guid = $1 AND qty IS NOT NULL AND qty::text != 'NaN'
+         WHERE company_guid = $1 AND ${OB_EXCL}
          GROUP BY stock_guid, company_guid
        ) sub
        WHERE s.name = sub.stock_guid
