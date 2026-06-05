@@ -1649,7 +1649,7 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
         COALESCE(SUM(CASE WHEN type='inward' THEN qty ELSE -qty END), 0) as total_qty,
         COUNT(DISTINCT stock_guid) as skus
        FROM stock_transactions WHERE company_guid=$1 AND warehouse=$2
-         AND voucher_type != 'Physical Stock'`,  -- exclude audit counts from summary
+         AND voucher_type != 'Physical Stock'`,
       [companyGuid, whName]
     );
 
@@ -1660,7 +1660,7 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
        LEFT JOIN stocks s ON s.name = st.stock_guid AND s.company_guid = st.company_guid
        LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
        WHERE st.company_guid=$1 AND st.warehouse=$2
-         AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from activity feed
+         AND st.voucher_type != 'Physical Stock'
        ORDER BY v.date DESC, st.id DESC LIMIT 500`,
       [companyGuid, whName]
     );
