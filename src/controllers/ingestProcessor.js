@@ -155,9 +155,11 @@ function _collectObjects(obj, keys, results, depth) {
 
 // Extract name from Tally record — handles both plain NAME and LANGUAGENAME.LIST multi-lang wrapper
 function tallyName(r) {
-  if (r.NAME) return r.NAME;
-  if (r.Name) return r.Name;
-  if (r.name) return r.name;
+  // Guard: xml2js returns arrays when duplicate <Name> tags exist (e.g. item has alias in same field)
+  const pickFirst = (v) => Array.isArray(v) ? (v[0] || '') : v;
+  if (r.NAME) return pickFirst(r.NAME);
+  if (r.Name) return pickFirst(r.Name);
+  if (r.name) return pickFirst(r.name);
   if (r.LEDGERNAME) return r.LEDGERNAME;
   const ll = r['LANGUAGENAME.LIST'];
   if (ll) {
