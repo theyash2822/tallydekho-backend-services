@@ -390,10 +390,11 @@ async function processStocks(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stocks (guid, company_guid, name, alias, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
-            name=EXCLUDED.name, alias=EXCLUDED.alias, category=EXCLUDED.category,
+            name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
+            category=EXCLUDED.category,
             group_name=EXCLUDED.group_name, unit=EXCLUDED.unit, hsn=EXCLUDED.hsn,
             tax_rate=EXCLUDED.tax_rate, closing_qty=EXCLUDED.closing_qty,
             closing_rate=EXCLUDED.closing_rate, closing_value=EXCLUDED.closing_value,
@@ -401,14 +402,14 @@ async function processStocks(data, companyGuid) {
             alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, name,
-          r.OnlyAlias || r.ALIAS || null,
+          r.OnlyAlias || r.ALIAS || null,                                        // alias
+          r.PartNumber || r.PARTNUMBER || r.OnlyAlias || r.ALIAS || null,        // sku (PartNumber from XML, fallback to alias)
+          r.Description || r.DESCRIPTION || null,                               // description
           r.Category || r.CATEGORY || r.STOCKCATEGORY || null,
           r.Parent || r.PARENT || r.GROUP || null,
           r.BaseUnits || r.BASEUNITS || r.UNIT || r.unit || 'Pcs',
           r.Hsncode || r.HSNDETAILS?.[0]?.HSNCODE || r.HSN || null,
           parseFloat(r.IGSTRate || r.GSTRATE || r.TAXRATE || 18),
-          // closing_qty/rate/value will be recomputed from StockTransaction stream after processing
-          // Store 0 here; transactions will update it correctly
           0, // closing_qty — will be set by stock transaction recompute
           0, // closing_rate
           0, // closing_value
