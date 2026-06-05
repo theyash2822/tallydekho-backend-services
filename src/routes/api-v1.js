@@ -4268,6 +4268,7 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
       JOIN vouchers v ON v.guid = vi.voucher_guid
       WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
         AND v.is_cancelled = FALSE
+        AND v.voucher_type != 'Physical Stock'  -- exclude stock audit counts; not real movements
       GROUP BY v.id, v.voucher_number, v.voucher_type, v.date
       ORDER BY v.date DESC, v.id DESC
       LIMIT $3
