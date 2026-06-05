@@ -1014,6 +1014,10 @@ async function processVoucherInventoryItems(data, companyGuid) {
       const rawAmt    = parseFloat(r.AMOUNT ?? r.Amount ?? 0);
       const amount    = isNaN(rawAmt) ? 0 : rawAmt;
 
+      // Normalize godown/batch: use '' instead of null so UNIQUE constraint works correctly
+      // PostgreSQL treats NULL != NULL in UNIQUE, causing duplicate inserts on every sync
+      const godownName = r.GODOWNNAME || r.GodownName || '';
+      const batchName  = r.BATCHNAME  || r.BatchName  || '';
       try {
         await client.query(`
           INSERT INTO voucher_inventory_items
@@ -1028,8 +1032,8 @@ async function processVoucherInventoryItems(data, companyGuid) {
           r.STOCKITEMGUID || r.StockItemGuid || null,
           Math.abs(qty), Math.abs(billedQty), rate, Math.abs(amount),
           parseFloat(r.DISCOUNT ?? r.Discount ?? 0),
-          r.GODOWNNAME || r.GodownName || null,
-          r.BATCHNAME  || r.BatchName  || null,
+          godownName,
+          batchName,
           r.UNIT       || r.Unit       || null,
           r.HSN        || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0),

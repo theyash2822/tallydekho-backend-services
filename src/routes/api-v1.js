@@ -4257,13 +4257,18 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
     const stockName = sRows[0].name;
 
     // Movement history from voucher_inventory_items
+    // GROUP BY voucher to collapse godown-split rows (same item delivered to multiple warehouses)
+    // This prevents duplicate entries when a single voucher splits qty across godowns
     const { rows } = await query(`
-      SELECT v.voucher_number as ref, v.voucher_type as type, v.date,
-             vi.actual_qty as qty, vi.rate, vi.amount
+      SELECT v.voucher_number, v.voucher_type as type, v.date,
+             SUM(vi.actual_qty) as qty,
+             CASE WHEN SUM(vi.actual_qty) > 0 THEN SUM(vi.amount) / NULLIF(SUM(vi.actual_qty), 0) ELSE AVG(vi.rate) END as rate,
+             SUM(vi.amount) as amount
       FROM voucher_inventory_items vi
       JOIN vouchers v ON v.guid = vi.voucher_guid
       WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
         AND v.is_cancelled = FALSE
+      GROUP BY v.id, v.voucher_number, v.voucher_type, v.date
       ORDER BY v.date DESC, v.id DESC
       LIMIT $3
     `, [stockName, companyGuid, parseInt(limit)]);
