@@ -1475,6 +1475,90 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/expiry-schedule — Batch-wise expiry data from batch_allocations
+// Tab classification: expired / 0-30 / 31-60 / >60 (no expiry date → '>60')
+router.get('/stocks/expiry-schedule', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { fy } = req.query;
+  try {
+    const { financialYear } = await resolveFYDates(companyGuid, null, null, fy);
+    const fyParam = fy ? financialYear : null;
+
+    const { rows } = await query(`
+      SELECT
+        ba.stock_item_name                              AS item_name,
+        COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), '') AS item_code,
+        COALESCE(s.group_name, '')                      AS group_name,
+        ba.batch_name,
+        COALESCE(NULLIF(ba.godown_name,''), 'Main Location') AS warehouse,
+        COALESCE(NULLIF(ba.expiry_date,''), NULL)        AS expiry_date,
+        COALESCE(NULLIF(ba.mfg_date,''), NULL)           AS mfg_date,
+        SUM(ba.qty)                                     AS qty,
+        MAX(ba.rate)                                    AS rate,
+        SUM(ba.qty * ba.rate)                           AS value
+      FROM batch_allocations ba
+      LEFT JOIN stocks s ON s.name = ba.stock_item_name AND s.company_guid = ba.company_guid
+      WHERE ba.company_guid = $1
+        AND ($2::text IS NULL OR ba.financial_year = $2)
+      GROUP BY
+        ba.stock_item_name, COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), ''),
+        COALESCE(s.group_name,''), ba.batch_name,
+        COALESCE(NULLIF(ba.godown_name,''), 'Main Location'),
+        ba.expiry_date, ba.mfg_date
+      HAVING SUM(ba.qty) != 0
+      ORDER BY ba.expiry_date ASC NULLS LAST, ba.stock_item_name ASC
+    `, [companyGuid, fyParam]);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const items = rows.map((r, idx) => {
+      const qty   = parseFloat(r.qty || 0);
+      const rate  = parseFloat(r.rate || 0);
+      const value = parseFloat(r.value || 0);
+
+      let daysLeft = null;
+      let tab = '>60';
+
+      if (r.expiry_date) {
+        const expDate = new Date(r.expiry_date);
+        expDate.setHours(0, 0, 0, 0);
+        daysLeft = Math.floor((expDate - today) / (1000 * 60 * 60 * 24));
+        if (daysLeft < 0)        tab = 'expired';
+        else if (daysLeft <= 30) tab = '0-30';
+        else if (daysLeft <= 60) tab = '31-60';
+        else                     tab = '>60';
+      }
+
+      return {
+        id:          `ex${idx + 1}`,
+        item:        r.item_name,
+        code:        r.item_code || '',
+        batch:       r.batch_name || 'Primary Batch',
+        expiryDate:  r.expiry_date || '—',
+        mfgDate:     r.mfg_date   || '—',
+        qty:         Math.abs(qty),
+        value:       `₹${Math.abs(value).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`,
+        daysLeft,
+        warehouse:   r.warehouse,
+        groupName:   r.group_name,
+        tab,
+      };
+    });
+
+    // Unique warehouses + groups for filter dropdowns
+    const warehouses = [...new Set(items.map(i => i.warehouse))].filter(Boolean).sort();
+    const groups     = [...new Set(items.map(i => i.groupName))].filter(Boolean).sort();
+
+    res.json({ success: true, data: { items, warehouses, groups, financial_year: financialYear } });
+  } catch (e) {
+    console.error('[expiry-schedule]', e.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
 // GET /api/stocks/fast-slow — Fast vs Slow moving items based on FY outward movement
 router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
