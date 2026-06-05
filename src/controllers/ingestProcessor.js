@@ -390,8 +390,8 @@ async function processStocks(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, batch_enabled, expiry_enabled, synced_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
             category=EXCLUDED.category,
@@ -399,7 +399,9 @@ async function processStocks(data, companyGuid) {
             tax_rate=EXCLUDED.tax_rate, closing_qty=EXCLUDED.closing_qty,
             closing_rate=EXCLUDED.closing_rate, closing_value=EXCLUDED.closing_value,
             reorder_level=EXCLUDED.reorder_level, minimum_order_qty=EXCLUDED.minimum_order_qty,
-            alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+            alter_id=EXCLUDED.alter_id,
+            batch_enabled=EXCLUDED.batch_enabled, expiry_enabled=EXCLUDED.expiry_enabled,
+            synced_at=EXCLUDED.synced_at
         `, [
           guid, companyGuid, name,
           r.OnlyAlias || r.ALIAS || null,                                        // alias
@@ -416,6 +418,9 @@ async function processStocks(data, companyGuid) {
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
           parseInt(r.ALTERID || r.AlterId || 0),
+          // Gap 4: batch & expiry flags from StockItem.xml (IsBatchWise / IsExpDtMaint)
+          (r.MAINTAININBATCHES === 'Yes' || r.MaintainInBatches === 'Yes'),
+          (r.USEEXPIRYDATES    === 'Yes' || r.UseExpirydates    === 'Yes'),
           now(),
         ]);
         saved++;
@@ -439,7 +444,8 @@ async function processVouchers(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
-    const voucherRowsForTax = []; // Collect for post-commit tax extraction
+    const voucherRowsForTax    = []; // Collect for post-commit tax extraction
+    const allBatchFlatRecords  = []; // Gap 1: collect nested batch allocs from AllVoucher.xml → Batchallocations
 
     for (const r of data) {
       const guid = r.GUID || r.Guid || r.guid || '';
@@ -542,6 +548,28 @@ async function processVouchers(data, companyGuid) {
                 entry.HSNCODE || entry.HsnCode || null,
               ]);
             } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+
+            // Gap 1: Extract nested Batchallocations from AllVoucher.xml inventory entries
+            const batchAllocs = entry.BATCHALLOCATIONS || entry.Batchallocations || entry.BatchAllocations || [];
+            if (Array.isArray(batchAllocs) && batchAllocs.length > 0) {
+              const itemName = entry.STOCKITEMNAME || entry.Stockitemname || entry.StockItemName || '';
+              for (const ba of batchAllocs) {
+                allBatchFlatRecords.push({
+                  VoucherGuid:       guid,
+                  StockItemName:     itemName,
+                  BatchName:         ba.BATCHNAME  || ba.Batchname  || ba.BatchName  || '',
+                  GodownName:        ba.GODOWNNAME || ba.Godownname || ba.GodownName || '',
+                  // Gap 2: prefer ActualQty (physical), fallback to BilledQty
+                  ActualQty:         ba.ACTUALQTY  || ba.ActualQty  || ba.BILLEDQTY  || ba.BilledQty  || 0,
+                  Rate:              ba.RATE        || ba.Rate        || 0,
+                  // Gap 3: ExpiryDate (formatted YYYY-MM-DD from XML), ExpiryPeriod (text fallback)
+                  ExpiryDate:        ba.EXPIRYDATE  || ba.ExpiryDate  || '',
+                  ExpiryPeriod:      ba.EXPIRYPERIOD || ba.ExpiryPeriod || '',
+                  ManufacturingDate: ba.MANUFACTURINGDATE || ba.ManufacturingDate || ba.MFGDATE || ba.MfgDate || '',
+                  _FINANCIAL_YEAR:   r._FINANCIAL_YEAR || null,
+                });
+              }
+            }
           }
         }
       } catch (e) {
@@ -551,6 +579,12 @@ async function processVouchers(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Vouchers: saved ${saved}/${data.length} for ${companyGuid}`);
+
+    // Gap 1: Persist batch allocations extracted from nested AllVoucher.xml → Batchallocations
+    // Runs post-commit with its own transaction; never blocks or rolls back voucher ingestion
+    if (allBatchFlatRecords.length > 0) {
+      await processBatchAllocations(allBatchFlatRecords, companyGuid);
+    }
 
     // Tax extraction — runs after COMMIT so ledger entries are visible
     // Never blocks or throws; failures are logged only
@@ -995,6 +1029,26 @@ function parseTallyRate(val) {
   if (!val) return 0;
   const s = String(val).split('/')[0].replace(/,/g, '');
   return parseFloat(s) || 0;
+}
+
+// Gap 3: Parse ExpiryPeriod text (e.g. "31-Dec-2026") to ISO date string "2026-12-31"
+// Returns null if unparseable; used as fallback when ExpiryDate field is empty
+function parseExpiryPeriod(period) {
+  if (!period || typeof period !== 'string') return null;
+  const p = period.trim();
+  if (!p) return null;
+  const months = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+  // Handle "31-Dec-2026" or "31 Dec 2026"
+  const m = p.match(/^(\d{1,2})[- ]([A-Za-z]{3})[- ](\d{4})$/);
+  if (m) {
+    const monthIdx = months[m[2].toLowerCase()];
+    if (monthIdx === undefined) return null;
+    const d = new Date(parseInt(m[3]), monthIdx, parseInt(m[1]));
+    return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0];
+  }
+  // Fallback: native Date parsing (handles YYYYMMDD, ISO, etc.)
+  const d = new Date(p);
+  return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0];
 }
 
 async function processVoucherInventoryItems(data, companyGuid) {
@@ -1761,8 +1815,11 @@ async function processRecords(data, companyGuid, userId, deviceId) {
       await processStockFyBalance(records, companyGuid);
       await applyCurrentFyClosingQty(companyGuid);
     } else if (xml === 'VoucherInventoryDetail.xml') {
+      // VoucherInventoryDetail.xml: flat inventory items (qty/rate/batch name at entry level)
+      // Batch allocations are now primarily sourced from AllVoucher.xml → nested Batchallocations
+      // Keep VID path as a secondary source for batch records that have BatchName at flat level
       await processVoucherInventoryItems(records, companyGuid);
-      const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME);
+      const withBatch = records.filter(r => r.BATCHNAME || r.BatchName || r.Batchname || r.BATCHALLOCNAME);
       if (withBatch.length > 0) await processBatchAllocations(withBatch, companyGuid);
     } else if (xml === 'GSTDetails.xml') {
       await processGSTDetails(records, companyGuid);
@@ -2070,11 +2127,19 @@ async function processBatchAllocations(data, companyGuid) {
     for (const r of data) {
       const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
       const itemName    = r.STOCKITEMNAME || r.StockItemName || r.ItemName || '';
-      const batchName   = r.BATCHNAME || r.BatchName || r.BATCHALLOCNAME || '';
+      // Gap 1 fix: add Batchname (AllVoucher.xml lowercase field name) to lookup chain
+      const batchName   = r.BATCHNAME || r.BatchName || r.Batchname || r.BATCHALLOCNAME || '';
       if (!voucherGuid || !batchName) continue;
-      const qty         = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.QTY || 0);
+      // Gap 2 fix: prefer ActualQty, fallback to BilledQty
+      const qty         = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.BILLEDQTY || r.BilledQty || r.QTY || 0);
       const rate        = parseTallyRate(r.RATE || r.Rate || 0);
       const fy          = r._FINANCIAL_YEAR || null;
+      // Gap 1 fix: add Godownname (AllVoucher.xml lowercase field name) to lookup chain
+      const godownName  = r.GODOWNNAME || r.GodownName || r.Godownname || null;
+      // Gap 3: resolve expiry — formatted date first, ExpiryPeriod text as fallback
+      const rawExpiry   = r.EXPIRYDATE || r.ExpiryDate || '';
+      const rawPeriod   = r.EXPIRYPERIOD || r.ExpiryPeriod || '';
+      const expiryDate  = rawExpiry || parseExpiryPeriod(rawPeriod) || null;
       try {
         await client.query(`
           INSERT INTO batch_allocations
@@ -2088,10 +2153,10 @@ async function processBatchAllocations(data, companyGuid) {
           voucherGuid, companyGuid, itemName,
           r.STOCKITEMGUID || r.StockItemGuid || null,
           batchName,
-          r.EXPIRYDATE || r.ExpiryDate || null,
+          expiryDate,
           r.MANUFACTURINGDATE || r.ManufacturingDate || r.MFGDATE || r.MfgDate || null,
           qty, rate,
-          r.GODOWNNAME || r.GodownName || null,
+          godownName,
           fy,
         ]);
         saved++;

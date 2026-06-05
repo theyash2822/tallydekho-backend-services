@@ -1675,8 +1675,14 @@ router.post('/reports/stock-summary', authMiddleware, async (req, res) => {
   try {
     const [totals, byGroup] = await Promise.all([
       query(`SELECT COUNT(*) as total_items, SUM(closing_qty) as total_qty, SUM(closing_qty * closing_rate) as total_value,
-                    SUM(CASE WHEN closing_qty <= reorder_level AND reorder_level > 0 THEN 1 ELSE 0 END) as low_stock_count
-             FROM stocks WHERE company_guid = $1 AND closing_qty != 0`, [companyGuid]),
+                    COUNT(CASE WHEN (
+                      (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
+                      OR
+                      (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
+                    ) AND s.closing_qty > 0 THEN 1 END) as low_stock_count
+             FROM stocks s
+             LEFT JOIN groups g ON g.company_guid = s.company_guid AND g.name = s.group_name
+             WHERE s.company_guid = $1 AND s.closing_qty != 0`, [companyGuid]),
       query(`SELECT group_name, COUNT(*) as item_count, SUM(closing_qty * closing_rate) as value
              FROM stocks WHERE company_guid = $1 AND closing_qty != 0
              GROUP BY group_name ORDER BY value DESC LIMIT 10`, [companyGuid]),

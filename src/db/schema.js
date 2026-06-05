@@ -655,8 +655,11 @@ export async function initSchema() {
       ALTER TABLE stocks ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
 
       -- Inventory master fields (sku = OnlyAlias/barcode, description = item notes)
-      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS sku         TEXT;
-      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS description TEXT;
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS sku              TEXT;
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS description       TEXT;
+      -- Gap 4: Batch & expiry tracking flags from StockItem.xml (IsBatchWise / IsExpDtMaint)
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS batch_enabled     BOOLEAN DEFAULT FALSE;
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS expiry_enabled    BOOLEAN DEFAULT FALSE;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS reorder_level     DECIMAL(15,4) DEFAULT 0;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
 

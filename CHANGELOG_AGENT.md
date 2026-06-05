@@ -1,4 +1,27 @@
-# CHANGELOG_AGENT.md — td-backend
+# CHANGELOG_AGENT.md
+
+## 2026-06-05 — Movement History Dedup Fix
+
+### Bug Fixed
+- **Root cause**: `voucher_inventory_items` was accumulating duplicate rows on every sync because `godown_name IS NULL` bypasses PostgreSQL's UNIQUE constraint (`NULL ≠ NULL`). Each sync inserted a fresh identical row instead of updating.
+- **Dahaad 250 ML**: had 77 identical rows for a single voucher → movement history showed 77x the same entry
+- **Godown-split items**: same item to multiple warehouses = multiple rows per voucher → duplicates in history
+
+### Changes
+- `src/controllers/ingestProcessor.js`: Store `''` instead of `NULL` for `godown_name`/`batch_name` in INSERT — UNIQUE constraint now works correctly
+- `src/routes/api-v1.js` `/stocks/items/:id/movements`: Added `GROUP BY v.id` + `SUM(actual_qty)` to collapse godown-split rows; fixed `voucher_number` alias (was `ref`, mobile reads `voucher_number`)
+- **DB**: Deleted 76 duplicate rows; normalized remaining NULLs to `''`
+
+### QA: 🟡 YELLOW (pushed — fixes correct, pre-existing mock data in movement-analytics.tsx flagged for cleanup)
+
+
+## 2026-06-05 — Low Stock Tile + Reorder Queue Consistency Fix
+- **Bug:** Dashboard `/stock-dashboard` low stock tile count was lower than items shown on reorder queue screen
+- **Root cause:** Tile query only checked `stocks.reorder_level > 0` — ignored group-level reorder fallback
+- **Fix:** Both `/stock-dashboard` (low tile count) and `/stocks?lowStockOnly=true` now use LEFT JOIN on `groups` with same COALESCE logic as the reorder queue API
+- **File changed:** `src/routes/data.js` (2 queries)
+- **No migration needed** — all columns already existed
+- **Commit:** `886cc42` — td-backend
 
 Format: Date | Task | Files Changed | Behavior Changed | Tested | Risks
 
@@ -206,3 +229,29 @@ _Add new entries at top._
   - Returns: entries[], warehouses[], summary (total, totalInQty, totalOutQty, totalValue), pagination
   - Sources: voucher_inventory_items JOIN vouchers
   - Company-scoped, auth-protected (verifyCompanyOwnership)
+
+## 2026-06-04 — Stock Ledger endpoint fixes
+
+### Bug Fixes
+- by_document GROUP BY error: ORDER BY v.id → MIN(v.id) (v.id not in GROUP BY)
+- by_item 0 movements: transactions sub-query was reusing stCond parameter indices which referenced item names instead of dates → removed stCond.slice(1) from sub-query
+
+## 2026-06-04
+
+### fix(stocks): exclude Physical Stock vouchers from FY qty calculations
+- **Root cause:** Physical Stock vouchers (Tally stock audit/count entries) were treated as inward movements, causing cumulative qty inflation in all FY-derived calculations
+- **Files changed:** `src/routes/api-v1.js`
+- **Routes affected:**
+  - `GET /api/stocks/items` (FY path) — JOIN excludes `voucher_type = 'Physical Stock'`
+  - `GET /api/stocks/fast-slow` — velocity JOIN excludes Physical Stock
+  - `GET /api/stocks/negative-stock` — FY + non-FY warehouse breakdown excludes Physical Stock
+  - `GET /api/stocks/warehouses` — net_qty JOIN excludes Physical Stock
+- **Data preserved:** Physical Stock rows kept in `stock_transactions` for future audit features
+- **TODO:** Future — model Physical Stock as absolute stock count event (last count wins, movements apply on top)
+
+### fix(stocks): add s.company_guid to GROUP BY in FY stocks/items query
+- SQL error: `subquery uses ungrouped column s.company_guid`
+
+### fix(stocks): FY query JOIN on st.stock_guid = s.name (not s.guid)
+- `stock_transactions.stock_guid` stores stock NAME, not UUID
+
