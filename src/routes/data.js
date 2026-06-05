@@ -132,7 +132,18 @@ router.post('/stock-dashboard', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { rows: total } = await query('SELECT COUNT(*) as c, SUM(closing_value) as v FROM stocks WHERE company_guid = $1', [companyGuid]);
-    const { rows: low } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid = $1 AND closing_qty > 0 AND closing_qty <= reorder_level AND reorder_level > 0', [companyGuid]);
+    const { rows: low } = await query(`
+      SELECT COUNT(*) as c
+      FROM stocks s
+      LEFT JOIN groups g ON g.company_guid = s.company_guid AND g.name = s.group_name
+      WHERE s.company_guid = $1
+        AND s.closing_qty > 0
+        AND (
+          (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
+          OR
+          (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
+        )
+    `, [companyGuid]);
     const { rows: out } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid = $1 AND closing_qty = 0', [companyGuid]);
 
     res.json({ status: true, data: {
@@ -170,7 +181,15 @@ router.post('/stocks', authMiddleware, requirePaired, requireCompanySynced, asyn
     let idx = 3;
 
     if (category) { q += ` AND category = $${idx++}`; params.push(category); }
-    if (lowStockOnly) { q += ` AND closing_qty <= reorder_level AND reorder_level > 0`; }
+    if (lowStockOnly) { q += ` AND EXISTS (
+      SELECT 1 FROM groups g
+      WHERE g.company_guid = stocks.company_guid AND g.name = stocks.group_name
+        AND (
+          (stocks.reorder_level > 0 AND stocks.closing_qty <= stocks.reorder_level)
+          OR
+          (stocks.reorder_level = 0 AND g.reorder_level > 0 AND stocks.closing_qty <= g.reorder_level)
+        )
+    )`; }
     q += ` ORDER BY name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(pageSize, offset);
 
