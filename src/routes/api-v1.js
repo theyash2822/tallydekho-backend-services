@@ -1759,13 +1759,11 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
         AND COALESCE(s.closing_qty,0)  > 0
         AND COALESCE(s.closing_rate,0) > 0
       GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
-      HAVING SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
-        THEN st.qty ELSE 0 END) > 0
       ORDER BY
         COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
           THEN st.qty ELSE 0 END), 0)
-        / NULLIF(COALESCE(s.closing_qty,0), 0) DESC
-      LIMIT 100
+        / NULLIF(COALESCE(s.closing_qty,0), 0) DESC NULLS LAST,
+        s.name ASC
     `, [companyGuid, fyFrom, fyTo]);
 
     const items = rows.map(r => {
