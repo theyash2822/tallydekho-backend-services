@@ -255,3 +255,33 @@ _Add new entries at top._
 ### fix(stocks): FY query JOIN on st.stock_guid = s.name (not s.guid)
 - `stock_transactions.stock_guid` stores stock NAME, not UUID
 
+
+## 2026-06-05 — Expiry Batch Pipeline Fix (All 4 Gaps)
+
+### Files Changed
+- `src/controllers/ingestProcessor.js`
+- `src/db/schema.js`
+
+### Changes
+**Gap 1 (critical):** `processVouchers()` now collects nested `Batchallocations` from `AllVoucher.xml` inventory entries and calls `processBatchAllocations()` post-commit. Was silently dropping data before.
+
+**Gap 2:** `processStocks()` updated to include `batch_enabled`/`expiry_enabled` in INSERT. `stocks` table gets two new columns via `ALTER TABLE IF NOT EXISTS`.
+
+**Gap 3:** `parseExpiryPeriod()` helper added. `processBatchAllocations()` resolves ExpiryDate first → ExpiryPeriod text fallback.
+
+**Field casing fixes:** Added `Batchname`/`Godownname` (AllVoucher.xml uses lowercase 'n') to lookup chains. Added `BilledQty` as fallback qty. Removed all TEMP DEBUG logs.
+
+### DB Result After Sync
+- 9,486 rows in `batch_allocations` ✅ (pipeline working)
+- expiry_date = 0 populated — expected: this company has no batch-tracked items in Tally
+- `batch_enabled = false` for all stocks — confirmed via StockItem.xml flags
+
+### Commit
+`e146f39` — pushed to `tallydekho-backend-services`
+
+## 2026-06-06
+
+### fix(stocks): movement-analytics — include sold-out items + last 30 entry dates
+- **Bug 1:** `closing_qty > 0` filter excluded sold-out items from list. Fixed with OR EXISTS subquery that includes items with FY outward movement regardless of current closing_qty. Backend now returns `sold_out: true` flag.
+- **Bug 2:** Chart was `CURRENT_DATE - 30` window + `type='outward'` only. Replaced with last 30 unique transaction DATES (inward + outward, no date window). Returns `outward_value`, `outward_qty`, `inward_value`, `inward_qty` per date.
+- Commit: `cde944b` — tallydekho-backend-services

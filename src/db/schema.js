@@ -720,6 +720,39 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_sa_company ON stock_adjustments(company_guid);
       CREATE INDEX IF NOT EXISTS idx_sa_stock   ON stock_adjustments(stock_guid);
       CREATE INDEX IF NOT EXISTS idx_sa_status  ON stock_adjustments(status);
+
+      -- Company Inventory Settings (TallyDekho-only config per company)
+      CREATE TABLE IF NOT EXISTS company_inventory_settings (
+        id                              SERIAL PRIMARY KEY,
+        company_guid                    TEXT NOT NULL UNIQUE,
+        -- General
+        product_display_field           TEXT DEFAULT 'auto',
+        default_unit_for_new_items      TEXT,
+        purchase_buffer_days            INTEGER DEFAULT 7,
+        reorder_calc_mode               TEXT DEFAULT 'hybrid',
+        low_stock_threshold_mode        TEXT DEFAULT 'reorder_level',
+        archive_old_stock_months        INTEGER DEFAULT 24,
+        -- Warehouses (per-warehouse maps keyed by warehouse guid)
+        warehouse_code_map              JSONB DEFAULT '{}',
+        cycle_count_frequency_map       JSONB DEFAULT '{}',
+        archive_stock_layers_map        JSONB DEFAULT '{}',
+        -- Items
+        default_low_stock_level         INTEGER DEFAULT 20,
+        inventory_aging_rules           JSONB DEFAULT '{"buckets":["0-30","31-60","61-90","90+"]}',
+        fast_moving_top_pct             INTEGER DEFAULT 20,
+        slow_moving_no_movement_days    INTEGER DEFAULT 90,
+        dead_stock_no_movement_days     INTEGER DEFAULT 180,
+        movement_analysis_period_days   INTEGER DEFAULT 90,
+        -- Alerts
+        low_stock_alerts                JSONB DEFAULT '{"inApp":true,"email":false,"whatsapp":false}',
+        negative_stock_alerts           JSONB DEFAULT '{"inApp":true,"email":true,"whatsapp":false}',
+        expiry_alerts                   JSONB DEFAULT '{"inApp":true,"email":false,"whatsapp":false,"daysBefore":30}',
+        fast_slow_moving_alerts         JSONB DEFAULT '{"inApp":false,"email":false,"whatsapp":false}',
+        -- Timestamps
+        created_at                      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at                      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_inv_settings_company ON company_inventory_settings(company_guid);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

@@ -2082,6 +2082,163 @@ router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Inventory Settings ─────────────────────────────────────────────────────
+
+// GET /api/inventory/settings — load inventory settings + Tally-derived defaults
+router.get('/inventory/settings', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    // Load saved settings (may be null for new company)
+    const { rows: [saved] } = await query(
+      `SELECT * FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
+      [companyGuid]
+    );
+
+    // Tally-derived: all distinct UoMs
+    const { rows: uomRows } = await query(
+      `SELECT DISTINCT TRIM(unit) AS name FROM stocks
+       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       ORDER BY TRIM(unit) ASC`,
+      [companyGuid]
+    );
+
+    // Tally-derived: most common unit (for default)
+    const { rows: commonUnitRows } = await query(
+      `SELECT TRIM(unit) AS name, COUNT(*) AS cnt FROM stocks
+       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       GROUP BY TRIM(unit) ORDER BY cnt DESC LIMIT 1`,
+      [companyGuid]
+    );
+
+    // Tally-derived: warehouses (godowns)
+    const { rows: warehouseRows } = await query(
+      `SELECT guid, name, parent, address FROM warehouses
+       WHERE company_guid=$1 ORDER BY name`,
+      [companyGuid]
+    );
+
+    const uoms = uomRows.map(r => r.name).filter(Boolean);
+    const tallyDefaultUnit = commonUnitRows[0]?.name || uoms[0] || 'Nos';
+
+    const defaults = {
+      product_display_field:          'auto',
+      default_unit_for_new_items:     tallyDefaultUnit,
+      purchase_buffer_days:           7,
+      reorder_calc_mode:              'hybrid',
+      low_stock_threshold_mode:       'reorder_level',
+      archive_old_stock_months:       24,
+      warehouse_code_map:             {},
+      cycle_count_frequency_map:      {},
+      archive_stock_layers_map:       {},
+      default_low_stock_level:        20,
+      inventory_aging_rules:          { buckets: ['0-30','31-60','61-90','90+'] },
+      fast_moving_top_pct:            20,
+      slow_moving_no_movement_days:   90,
+      dead_stock_no_movement_days:    180,
+      movement_analysis_period_days:  90,
+      low_stock_alerts:               { inApp: true,  email: false, whatsapp: false },
+      negative_stock_alerts:          { inApp: true,  email: true,  whatsapp: false },
+      expiry_alerts:                  { inApp: true,  email: false, whatsapp: false, daysBefore: 30 },
+      fast_slow_moving_alerts:        { inApp: false, email: false, whatsapp: false },
+    };
+
+    // Merge saved over defaults (JSONB cols come as objects from pg driver)
+    const merged = { ...defaults };
+    if (saved) {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v !== null && v !== undefined) merged[k] = v;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        settings: merged,
+        available_uoms: uoms,
+        warehouses: warehouseRows.map(w => ({
+          id:      w.guid,
+          name:    w.name,
+          parent:  w.parent  || '',
+          address: w.address || '',
+        })),
+        tally_derived: { default_unit: tallyDefaultUnit },
+      },
+    });
+  } catch (err) {
+    console.error('[inventory/settings GET]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/settings — save inventory settings
+router.post('/inventory/settings', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid || req.body.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const b = req.body;
+    await query(`
+      INSERT INTO company_inventory_settings (
+        company_guid, product_display_field, default_unit_for_new_items,
+        purchase_buffer_days, reorder_calc_mode, low_stock_threshold_mode,
+        archive_old_stock_months, warehouse_code_map, cycle_count_frequency_map,
+        archive_stock_layers_map, default_low_stock_level, inventory_aging_rules,
+        fast_moving_top_pct, slow_moving_no_movement_days, dead_stock_no_movement_days,
+        movement_analysis_period_days, low_stock_alerts, negative_stock_alerts,
+        expiry_alerts, fast_slow_moving_alerts, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+      ON CONFLICT (company_guid) DO UPDATE SET
+        product_display_field           = EXCLUDED.product_display_field,
+        default_unit_for_new_items      = EXCLUDED.default_unit_for_new_items,
+        purchase_buffer_days            = EXCLUDED.purchase_buffer_days,
+        reorder_calc_mode               = EXCLUDED.reorder_calc_mode,
+        low_stock_threshold_mode        = EXCLUDED.low_stock_threshold_mode,
+        archive_old_stock_months        = EXCLUDED.archive_old_stock_months,
+        warehouse_code_map              = EXCLUDED.warehouse_code_map,
+        cycle_count_frequency_map       = EXCLUDED.cycle_count_frequency_map,
+        archive_stock_layers_map        = EXCLUDED.archive_stock_layers_map,
+        default_low_stock_level         = EXCLUDED.default_low_stock_level,
+        inventory_aging_rules           = EXCLUDED.inventory_aging_rules,
+        fast_moving_top_pct             = EXCLUDED.fast_moving_top_pct,
+        slow_moving_no_movement_days    = EXCLUDED.slow_moving_no_movement_days,
+        dead_stock_no_movement_days     = EXCLUDED.dead_stock_no_movement_days,
+        movement_analysis_period_days   = EXCLUDED.movement_analysis_period_days,
+        low_stock_alerts                = EXCLUDED.low_stock_alerts,
+        negative_stock_alerts           = EXCLUDED.negative_stock_alerts,
+        expiry_alerts                   = EXCLUDED.expiry_alerts,
+        fast_slow_moving_alerts         = EXCLUDED.fast_slow_moving_alerts,
+        updated_at                      = NOW()
+    `, [
+      companyGuid,
+      b.product_display_field         || 'auto',
+      b.default_unit_for_new_items    || null,
+      b.purchase_buffer_days          ?? 7,
+      b.reorder_calc_mode             || 'hybrid',
+      b.low_stock_threshold_mode      || 'reorder_level',
+      b.archive_old_stock_months      ?? 24,
+      JSON.stringify(b.warehouse_code_map            || {}),
+      JSON.stringify(b.cycle_count_frequency_map     || {}),
+      JSON.stringify(b.archive_stock_layers_map      || {}),
+      b.default_low_stock_level       ?? 20,
+      JSON.stringify(b.inventory_aging_rules         || { buckets: ['0-30','31-60','61-90','90+'] }),
+      b.fast_moving_top_pct           ?? 20,
+      b.slow_moving_no_movement_days  ?? 90,
+      b.dead_stock_no_movement_days   ?? 180,
+      b.movement_analysis_period_days ?? 90,
+      JSON.stringify(b.low_stock_alerts              || { inApp: true,  email: false, whatsapp: false }),
+      JSON.stringify(b.negative_stock_alerts         || { inApp: true,  email: true,  whatsapp: false }),
+      JSON.stringify(b.expiry_alerts                 || { inApp: true,  email: false, whatsapp: false, daysBefore: 30 }),
+      JSON.stringify(b.fast_slow_moving_alerts       || { inApp: false, email: false, whatsapp: false }),
+    ]);
+    res.json({ success: true, message: 'Inventory settings saved successfully' });
+  } catch (err) {
+    console.error('[inventory/settings POST]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/stocks/units — distinct units of measure for this company
 router.get('/stocks/units', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
