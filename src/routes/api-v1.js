@@ -1682,8 +1682,8 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
     const { rows: rateRows } = await query(`
       SELECT
         name,
-        COALESCE(NULLIF(closing_rate, 0), NULLIF(opening_rate, 0), 0)  AS closing_rate,
-        COALESCE(NULLIF(opening_rate, 0), NULLIF(closing_rate, 0), 0)  AS opening_rate
+        COALESCE(closing_rate, 0)  AS closing_rate,
+        COALESCE(opening_rate, 0)  AS opening_rate
       FROM stocks
       WHERE company_guid = $1
     `, [companyGuid]);
@@ -1752,10 +1752,14 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { fy, page = 1, limit = 30 } = req.query;
+    const { fy, from: qFrom, to: qTo, page = 1, limit = 30 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
     let fyFrom = null, fyTo = null;
-    if (fy) {
+    if (qFrom && qTo) {
+      // Explicit date range overrides FY
+      fyFrom = qFrom;
+      fyTo   = qTo;
+    } else if (fy) {
       const resolved = await resolveFYDates(companyGuid, null, null, fy);
       fyFrom = resolved.from;
       fyTo   = resolved.to;
