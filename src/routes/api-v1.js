@@ -1645,7 +1645,6 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/stocks/transfer-history — stock journal godown transfers (inward+outward on same voucher)
 // GET /api/stocks/snapshot — stock portfolio value breakdown by warehouse, 4 valuation types
 router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -1656,8 +1655,8 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
     let fyFrom = null, fyTo = null, financialYear = fy || null;
     if (fy) {
       const resolved = await resolveFYDates(companyGuid, null, null, fy);
-      fyFrom = resolved.from;
-      fyTo   = resolved.to;
+      fyFrom        = resolved.from;            // used in batch_allocations FY filter below
+      fyTo          = resolved.to;              // used in batch_allocations FY filter below
       financialYear = resolved.financialYear || fy;
     }
 
@@ -1677,18 +1676,21 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
       return res.json({ success: true, data: { warehouses: [], summary: { total_closing: 0, total_opening: 0, total_average: 0, total_peak: 0 }, financial_year: financialYear } });
     }
 
-    // Per-warehouse qty distribution from batch_allocations (most granular godown data)
-    // If no batch data, fall back to stock_transactions for godown distribution
+    // Per-warehouse qty distribution from batch_allocations, scoped to the selected FY
+    // FY date filter ensures allocation ratios match the same period as the valuation values
     const { rows: godownRows } = await query(`
       SELECT
         COALESCE(NULLIF(ba.godown_name, ''), 'Main Location') AS warehouse,
         ba.stock_item_name AS stock_name,
         ABS(SUM(COALESCE(ba.qty, 0))) AS total_qty
       FROM batch_allocations ba
+      JOIN vouchers v ON v.guid = ba.voucher_guid AND v.company_guid = ba.company_guid
       WHERE ba.company_guid = $1
+        AND ($2::date IS NULL OR v.date::date >= $2::date)
+        AND ($3::date IS NULL OR v.date::date <= $3::date)
       GROUP BY ba.godown_name, ba.stock_item_name
       HAVING ABS(SUM(COALESCE(ba.qty, 0))) > 0
-    `, [companyGuid]);
+    `, [companyGuid, fyFrom, fyTo]);
 
     // Build warehouse distribution map  {stock_name -> [{warehouse, qty}]}
     const distMap = {};
@@ -1756,6 +1758,7 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/transfer-history — stock journal godown transfers (inward+outward on same voucher)
 router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
