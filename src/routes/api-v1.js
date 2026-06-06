@@ -1652,87 +1652,76 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { fy } = req.query;
-    let fyFrom = null, fyTo = null, financialYear = fy || null;
-    if (fy) {
-      const resolved = await resolveFYDates(companyGuid, null, null, fy);
-      fyFrom        = resolved.from;            // used in batch_allocations FY filter below
-      fyTo          = resolved.to;              // used in batch_allocations FY filter below
-      financialYear = resolved.financialYear || fy;
-    }
+    let financialYear = fy || null;
 
-    // Primary source: stock_fy_valuation (authoritative Tally sync values per item per FY)
-    // This is more reliable than stock_transactions.value (which can be 0 for zero-rate items)
-    const { rows: fyRows } = await query(`
-      SELECT
-        stock_name,
-        GREATEST(COALESCE(opening_value, 0), 0) AS opening_value,
-        GREATEST(COALESCE(closing_value, 0), 0) AS closing_value
-      FROM stock_fy_valuation
-      WHERE company_guid = $1
-        AND ($2::text IS NULL OR financial_year = $2)
-    `, [companyGuid, financialYear]);
+    // ── 1. All registered warehouses — always included even if empty ─────────────────────
+    const { rows: allWarehouses } = await query(
+      'SELECT name FROM warehouses WHERE company_guid=$1 ORDER BY name',
+      [companyGuid]
+    );
 
-    if (!fyRows.length) {
-      return res.json({ success: true, data: { warehouses: [], summary: { total_closing: 0, total_opening: 0, total_average: 0, total_peak: 0 }, financial_year: financialYear } });
-    }
-
-    // Per-warehouse qty distribution from batch_allocations, scoped to the selected FY
-    // FY date filter ensures allocation ratios match the same period as the valuation values
-    const { rows: godownRows } = await query(`
+    // ── 2. Per-godown per-item net positive qty from batch_allocations ──────────────
+    // Using SUM(qty) and clamping to >= 0: positive qty = stock present in godown
+    // Not filtered by FY date because batch_allocations tracks all-time movements;
+    // the net qty represents current stock on-hand per godown.
+    const { rows: godownQtyRows } = await query(`
       SELECT
         COALESCE(NULLIF(ba.godown_name, ''), 'Main Location') AS warehouse,
         ba.stock_item_name AS stock_name,
-        ABS(SUM(COALESCE(ba.qty, 0))) AS total_qty
+        GREATEST(SUM(COALESCE(ba.qty, 0)), 0) AS net_qty
       FROM batch_allocations ba
-      JOIN vouchers v ON v.guid = ba.voucher_guid AND v.company_guid = ba.company_guid
       WHERE ba.company_guid = $1
-        AND ($2::date IS NULL OR v.date::date >= $2::date)
-        AND ($3::date IS NULL OR v.date::date <= $3::date)
       GROUP BY ba.godown_name, ba.stock_item_name
-      HAVING ABS(SUM(COALESCE(ba.qty, 0))) > 0
-    `, [companyGuid, fyFrom, fyTo]);
+      HAVING GREATEST(SUM(COALESCE(ba.qty, 0)), 0) > 0
+    `, [companyGuid]);
 
-    // Build warehouse distribution map  {stock_name -> [{warehouse, qty}]}
-    const distMap = {};
-    for (const r of godownRows) {
-      if (!distMap[r.stock_name]) distMap[r.stock_name] = [];
-      distMap[r.stock_name].push({ warehouse: r.warehouse, qty: parseFloat(r.total_qty || 0) });
+    // ── 3. Authoritative closing + opening rates from stocks table ─────────────────
+    // stocks.closing_rate is the most accurate rate per item (from Tally current valuation).
+    // stock_fy_valuation.closing_value is UNRELIABLE for this purpose: Tally can produce
+    // negative closing values due to opening balance offsets — those values are NOT stock value.
+    const { rows: rateRows } = await query(`
+      SELECT
+        name,
+        COALESCE(NULLIF(closing_rate, 0), NULLIF(opening_rate, 0), 0)  AS closing_rate,
+        COALESCE(NULLIF(opening_rate, 0), NULLIF(closing_rate, 0), 0)  AS opening_rate
+      FROM stocks
+      WHERE company_guid = $1
+    `, [companyGuid]);
+
+    // Build rate lookup map {stock_name -> {closing_rate, opening_rate}}
+    const rateMap = {};
+    for (const r of rateRows) {
+      rateMap[r.name] = {
+        closing: parseFloat(r.closing_rate || 0),
+        opening: parseFloat(r.opening_rate || 0),
+      };
     }
 
-    // Aggregate value by warehouse
-    const warehouseValues = {}; // warehouse -> { closing, opening, average, peak, skus }
-
-    for (const item of fyRows) {
-      const closing = parseFloat(item.closing_value || 0);
-      const opening = parseFloat(item.opening_value || 0);
-      const average = (closing + opening) / 2;
-      const peak    = Math.max(closing, opening);
-
-      const dist = distMap[item.stock_name];
-      if (dist && dist.length > 0) {
-        // Distribute proportionally by batch_allocations qty
-        const totalQty = dist.reduce((s, d) => s + d.qty, 0);
-        for (const d of dist) {
-          const share = totalQty > 0 ? d.qty / totalQty : 1 / dist.length;
-          if (!warehouseValues[d.warehouse]) warehouseValues[d.warehouse] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
-          warehouseValues[d.warehouse].closing += closing * share;
-          warehouseValues[d.warehouse].opening += opening * share;
-          warehouseValues[d.warehouse].average += average * share;
-          warehouseValues[d.warehouse].peak    += peak    * share;
-          warehouseValues[d.warehouse].skus    += 1;
-        }
-      } else {
-        // No godown data for this item → assign to Main Location (single-warehouse default)
-        const wh = 'Main Location';
-        if (!warehouseValues[wh]) warehouseValues[wh] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
-        warehouseValues[wh].closing += closing;
-        warehouseValues[wh].opening += opening;
-        warehouseValues[wh].average += average;
-        warehouseValues[wh].peak    += peak;
-        warehouseValues[wh].skus    += 1;
-      }
+    // ── 4. Compute warehouse values: qty × rate ────────────────────────────────────
+    const warehouseValues = {};
+    // Seed all registered warehouses at 0 so they always appear in output
+    for (const wh of allWarehouses) {
+      warehouseValues[wh.name] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
     }
 
+    for (const row of godownQtyRows) {
+      const qty   = parseFloat(row.net_qty || 0);
+      const rates = rateMap[row.stock_name] || { closing: 0, opening: 0 };
+      const closingVal = qty * rates.closing;
+      const openingVal = qty * rates.opening;
+      const avgVal     = qty * (rates.closing + rates.opening) / 2;
+      const peakVal    = qty * Math.max(rates.closing, rates.opening);
+
+      const wh = row.warehouse;
+      if (!warehouseValues[wh]) warehouseValues[wh] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
+      warehouseValues[wh].closing += closingVal;
+      warehouseValues[wh].opening += openingVal;
+      warehouseValues[wh].average += avgVal;
+      warehouseValues[wh].peak    += peakVal;
+      warehouseValues[wh].skus    += 1;
+    }
+
+    // ── 5. Format and sort ─────────────────────────────────────────────────────────
     const warehouses = Object.entries(warehouseValues)
       .map(([warehouse, v]) => ({
         warehouse,
@@ -1742,7 +1731,6 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
         average_value: Math.round(v.average * 100) / 100,
         peak_value:    Math.round(v.peak    * 100) / 100,
       }))
-      .filter(w => w.closing_value > 0 || w.opening_value > 0)
       .sort((a, b) => b.closing_value - a.closing_value);
 
     const summary = {
