@@ -1737,33 +1737,51 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
     const { fy } = req.query;
     const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, null, null, fy);
 
+    // Wrap in subquery so we can reference column aliases in ORDER BY
+    // Include sold-out items (closing_qty=0) if they had outward movement in the FY
     const { rows } = await query(`
-      SELECT
-        s.name,
-        COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), '') AS sku,
-        COALESCE(s.group_name,'')                          AS category,
-        COALESCE(s.closing_qty, 0)                         AS closing_qty,
-        COALESCE(s.closing_rate, 0)                        AS closing_rate,
-        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
-          THEN st.qty ELSE 0 END), 0)                      AS outward_qty,
-        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
-          THEN st.value ELSE 0 END), 0)                    AS outward_value,
-        COUNT(DISTINCT CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
-          THEN st.date::date END)                          AS active_days
-      FROM stocks s
-      LEFT JOIN stock_transactions st
-        ON  st.stock_guid   = s.name
-        AND st.company_guid = s.company_guid
-        AND st.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-      WHERE s.company_guid = $1
-        AND COALESCE(s.closing_qty,0)  > 0
-        AND COALESCE(s.closing_rate,0) > 0
-      GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
+      SELECT * FROM (
+        SELECT
+          s.name,
+          COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), '') AS sku,
+          COALESCE(s.group_name,'')                          AS category,
+          COALESCE(s.closing_qty, 0)                         AS closing_qty,
+          COALESCE(s.closing_rate, 0)                        AS closing_rate,
+          COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+            THEN st.qty ELSE 0 END), 0)                      AS outward_qty,
+          COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+            THEN st.value ELSE 0 END), 0)                    AS outward_value,
+          COUNT(DISTINCT CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+            THEN st.date::date END)                          AS active_days
+        FROM stocks s
+        LEFT JOIN stock_transactions st
+          ON  st.stock_guid   = s.name
+          AND st.company_guid = s.company_guid
+          AND st.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+        WHERE s.company_guid = $1
+          AND (
+            -- Items currently in stock
+            COALESCE(s.closing_qty, 0) > 0
+            -- OR items recently sold out but had movement in this FY
+            OR EXISTS (
+              SELECT 1 FROM stock_transactions st2
+              WHERE st2.stock_guid   = s.name
+                AND st2.company_guid = s.company_guid
+                AND st2.type         = 'outward'
+                AND st2.date::date  >= $2::date
+                AND st2.date::date  <= $3::date
+                AND st2.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+            )
+          )
+        GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
+      ) sub
       ORDER BY
-        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
-          THEN st.qty ELSE 0 END), 0)
-        / NULLIF(COALESCE(s.closing_qty,0), 0) DESC NULLS LAST,
-        s.name ASC
+        -- Sold-out items (closing_qty=0) get highest effective TR (treated as huge number)
+        COALESCE(
+          outward_qty / NULLIF(closing_qty, 0),
+          outward_qty * 999.0
+        ) DESC NULLS LAST,
+        name ASC
     `, [companyGuid, fyFrom, fyTo]);
 
     const items = rows.map(r => {
@@ -1771,9 +1789,10 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
       const closingQty   = parseFloat(r.closing_qty   || 0);
       const outwardValue = parseFloat(r.outward_value || 0);
       const activeDays   = parseInt(r.active_days     || 0);
+      const soldOut      = closingQty <= 0 && outwardQty > 0;
       const tr  = closingQty > 0 ? Math.round((outwardQty / closingQty) * 100) / 100 : 0;
       const avgDailySales = activeDays > 0 ? outwardQty / activeDays : 0;
-      const dsi = avgDailySales > 0 ? Math.round(closingQty / avgDailySales) : null;
+      const dsi = soldOut ? 0 : avgDailySales > 0 ? Math.round(closingQty / avgDailySales) : null;
       return {
         name:          r.name,
         sku:           r.sku,
@@ -1785,6 +1804,7 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
         outward_value: Math.round(outwardValue),
         tr,
         dsi,
+        sold_out: soldOut,
       };
     });
     res.json({ success: true, data: items });
@@ -1803,35 +1823,37 @@ router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) 
     if (!item) return res.status(400).json({ success: false, error: { code: 'MISSING_ITEM', message: 'item param required' } });
 
     // stock_transactions.date is TEXT 'YYYY-MM-DD' (IST date from Tally — no TZ conversion needed).
-    // Group by the text date directly; filter using string comparison.
+    // NEW: Last 30 ENTRY DATES (not last 30 calendar days).
+    //      Includes both outward (sold) and inward (purchased/received) movements.
+    //      Inner query: latest 30 unique dates with any movement → outer: chronological for chart.
     const { rows } = await query(`
-      SELECT
-        date                                       AS sale_date,
-        ROUND(SUM(value)::numeric, 2)              AS daily_value,
-        ROUND(SUM(qty)::numeric,   2)              AS daily_qty
-      FROM stock_transactions
-      WHERE company_guid = $1
-        AND stock_guid   = $2
-        AND type         = 'outward'
-        AND date >= TO_CHAR(CURRENT_DATE - 30, 'YYYY-MM-DD')
-        AND voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-      GROUP BY date
+      SELECT * FROM (
+        SELECT
+          date,
+          ROUND(SUM(CASE WHEN type='outward' THEN value ELSE 0 END)::numeric, 2) AS outward_value,
+          ROUND(SUM(CASE WHEN type='outward' THEN qty   ELSE 0 END)::numeric, 2) AS outward_qty,
+          ROUND(SUM(CASE WHEN type='inward'  THEN value ELSE 0 END)::numeric, 2) AS inward_value,
+          ROUND(SUM(CASE WHEN type='inward'  THEN qty   ELSE 0 END)::numeric, 2) AS inward_qty
+        FROM stock_transactions
+        WHERE company_guid = $1
+          AND stock_guid   = $2
+          AND type IN ('outward', 'inward')
+          AND voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT 30
+      ) sub
       ORDER BY date ASC
     `, [companyGuid, item]);
 
-    // sale_date is a plain 'YYYY-MM-DD' string — no .toISOString() needed
-    const dataMap = {};
-    for (const r of rows) dataMap[r.sale_date] = { value: parseFloat(r.daily_value), qty: parseFloat(r.daily_qty) };
-
-    // Generate last 31 days as 'YYYY-MM-DD' strings and fill gaps with 0
-    const filledData = [];
-    const baseDate = new Date();
-    for (let i = 30; i >= 0; i--) {
-      const d = new Date(baseDate);
-      d.setDate(baseDate.getDate() - i);
-      const key = d.toISOString().split('T')[0];  // UTC date — matches TEXT dates from Tally
-      filledData.push({ date: key, value: dataMap[key]?.value ?? 0, qty: dataMap[key]?.qty ?? 0 });
-    }
+    // Return actual entry dates with separate inward/outward values
+    const filledData = rows.map(r => ({
+      date:         r.date,
+      value:        parseFloat(r.outward_value || 0),
+      qty:          parseFloat(r.outward_qty   || 0),
+      inward_value: parseFloat(r.inward_value  || 0),
+      inward_qty:   parseFloat(r.inward_qty    || 0),
+    }));
     res.json({ success: true, data: filledData });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
