@@ -1802,28 +1802,34 @@ router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) 
     const { item } = req.query;
     if (!item) return res.status(400).json({ success: false, error: { code: 'MISSING_ITEM', message: 'item param required' } });
 
+    // stock_transactions.date is TEXT 'YYYY-MM-DD' (IST date from Tally — no TZ conversion needed).
+    // Group by the text date directly; filter using string comparison.
     const { rows } = await query(`
       SELECT
-        date::date                                AS sale_date,
-        ROUND(SUM(value)::numeric,  2)            AS daily_value,
-        ROUND(SUM(qty)::numeric,    2)            AS daily_qty
+        date                                       AS sale_date,
+        ROUND(SUM(value)::numeric, 2)              AS daily_value,
+        ROUND(SUM(qty)::numeric,   2)              AS daily_qty
       FROM stock_transactions
       WHERE company_guid = $1
         AND stock_guid   = $2
         AND type         = 'outward'
-        AND date::date  >= CURRENT_DATE - 30
+        AND date >= TO_CHAR(CURRENT_DATE - 30, 'YYYY-MM-DD')
         AND voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-      GROUP BY date::date
-      ORDER BY sale_date ASC
+      GROUP BY date
+      ORDER BY date ASC
     `, [companyGuid, item]);
 
-    // Fill missing days with 0 so chart is continuous
+    // sale_date is a plain 'YYYY-MM-DD' string — no .toISOString() needed
     const dataMap = {};
-    for (const r of rows) dataMap[r.sale_date.toISOString().split('T')[0]] = { value: parseFloat(r.daily_value), qty: parseFloat(r.daily_qty) };
+    for (const r of rows) dataMap[r.sale_date] = { value: parseFloat(r.daily_value), qty: parseFloat(r.daily_qty) };
+
+    // Generate last 31 days as 'YYYY-MM-DD' strings and fill gaps with 0
     const filledData = [];
+    const baseDate = new Date();
     for (let i = 30; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
-      const key = d.toISOString().split('T')[0];
+      const d = new Date(baseDate);
+      d.setDate(baseDate.getDate() - i);
+      const key = d.toISOString().split('T')[0];  // UTC date — matches TEXT dates from Tally
       filledData.push({ date: key, value: dataMap[key]?.value ?? 0, qty: dataMap[key]?.qty ?? 0 });
     }
     res.json({ success: true, data: filledData });
