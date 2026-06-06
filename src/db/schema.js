@@ -753,6 +753,11 @@ export async function initSchema() {
         updated_at                      TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_inv_settings_company ON company_inventory_settings(company_guid);
+
+      -- App-level intent for Tally-controlled settings (saved as user preference, not written to Tally automatically)
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS batch_tracking_app_enabled   BOOLEAN DEFAULT FALSE;
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS expiry_tracking_app_enabled  BOOLEAN DEFAULT FALSE;
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS allow_negative_stock_app     BOOLEAN DEFAULT FALSE;
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

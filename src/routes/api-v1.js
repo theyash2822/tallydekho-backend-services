@@ -35,6 +35,42 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// ─── Product Display Name helpers ───────────────────────────────────
+
+// Fetch the company's product_display_field setting. Returns 'name' if not set.
+async function getProductDisplayField(companyGuid) {
+  try {
+    const { rows } = await query(
+      `SELECT product_display_field FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
+      [companyGuid]
+    );
+    return rows[0]?.product_display_field || 'name';
+  } catch {
+    return 'name';
+  }
+}
+
+// Compute displayName from a stock item object based on the company's display field setting.
+// Never overwrites stocks.name (Tally master). Falls back to name if chosen field is empty.
+function computeDisplayName(item, field) {
+  const name        = (item.name        || item.itemName || '').trim();
+  const alias       = (item.alias       || '').trim();
+  const sku         = (item.sku         || '').trim();   // part_number (OnlyAlias from Tally)
+  const description = (item.description || '').trim();
+  switch (field) {
+    case 'alias':       return alias       || name;
+    case 'part_number': return sku         || name;
+    case 'description': return description || name;
+    case 'name':        return name;
+    case 'auto':
+      if (alias && alias !== name && alias.length >= 3)       return alias;
+      if (description && description.length >= 3)             return description;
+      if (sku && sku !== name && sku.length >= 3)             return sku;
+      return name;
+    default:            return name;
+  }
+}
+
 // Ownership check helper — verifies companyGuid belongs to req.user.userId
 // Returns true if owned (or no companyGuid provided), false + sends 403 if not owned
 async function verifyCompanyOwnership(req, res, companyGuid) {
@@ -1162,12 +1198,13 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
+    const displayField = await getProductDisplayField(companyGuid);
 
     let q, params, idx;
     if (fyRequested) {
       // FY-specific: derive closing qty from stock_transactions up to fyTo (Tally FY guide compliant)
       q = `
-        SELECT s.guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+        SELECT s.guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                s.reorder_level, s.closing_rate,
                (SELECT st2.warehouse FROM stock_transactions st2
                 WHERE st2.company_guid = s.company_guid AND st2.stock_guid = s.name
@@ -1201,7 +1238,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
           AND COALESCE(st.voucher_type, '') != 'Opening Balance'
         WHERE s.company_guid = $1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
-        GROUP BY s.guid, s.company_guid, s.name, s.alias, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+        GROUP BY s.guid, s.company_guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                  s.reorder_level, s.closing_rate, s.opening_qty
         ORDER BY fy_closing_value DESC NULLS LAST, s.name
       `;
@@ -1223,10 +1260,11 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       const totalRows = allRows.length;
       const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
         ...r,
-        closing_qty:         parseFloat(r.fy_closing_qty        || 0),
-        closing_value:       parseFloat(r.fy_closing_value      || 0),
-        primary_warehouse:   r.primary_warehouse                || null,
+        closing_qty:          parseFloat(r.fy_closing_qty        || 0),
+        closing_value:        parseFloat(r.fy_closing_value      || 0),
+        primary_warehouse:    r.primary_warehouse                || null,
         avg_daily_consumption: parseFloat(r.avg_daily_consumption || 0),
+        displayName:          computeDisplayName(r, displayField),
       }));
       const totalValue  = allRows.reduce((s, r) => s + parseFloat(r.fy_closing_value || 0), 0);
       const lowStockCnt = allRows.filter(r => parseFloat(r.fy_closing_qty || 0) > 0 && parseFloat(r.fy_closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
@@ -1270,14 +1308,15 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     }
     q += ` ORDER BY closing_value DESC NULLS LAST, name LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
-    const { rows } = await query(q, params);
+    const { rows: rawItems } = await query(q, params);
     const { rows: cnt } = await query('SELECT COUNT(*) as c, COALESCE(SUM(closing_value),0) as v FROM stocks WHERE company_guid=$1', [companyGuid]);
     const { rows: low } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid=$1 AND closing_qty > 0 AND closing_qty <= reorder_level AND reorder_level > 0', [companyGuid]);
+    const items = rawItems.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
     res.json({
       success: true,
       data: {
         summary: { total_value: `₹${(+(cnt?.[0]?.v ?? 0)/1e5).toFixed(1)}L`, total_skus: parseInt(cnt[0].c), low_stock_count: parseInt(low[0].c) },
-        items: rows,
+        items,
       },
       meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
     });
@@ -1303,6 +1342,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
+    const displayField = await getProductDisplayField(companyGuid);
 
     let allRows;
 
@@ -1450,7 +1490,8 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
       }
 
       const sku = r.sku || '';
-      return { stockGuid, itemName, groupName, category, unit, sku, closingQty, negativeQty, closingValue, rate, isNegativeStock: true, priority, warehouses };
+      const displayName = computeDisplayName({ name: itemName, sku }, displayField);
+      return { stockGuid, itemName, displayName, groupName, category, unit, sku, closingQty, negativeQty, closingValue, rate, isNegativeStock: true, priority, warehouses };
     });
 
     const totalNegativeQty = allRows.reduce((s, r) => s + Math.abs(r.closingQty), 0);
@@ -1608,9 +1649,11 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     const fastRaw  = active.slice(0, halfIdx);
     const slowRaw  = [...active.slice(halfIdx), ...inactive];
 
+    const displayField = await getProductDisplayField(companyGuid);
     const mapItem = (r, idx, tab) => ({
       id:                 r.guid,
       name:               r.name,
+      displayName:        computeDisplayName(r, displayField),
       sku:                r.sku || r.alias || '',
       group:              r.group_name || '—',
       unit:               r.unit       || '',
@@ -1714,10 +1757,12 @@ router.get('/stocks/aged-items', authMiddleware, async (req, res) => {
         END DESC
     `, [companyGuid, mode, bucketStart, bucketEnd]);
 
-    const totalValue = rows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
+    const displayField  = await getProductDisplayField(companyGuid);
+    const totalValue    = rows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
+    const mappedRows    = rows.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
     res.json({
       success: true,
-      data: rows,
+      data: mappedRows,
       summary: {
         total_skus:  rows.length,
         total_value: Math.round(totalValue * 100) / 100,
@@ -2122,6 +2167,21 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
     const uoms = uomRows.map(r => r.name).filter(Boolean);
     const tallyDefaultUnit = commonUnitRows[0]?.name || uoms[0] || 'Nos';
 
+    // Tally-derived: company-level batch/expiry flags (aggregate from stocks table)
+    const { rows: tallyBatchRows } = await query(
+      `SELECT
+         COUNT(*) FILTER (WHERE batch_enabled  = TRUE) AS batch_count,
+         COUNT(*) FILTER (WHERE expiry_enabled = TRUE) AS expiry_count,
+         COUNT(*) AS total
+       FROM stocks WHERE company_guid=$1`,
+      [companyGuid]
+    );
+    const tallyBatchStats = {
+      batch_enabled_count:  parseInt(tallyBatchRows[0]?.batch_count  || 0),
+      expiry_enabled_count: parseInt(tallyBatchRows[0]?.expiry_count || 0),
+      total_stock_items:    parseInt(tallyBatchRows[0]?.total        || 0),
+    };
+
     const defaults = {
       product_display_field:          'auto',
       default_unit_for_new_items:     tallyDefaultUnit,
@@ -2142,6 +2202,10 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
       negative_stock_alerts:          { inApp: true,  email: true,  whatsapp: false },
       expiry_alerts:                  { inApp: true,  email: false, whatsapp: false, daysBefore: 30 },
       fast_slow_moving_alerts:        { inApp: false, email: false, whatsapp: false },
+      // App-level preferences for Tally-controlled settings
+      batch_tracking_app_enabled:     false,
+      expiry_tracking_app_enabled:    false,
+      allow_negative_stock_app:       false,
     };
 
     // Merge saved over defaults (JSONB cols come as objects from pg driver)
@@ -2163,7 +2227,12 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
           parent:  w.parent  || '',
           address: w.address || '',
         })),
-        tally_derived: { default_unit: tallyDefaultUnit },
+        tally_derived: {
+          default_unit:     tallyDefaultUnit,
+          batch_stats:      tallyBatchStats,
+          // Archive stock layers: TallyDekho-only, filters app-side display only (no delete)
+          archive_note:     'Archive layers hides old activity from default view. Does not delete data.',
+        },
       },
     });
   } catch (err) {
@@ -2187,8 +2256,10 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
         archive_stock_layers_map, default_low_stock_level, inventory_aging_rules,
         fast_moving_top_pct, slow_moving_no_movement_days, dead_stock_no_movement_days,
         movement_analysis_period_days, low_stock_alerts, negative_stock_alerts,
-        expiry_alerts, fast_slow_moving_alerts, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+        expiry_alerts, fast_slow_moving_alerts,
+        batch_tracking_app_enabled, expiry_tracking_app_enabled, allow_negative_stock_app,
+        updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW())
       ON CONFLICT (company_guid) DO UPDATE SET
         product_display_field           = EXCLUDED.product_display_field,
         default_unit_for_new_items      = EXCLUDED.default_unit_for_new_items,
@@ -2209,6 +2280,9 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
         negative_stock_alerts           = EXCLUDED.negative_stock_alerts,
         expiry_alerts                   = EXCLUDED.expiry_alerts,
         fast_slow_moving_alerts         = EXCLUDED.fast_slow_moving_alerts,
+        batch_tracking_app_enabled      = EXCLUDED.batch_tracking_app_enabled,
+        expiry_tracking_app_enabled     = EXCLUDED.expiry_tracking_app_enabled,
+        allow_negative_stock_app        = EXCLUDED.allow_negative_stock_app,
         updated_at                      = NOW()
     `, [
       companyGuid,
@@ -2231,6 +2305,9 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
       JSON.stringify(b.negative_stock_alerts         || { inApp: true,  email: true,  whatsapp: false }),
       JSON.stringify(b.expiry_alerts                 || { inApp: true,  email: false, whatsapp: false, daysBefore: 30 }),
       JSON.stringify(b.fast_slow_moving_alerts       || { inApp: false, email: false, whatsapp: false }),
+      b.batch_tracking_app_enabled    ?? false,
+      b.expiry_tracking_app_enabled   ?? false,
+      b.allow_negative_stock_app      ?? false,
     ]);
     res.json({ success: true, message: 'Inventory settings saved successfully' });
   } catch (err) {
@@ -2292,9 +2369,26 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
        ORDER BY w.name`,
       [companyGuid]
     );
+    // Merge TallyDekho-only warehouse settings (code, cycle freq, archive months)
+    const { rows: settRows } = await query(
+      `SELECT warehouse_code_map, cycle_count_frequency_map, archive_stock_layers_map
+       FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
+      [companyGuid]
+    );
+    const codeMap    = settRows[0]?.warehouse_code_map          || {};
+    const cycleMap   = settRows[0]?.cycle_count_frequency_map   || {};
+    const archiveMap = settRows[0]?.archive_stock_layers_map    || {};
     res.json({ success: true, data: rows.map(r => ({
-      id: r.guid, name: r.name, parent: r.parent, address: r.address || '',
-      total_qty: parseFloat(r.net_qty||0), skus: parseInt(r.skus||0),
+      id:                   r.guid,
+      name:                 r.name,
+      parent:               r.parent    || '',
+      address:              r.address   || '',
+      total_qty:            parseFloat(r.net_qty || 0),
+      skus:                 parseInt(r.skus || 0),
+      // TallyDekho-only settings (do not overwrite Tally godown name)
+      code:                 codeMap[r.guid]    || '',
+      cycle_count_frequency: cycleMap[r.guid]  || 'Weekly',
+      archive_layers_months: archiveMap[r.guid] || 24,
     })) });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
