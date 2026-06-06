@@ -1645,6 +1645,196 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/aged-items — items that haven't sold / haven't been received for X days
+// mode=sold  → items not sold in the given age bucket (by last sold date)
+// mode=received → items sitting in stock for the given age bucket (by last received date)
+// days param is the START of the bucket: 30=30-59d, 60=60-89d, 90=90-119d, 120=120+d
+router.get('/stocks/aged-items', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { mode = 'sold', days: daysParam = '30' } = req.query;
+    const bucketStart = parseInt(daysParam);
+    const bucketEnd   = bucketStart === 120 ? null : bucketStart + 30;
+
+    const { rows } = await query(`
+      WITH item_activity AS (
+        SELECT
+          s.name,
+          COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), '')        AS sku,
+          COALESCE(s.group_name, '')                                 AS category,
+          COALESCE(s.closing_qty,  0)                                AS closing_qty,
+          COALESCE(s.closing_rate, 0)                                AS closing_rate,
+          COALESCE(s.closing_qty,0) * COALESCE(s.closing_rate,0)    AS total_value,
+          MAX(st_out.date::date) AS last_sold_date,
+          MAX(st_in.date::date)  AS last_received_date
+        FROM stocks s
+        LEFT JOIN stock_transactions st_out
+          ON  st_out.stock_guid    = s.name
+          AND st_out.company_guid  = s.company_guid
+          AND st_out.type          = 'outward'
+          AND st_out.voucher_type NOT IN ('Stock Journal','Physical Stock')
+        LEFT JOIN stock_transactions st_in
+          ON  st_in.stock_guid    = s.name
+          AND st_in.company_guid  = s.company_guid
+          AND st_in.type          = 'inward'
+          AND st_in.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+        WHERE s.company_guid = $1
+          AND COALESCE(s.closing_qty, 0) > 0
+        GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
+      ),
+      computed AS (
+        SELECT *,
+          CURRENT_DATE - COALESCE(last_sold_date,     '2000-01-01'::date) AS days_since_sold,
+          CURRENT_DATE - COALESCE(last_received_date, '2000-01-01'::date) AS days_since_received
+        FROM item_activity
+        WHERE total_value > 0
+      )
+      SELECT
+        name, sku, category,
+        ROUND(closing_qty::numeric, 2)   AS closing_qty,
+        ROUND(closing_rate::numeric, 2)  AS closing_rate,
+        ROUND(total_value::numeric, 2)   AS total_value,
+        last_sold_date, last_received_date,
+        days_since_sold::int             AS days_since_sold,
+        days_since_received::int         AS days_since_received
+      FROM computed
+      WHERE
+        CASE $2
+          WHEN 'sold'     THEN days_since_sold     >= $3 AND ($4::int IS NULL OR days_since_sold     < $4)
+          WHEN 'received' THEN days_since_received >= $3 AND ($4::int IS NULL OR days_since_received < $4)
+          ELSE days_since_sold >= $3 AND ($4::int IS NULL OR days_since_sold < $4)
+        END
+      ORDER BY
+        CASE $2
+          WHEN 'sold'     THEN total_value
+          WHEN 'received' THEN days_since_received::float
+          ELSE total_value
+        END DESC
+    `, [companyGuid, mode, bucketStart, bucketEnd]);
+
+    const totalValue = rows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
+    res.json({
+      success: true,
+      data: rows,
+      summary: {
+        total_skus:  rows.length,
+        total_value: Math.round(totalValue * 100) / 100,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/stocks/movement-analytics — items sorted by Turnover Ratio for selected FY
+router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { fy } = req.query;
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, null, null, fy);
+    const fyDays = Math.max(Math.round((new Date(fyTo) - new Date(fyFrom)) / 86400000), 1);
+
+    const { rows } = await query(`
+      SELECT
+        s.name,
+        COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), '') AS sku,
+        COALESCE(s.group_name,'')                          AS category,
+        COALESCE(s.closing_qty, 0)                         AS closing_qty,
+        COALESCE(s.closing_rate, 0)                        AS closing_rate,
+        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+          THEN st.qty ELSE 0 END), 0)                      AS outward_qty,
+        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+          THEN st.value ELSE 0 END), 0)                    AS outward_value,
+        COUNT(DISTINCT CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+          THEN st.date::date END)                          AS active_days
+      FROM stocks s
+      LEFT JOIN stock_transactions st
+        ON  st.stock_guid   = s.name
+        AND st.company_guid = s.company_guid
+        AND st.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+      WHERE s.company_guid = $1
+        AND COALESCE(s.closing_qty,0)  > 0
+        AND COALESCE(s.closing_rate,0) > 0
+      GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
+      HAVING SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+        THEN st.qty ELSE 0 END) > 0
+      ORDER BY
+        COALESCE(SUM(CASE WHEN st.type='outward' AND st.date::date >= $2::date AND st.date::date <= $3::date
+          THEN st.qty ELSE 0 END), 0)
+        / NULLIF(COALESCE(s.closing_qty,0), 0) DESC
+      LIMIT 100
+    `, [companyGuid, fyFrom, fyTo]);
+
+    const items = rows.map(r => {
+      const outwardQty   = parseFloat(r.outward_qty   || 0);
+      const closingQty   = parseFloat(r.closing_qty   || 0);
+      const outwardValue = parseFloat(r.outward_value || 0);
+      const activeDays   = parseInt(r.active_days     || 0);
+      const tr  = closingQty > 0 ? Math.round((outwardQty / closingQty) * 100) / 100 : 0;
+      const avgDailySales = activeDays > 0 ? outwardQty / activeDays : 0;
+      const dsi = avgDailySales > 0 ? Math.round(closingQty / avgDailySales) : null;
+      return {
+        name:          r.name,
+        sku:           r.sku,
+        category:      r.category,
+        closing_qty:   Math.round(closingQty),
+        closing_rate:  parseFloat(r.closing_rate),
+        total_value:   Math.round(closingQty * parseFloat(r.closing_rate)),
+        outward_qty:   Math.round(outwardQty),
+        outward_value: Math.round(outwardValue),
+        tr,
+        dsi,
+      };
+    });
+    res.json({ success: true, data: items });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/stocks/movement-analytics/chart — last 30 days daily outward for one item
+router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { item } = req.query;
+    if (!item) return res.status(400).json({ success: false, error: { code: 'MISSING_ITEM', message: 'item param required' } });
+
+    const { rows } = await query(`
+      SELECT
+        date::date                                AS sale_date,
+        ROUND(SUM(value)::numeric,  2)            AS daily_value,
+        ROUND(SUM(qty)::numeric,    2)            AS daily_qty
+      FROM stock_transactions
+      WHERE company_guid = $1
+        AND stock_guid   = $2
+        AND type         = 'outward'
+        AND date::date  >= CURRENT_DATE - 30
+        AND voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
+      GROUP BY date::date
+      ORDER BY sale_date ASC
+    `, [companyGuid, item]);
+
+    // Fill missing days with 0 so chart is continuous
+    const dataMap = {};
+    for (const r of rows) dataMap[r.sale_date.toISOString().split('T')[0]] = { value: parseFloat(r.daily_value), qty: parseFloat(r.daily_qty) };
+    const filledData = [];
+    for (let i = 30; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const key = d.toISOString().split('T')[0];
+      filledData.push({ date: key, value: dataMap[key]?.value ?? 0, qty: dataMap[key]?.qty ?? 0 });
+    }
+    res.json({ success: true, data: filledData });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/stocks/snapshot — stock portfolio value breakdown by warehouse, 4 valuation types
 router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
