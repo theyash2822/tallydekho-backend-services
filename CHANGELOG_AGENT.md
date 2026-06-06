@@ -1,5 +1,22 @@
 # CHANGELOG_AGENT.md
 
+## 2026-06-06 — Stock Settings — Backend API + DB Schema
+
+### Added
+- `company_inventory_settings` table — 23 columns covering all General/Warehouse/Items/Alerts settings per company
+- `GET /api/inventory/settings` — returns saved settings merged with Tally-derived defaults (UoMs from stocks table, warehouses from warehouses table, most-common unit as default)
+- `POST /api/inventory/settings` — upsert on company_guid conflict, covers all 20 setting fields
+- Settings properly separate TallyDekho-only (stored in DB only) vs Tally-controlled (read-only badges on mobile)
+
+### Files Changed
+- `src/db/schema.js` — company_inventory_settings table + index
+- `src/routes/api-v1.js` — GET + POST /api/inventory/settings routes
+
+### Commit
+- `2ef4308` → tallydekho-backend-services
+
+---
+
 ## 2026-06-05 — Movement History Dedup Fix
 
 ### Bug Fixed
