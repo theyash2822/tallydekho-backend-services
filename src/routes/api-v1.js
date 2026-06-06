@@ -1646,6 +1646,116 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
 });
 
 // GET /api/stocks/transfer-history — stock journal godown transfers (inward+outward on same voucher)
+// GET /api/stocks/snapshot — stock portfolio value breakdown by warehouse, 4 valuation types
+router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { fy } = req.query;
+    let fyFrom = null, fyTo = null, financialYear = fy || null;
+    if (fy) {
+      const resolved = await resolveFYDates(companyGuid, null, null, fy);
+      fyFrom = resolved.from;
+      fyTo   = resolved.to;
+      financialYear = resolved.financialYear || fy;
+    }
+
+    // Primary source: stock_fy_valuation (authoritative Tally sync values per item per FY)
+    // This is more reliable than stock_transactions.value (which can be 0 for zero-rate items)
+    const { rows: fyRows } = await query(`
+      SELECT
+        stock_name,
+        GREATEST(COALESCE(opening_value, 0), 0) AS opening_value,
+        GREATEST(COALESCE(closing_value, 0), 0) AS closing_value
+      FROM stock_fy_valuation
+      WHERE company_guid = $1
+        AND ($2::text IS NULL OR financial_year = $2)
+    `, [companyGuid, financialYear]);
+
+    if (!fyRows.length) {
+      return res.json({ success: true, data: { warehouses: [], summary: { total_closing: 0, total_opening: 0, total_average: 0, total_peak: 0 }, financial_year: financialYear } });
+    }
+
+    // Per-warehouse qty distribution from batch_allocations (most granular godown data)
+    // If no batch data, fall back to stock_transactions for godown distribution
+    const { rows: godownRows } = await query(`
+      SELECT
+        COALESCE(NULLIF(ba.godown_name, ''), 'Main Location') AS warehouse,
+        ba.stock_item_name AS stock_name,
+        ABS(SUM(COALESCE(ba.qty, 0))) AS total_qty
+      FROM batch_allocations ba
+      WHERE ba.company_guid = $1
+      GROUP BY ba.godown_name, ba.stock_item_name
+      HAVING ABS(SUM(COALESCE(ba.qty, 0))) > 0
+    `, [companyGuid]);
+
+    // Build warehouse distribution map  {stock_name -> [{warehouse, qty}]}
+    const distMap = {};
+    for (const r of godownRows) {
+      if (!distMap[r.stock_name]) distMap[r.stock_name] = [];
+      distMap[r.stock_name].push({ warehouse: r.warehouse, qty: parseFloat(r.total_qty || 0) });
+    }
+
+    // Aggregate value by warehouse
+    const warehouseValues = {}; // warehouse -> { closing, opening, average, peak, skus }
+
+    for (const item of fyRows) {
+      const closing = parseFloat(item.closing_value || 0);
+      const opening = parseFloat(item.opening_value || 0);
+      const average = (closing + opening) / 2;
+      const peak    = Math.max(closing, opening);
+
+      const dist = distMap[item.stock_name];
+      if (dist && dist.length > 0) {
+        // Distribute proportionally by batch_allocations qty
+        const totalQty = dist.reduce((s, d) => s + d.qty, 0);
+        for (const d of dist) {
+          const share = totalQty > 0 ? d.qty / totalQty : 1 / dist.length;
+          if (!warehouseValues[d.warehouse]) warehouseValues[d.warehouse] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
+          warehouseValues[d.warehouse].closing += closing * share;
+          warehouseValues[d.warehouse].opening += opening * share;
+          warehouseValues[d.warehouse].average += average * share;
+          warehouseValues[d.warehouse].peak    += peak    * share;
+          warehouseValues[d.warehouse].skus    += 1;
+        }
+      } else {
+        // No godown data for this item → assign to Main Location (single-warehouse default)
+        const wh = 'Main Location';
+        if (!warehouseValues[wh]) warehouseValues[wh] = { closing: 0, opening: 0, average: 0, peak: 0, skus: 0 };
+        warehouseValues[wh].closing += closing;
+        warehouseValues[wh].opening += opening;
+        warehouseValues[wh].average += average;
+        warehouseValues[wh].peak    += peak;
+        warehouseValues[wh].skus    += 1;
+      }
+    }
+
+    const warehouses = Object.entries(warehouseValues)
+      .map(([warehouse, v]) => ({
+        warehouse,
+        skus:          v.skus,
+        closing_value: Math.round(v.closing * 100) / 100,
+        opening_value: Math.round(v.opening * 100) / 100,
+        average_value: Math.round(v.average * 100) / 100,
+        peak_value:    Math.round(v.peak    * 100) / 100,
+      }))
+      .filter(w => w.closing_value > 0 || w.opening_value > 0)
+      .sort((a, b) => b.closing_value - a.closing_value);
+
+    const summary = {
+      total_closing: Math.round(warehouses.reduce((s, w) => s + w.closing_value, 0) * 100) / 100,
+      total_opening: Math.round(warehouses.reduce((s, w) => s + w.opening_value, 0) * 100) / 100,
+      total_average: Math.round(warehouses.reduce((s, w) => s + w.average_value, 0) * 100) / 100,
+      total_peak:    Math.round(warehouses.reduce((s, w) => s + w.peak_value,    0) * 100) / 100,
+    };
+
+    res.json({ success: true, data: { warehouses, summary, financial_year: financialYear } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -1675,7 +1785,9 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
           AND COUNT(CASE WHEN st.type = 'inward'  THEN 1 END) > 0
       ),
       transfer_items AS (
-        SELECT
+        -- DISTINCT ON prevents Cartesian inflation when 1 outward row joins N inward rows
+        -- (e.g. same item split across 2 destination godowns in one Stock Journal)
+        SELECT DISTINCT ON (st_out.voucher_guid, st_out.stock_guid, st_out.warehouse)
           st_out.voucher_guid,
           st_out.date,
           st_out.stock_guid AS item_name,
@@ -1693,6 +1805,7 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
           AND st_in.type          = 'inward'
         JOIN transfer_voucher_guids tvg ON tvg.voucher_guid = st_out.voucher_guid
         WHERE st_out.company_guid = $1
+        ORDER BY st_out.voucher_guid, st_out.stock_guid, st_out.warehouse, st_in.warehouse
       ),
       grouped AS (
         SELECT
