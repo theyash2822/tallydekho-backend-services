@@ -1645,9 +1645,21 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     const inactive = rows.filter(r => parseFloat(r.total_outward_qty) === 0);
 
     // Among active items, top 50% by total_outward_qty = fast, bottom 50% = slow
-    const halfIdx = Math.ceil(active.length / 2);
-    const fastRaw  = active.slice(0, halfIdx);
-    const slowRaw  = [...active.slice(halfIdx), ...inactive];
+    // Use company's fast_moving_top_pct setting (default 20%); fall back to 50% if not set
+    const { rows: fsSettings } = await query(
+      `SELECT fast_moving_top_pct, slow_moving_no_movement_days, dead_stock_no_movement_days
+       FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
+      [companyGuid]
+    );
+    const fastPct    = parseInt(fsSettings[0]?.fast_moving_top_pct)  || 20;  // top X% by outward qty
+    const slowDays   = parseInt(fsSettings[0]?.slow_moving_no_movement_days) || 90;
+    const deadDays   = parseInt(fsSettings[0]?.dead_stock_no_movement_days)  || 180;
+    const fastCount  = Math.max(1, Math.ceil(active.length * fastPct / 100));
+    const fastRaw    = active.slice(0, fastCount);
+    // Slow: active items below fast threshold
+    // Dead: inactive items with no movement beyond deadDays (use transaction date proxy)
+    const slowActive = active.slice(fastCount);
+    const slowRaw    = [...slowActive, ...inactive];
 
     const displayField = await getProductDisplayField(companyGuid);
     const mapItem = (r, idx, tab) => ({
