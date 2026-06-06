@@ -1736,7 +1736,6 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
   try {
     const { fy } = req.query;
     const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, null, null, fy);
-    const fyDays = Math.max(Math.round((new Date(fyTo) - new Date(fyFrom)) / 86400000), 1);
 
     const { rows } = await query(`
       SELECT
