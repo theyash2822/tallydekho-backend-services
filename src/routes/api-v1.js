@@ -1645,6 +1645,108 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/stocks/transfer-history — stock journal godown transfers (inward+outward on same voucher)
+router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { fy, page = 1, limit = 30 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    let fyFrom = null, fyTo = null;
+    if (fy) {
+      const resolved = await resolveFYDates(companyGuid, null, null, fy);
+      fyFrom = resolved.from;
+      fyTo   = resolved.to;
+    }
+
+    // A "transfer" voucher = same voucher_guid has BOTH outward and inward stock_transaction rows
+    // This covers Stock Journal godown transfers synced from Tally
+    const { rows: transfers } = await query(`
+      WITH transfer_voucher_guids AS (
+        SELECT st.voucher_guid
+        FROM stock_transactions st
+        WHERE st.company_guid = $1
+          AND ($2::date IS NULL OR st.date::date >= $2::date)
+          AND ($3::date IS NULL OR st.date::date <= $3::date)
+        GROUP BY st.voucher_guid
+        HAVING
+          COUNT(CASE WHEN st.type = 'outward' THEN 1 END) > 0
+          AND COUNT(CASE WHEN st.type = 'inward'  THEN 1 END) > 0
+      ),
+      transfer_items AS (
+        SELECT
+          st_out.voucher_guid,
+          st_out.date,
+          st_out.stock_guid AS item_name,
+          COALESCE(NULLIF(st_out.warehouse, ''), 'Main Location') AS from_warehouse,
+          COALESCE(NULLIF(st_in.warehouse,  ''), 'Main Location') AS to_warehouse,
+          st_out.qty,
+          st_out.value,
+          COALESCE(st_out.voucher_type, 'Stock Journal') AS voucher_type
+        FROM stock_transactions st_out
+        JOIN stock_transactions st_in
+          ON  st_out.voucher_guid = st_in.voucher_guid
+          AND st_out.company_guid = st_in.company_guid
+          AND st_out.stock_guid   = st_in.stock_guid
+          AND st_out.type         = 'outward'
+          AND st_in.type          = 'inward'
+        JOIN transfer_voucher_guids tvg ON tvg.voucher_guid = st_out.voucher_guid
+        WHERE st_out.company_guid = $1
+      ),
+      grouped AS (
+        SELECT
+          ti.voucher_guid,
+          MAX(ti.date)         AS date,
+          MAX(ti.voucher_type) AS voucher_type,
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'item',           ti.item_name,
+              'qty',            ti.qty,
+              'value',          ti.value,
+              'from_warehouse', ti.from_warehouse,
+              'to_warehouse',   ti.to_warehouse
+            ) ORDER BY ti.item_name
+          ) AS items,
+          COUNT(*)::int  AS item_count,
+          SUM(ti.value)  AS total_value,
+          COALESCE(MAX(v.voucher_number), '') AS voucher_number
+        FROM transfer_items ti
+        LEFT JOIN vouchers v ON v.guid = ti.voucher_guid AND v.company_guid = $1
+        GROUP BY ti.voucher_guid
+      )
+      SELECT * FROM grouped
+      ORDER BY date DESC
+      LIMIT $4 OFFSET $5
+    `, [companyGuid, fyFrom, fyTo, parseInt(limit), offset]);
+
+    const { rows: countRow } = await query(`
+      SELECT COUNT(*) AS total
+      FROM (
+        SELECT st.voucher_guid
+        FROM stock_transactions st
+        WHERE st.company_guid = $1
+          AND ($2::date IS NULL OR st.date::date >= $2::date)
+          AND ($3::date IS NULL OR st.date::date <= $3::date)
+        GROUP BY st.voucher_guid
+        HAVING
+          COUNT(CASE WHEN st.type = 'outward' THEN 1 END) > 0
+          AND COUNT(CASE WHEN st.type = 'inward'  THEN 1 END) > 0
+      ) t
+    `, [companyGuid, fyFrom, fyTo]);
+
+    res.json({
+      success: true,
+      data:  transfers,
+      total: parseInt(countRow[0]?.total ?? 0),
+      page:  parseInt(page),
+      limit: parseInt(limit),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
