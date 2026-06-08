@@ -5153,6 +5153,60 @@ function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
   return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM NAME="${stockName}" ACTION="Alter"><NAME>${stockName}</NAME><NAME.LIST TYPE="String">${nameList}</NAME.LIST></STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
 
+// POST /api/inventory/barcodes/generate-bulk — generate barcodes for multiple/all unlinked items
+router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res) => {
+  const { companyGuid, stockGuids, all, barcodeType = 'CODE128', syncTarget = 'app_only' } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!all && (!Array.isArray(stockGuids) || !stockGuids.length))
+    return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'stockGuids[] or all=true required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    // Fetch target items that have NO active primary barcode
+    const baseFilter = all
+      ? `s.company_guid = $1`
+      : `s.company_guid = $1 AND s.guid = ANY($2::text[])`;
+    const baseParams = all ? [companyGuid] : [companyGuid, stockGuids];
+    const { rows: targets } = await query(`
+      SELECT s.guid, s.name FROM stocks s
+      WHERE ${baseFilter}
+      AND NOT EXISTS (
+        SELECT 1 FROM stock_barcodes sb
+        WHERE sb.stock_guid = s.guid AND sb.company_guid = $1 AND sb.is_primary = TRUE AND sb.status = 'active'
+      )
+      ORDER BY s.name`, baseParams);
+
+    if (!targets.length)
+      return res.json({ success: true, data: { generated: 0, alreadyLinked: stockGuids?.length || 0, errors: 0 } });
+
+    const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid]);
+    const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+    let generated = 0, errors = 0;
+
+    for (let i = 0; i < targets.length; i++) {
+      const item = targets[i];
+      try {
+        let barcode, tries = 0;
+        do {
+          barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + generated + tries + 1);
+          tries++;
+          const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode]);
+          if (!dup) break;
+        } while (tries < 10);
+        await query(`
+          INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+          VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
+          ON CONFLICT (company_guid, barcode) DO NOTHING`,
+          [companyGuid, item.guid, item.name, barcode, barcodeType, syncTarget, tallyStatus]);
+        generated++;
+      } catch { errors++; }
+    }
+    res.json({ success: true, data: { generated, alreadyLinked: (stockGuids?.length || targets.length) - targets.length, errors, total: targets.length } });
+  } catch (err) {
+    console.error('[inventory/barcodes GENERATE-BULK]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // POST /api/inventory/barcodes/by-guids — fetch barcode data for a specific list of stockGuids (used by print screens)
 router.post('/inventory/barcodes/by-guids', authMiddleware, async (req, res) => {
   const { companyGuid, stockGuids } = req.body;
