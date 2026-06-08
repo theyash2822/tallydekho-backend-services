@@ -302,3 +302,27 @@ _Add new entries at top._
 - **Bug 1:** `closing_qty > 0` filter excluded sold-out items from list. Fixed with OR EXISTS subquery that includes items with FY outward movement regardless of current closing_qty. Backend now returns `sold_out: true` flag.
 - **Bug 2:** Chart was `CURRENT_DATE - 30` window + `type='outward'` only. Replaced with last 30 unique transaction DATES (inward + outward, no date window). Returns `outward_value`, `outward_qty`, `inward_value`, `inward_qty` per date.
 - Commit: `cde944b` — tallydekho-backend-services
+
+## 2026-06-08 — Barcode Module (Backend)
+
+### New DB Tables (schema.js)
+- `stock_barcodes` — barcode↔stock mapping (company_guid, stock_guid, barcode, type, source, status, sync_target, tally_sync_status)
+- `barcode_import_jobs` — bulk import job tracking
+- `barcode_import_errors` — per-row import error log
+- `inventory_barcode_settings` — per-company barcode config (storage mode, type, auto-sync)
+
+### New APIs (api-v1.js) — all JWT + verifyCompanyOwnership
+- `POST /api/inventory/barcodes` — list with pagination, period/group/status/search filters, summary
+- `POST /api/inventory/barcodes/generate` — generate barcode (CODE128: TDKxxxx0000001, EAN13: valid checksum)
+- `POST /api/inventory/barcodes/link` — link manual/scanned barcode to stock item (duplicate check + validation)
+- `POST /api/inventory/barcodes/lookup` — scan lookup by barcode value
+- `POST /api/inventory/barcodes/bulk-import` — CSV/paste import with job tracking
+- `GET  /api/inventory/barcodes/template` — CSV template download
+- `GET  /api/inventory/barcodes/settings` — get barcode settings
+- `POST /api/inventory/barcodes/settings` — save barcode settings
+
+### ingestProcessor.js
+- `_tallyAliasMayBeBarcode()` helper: detects barcode-like aliases (>=70% numeric, 8-32 chars, no spaces)
+- processStocks(): auto-seeds `stock_barcodes` with `source='tally'` when alias looks like barcode
+
+### Commit: `df00776` → tallydekho-backend-services

@@ -5153,6 +5153,46 @@ function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
   return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM NAME="${stockName}" ACTION="Alter"><NAME>${stockName}</NAME><NAME.LIST TYPE="String">${nameList}</NAME.LIST></STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
 
+// POST /api/inventory/barcodes/by-guids — fetch barcode data for a specific list of stockGuids (used by print screens)
+router.post('/inventory/barcodes/by-guids', authMiddleware, async (req, res) => {
+  const { companyGuid, stockGuids } = req.body;
+  if (!companyGuid || !Array.isArray(stockGuids) || !stockGuids.length)
+    return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and stockGuids[] required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const displayField = await getProductDisplayField(companyGuid);
+    const { rows } = await query(`
+      SELECT
+        s.guid AS stock_guid, s.name, s.alias, s.sku, s.group_name, s.unit,
+        s.closing_qty, s.closing_rate,
+        sb.barcode, sb.barcode_type, sb.status AS barcode_status, sb.tally_sync_status
+      FROM stocks s
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+      WHERE s.company_guid=$1 AND s.guid = ANY($2::text[])
+      ORDER BY s.name ASC`, [companyGuid, stockGuids]);
+    res.json({
+      success: true,
+      data: {
+        items: rows.map(r => ({
+          stockGuid:    r.stock_guid,
+          displayName:  computeDisplayName(r, displayField),
+          name:         r.name,
+          sku:          r.sku || r.alias || null,
+          barcode:      r.barcode || null,
+          barcodeType:  r.barcode_type || 'CODE128',
+          closingRate:  parseFloat(r.closing_rate || 0),
+          currentQty:   parseFloat(r.closing_qty  || 0),
+          groupName:    r.group_name || null,
+          unit:         r.unit || 'Pcs',
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('[inventory/barcodes BY-GUIDS]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // POST /api/inventory/barcodes — list with filters + summary
 router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
   const { companyGuid, period, group, status, search, page = 1, pageSize = 50 } = req.body;
