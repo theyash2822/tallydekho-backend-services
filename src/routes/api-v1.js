@@ -5475,8 +5475,10 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
   }
 });
 
-// GET /api/inventory/barcodes/template — CSV template download
-router.get('/inventory/barcodes/template', authMiddleware, (req, res) => {
+// GET /api/inventory/barcodes/template — CSV template download (auth required; no company data exposed)
+router.get('/inventory/barcodes/template', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid;
+  if (companyGuid && !await verifyCompanyOwnership(req, res, companyGuid)) return;
   const csv = 'stock_guid,item_name,sku,barcode,barcode_type,is_primary,sync_target\n,,, "8901234567890",EAN13,true,app_only\n,, SKU-001,"TDKXXXX0000001",CODE128,true,app_only\n';
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="barcode_import_template.csv"');
@@ -5485,7 +5487,7 @@ router.get('/inventory/barcodes/template', authMiddleware, (req, res) => {
 
 // GET /api/inventory/barcodes/settings — get barcode settings
 router.get('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
-  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  const companyGuid = req.query.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
