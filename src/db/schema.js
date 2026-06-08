@@ -758,6 +758,65 @@ export async function initSchema() {
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS batch_tracking_app_enabled   BOOLEAN DEFAULT FALSE;
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS expiry_tracking_app_enabled  BOOLEAN DEFAULT FALSE;
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS allow_negative_stock_app     BOOLEAN DEFAULT FALSE;
+
+      -- ── Barcode Module ────────────────────────────────────────────────────────
+      CREATE TABLE IF NOT EXISTS stock_barcodes (
+        id               SERIAL PRIMARY KEY,
+        company_guid     TEXT NOT NULL,
+        stock_guid       TEXT,
+        stock_name       TEXT,
+        barcode          TEXT NOT NULL,
+        barcode_type     TEXT DEFAULT 'CODE128',
+        source           TEXT DEFAULT 'manual',
+        status           TEXT DEFAULT 'active',
+        is_primary       BOOLEAN DEFAULT TRUE,
+        sync_target      TEXT DEFAULT 'app_only',
+        tally_sync_status TEXT DEFAULT 'not_required',
+        synced_to_tally_at TIMESTAMPTZ,
+        duplicate_of     INTEGER,
+        validation_error TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_barcodes_company_barcode ON stock_barcodes(company_guid, barcode);
+      CREATE INDEX IF NOT EXISTS idx_stock_barcodes_company_stock  ON stock_barcodes(company_guid, stock_guid);
+      CREATE INDEX IF NOT EXISTS idx_stock_barcodes_status         ON stock_barcodes(company_guid, status);
+      CREATE INDEX IF NOT EXISTS idx_stock_barcodes_sync           ON stock_barcodes(company_guid, tally_sync_status);
+
+      CREATE TABLE IF NOT EXISTS barcode_import_jobs (
+        id               TEXT PRIMARY KEY,
+        company_guid     TEXT NOT NULL,
+        file_name        TEXT,
+        status           TEXT DEFAULT 'pending',
+        total_rows       INTEGER DEFAULT 0,
+        imported_rows    INTEGER DEFAULT 0,
+        duplicate_rows   INTEGER DEFAULT 0,
+        invalid_rows     INTEGER DEFAULT 0,
+        needs_review_rows INTEGER DEFAULT 0,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        completed_at     TIMESTAMPTZ
+      );
+
+      CREATE TABLE IF NOT EXISTS barcode_import_errors (
+        id               SERIAL PRIMARY KEY,
+        job_id           TEXT NOT NULL,
+        row_number       INTEGER,
+        item_identifier  TEXT,
+        barcode          TEXT,
+        error_type       TEXT,
+        error_message    TEXT,
+        raw_data         TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS inventory_barcode_settings (
+        company_guid          TEXT PRIMARY KEY,
+        barcode_storage_mode  TEXT DEFAULT 'app_only',
+        default_barcode_type  TEXT DEFAULT 'CODE128',
+        auto_sync_to_tally    BOOLEAN DEFAULT FALSE,
+        created_at            TIMESTAMPTZ DEFAULT NOW(),
+        updated_at            TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

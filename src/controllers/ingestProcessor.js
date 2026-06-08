@@ -183,6 +183,18 @@ const now = () => Math.floor(Date.now() / 1000);
 // V2: Optionally store raw records before processing (TALLY_STORE_RAW=true env var)
 const STORE_RAW = process.env.TALLY_STORE_RAW === 'true';
 
+// Detect if a Tally alias/part-number value looks like a barcode
+// Rules: 8-32 chars, no spaces, mostly numeric (>=70%) or TDK-prefixed internal codes
+function _tallyAliasMayBeBarcode(val) {
+  if (!val) return false;
+  const v = String(val).trim();
+  if (v.length < 8 || v.length > 32) return false;
+  if (/\s/.test(v)) return false;
+  if (!/^[A-Za-z0-9\-\.]+$/.test(v)) return false;
+  const numRatio = (v.match(/[0-9]/g) || []).length / v.length;
+  return numRatio >= 0.7 || v.startsWith('TDK');
+}
+
 // Derive parent voucher type from custom Tally voucher type name
 function deriveVoucherTypeParent(voucherType) {
   if (!voucherType) return voucherType;
@@ -424,6 +436,18 @@ async function processStocks(data, companyGuid) {
           now(),
         ]);
         saved++;
+
+        // Auto-detect barcode-like aliases from Tally and seed stock_barcodes
+        const aliasVal = r.OnlyAlias || r.ALIAS || r.PartNumber || r.PARTNUMBER || null;
+        if (aliasVal && _tallyAliasMayBeBarcode(String(aliasVal))) {
+          try {
+            await client.query(`
+              INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+              VALUES ($1, $2, $3, $4, 'CODE128', 'tally', 'active', TRUE, 'app_only', 'not_required')
+              ON CONFLICT (company_guid, barcode) DO NOTHING`,
+              [companyGuid, guid, name, String(aliasVal).trim()]);
+          } catch (_) { /* non-critical — skip silently */ }
+        }
       } catch (e) {
         console.warn('[DB] Stock insert failed:', e.message);
       }

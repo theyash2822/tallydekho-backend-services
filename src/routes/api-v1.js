@@ -5108,4 +5108,315 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════
+// BARCODE MODULE
+// ════════════════════════════════════════════════════════════
+
+// ── Barcode helpers ──────────────────────────────────────────────────────────────────
+function _hashCode32(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+function _ean13Check(d12) {
+  let s = 0;
+  for (let i = 0; i < 12; i++) s += parseInt(d12[i]) * (i % 2 === 0 ? 1 : 3);
+  return ((10 - (s % 10)) % 10).toString();
+}
+function generateBarcodeValue(type, companyGuid, seq) {
+  if (type === 'EAN13') {
+    const p  = '890';
+    const ch = _hashCode32(companyGuid).toString().padStart(4,'0').slice(0,4);
+    const s  = seq.toString().padStart(5,'0').slice(-5);
+    const d12 = p + ch + s;
+    return d12 + _ean13Check(d12);
+  }
+  const slug = companyGuid.replace(/[^A-Z0-9]/gi,'').slice(0,4).toUpperCase().padEnd(4,'X');
+  return `TDK${slug}${seq.toString().padStart(7,'0').slice(-7)}`;
+}
+function validateBarcode(barcode, type) {
+  if (!barcode) return 'Barcode is required';
+  const b = String(barcode).trim();
+  if (b.length < 4)  return 'Too short (min 4)';
+  if (b.length > 64) return 'Too long (max 64)';
+  if (/\s/.test(b))  return 'Spaces not allowed in barcode';
+  if (type === 'EAN13') {
+    if (!/^\d{13}$/.test(b))            return 'EAN13 must be exactly 13 digits';
+    if (_ean13Check(b.slice(0,12)) !== b[12]) return 'Invalid EAN13 checksum';
+  }
+  if (type === 'EAN8' && !/^\d{8}$/.test(b)) return 'EAN8 must be exactly 8 digits';
+  return null;
+}
+function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
+  const all = [...new Set([stockName, ...existingAliases, barcode])];
+  const nameList = all.map(a => `<NAME>${a.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</NAME>`).join('\n              ');
+  return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM NAME="${stockName}" ACTION="Alter"><NAME>${stockName}</NAME><NAME.LIST TYPE="String">${nameList}</NAME.LIST></STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+}
+
+// POST /api/inventory/barcodes — list with filters + summary
+router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
+  const { companyGuid, period, group, status, search, page = 1, pageSize = 50 } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const displayField = await getProductDisplayField(companyGuid);
+    const lim  = Math.min(parseInt(pageSize) || 50, 200);
+    const off  = (Math.max(1, parseInt(page)) - 1) * lim;
+    const params = [companyGuid];
+    let where = 's.company_guid = $1';
+
+    if (group && group !== 'All' && group !== 'all') {
+      params.push(group); where += ` AND s.group_name = $${params.length}`;
+    }
+    if (period && !['All','all'].includes(period)) {
+      const d = period === 'Today' ? new Date().setHours(0,0,0,0)
+              : period === '7 Days'  ? Date.now() - 7*864e5
+              : period === '30 Days' ? Date.now() - 30*864e5 : null;
+      if (d) { params.push(new Date(d).toISOString()); where += ` AND (sb.created_at IS NULL OR sb.created_at >= $${params.length})`; }
+    }
+    if (status && !['All','all'].includes(status)) {
+      if (status === 'Linked')              where += ` AND sb.barcode IS NOT NULL`;
+      else if (status === 'Unlinked')       where += ` AND sb.barcode IS NULL`;
+      else if (status === 'In Stock')       where += ` AND s.closing_qty > 0`;
+      else if (status === 'Low Stock')      where += ` AND s.closing_qty > 0 AND s.reorder_level > 0 AND s.closing_qty <= s.reorder_level`;
+      else if (status === 'Out of Stock')   where += ` AND s.closing_qty <= 0`;
+      else if (status === 'Duplicate')      where += ` AND sb.status = 'duplicate'`;
+      else if (status === 'Invalid')        where += ` AND sb.status = 'invalid'`;
+      else if (status === 'Pending Tally Sync') where += ` AND sb.tally_sync_status IN ('pending_tally','failed')`;
+    }
+    if (search && search.trim()) {
+      params.push(`%${search.trim()}%`);
+      where += ` AND (s.name ILIKE $${params.length} OR s.sku ILIKE $${params.length} OR s.alias ILIKE $${params.length} OR sb.barcode ILIKE $${params.length})`;
+    }
+
+    const sumRes = await query(`
+      SELECT
+        COUNT(DISTINCT s.guid)::int AS total_items,
+        COUNT(DISTINCT sb.stock_guid) FILTER (WHERE sb.status='active')::int AS linked,
+        COUNT(*) FILTER (WHERE sb.status='duplicate')::int AS duplicates,
+        COUNT(*) FILTER (WHERE sb.status='invalid')::int AS invalid,
+        COUNT(*) FILTER (WHERE sb.tally_sync_status IN ('pending_tally','failed'))::int AS pending_tally_sync
+      FROM stocks s
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE
+      WHERE s.company_guid=$1`, [companyGuid]);
+    const sr = sumRes.rows[0] || {};
+
+    const { rows } = await query(`
+      SELECT
+        s.guid AS stock_guid, s.name, s.alias, s.sku, s.description, s.group_name, s.unit,
+        s.closing_qty, s.reorder_level,
+        sb.id AS barcode_id, sb.barcode, sb.barcode_type,
+        sb.status AS barcode_status, sb.source, sb.sync_target, sb.tally_sync_status, sb.is_primary,
+        COUNT(*) OVER() AS _total
+      FROM stocks s
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+      WHERE ${where}
+      ORDER BY s.name ASC
+      LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, lim, off]);
+
+    const total  = parseInt(rows[0]?._total ?? 0);
+    const linked = parseInt(sr.linked || 0);
+    const items  = rows.map(r => ({
+      stockGuid:       r.stock_guid,
+      displayName:     computeDisplayName(r, displayField),
+      name:            r.name,
+      alias:           r.alias,
+      partNumber:      r.sku,
+      description:     r.description,
+      sku:             r.sku || r.alias,
+      barcode:         r.barcode || null,
+      barcodeId:       r.barcode_id,
+      barcodeType:     r.barcode_type || null,
+      barcodeStatus:   r.barcode_status || null,
+      source:          r.source || null,
+      syncTarget:      r.sync_target || 'app_only',
+      tallySyncStatus: r.tally_sync_status || null,
+      groupName:       r.group_name,
+      currentQty:      parseFloat(r.closing_qty || 0),
+      unit:            r.unit || 'Pcs',
+    }));
+
+    const groupsRes = await query(`SELECT DISTINCT group_name FROM stocks WHERE company_guid=$1 AND group_name IS NOT NULL AND group_name != '' ORDER BY group_name`, [companyGuid]);
+    const groups = ['All', ...groupsRes.rows.map(r => r.group_name)];
+
+    res.json({
+      success: true,
+      data: {
+        summary: { totalItems: parseInt(sr.total_items||0), linked, unlinked: Math.max(0, parseInt(sr.total_items||0) - linked), duplicates: parseInt(sr.duplicates||0), invalid: parseInt(sr.invalid||0), pendingTallySync: parseInt(sr.pending_tally_sync||0) },
+        items,
+        filters: { groups, statuses: ['All','In Stock','Low Stock','Out of Stock','Linked','Unlinked','Duplicate','Invalid','Pending Tally Sync'] },
+        pagination: { page: parseInt(page), pageSize: lim, total },
+      },
+    });
+  } catch (err) {
+    console.error('[inventory/barcodes LIST]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/barcodes/generate — generate barcode for a stock item
+router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => {
+  const { companyGuid, stockGuid, barcodeType = 'CODE128', syncTarget = 'app_only' } = req.body;
+  if (!companyGuid || !stockGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and stockGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: [stock] } = await query('SELECT name, guid FROM stocks WHERE guid=$1 AND company_guid=$2', [stockGuid, companyGuid]);
+    if (!stock) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Stock item not found' } });
+    const { rows: [existing] } = await query(`SELECT barcode, barcode_type FROM stock_barcodes WHERE stock_guid=$1 AND company_guid=$2 AND is_primary=TRUE AND status='active' LIMIT 1`, [stockGuid, companyGuid]);
+    if (existing) return res.json({ success: true, data: { barcode: existing.barcode, barcodeType: existing.barcode_type, status: 'active', alreadyExisted: true } });
+    const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid]);
+    let barcode, tries = 0;
+    do {
+      barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + tries + 1);
+      tries++;
+      const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode]);
+      if (!dup) break;
+    } while (tries < 10);
+    const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+    const { rows: [ins] } = await query(`
+      INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+      VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
+      RETURNING barcode, barcode_type, status, tally_sync_status`,
+      [companyGuid, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
+    res.json({ success: true, data: { barcode: ins.barcode, barcodeType: ins.barcode_type, status: ins.status, tallySyncStatus: ins.tally_sync_status } });
+  } catch (err) {
+    console.error('[inventory/barcodes GENERATE]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/barcodes/link — link/assign a barcode to a stock item
+router.post('/inventory/barcodes/link', authMiddleware, async (req, res) => {
+  const { companyGuid, stockGuid, barcode, barcodeType = 'CODE128', source = 'manual', syncTarget = 'app_only', isPrimary = true } = req.body;
+  if (!companyGuid || !stockGuid || !barcode) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid, stockGuid, barcode required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const vErr = validateBarcode(barcode, barcodeType);
+  if (vErr) return res.status(400).json({ success: false, error: { code: 'INVALID_BARCODE', message: vErr } });
+  try {
+    const { rows: [stock] } = await query('SELECT name FROM stocks WHERE guid=$1 AND company_guid=$2', [stockGuid, companyGuid]);
+    if (!stock) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Stock item not found' } });
+    const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode.trim()]);
+    if (dup) return res.status(409).json({ success: false, error: { code: 'DUPLICATE_BARCODE', message: `Barcode already linked to "${dup.stock_name}"` } });
+    if (isPrimary) await query(`UPDATE stock_barcodes SET is_primary=FALSE WHERE stock_guid=$1 AND company_guid=$2 AND is_primary=TRUE`, [stockGuid, companyGuid]);
+    const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+    await query(`
+      INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+      VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9)`,
+      [companyGuid, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
+    res.json({ success: true, data: { status: 'active', tallySyncStatus: tallyStatus } });
+  } catch (err) {
+    console.error('[inventory/barcodes LINK]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/barcodes/lookup — lookup by scanned barcode
+router.post('/inventory/barcodes/lookup', authMiddleware, async (req, res) => {
+  const { companyGuid, barcode } = req.body;
+  if (!companyGuid || !barcode) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and barcode required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const displayField = await getProductDisplayField(companyGuid);
+    const { rows: [row] } = await query(`
+      SELECT s.guid AS stock_guid, s.name, s.sku, s.alias, s.group_name, s.unit, s.closing_qty,
+             sb.barcode, sb.barcode_type
+      FROM stock_barcodes sb
+      JOIN stocks s ON s.guid=sb.stock_guid AND s.company_guid=sb.company_guid
+      WHERE sb.company_guid=$1 AND sb.barcode=$2 AND sb.status='active'
+      LIMIT 1`, [companyGuid, barcode.trim()]);
+    if (!row) return res.json({ success: true, data: { found: false, barcode, actions: ['link_existing_item','create_new_item'] } });
+    res.json({ success: true, data: { found: true, item: { stockGuid: row.stock_guid, displayName: computeDisplayName(row, displayField), name: row.name, sku: row.sku || row.alias, barcode: row.barcode, currentQty: parseFloat(row.closing_qty||0), groupName: row.group_name, unit: row.unit } } });
+  } catch (err) {
+    console.error('[inventory/barcodes LOOKUP]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/barcodes/bulk-import — bulk import barcodes (CSV text or paste lines)
+router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) => {
+  const { companyGuid, text, lines, fileName = 'import.csv' } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const rawLines = lines || (text ? String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean) : []);
+  if (!rawLines.length) return res.status(400).json({ success: false, error: { code: 'NO_DATA', message: 'No data to import' } });
+  try {
+    const { v4: uuidv4 } = await import('uuid');
+    const jobId = uuidv4();
+    const parsed = rawLines.map((line, idx) => {
+      const parts = line.split(',').map(p => p.trim().replace(/^["']|["']$/g,''));
+      if (idx === 0 && (parts[0].toLowerCase().includes('name') || parts[0].toLowerCase().includes('guid'))) return null;
+      return parts.length >= 2
+        ? { rawItemName: parts[0], rawBarcode: parts[1], rowNumber: idx+1, raw: line }
+        : { rawItemName: null, rawBarcode: parts[0], rowNumber: idx+1, raw: line };
+    }).filter(Boolean);
+
+    let imported=0, duplicates=0, invalid=0, needsReview=0;
+    const errors = [];
+    for (const row of parsed) {
+      const b = row.rawBarcode?.trim();
+      if (!b || b.length < 4) {
+        invalid++;
+        errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'invalid', error_message: 'Missing or too-short barcode', raw_data: row.raw });
+        continue;
+      }
+      let stockGuid=null, stockName=null;
+      if (row.rawItemName) {
+        const { rows: [found] } = await query(`SELECT guid,name FROM stocks WHERE company_guid=$1 AND (LOWER(name)=LOWER($2) OR LOWER(sku)=LOWER($2) OR LOWER(alias)=LOWER($2)) LIMIT 1`, [companyGuid, row.rawItemName]);
+        if (found) { stockGuid=found.guid; stockName=found.name; }
+        else { needsReview++; errors.push({ job_id: jobId, row_number: row.rowNumber, item_identifier: row.rawItemName, barcode: b, error_type: 'needs_review', error_message: `No stock item matched "${row.rawItemName}"`, raw_data: row.raw }); continue; }
+      }
+      const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, b]);
+      if (dup) { duplicates++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'duplicate', error_message: `Barcode already linked to "${dup.stock_name}"`, raw_data: row.raw }); continue; }
+      try {
+        await query(`INSERT INTO stock_barcodes (company_guid,stock_guid,stock_name,barcode,barcode_type,source,status,is_primary,sync_target,tally_sync_status) VALUES ($1,$2,$3,$4,'CODE128','import','active',TRUE,'app_only','not_required') ON CONFLICT (company_guid,barcode) DO NOTHING`, [companyGuid, stockGuid, stockName, b]);
+        imported++;
+      } catch(e) { invalid++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'error', error_message: e.message, raw_data: row.raw }); }
+    }
+    await query(`INSERT INTO barcode_import_jobs (id,company_guid,file_name,status,total_rows,imported_rows,duplicate_rows,invalid_rows,needs_review_rows,created_at,completed_at) VALUES ($1,$2,$3,'completed',$4,$5,$6,$7,$8,NOW(),NOW())`, [jobId, companyGuid, fileName, parsed.length, imported, duplicates, invalid, needsReview]);
+    for (const e of errors) await query(`INSERT INTO barcode_import_errors (job_id,row_number,item_identifier,barcode,error_type,error_message,raw_data) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [e.job_id, e.row_number, e.item_identifier||null, e.barcode, e.error_type, e.error_message, e.raw_data]);
+    res.json({ success: true, data: { jobId, summary: { totalRows: parsed.length, imported, duplicates, invalid, needsReview } } });
+  } catch (err) {
+    console.error('[inventory/barcodes BULK-IMPORT]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/inventory/barcodes/template — CSV template download
+router.get('/inventory/barcodes/template', authMiddleware, (req, res) => {
+  const csv = 'stock_guid,item_name,sku,barcode,barcode_type,is_primary,sync_target\n,,, "8901234567890",EAN13,true,app_only\n,, SKU-001,"TDKXXXX0000001",CODE128,true,app_only\n';
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="barcode_import_template.csv"');
+  res.send(csv);
+});
+
+// GET /api/inventory/barcodes/settings — get barcode settings
+router.get('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: [row] } = await query(`SELECT * FROM inventory_barcode_settings WHERE company_guid=$1`, [companyGuid]);
+    res.json({ success: true, data: { barcodeStorageMode: row?.barcode_storage_mode || 'app_only', defaultBarcodeType: row?.default_barcode_type || 'CODE128', autoSyncToTally: row?.auto_sync_to_tally || false } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// POST /api/inventory/barcodes/settings — save barcode settings
+router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
+  const { companyGuid, barcodeStorageMode = 'app_only', defaultBarcodeType = 'CODE128', autoSyncToTally = false } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const VALID_MODES = ['app_only','tally_alias','tally_part_number','tally_udf'];
+  const VALID_TYPES = ['CODE128','EAN13','EAN8','UPC','QR','INTERNAL'];
+  if (!VALID_MODES.includes(barcodeStorageMode)) return res.status(400).json({ success: false, error: { code: 'INVALID_MODE', message: 'Invalid storage mode' } });
+  if (!VALID_TYPES.includes(defaultBarcodeType))  return res.status(400).json({ success: false, error: { code: 'INVALID_TYPE', message: 'Invalid barcode type' } });
+  try {
+    await query(`
+      INSERT INTO inventory_barcode_settings (company_guid,barcode_storage_mode,default_barcode_type,auto_sync_to_tally,updated_at)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (company_guid) DO UPDATE SET barcode_storage_mode=EXCLUDED.barcode_storage_mode, default_barcode_type=EXCLUDED.default_barcode_type, auto_sync_to_tally=EXCLUDED.auto_sync_to_tally, updated_at=NOW()`,
+      [companyGuid, barcodeStorageMode, defaultBarcodeType, autoSyncToTally]);
+    res.json({ success: true, data: { barcodeStorageMode, defaultBarcodeType, autoSyncToTally } });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
 export default router;
