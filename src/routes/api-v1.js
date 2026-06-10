@@ -5466,6 +5466,15 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
   const rawLines = lines || (text ? String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean) : []);
   if (!rawLines.length) return res.status(400).json({ success: false, error: { code: 'NO_DATA', message: 'No data to import' } });
   try {
+    // Read company's current sync settings so imported barcodes respect them
+    const { rows: [companySettings] } = await query(
+      'SELECT barcode_storage_mode, auto_sync_to_tally FROM inventory_barcode_settings WHERE company_guid=$1',
+      [companyGuid]
+    ).catch(() => ({ rows: [{}] }));
+    const companySyncTarget   = companySettings?.barcode_storage_mode || 'app_only';
+    const companyAutoSync     = companySettings?.auto_sync_to_tally   || false;
+    const companyTallyStatus  = companySyncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+
     const { v4: uuidv4 } = await import('uuid');
     const jobId = uuidv4();
     const parsed = rawLines.map((line, idx) => {
@@ -5494,12 +5503,41 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
       const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, b]);
       if (dup) { duplicates++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'duplicate', error_message: `Barcode already linked to "${dup.stock_name}"`, raw_data: row.raw }); continue; }
       try {
-        await query(`INSERT INTO stock_barcodes (company_guid,stock_guid,stock_name,barcode,barcode_type,source,status,is_primary,sync_target,tally_sync_status) VALUES ($1,$2,$3,$4,'CODE128','import','active',TRUE,'app_only','not_required') ON CONFLICT (company_guid,barcode) DO NOTHING`, [companyGuid, stockGuid, stockName, b]);
+        await query(`INSERT INTO stock_barcodes (company_guid,stock_guid,stock_name,barcode,barcode_type,source,status,is_primary,sync_target,tally_sync_status) VALUES ($1,$2,$3,$4,'CODE128','import','active',TRUE,$5,$6) ON CONFLICT (company_guid,barcode) DO NOTHING`, [companyGuid, stockGuid, stockName, b, companySyncTarget, companyTallyStatus]);
         imported++;
       } catch(e) { invalid++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'error', error_message: e.message, raw_data: row.raw }); }
     }
     await query(`INSERT INTO barcode_import_jobs (id,company_guid,file_name,status,total_rows,imported_rows,duplicate_rows,invalid_rows,needs_review_rows,created_at,completed_at) VALUES ($1,$2,$3,'completed',$4,$5,$6,$7,$8,NOW(),NOW())`, [jobId, companyGuid, fileName, parsed.length, imported, duplicates, invalid, needsReview]);
     for (const e of errors) await query(`INSERT INTO barcode_import_errors (job_id,row_number,item_identifier,barcode,error_type,error_message,raw_data) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [e.job_id, e.row_number, e.item_identifier||null, e.barcode, e.error_type, e.error_message, e.raw_data]);
+
+    // Auto-push imported barcodes to Tally if company settings say so
+    if (imported > 0 && companyAutoSync && companySyncTarget !== 'app_only') {
+      setImmediate(async () => {
+        try {
+          const { pushBarcodeToTally } = await import('./tally-write.js');
+          const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+          if (!co?.name) return;
+          const { rows: newBarcodes } = await query(
+            `SELECT stock_guid, stock_name, barcode, sync_target FROM stock_barcodes
+             WHERE company_guid=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
+            [companyGuid]);
+          for (const row of newBarcodes) {
+            const result = await pushBarcodeToTally({
+              companyGuid, userId: req.user.userId,
+              stockGuid: row.stock_guid, stockName: row.stock_name,
+              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name,
+            }).catch(() => null);
+            const s = !result ? 'pending_tally'
+              : result.status === 'desktop_offline' ? 'pending_tally'
+              : (result.status === 'success' || (result.altered > 0 && !result.errors)) ? 'synced' : 'failed';
+            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
+              [s, companyGuid, row.stock_guid, row.barcode]);
+            if (s === 'pending_tally') break;
+          }
+        } catch (e) { console.error('[bulk-import auto-sync]', e.message); }
+      });
+    }
+
     res.json({ success: true, data: { jobId, summary: { totalRows: parsed.length, imported, duplicates, invalid, needsReview } } });
   } catch (err) {
     console.error('[inventory/barcodes BULK-IMPORT]', err.message);
@@ -5507,14 +5545,40 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
   }
 });
 
-// GET /api/inventory/barcodes/template — CSV template download (auth required; no company data exposed)
+// GET /api/inventory/barcodes/template — pre-filled CSV with all company stocks
+// Columns: item_name,barcode  (simple — user fills barcode column and re-uploads)
 router.get('/inventory/barcodes/template', authMiddleware, async (req, res) => {
-  const companyGuid = req.query.companyGuid;
-  if (companyGuid && !await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const csv = 'stock_guid,item_name,sku,barcode,barcode_type,is_primary,sync_target\n,,, "8901234567890",EAN13,true,app_only\n,, SKU-001,"TDKXXXX0000001",CODE128,true,app_only\n';
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="barcode_import_template.csv"');
-  res.send(csv);
+  const { companyGuid } = req.query;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    // Fetch all stocks + their primary barcode (if already linked)
+    const { rows } = await query(`
+      SELECT s.name AS item_name, sb.barcode
+      FROM stocks s
+      LEFT JOIN stock_barcodes sb
+        ON sb.stock_guid = s.guid AND sb.company_guid = s.company_guid
+           AND sb.is_primary = TRUE AND sb.status = 'active'
+      WHERE s.company_guid = $1
+      ORDER BY s.name ASC`, [companyGuid]);
+
+    // Build CSV: header + one row per stock
+    const lines = ['item_name,barcode'];
+    for (const r of rows) {
+      // Escape item_name if it contains commas or quotes
+      const name = r.item_name ? `"${String(r.item_name).replace(/"/g, '""')}"` : '';
+      const bc   = r.barcode   ? `"${String(r.barcode).replace(/"/g, '""')}"` : '';
+      lines.push(`${name},${bc}`);
+    }
+    const csv = lines.join('\r\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="barcode_template.csv"');
+    res.send(csv);
+  } catch (err) {
+    console.error('[barcode template]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // GET /api/inventory/barcodes/settings — get barcode settings
