@@ -1248,4 +1248,75 @@ router.get('/master/bank', authMiddleware, async (req, res) => {
   }
 });
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BARCODE TALLY SYNC — Phase 1 (Part Number) + Phase 2 (Alias)
+// UDF intentionally skipped (requires TDL/TCP — future phase).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const escXml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+
+/**
+ * Push a single barcode to TallyPrime via desktop connector.
+ * syncTarget: 'tally_part_number' | 'tally_alias'
+ * Returns the forwardToTally result object or null if no push needed.
+ */
+export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stockName, barcode, syncTarget, companyName }) {
+  if (!syncTarget || syncTarget === 'app_only') return null;
+
+  // Read existing sku from stocks table so we can preserve it in Tally
+  // stocks.sku = PartNumber / OnlyAlias synced from Tally's StockItem XML
+  const { rows: [stockRow] } = await query(
+    'SELECT sku FROM stocks WHERE guid=$1 AND company_guid=$2',
+    [stockGuid, companyGuid]
+  ).catch(() => ({ rows: [{}] }));
+  const existingSku = stockRow?.sku || '';
+
+  const eName     = escXml(stockName);
+  const eBc       = escXml(barcode);
+  const eCompany  = escXml(companyName);
+  const eExisting = escXml(existingSku);
+
+  const wrap = (inner) =>
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>` +
+    `<STATICVARIABLES><SVCURRENTCOMPANY>${eCompany}</SVCURRENTCOMPANY></STATICVARIABLES>` +
+    `</REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">` +
+    `<STOCKITEM NAME="${eName}" ACTION="Alter">${inner}</STOCKITEM>` +
+    `</TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+
+  let xml;
+  if (syncTarget === 'tally_part_number') {
+    // MAILINGNAME.LIST = Part Number field in Tally
+    // Preserve existing sku (if it's different from the barcode being pushed)
+    const existLine = (eExisting && eExisting !== eBc)
+      ? `<MAILINGNAME>${eExisting}</MAILINGNAME>` : '';
+    xml = wrap(`<MAILINGNAME.LIST TYPE="String">${existLine}<MAILINGNAME>${eBc}</MAILINGNAME></MAILINGNAME.LIST>`);
+
+  } else if (syncTarget === 'tally_alias') {
+    // NAME.LIST = Alias. First entry MUST be primary stock item name.
+    // Preserve existing sku alias (if different from name and barcode).
+    const existLine = (eExisting && eExisting !== eName && eExisting !== eBc)
+      ? `<NAME>${eExisting}</NAME>` : '';
+    xml = wrap(`<NAME.LIST TYPE="String"><NAME>${eName}</NAME>${existLine}<NAME>${eBc}</NAME></NAME.LIST>`);
+
+  } else {
+    return null;
+  }
+
+  const queueId = await logWriteQueue(
+    userId, companyGuid, 'barcode_sync',
+    `${stockName} → ${barcode} (${syncTarget})`,
+    null, { stockGuid, stockName, barcode, syncTarget }, xml
+  ).catch(() => null);
+
+  let result;
+  try {
+    result = await forwardToTally(companyGuid, userId, xml);
+  } catch (err) {
+    result = { status: 'failed', message: err.message };
+  }
+  await updateWriteQueue(queueId, result, null);
+  return result;
+}
+
 export default router;

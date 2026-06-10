@@ -5349,6 +5349,34 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
 });
 
 // POST /api/inventory/barcodes/generate — generate barcode for a stock item
+// ── Helper: push barcode to Tally if auto-sync is enabled ─────────────────────
+async function autoSyncBarcodeToTally(userId, companyGuid, stockGuid, stockName, barcode, syncTarget) {
+  if (!syncTarget || syncTarget === 'app_only') return;
+  try {
+    const { rows: [settings] } = await query(
+      'SELECT auto_sync_to_tally FROM inventory_barcode_settings WHERE company_guid=$1', [companyGuid]);
+    if (!settings?.auto_sync_to_tally) return; // toggle is OFF — do not push
+    const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+    if (!co?.name) return;
+    const { pushBarcodeToTally } = await import('./tally-write.js');
+    const result = await pushBarcodeToTally({
+      companyGuid, userId, stockGuid, stockName, barcode, syncTarget, companyName: co.name,
+    });
+    // Map Tally result → tally_sync_status
+    const newStatus =
+      !result                               ? 'pending_tally' :
+      result.status === 'desktop_offline'   ? 'pending_tally' :
+      result.status === 'success'           ? 'synced'        :
+      (result.altered > 0 && !result.errors)? 'synced'        : 'failed';
+    await query(
+      'UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
+      [newStatus, companyGuid, stockGuid, barcode]
+    );
+  } catch (err) {
+    console.error('[autoSyncBarcodeToTally]', err.message); // non-fatal — barcode already saved
+  }
+}
+
 router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => {
   const { companyGuid, stockGuid, barcodeType = 'CODE128', syncTarget = 'app_only' } = req.body;
   if (!companyGuid || !stockGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and stockGuid required' } });
@@ -5372,6 +5400,8 @@ router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => 
       VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
       RETURNING barcode, barcode_type, status, tally_sync_status`,
       [companyGuid, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
+    // Auto-push to Tally if toggle is ON (fire-and-forget, non-blocking)
+    autoSyncBarcodeToTally(req.user.userId, companyGuid, stockGuid, stock.name, ins.barcode, syncTarget).catch(() => {});
     res.json({ success: true, data: { barcode: ins.barcode, barcodeType: ins.barcode_type, status: ins.status, tallySyncStatus: ins.tally_sync_status } });
   } catch (err) {
     console.error('[inventory/barcodes GENERATE]', err.message);
@@ -5397,6 +5427,8 @@ router.post('/inventory/barcodes/link', authMiddleware, async (req, res) => {
       INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
       VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9)`,
       [companyGuid, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
+    // Auto-push to Tally if toggle is ON
+    autoSyncBarcodeToTally(req.user.userId, companyGuid, stockGuid, stock.name, barcode.trim(), syncTarget).catch(() => {});
     res.json({ success: true, data: { status: 'active', tallySyncStatus: tallyStatus } });
   } catch (err) {
     console.error('[inventory/barcodes LINK]', err.message);
@@ -5496,6 +5528,60 @@ router.get('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
+// POST /api/inventory/barcodes/push-pending — manually push all pending_tally barcodes to Tally
+// Also called automatically when user saves settings with autoSyncToTally=true
+router.post('/inventory/barcodes/push-pending', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+    if (!co?.name) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
+
+    const { rows: pending } = await query(`
+      SELECT sb.stock_guid, sb.stock_name, sb.barcode, sb.sync_target
+      FROM stock_barcodes sb
+      WHERE sb.company_guid=$1 AND sb.tally_sync_status='pending_tally' AND sb.status='active'
+      ORDER BY sb.created_at ASC LIMIT 100`, [companyGuid]);
+
+    if (!pending.length) return res.json({ success: true, data: { pushed: 0, message: 'No pending barcodes to sync' } });
+
+    const { pushBarcodeToTally } = await import('./tally-write.js');
+    let synced = 0, failed = 0, offline = 0;
+
+    for (const row of pending) {
+      try {
+        const result = await pushBarcodeToTally({
+          companyGuid, userId: req.user.userId,
+          stockGuid: row.stock_guid, stockName: row.stock_name,
+          barcode: row.barcode, syncTarget: row.sync_target,
+          companyName: co.name,
+        });
+        const newStatus =
+          !result                                ? 'pending_tally' :
+          result.status === 'desktop_offline'    ? 'pending_tally' :
+          result.status === 'success'            ? 'synced'        :
+          (result.altered > 0 && !result.errors) ? 'synced'        : 'failed';
+
+        await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
+          [newStatus, companyGuid, row.stock_guid, row.barcode]);
+
+        if (newStatus === 'synced') synced++;
+        else if (newStatus === 'pending_tally') { offline++; break; } // desktop offline — stop batching
+        else failed++;
+      } catch (e) {
+        failed++;
+        console.error('[push-pending] row error', e.message);
+      }
+    }
+
+    res.json({ success: true, data: { pushed: pending.length, synced, failed, offline, message: offline ? 'Desktop offline — will retry when connected' : `Synced ${synced}/${pending.length}` } });
+  } catch (err) {
+    console.error('[push-pending]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // POST /api/inventory/barcodes/settings — save barcode settings
 router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
   const { companyGuid, barcodeStorageMode = 'app_only', defaultBarcodeType = 'CODE128', autoSyncToTally = false } = req.body;
@@ -5511,6 +5597,41 @@ router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => 
       VALUES ($1,$2,$3,$4,NOW())
       ON CONFLICT (company_guid) DO UPDATE SET barcode_storage_mode=EXCLUDED.barcode_storage_mode, default_barcode_type=EXCLUDED.default_barcode_type, auto_sync_to_tally=EXCLUDED.auto_sync_to_tally, updated_at=NOW()`,
       [companyGuid, barcodeStorageMode, defaultBarcodeType, autoSyncToTally]);
+
+    // When user enables auto-sync AND selects a Tally target, update any existing
+    // 'app_only' barcodes for this company to the new sync_target so they get queued,
+    // then trigger push-pending (fire-and-forget)
+    if (autoSyncToTally && barcodeStorageMode !== 'app_only') {
+      await query(`UPDATE stock_barcodes SET sync_target=$1, tally_sync_status='pending_tally'
+        WHERE company_guid=$2 AND status='active' AND tally_sync_status='not_required'`,
+        [barcodeStorageMode, companyGuid]);
+      // Kick off push in background — response does not wait for it
+      setImmediate(async () => {
+        try {
+          const { pushBarcodeToTally } = await import('./tally-write.js');
+          const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+          if (!co?.name) return;
+          const { rows: pending } = await query(`
+            SELECT stock_guid, stock_name, barcode, sync_target FROM stock_barcodes
+            WHERE company_guid=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
+            [companyGuid]);
+          for (const row of pending) {
+            const result = await pushBarcodeToTally({
+              companyGuid, userId: req.user.userId,
+              stockGuid: row.stock_guid, stockName: row.stock_name,
+              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name,
+            }).catch(() => null);
+            const s = !result ? 'pending_tally'
+              : result.status === 'desktop_offline' ? 'pending_tally'
+              : (result.status === 'success' || (result.altered > 0 && !result.errors)) ? 'synced' : 'failed';
+            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
+              [s, companyGuid, row.stock_guid, row.barcode]);
+            if (s === 'pending_tally') break; // desktop offline — stop
+          }
+        } catch (e) { console.error('[settings auto-sync]', e.message); }
+      });
+    }
+
     res.json({ success: true, data: { barcodeStorageMode, defaultBarcodeType, autoSyncToTally } });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
