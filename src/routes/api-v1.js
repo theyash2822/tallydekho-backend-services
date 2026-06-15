@@ -857,10 +857,22 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
   try {
     // 1. Posted vouchers (synced back from Tally)
     let q = `
-      SELECT DISTINCT v.*, 'posted' as _queue_status, wq.id as _queue_id
+      SELECT DISTINCT
+        v.*,
+        'posted' as _queue_status,
+        wq.id as _queue_id,
+        av.tdk_reference_no,
+        av.original_entry_type,
+        av.current_entry_type,
+        av.books_impact_status,
+        av.conversion_status,
+        av.e_invoice_status,
+        av.e_way_bill_status,
+        av.tally_voucher_no as av_tally_voucher_no
       FROM vouchers v
       JOIN write_queue wq ON wq.company_guid = v.company_guid
         AND wq.tally_voucher_number = v.voucher_number
+      LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
       WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
     `;
     const params = [companyGuid, userId];
@@ -888,15 +900,21 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         wq.tally_voucher_number as voucher_number,
         wq.amount as amount,
         wq.payload as _payload,
-        NULL as guid
+        NULL as guid,
+        av.tdk_reference_no,
+        av.original_entry_type,
+        av.current_entry_type,
+        av.books_impact_status,
+        av.conversion_status,
+        av.e_invoice_status,
+        av.e_way_bill_status
       FROM write_queue wq
+      LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
       WHERE wq.company_guid = $1
         AND wq.user_id = $2
         AND (
           wq.status IN ('pending', 'processing', 'desktop_offline', 'failed')
           OR (
-            -- Keep ALL successful entries for 30 days so user can verify what was created.
-            -- Invoices/vouchers also show via posted JOIN above, mobile deduplicates by ref.
             wq.status = 'success'
             AND wq.created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 2592000
           )
@@ -905,7 +923,37 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       LIMIT 50
     `, [companyGuid, userId]);
 
-    res.json({ success: true, data: postedRows, pending: pendingRows });
+    const { lifecycleFilter } = req.query;
+
+    // Apply lifecycle filter to combined results (filter on JS side — simpler than complex SQL)
+    let allRows = [...pendingRows, ...postedRows];
+    if (lifecycleFilter && lifecycleFilter !== 'all') {
+      allRows = allRows.filter(r => {
+        const entryType  = r.current_entry_type || r.original_entry_type;
+        const origType   = r.original_entry_type;
+        const syncStatus = r._queue_status;
+        const eInvoice   = r.e_invoice_status;
+        const eWayBill   = r.e_way_bill_status;
+
+        if (lifecycleFilter === 'pending_sync')
+          return ['pending', 'processing', 'desktop_offline'].includes(syncStatus);
+        if (lifecycleFilter === 'regular')
+          return entryType === 'regular' || (!entryType && syncStatus === 'posted');
+        if (lifecycleFilter === 'optional')
+          return entryType === 'optional';
+        if (lifecycleFilter === 'originally_optional')
+          return origType === 'optional' && entryType === 'regular';
+        if (lifecycleFilter === 'failed')
+          return syncStatus === 'failed';
+        if (lifecycleFilter === 'irn_pending')
+          return ['locked', 'pending', 'details_required'].includes(eInvoice || '');
+        if (lifecycleFilter === 'ewb_pending')
+          return ['locked', 'pending', 'details_required'].includes(eWayBill || '');
+        return true;
+      });
+    }
+
+    res.json({ success: true, data: allRows.filter(r => r._queue_status === 'posted'), pending: allRows.filter(r => r._queue_status !== 'posted') });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
