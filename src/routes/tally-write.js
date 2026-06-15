@@ -6,6 +6,7 @@ import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 import { generateIRN } from '../utils/irnGenerator.js';
+import { generateEWB } from '../utils/ewbGenerator.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -167,6 +168,48 @@ const updateWriteQueue = async (id, result, error) => {
           }
         } catch (autoErr) {
           console.error(`[auto-IRN] Failed for ${result.voucherNumber}:`, autoErr.message);
+        }
+      });
+
+      // Auto-EWB: if e_way_bill_mode = 'auto' and e_way_bill_applicable = 'applicable_configured'
+      setImmediate(async () => {
+        try {
+          // Get companyGuid and userId from write_queue entry
+          const { rows: wqRowsEWB } = await query(
+            `SELECT user_id, company_guid FROM write_queue WHERE id = $1`, [id]
+          ).catch(() => ({ rows: [] }));
+          if (!wqRowsEWB[0]) return;
+          const { user_id: userId, company_guid: companyGuid } = wqRowsEWB[0];
+
+          // Check if auto-EWB is configured for this company
+          const { rows: ewbCfgRows } = await query(
+            `SELECT e_way_bill_applicable, e_way_bill_mode FROM company_compliance_config WHERE company_guid = $1`,
+            [companyGuid]
+          ).catch(() => ({ rows: [] }));
+          const ewbCfg = ewbCfgRows[0];
+          if (ewbCfg?.e_way_bill_applicable !== 'applicable_configured' || ewbCfg?.e_way_bill_mode !== 'auto') return;
+
+          // Load voucher + dispatch details from app_vouchers payload
+          const { rows: vRowsEWB } = await query(
+            `SELECT v.*, av.payload as av_payload
+             FROM vouchers v
+             LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_guid = v.company_guid
+             WHERE v.company_guid = $1 AND v.voucher_number = $2`,
+            [companyGuid, result.voucherNumber]
+          ).catch(() => ({ rows: [] }));
+          if (!vRowsEWB[0]) return;
+
+          const dispatchDetails = vRowsEWB[0].av_payload?.dispatch_details;
+          if (!dispatchDetails?.dispatch_from || !dispatchDetails?.ship_to) return;
+
+          const { rows: coRowsEWB }   = await query(`SELECT * FROM companies WHERE guid = $1`, [companyGuid]).catch(() => ({ rows: [] }));
+          const { rows: ewbUserRows } = await query(`SELECT integration_settings FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
+          const ewbCreds = ewbUserRows[0]?.integration_settings?.ewaybill || {};
+
+          await generateEWB(companyGuid, vRowsEWB[0], coRowsEWB[0], ewbCreds, dispatchDetails);
+          console.log(`[auto-EWB] Success for ${result.voucherNumber}`);
+        } catch (ewbErr) {
+          console.error(`[auto-EWB] Failed for ${result.voucherNumber}:`, ewbErr.message);
         }
       });
     }

@@ -14,6 +14,7 @@ import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
 import { getGstTabsForVoucher, getClassificationReason } from '../utils/gstClassifier.js';
 import { generateIRN } from '../utils/irnGenerator.js';
+import { generateEWB } from '../utils/ewbGenerator.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -3398,6 +3399,115 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
       meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
     });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// POST /api/ewaybills/generate — Generate E-Way Bill for a voucher
+router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
+  const companyGuid = req.body.companyGuid || req.user?.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { voucherGuid, dispatchDetails, force = false } = req.body;
+  if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER', message: 'voucherGuid required' } });
+
+  try {
+    // 1. Load voucher
+    const { rows: vRows } = await query(`SELECT * FROM vouchers WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND' } });
+    const voucher = vRows[0];
+
+    // 2. Check compliance config
+    const { rows: cfgRows } = await query(`SELECT * FROM company_compliance_config WHERE company_guid=$1`, [companyGuid]);
+    const cfg = cfgRows[0];
+    if (!cfg || cfg.e_way_bill_applicable !== 'applicable_configured') {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NOT_CONFIGURED', message: 'E-Way Bill not configured. Go to Settings → Voucher Config.' } });
+    }
+
+    // 3. Must have final Tally voucher/invoice number
+    if (!voucher.voucher_number) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_TALLY_NUMBER', message: 'Waiting for final Tally invoice number. Sync with Tally first.' } });
+    }
+
+    // 4. Must not be optional
+    if (voucher.is_optional) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'OPTIONAL_VOUCHER', message: 'Convert to Regular in TallyPrime before generating EWB.' } });
+    }
+
+    // 5. If e-invoice is configured, IRN must exist first
+    if (cfg.e_invoice_applicable === 'applicable_configured' && !voucher.irn) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'IRN_REQUIRED', message: 'E-Invoice (IRN) must be generated before E-Way Bill for this company.' } });
+    }
+
+    // 6. Check existing EWB
+    const { rows: existingEWB } = await query(`SELECT ewb_no FROM e_way_bill_details WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]).catch(() => ({ rows: [] }));
+    if (existingEWB[0]?.ewb_no && !force) {
+      return res.status(400).json({ success: false, error: { code: 'EWB_EXISTS', message: 'E-Way Bill already generated', ewbNo: existingEWB[0].ewb_no } });
+    }
+
+    // 7. Company GSTIN
+    const { rows: coRows } = await query(`SELECT gstin, name, address, state, pincode, state_code FROM companies WHERE guid=$1`, [companyGuid]);
+    if (!coRows[0]?.gstin) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_GSTIN', message: 'Company GSTIN not set. Add in Settings → Company Profile.' } });
+    }
+
+    // 8. Dispatch details (from request or from app_vouchers payload)
+    let details = dispatchDetails;
+    if (!details) {
+      const { rows: avRows } = await query(`SELECT payload FROM app_vouchers WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => ({ rows: [] }));
+      details = avRows[0]?.payload?.dispatch_details;
+    }
+    if (!details?.dispatch_from || !details?.ship_to) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_DISPATCH_DETAILS', message: 'Dispatch details required. Fill in Dispatch From and Ship To fields.' } });
+    }
+
+    // 9. Credentials
+    const { rows: userRows } = await query(`SELECT integration_settings FROM users WHERE id=$1`, [req.user.userId]);
+    const ewbCreds = userRows[0]?.integration_settings?.ewaybill || userRows[0]?.integration_settings?.ewb || {};
+
+    // Mark as generating
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => {});
+
+    // Call EWB generator
+    const ewbResult = await generateEWB(companyGuid, voucher, coRows[0], ewbCreds, details).catch(e => ({ _error: e.message }));
+
+    if (ewbResult._error) {
+      await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$2 AND tally_voucher_no=$3`, [ewbResult._error, companyGuid, voucher.voucher_number]).catch(() => {});
+      return res.status(500).json({ success: false, error: { code: 'EWB_FAILED', message: ewbResult._error } });
+    }
+
+    const { ewbNo, ewbDate, validUpto } = ewbResult;
+    // Store in e_way_bill_details (schema cols: ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
+    await query(
+      `INSERT INTO e_way_bill_details (voucher_guid, company_guid, ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET ewb_no=$3, ewb_date=$4, valid_till=$5`,
+      [voucherGuid, companyGuid, ewbNo, ewbDate, validUpto, details.transporter_id || null, details.vehicle_number || null, 'Road']
+    ).catch(() => {});
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => {});
+
+    res.json({ success: true, data: { ewbNo, ewbDate, validUpto } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/ewaybills/cancel
+router.post('/ewaybills/cancel', authMiddleware, async (req, res) => {
+  const companyGuid = req.body.companyGuid || req.user?.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { voucherGuid, cancelReason = 1 } = req.body;
+  if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER' } });
+  try {
+    await query(`UPDATE e_way_bill_details SET status='cancelled' WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]).catch(() => {});
+    await query(
+      `UPDATE app_vouchers SET e_way_bill_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+       WHERE company_guid=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_guid=$1)`,
+      [companyGuid, voucherGuid]
+    ).catch(() => {});
+    res.json({ success: true, message: 'E-Way Bill cancelled' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
