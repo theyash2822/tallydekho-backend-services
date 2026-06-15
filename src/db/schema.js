@@ -856,6 +856,22 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_company ON app_vouchers(company_guid);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
+
+      -- ── Company Compliance Config (E-Invoice, E-Way Bill, Numbering Policy) ──
+      CREATE TABLE IF NOT EXISTS company_compliance_config (
+        company_guid            TEXT PRIMARY KEY REFERENCES companies(guid) ON DELETE CASCADE,
+        numbering_policy        TEXT NOT NULL DEFAULT 'tally_prime_series',
+        -- per-voucher-type overrides: JSON like {"sales_invoice":"tallydekho_series","receipt":"tally_prime_series"}
+        numbering_overrides     JSONB DEFAULT '{}',
+        e_invoice_applicable    TEXT NOT NULL DEFAULT 'not_applicable',
+        -- 'not_applicable' | 'applicable_not_configured' | 'applicable_configured'
+        e_invoice_mode          TEXT NOT NULL DEFAULT 'manual',
+        -- 'manual' | 'auto'
+        e_way_bill_applicable   TEXT NOT NULL DEFAULT 'not_applicable',
+        e_way_bill_mode         TEXT NOT NULL DEFAULT 'manual',
+        -- 'manual' | 'auto' | 'ask_after_irn'
+        updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {

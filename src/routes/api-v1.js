@@ -770,6 +770,64 @@ router.get('/sales/quotations',  authMiddleware, voucherListHandler('Quotation')
 router.get('/sales/credit-notes',authMiddleware, voucherListHandler('Credit Note'));
 router.get('/sales/delivery-notes', authMiddleware, voucherListHandler('Delivery Note'));
 router.get('/sales/ewaybills',   authMiddleware, voucherListHandler('Sales'));
+
+// GET /api/company/:guid/compliance-config
+router.get('/company/:guid/compliance-config', authMiddleware, async (req, res) => {
+  try {
+    const { guid } = req.params;
+    if (!await verifyCompanyOwnership(req, res, guid)) return;
+    const { rows } = await query(
+      `SELECT * FROM company_compliance_config WHERE company_guid = $1`,
+      [guid]
+    );
+    // Return defaults if not yet configured
+    const defaults = {
+      company_guid: guid,
+      numbering_policy: 'tally_prime_series',
+      numbering_overrides: {},
+      e_invoice_applicable: 'not_applicable',
+      e_invoice_mode: 'manual',
+      e_way_bill_applicable: 'not_applicable',
+      e_way_bill_mode: 'manual',
+    };
+    res.json({ status: true, data: rows[0] || defaults });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// POST /api/company/:guid/compliance-config
+router.post('/company/:guid/compliance-config', authMiddleware, async (req, res) => {
+  try {
+    const { guid } = req.params;
+    if (!await verifyCompanyOwnership(req, res, guid)) return;
+    const {
+      numbering_policy = 'tally_prime_series',
+      numbering_overrides = {},
+      e_invoice_applicable = 'not_applicable',
+      e_invoice_mode = 'manual',
+      e_way_bill_applicable = 'not_applicable',
+      e_way_bill_mode = 'manual',
+    } = req.body;
+    await query(`
+      INSERT INTO company_compliance_config
+        (company_guid, numbering_policy, numbering_overrides, e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7, EXTRACT(EPOCH FROM NOW())::BIGINT)
+      ON CONFLICT (company_guid) DO UPDATE SET
+        numbering_policy      = EXCLUDED.numbering_policy,
+        numbering_overrides   = EXCLUDED.numbering_overrides,
+        e_invoice_applicable  = EXCLUDED.e_invoice_applicable,
+        e_invoice_mode        = EXCLUDED.e_invoice_mode,
+        e_way_bill_applicable = EXCLUDED.e_way_bill_applicable,
+        e_way_bill_mode       = EXCLUDED.e_way_bill_mode,
+        updated_at            = EXCLUDED.updated_at
+    `, [guid, numbering_policy, JSON.stringify(numbering_overrides), e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode]);
+    res.json({ status: true, message: 'Compliance config saved' });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 // GET /api/sales/ledger-accounts — Sales Accounts group ledgers only
 router.get('/sales/ledger-accounts', authMiddleware, async (req, res) => {
   try {
