@@ -770,6 +770,44 @@ router.get('/sales/quotations',  authMiddleware, voucherListHandler('Quotation')
 router.get('/sales/credit-notes',authMiddleware, voucherListHandler('Credit Note'));
 router.get('/sales/delivery-notes', authMiddleware, voucherListHandler('Delivery Note'));
 router.get('/sales/ewaybills',   authMiddleware, voucherListHandler('Sales'));
+// GET /api/sales/ledger-accounts — Sales Accounts group ledgers only
+router.get('/sales/ledger-accounts', authMiddleware, async (req, res) => {
+  try {
+    const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    const { rows } = await query(
+      `SELECT name, guid FROM ledgers
+       WHERE company_guid = $1
+         AND (parent = 'Sales Accounts' OR parent ILIKE '%Sales Account%' OR parent ILIKE 'Sales Accounts')
+       ORDER BY name ASC`,
+      [companyGuid]
+    );
+    res.json({ status: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// GET /api/tax/ledgers — GST/Tax ledgers for item-level tax assignment
+router.get('/tax/ledgers', authMiddleware, async (req, res) => {
+  try {
+    const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    const { rows } = await query(
+      `SELECT name, guid FROM ledgers
+       WHERE company_guid = $1
+         AND (parent ILIKE '%GST%' OR parent ILIKE '%Tax%' OR parent ILIKE '%Duty%'
+              OR name ILIKE '%CGST%' OR name ILIKE '%SGST%' OR name ILIKE '%IGST%'
+              OR name ILIKE '%UTGST%' OR name ILIKE '%GST%')
+       ORDER BY name ASC`,
+      [companyGuid]
+    );
+    res.json({ status: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 
 // ══════════════════════════════════════════════════════════════
 // PURCHASE

@@ -106,7 +106,23 @@ const updateWriteQueue = async (id, result, error) => {
   }
 };
 
-// ── POST /tally/voucher/sales ─────────────────────────────────────────────────
+// ── TDK Reference Generator ────────────────────────────────────────────────────
+async function generateTDKReference(companyGuid, isOptional, voucherTypeCode = 'SAL') {
+  const prefix = isOptional ? `OPT-${voucherTypeCode}` : voucherTypeCode;
+  const year = new Date().getFullYear();
+  const { rows } = await query(
+    `INSERT INTO tdk_reference_counters (company_guid, voucher_prefix, fiscal_year, last_seq)
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT (company_guid, voucher_prefix, fiscal_year)
+     DO UPDATE SET last_seq = tdk_reference_counters.last_seq + 1
+     RETURNING last_seq`,
+    [companyGuid, prefix, year]
+  );
+  const seq = rows[0].last_seq;
+  return `TDK-${prefix}-${year}-${String(seq).padStart(4, '0')}`;
+}
+
+// ── POST /tally/voucher/sales ─────────────────────────────────────────────
 router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
@@ -116,6 +132,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     logistics = [], // [{ ledgerName, amount }]
     isOptional = false,
     voucherType = 'Sales GST',
+    original_entry_type = 'regular',
   } = req.body;
 
   if (!companyGuid || !partyLedger || !items.length) {
@@ -126,6 +143,9 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const dt = tallyDate(date);
   const amt = parseFloat(totalAmount) || 0;
   const vchType = voucherType || 'Sales GST';
+
+  // Generate TDK reference
+  const tdkRef = await generateTDKReference(companyGuid, isOptional).catch(() => null);
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -141,7 +161,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
-  <REFERENCE>${reference || ''}</REFERENCE>
+  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
   <ISPOSTDATED>No</ISPOSTDATED>
@@ -218,11 +238,22 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
 
   const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
+
+  // Create app_voucher lifecycle record
+  if (queueId && tdkRef) {
+    await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type, tally_sync_status, books_impact_status, party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9)`,
+      [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type, partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
+    ).catch(e => console.error('[app_vouchers] insert failed:', e.message));
+  }
+
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
-    res.json({ status: true, queued: offline, queueId, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({ status: true, queued: offline, queueId, tdkReferenceNo: tdkRef, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });

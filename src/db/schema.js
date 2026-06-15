@@ -817,6 +817,45 @@ export async function initSchema() {
         created_at            TIMESTAMPTZ DEFAULT NOW(),
         updated_at            TIMESTAMPTZ DEFAULT NOW()
       );
+
+      -- ── TDK Reference Counters ────────────────────────────────────────────
+      CREATE TABLE IF NOT EXISTS tdk_reference_counters (
+        company_guid    TEXT NOT NULL,
+        voucher_prefix  TEXT NOT NULL,   -- 'SAL', 'OPT-SAL', 'SO', 'PUR', etc.
+        fiscal_year     INT NOT NULL,    -- e.g. 2026
+        last_seq        INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (company_guid, voucher_prefix, fiscal_year)
+      );
+
+      -- ── App Vouchers (TallyDekho lifecycle tracking) ──────────────────────
+      CREATE TABLE IF NOT EXISTS app_vouchers (
+        id                      SERIAL PRIMARY KEY,
+        company_guid            TEXT NOT NULL,
+        user_id                 INTEGER REFERENCES users(id),
+        write_queue_id          INTEGER REFERENCES write_queue(id),
+        voucher_type            TEXT NOT NULL,            -- 'sales_invoice', 'sales_order', etc.
+        tdk_reference_no        TEXT NOT NULL UNIQUE,     -- TDK-SAL-2026-0042
+        tally_voucher_no        TEXT,                     -- set after Tally sync
+        tally_guid              TEXT,
+        original_entry_type     TEXT NOT NULL DEFAULT 'regular',   -- 'regular' | 'optional'
+        current_entry_type      TEXT NOT NULL DEFAULT 'regular',   -- 'regular' | 'optional'
+        numbering_policy        TEXT NOT NULL DEFAULT 'tally_prime_series', -- 'tally_prime_series' | 'tallydekho_series'
+        tally_sync_status       TEXT NOT NULL DEFAULT 'queued',    -- 'queued' | 'pushed' | 'synced' | 'failed'
+        books_impact_status     TEXT NOT NULL DEFAULT 'not_posted', -- 'not_posted' | 'posted'
+        conversion_status       TEXT NOT NULL DEFAULT 'pending',   -- 'pending' | 'converted' | 'cancelled'
+        e_invoice_status        TEXT NOT NULL DEFAULT 'not_applicable',
+        e_way_bill_status       TEXT NOT NULL DEFAULT 'not_required',
+        party_name              TEXT,
+        total_amount            DECIMAL(15,4),
+        voucher_date            DATE,
+        payload                 JSONB,
+        sync_error              TEXT,
+        created_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_company ON app_vouchers(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {
