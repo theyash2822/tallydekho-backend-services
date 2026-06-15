@@ -103,6 +103,24 @@ const updateWriteQueue = async (id, result, error) => {
        error_message = NULL, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
       [id, result?.voucherNumber || null, result?.tallyId || null]
     );
+    // Sync app_vouchers lifecycle record when write_queue succeeds
+    if (result?.voucherNumber) {
+      const avResult = await query(`
+        UPDATE app_vouchers
+        SET tally_voucher_no      = $1,
+            tally_sync_status     = 'synced',
+            books_impact_status   = 'posted',
+            updated_at            = EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE write_queue_id = $2
+          AND tally_sync_status != 'synced'
+        RETURNING company_guid, tdk_reference_no
+      `, [result.voucherNumber, id]).catch(e => { console.error('[app_vouchers sync]', e.message); return { rows: [] }; });
+      const avRows = avResult?.rows ?? [];
+      if (avRows.length > 0) {
+        const { company_guid, tdk_reference_no } = avRows[0];
+        _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, result.voucherNumber);
+      }
+    }
   }
 };
 

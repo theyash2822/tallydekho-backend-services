@@ -10,9 +10,44 @@ setTimeout(async () => {
   _retryOfflineEntries = mod.retryOfflineEntries;
 }, 1000);
 
+// ── Module-level io reference (set by setupSocket) ────────────────────────────
+let _io = null;
+
+// ── Voucher lifecycle emitters ────────────────────────────────────────────────
+// Clients join `company:<guid>` room when they register (see register handler below).
+
+export function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo) {
+  if (!_io) return;
+  _io.to(`company:${companyGuid}`).emit('voucher:regularized', {
+    companyGuid,
+    tdkReferenceNo: tdkRef,
+    tallyVoucherNo,
+    currentEntryType: 'regular',
+    booksImpactStatus: 'posted',
+    conversionStatus: 'converted',
+    timestamp: new Date().toISOString(),
+  });
+  console.log(`[socket] voucher:regularized emitted for ${tdkRef}`);
+}
+
+export function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo) {
+  if (!_io) return;
+  _io.to(`company:${companyGuid}`).emit('voucher:tallySynced', {
+    companyGuid,
+    tdkReferenceNo: tdkRef,
+    tallyVoucherNo,
+    tallySyncStatus: 'synced',
+    booksImpactStatus: 'posted',
+    timestamp: new Date().toISOString(),
+  });
+  console.log(`[socket] voucher:tallySynced emitted for ${tdkRef}`);
+}
+
 const connectedClients = new Map(); // token/deviceId → socket
 
 export function setupSocket(io) {
+  _io = io; // Store reference for module-level emitters
+
   io.on('connection', (socket) => {
     console.log(`[WS] client connected: ${socket.id}`);
 
@@ -44,6 +79,14 @@ export function setupSocket(io) {
         connectedClients.set(`${type}_${userId}`, socket);
         console.log(`[WS] registered ${type} client for user ${userId}`);
         socket.emit('registered', { status: true });
+        // Join company room so targeted lifecycle events reach this client
+        query('SELECT guid FROM companies WHERE user_id=$1 LIMIT 1', [userId])
+          .then(({ rows }) => {
+            if (rows[0]?.guid) {
+              socket.join(`company:${rows[0].guid}`);
+              console.log(`[WS] user ${userId} joined company room: ${rows[0].guid}`);
+            }
+          }).catch(() => {});
       } catch {
         socket.emit('error', { message: 'Invalid token' });
       }
@@ -137,5 +180,8 @@ export function setupSocket(io) {
     },
 
     connectedClients,
+    // Expose lifecycle emitters via socketService for callers that use the injected service
+    emitVoucherRegularized,
+    emitVoucherSynced,
   };
 }

@@ -2,6 +2,8 @@
 // Handles: masters (ledgers, stocks), vouchers, stock transactions
 import { getClient, query as dbQuery } from '../db/schema.js';
 import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
+// Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
+import { emitVoucherRegularized } from '../socket/socketHandler.js';
 
 // ── Tax Extraction ────────────────────────────────────────────────────────────
 // Extract and save tax transactions from voucher ledger entries.
@@ -598,6 +600,36 @@ async function processVouchers(data, companyGuid) {
         }
       } catch (e) {
         console.warn('[DB] Voucher insert failed:', e.message, '| guid:', guid);
+      }
+
+      // ── Optional → Regular reconciliation ────────────────────────────────────────────
+      // When Tally syncs back a voucher whose reference starts with TDK-OPT- but
+      // is now regular (ISOPTIONAL not set), update app_vouchers + emit WS event.
+      try {
+        const ref = r.Reference || r.REFERENCE || r.reference || '';
+        if (!isOptional && ref && ref.startsWith('TDK-OPT-')) {
+          const { rows: avRows } = await dbQuery(
+            `SELECT id, current_entry_type FROM app_vouchers
+             WHERE tdk_reference_no = $1 AND company_guid = $2`,
+            [ref, companyGuid]
+          );
+          if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
+            await dbQuery(`
+              UPDATE app_vouchers
+              SET current_entry_type  = 'regular',
+                  books_impact_status = 'posted',
+                  conversion_status   = 'converted',
+                  tally_voucher_no    = COALESCE($1, tally_voucher_no),
+                  tally_sync_status   = 'synced',
+                  updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+              WHERE id = $2
+            `, [voucherNumber, avRows[0].id]);
+            console.log(`[reconcile] Optional→Regular: ${ref} → ${voucherNumber}`);
+            emitVoucherRegularized(companyGuid, ref, voucherNumber);
+          }
+        }
+      } catch (reconcileErr) {
+        console.error('[reconcile] optional→regular error:', reconcileErr.message);
       }
     }
 
