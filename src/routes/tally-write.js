@@ -5,6 +5,7 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
+import { generateIRN } from '../utils/irnGenerator.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -120,6 +121,54 @@ const updateWriteQueue = async (id, result, error) => {
         const { company_guid, tdk_reference_no } = avRows[0];
         _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, result.voucherNumber);
       }
+
+      // Auto-IRN: if e_invoice_mode = 'auto' and e_invoice_applicable = 'applicable_configured', trigger IRN
+      setImmediate(async () => {
+        try {
+          // Get companyGuid and userId from write_queue entry
+          const { rows: wqRows } = await query(
+            `SELECT user_id, company_guid FROM write_queue WHERE id = $1`, [id]
+          ).catch(() => ({ rows: [] }));
+          if (!wqRows[0]) return;
+          const { user_id: userId, company_guid: companyGuid } = wqRows[0];
+
+          // Check if auto-IRN is configured for this company
+          const { rows: cfgRows } = await query(
+            `SELECT e_invoice_applicable, e_invoice_mode FROM company_compliance_config WHERE company_guid = $1`,
+            [companyGuid]
+          ).catch(() => ({ rows: [] }));
+          const cfg = cfgRows[0];
+          if (cfg?.e_invoice_applicable !== 'applicable_configured' || cfg?.e_invoice_mode !== 'auto') return;
+
+          // Get voucherGuid for this write_queue entry
+          const { rows: vRows } = await query(
+            `SELECT guid FROM vouchers WHERE company_guid = $1 AND voucher_number = $2`,
+            [companyGuid, result.voucherNumber]
+          ).catch(() => ({ rows: [] }));
+          if (!vRows[0]?.guid) return;
+
+          const { rows: userRows } = await query(
+            `SELECT integration_settings FROM users WHERE id = $1`, [userId]
+          ).catch(() => ({ rows: [] }));
+          const einvoiceCreds = userRows[0]?.integration_settings?.einvoice;
+          if (!einvoiceCreds?.gstin || !einvoiceCreds?.username) return;
+
+          const { rows: coRows } = await query(
+            `SELECT gstin, name FROM companies WHERE guid = $1`, [companyGuid]
+          ).catch(() => ({ rows: [] }));
+          const { rows: voucherRows } = await query(
+            `SELECT * FROM vouchers WHERE guid = $1`, [vRows[0].guid]
+          ).catch(() => ({ rows: [] }));
+
+          if (einvoiceCreds?.gstin && coRows[0] && voucherRows[0]) {
+            console.log(`[auto-IRN] Triggering for ${result.voucherNumber}`);
+            await generateIRN(companyGuid, voucherRows[0], coRows[0], einvoiceCreds);
+            console.log(`[auto-IRN] Success for ${result.voucherNumber}`);
+          }
+        } catch (autoErr) {
+          console.error(`[auto-IRN] Failed for ${result.voucherNumber}:`, autoErr.message);
+        }
+      });
     }
   }
 };

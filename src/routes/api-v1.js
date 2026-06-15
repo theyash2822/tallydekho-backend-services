@@ -13,6 +13,7 @@ import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
 import { getGstTabsForVoucher, getClassificationReason } from '../utils/gstClassifier.js';
+import { generateIRN } from '../utils/irnGenerator.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -3467,6 +3468,135 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
     const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]);
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+});
+
+// POST /api/einvoice/generate — Generate IRN for a voucher
+router.post('/einvoice/generate', authMiddleware, async (req, res) => {
+  const companyGuid = req.body.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+
+  const { voucherGuid, voucherNumber, force = false } = req.body;
+  if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER', message: 'voucherGuid required' } });
+
+  try {
+    // -- 1. Prerequisite checks -----------------------------------------------
+    const { rows: vRows } = await query(
+      `SELECT * FROM vouchers WHERE guid = $1 AND company_guid = $2`,
+      [voucherGuid, companyGuid]
+    );
+    if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
+    const voucher = vRows[0];
+
+    // Check compliance config
+    const { rows: cfgRows } = await query(
+      `SELECT * FROM company_compliance_config WHERE company_guid = $1`, [companyGuid]
+    );
+    const cfg = cfgRows[0];
+    if (!cfg || cfg.e_invoice_applicable !== 'applicable_configured') {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NOT_CONFIGURED', message: 'E-Invoice integration is not configured. Go to Settings > Voucher Config to set up.' } });
+    }
+
+    // Must have final Tally voucher number
+    if (!voucher.voucher_number) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_TALLY_NUMBER', message: 'Waiting for final Tally invoice number. IRN cannot be generated until Tally sync completes.' } });
+    }
+
+    // Must not be optional
+    if (voucher.is_optional) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'OPTIONAL_VOUCHER', message: 'Optional vouchers cannot generate IRN. Convert to Regular in TallyPrime first.' } });
+    }
+
+    // Must not already have IRN (unless force=true)
+    if (voucher.irn && !force) {
+      return res.status(400).json({ success: false, error: { code: 'IRN_EXISTS', message: 'IRN already generated for this voucher', irn: voucher.irn } });
+    }
+
+    // Check company GSTIN
+    const { rows: coRows } = await query(`SELECT gstin, name FROM companies WHERE guid = $1`, [companyGuid]);
+    const company = coRows[0];
+    if (!company?.gstin) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_GSTIN', message: 'Company GSTIN not configured. Add GSTIN in Settings > Company Profile.' } });
+    }
+
+    // Check integration credentials
+    const { rows: userRows } = await query(`SELECT integration_settings FROM users WHERE id = $1`, [req.user.userId]);
+    const einvoiceCreds = userRows[0]?.integration_settings?.einvoice;
+    if (!einvoiceCreds?.gstin || !einvoiceCreds?.username) {
+      return res.status(400).json({ success: false, locked: true, error: { code: 'NO_CREDENTIALS', message: 'IRP credentials not configured. Go to Settings > E-Invoice to set up.' } });
+    }
+
+    // -- 2. Mark as generating ------------------------------------------------
+    await query(
+      `UPDATE app_vouchers SET e_invoice_status = 'generating', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $1 AND tally_voucher_no = $2`,
+      [companyGuid, voucher.voucher_number]
+    ).catch(() => {});
+
+    // -- 3. IRP API call (wire real GSP/NIC API in irnGenerator.js) -----------
+    const irnResult = await generateIRN(companyGuid, voucher, company, einvoiceCreds).catch(e => ({ error: e.message }));
+
+    if (irnResult.error) {
+      // Store failure record
+      await query(
+        `INSERT INTO e_invoice_details (voucher_guid, company_guid, status, error_message, synced_at)
+         VALUES ($1, $2, 'failed', $3, NOW())
+         ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET status='failed', error_message=$3, synced_at=NOW()`,
+        [voucherGuid, companyGuid, irnResult.error]
+      );
+      await query(
+        `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $2 AND tally_voucher_no = $3`,
+        [irnResult.error, companyGuid, voucher.voucher_number]
+      ).catch(() => {});
+      return res.status(500).json({ success: false, error: { code: 'IRN_FAILED', message: irnResult.error } });
+    }
+
+    // -- 4. Store IRN result --------------------------------------------------
+    const { irn, ackNo, ackDate, signedInvoice, qrCode } = irnResult;
+    await query(
+      `INSERT INTO e_invoice_details (voucher_guid, company_guid, irn, ack_no, ack_date, signed_invoice, qr_code, status, synced_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'generated',NOW())
+       ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
+         irn=$3, ack_no=$4, ack_date=$5, signed_invoice=$6, qr_code=$7, status='generated', synced_at=NOW()`,
+      [voucherGuid, companyGuid, irn, ackNo, ackDate, signedInvoice, qrCode]
+    );
+    // Update vouchers table
+    await query(
+      `UPDATE vouchers SET irn=$1, irn_date=$2 WHERE guid=$3 AND company_guid=$4`,
+      [irn, ackDate, voucherGuid, companyGuid]
+    );
+    // Update app_vouchers
+    await query(
+      `UPDATE app_vouchers SET e_invoice_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`,
+      [companyGuid, voucher.voucher_number]
+    ).catch(() => {});
+
+    res.json({ success: true, data: { irn, ackNo, ackDate, qrCode } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/einvoice/cancel — Cancel an IRN
+router.post('/einvoice/cancel', authMiddleware, async (req, res) => {
+  const companyGuid = req.body.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { voucherGuid, cancelReason = 1, cancelRemarks = '' } = req.body;
+  if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER' } });
+  try {
+    const { rows } = await query(`SELECT irn FROM vouchers WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    if (!rows[0]?.irn) return res.status(404).json({ success: false, error: { code: 'NO_IRN', message: 'No IRN found for this voucher' } });
+    // Placeholder: call IRP cancel API in production
+    await query(`UPDATE vouchers SET irn_cancelled=TRUE WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    await query(
+      `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2)`,
+      [companyGuid, voucherGuid]
+    ).catch(() => {});
+    res.json({ success: true, message: 'IRN cancelled successfully' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
