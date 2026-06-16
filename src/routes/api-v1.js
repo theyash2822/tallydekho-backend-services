@@ -751,9 +751,23 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   try {
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND (party_name ILIKE $3 OR voucher_number ILIKE $3) AND date BETWEEN $4 AND $5`;
+    let q = `
+      SELECT v.*,
+             av_info.tdk_reference_no,
+             av_info.current_entry_type,
+             av_info.original_entry_type
+      FROM vouchers v
+      LEFT JOIN LATERAL (
+        SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
+        FROM app_vouchers av
+        WHERE av.company_guid = v.company_guid AND av.tally_voucher_no = v.voucher_number
+        ORDER BY av.id DESC LIMIT 1
+      ) av_info ON true
+      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE $2
+        AND (v.party_name ILIKE $3 OR v.voucher_number ILIKE $3)
+        AND v.date BETWEEN $4 AND $5`;
     const params = [companyGuid, `%${voucherType}%`, `%${search}%`, from, to];
-    q += ` ORDER BY date DESC, id DESC LIMIT $6 OFFSET $7`;
+    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $6 OFFSET $7`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
     const { rows: cnt } = await query(

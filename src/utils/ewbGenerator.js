@@ -63,6 +63,7 @@ export async function generateEWB(companyGuid, voucher, company, creds, dispatch
     transporterName: dispatchDetails.transporter_name  || '',
     transporterId:   dispatchDetails.transporter_id    || '',
     transDocNo:      dispatchDetails.transport_doc_no  || '',
+    transDocDate:    dispatchDetails.transport_doc_date ? dispatchDetails.transport_doc_date.split('-').reverse().join('/') : '', // YYYY-MM-DD → DD/MM/YYYY
     vehicleNo:       dispatchDetails.vehicle_number    || '',
     vehicleType:     dispatchDetails.vehicle_type === 'ODC' ? 'O' : 'R',
     itemList: items.map((item, i) => ({
