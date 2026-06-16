@@ -1006,9 +1006,9 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         if (lifecycleFilter === 'failed')
           return syncStatus === 'failed';
         if (lifecycleFilter === 'irn_pending')
-          return ['locked', 'pending', 'details_required'].includes(eInvoice || '');
+          return !['not_applicable', 'not_required', 'generated', 'cancelled'].includes(eInvoice || 'not_applicable');
         if (lifecycleFilter === 'ewb_pending')
-          return ['locked', 'pending', 'details_required'].includes(eWayBill || '');
+          return !['not_applicable', 'not_required', 'generated', 'cancelled'].includes(eWayBill || 'not_applicable');
         return true;
       });
     }

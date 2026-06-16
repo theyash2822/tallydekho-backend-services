@@ -165,6 +165,10 @@ const updateWriteQueue = async (id, result, error) => {
             console.log(`[auto-IRN] Triggering for ${result.voucherNumber}`);
             await generateIRN(companyGuid, voucherRows[0], coRows[0], einvoiceCreds);
             console.log(`[auto-IRN] Success for ${result.voucherNumber}`);
+            await query(
+              `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $1 AND tally_voucher_no = $2`,
+              [companyGuid, result.voucherNumber]
+            ).catch(() => {});
           }
         } catch (autoErr) {
           console.error(`[auto-IRN] Failed for ${result.voucherNumber}:`, autoErr.message);
