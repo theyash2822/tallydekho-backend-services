@@ -367,6 +367,27 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
+    // After a successful Tally write (desktop online), signal desktop to sync back the new voucher.
+    // This ensures app_vouchers.tally_voucher_no is populated without waiting for the next full sync.
+    if (!offline && _socketService?.connectedClients) {
+      setImmediate(async () => {
+        try {
+          const { rows: devRows } = await query(
+            'SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE ORDER BY last_seen DESC LIMIT 1',
+            [req.user.userId]
+          );
+          if (devRows[0]?.device_id) {
+            const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
+            if (ds?.connected) {
+              ds.emit('sync:request', { reason: 'voucher_created', tdkRef, companyGuid });
+              console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef}`);
+            }
+          }
+        } catch (syncErr) {
+          console.warn('[sync:request] Could not trigger desktop sync:', syncErr.message);
+        }
+      });
+    }
     res.json({ status: true, queued: offline, queueId, tdkReferenceNo: tdkRef, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);

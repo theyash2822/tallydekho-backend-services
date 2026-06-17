@@ -3,7 +3,7 @@
 import { getClient, query as dbQuery } from '../db/schema.js';
 import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
-import { emitVoucherRegularized } from '../socket/socketHandler.js';
+import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
 
 // ── Tax Extraction ────────────────────────────────────────────────────────────
 // Extract and save tax transactions from voucher ledger entries.
@@ -630,6 +630,35 @@ async function processVouchers(data, companyGuid) {
         }
       } catch (reconcileErr) {
         console.error('[reconcile] optional→regular error:', reconcileErr.message);
+      }
+
+      // ── Regular TDK reconciliation ─────────────────────────────────────────────────────
+      // When a TDK- (non-optional) voucher syncs back from Tally, update app_vouchers
+      // with the assigned Tally voucher number if it hasn't been set yet.
+      // This fixes the bug where the Tally voucher number never came back to the app.
+      try {
+        const ref2 = r.Reference || r.REFERENCE || r.reference || '';
+        if (voucherNumber && ref2 && ref2.startsWith('TDK-') && !ref2.startsWith('TDK-OPT-')) {
+          const { rows: avRegRows } = await dbQuery(
+            `UPDATE app_vouchers
+             SET tally_voucher_no    = $1,
+                 tally_sync_status   = 'synced',
+                 books_impact_status = 'posted',
+                 updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+             WHERE tdk_reference_no = $2
+               AND company_guid     = $3
+               AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
+             RETURNING company_guid, tdk_reference_no`,
+            [voucherNumber, ref2, companyGuid]
+          );
+          if (avRegRows.length > 0) {
+            const { company_guid: cg, tdk_reference_no: tRef } = avRegRows[0];
+            emitVoucherSynced(cg, tRef, voucherNumber);
+            console.log(`[reconcile] Regular TDK voucher synced: ${tRef} → ${voucherNumber}`);
+          }
+        }
+      } catch (regRecErr) {
+        console.error('[reconcile] regular TDK error:', regRecErr.message);
       }
     }
 
