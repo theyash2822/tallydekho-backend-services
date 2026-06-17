@@ -883,6 +883,42 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
 });
 
 
+// GET /api/charge-ledgers — Logistics & additional charge ledgers for invoice form
+router.get('/charge-ledgers', authMiddleware, async (req, res) => {
+  try {
+    const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const { rows } = await query(
+      `SELECT DISTINCT name, guid, parent
+       FROM ledgers
+       WHERE company_guid = $1
+         AND parent IS NOT NULL
+         AND (
+           parent ILIKE 'Direct Expenses%'
+           OR parent ILIKE 'Indirect Expenses%'
+           OR parent ILIKE 'Direct Incomes%'
+           OR parent ILIKE 'Indirect Incomes%'
+         )
+       ORDER BY name ASC`,
+      [companyGuid]
+    );
+    const normalize = (s) => String(s || '').trim().toLowerCase();
+    const LOGISTICS_KW = ['freight','transport','delivery','courier','loading','unloading','handling','cartage','hamali','logistics','forwarding','shipping','dispatch'];
+    const ROUND_OFF_KW = ['round off','rounded off','rounding','roundoff'];
+    const logistics = [], additional = [], roundOff = [];
+    rows.forEach(r => {
+      const n = normalize(r.name);
+      if (ROUND_OFF_KW.some(k => n.includes(k))) { roundOff.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
+      if (LOGISTICS_KW.some(k => n.includes(k))) { logistics.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
+      additional.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent });
+    });
+    res.json({ status: true, data: { logisticsCharges: logistics, additionalCharges: additional, roundOffLedgers: roundOff, allCharges: [...logistics, ...additional, ...roundOff] } });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // PURCHASE
 // ══════════════════════════════════════════════════════════════
