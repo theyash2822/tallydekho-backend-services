@@ -671,6 +671,34 @@ async function processVouchers(data, companyGuid) {
       await processBatchAllocations(allBatchFlatRecords, companyGuid);
     }
 
+    // Batch JOIN reconciliation — handles SimplifiedVoucher.xml which omits REFERENCE field.
+    // When Tally sends incremental sync data without REFERENCE, the per-record reconciliation
+    // above cannot match TDK refs. This JOIN-based sweep catches any remaining gaps.
+    // Safe & idempotent — only updates rows where tally_voucher_no IS NULL.
+    try {
+      const { rows: reconRows } = await dbQuery(`
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = v.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM vouchers v
+        WHERE v.reference      = av.tdk_reference_no
+          AND v.company_guid   = av.company_guid
+          AND av.company_guid  = $1
+          AND av.tally_voucher_no IS NULL
+          AND v.voucher_number IS NOT NULL
+          AND v.voucher_number != ''
+        RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
+      `, [companyGuid]);
+      for (const row of reconRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Batch JOIN reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (batchReconErr) {
+      console.warn('[reconcile] Batch JOIN reconciliation error (non-fatal):', batchReconErr.message);
+    }
+
     // Tax extraction — runs after COMMIT so ledger entries are visible
     // Never blocks or throws; failures are logged only
     for (const { guid: vGuid, row } of voucherRowsForTax) {
