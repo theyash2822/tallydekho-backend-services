@@ -992,9 +992,12 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.e_way_bill_status,
         av.tally_voucher_no as av_tally_voucher_no
       FROM vouchers v
-      JOIN write_queue wq ON wq.company_guid = v.company_guid
-        AND wq.tally_voucher_number = v.voucher_number
-      LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
+      -- Primary join path: via app_vouchers.tally_voucher_no (Tally's ImportData rarely returns
+      -- voucher number in callback, so write_queue.tally_voucher_number is often empty.
+      -- app_vouchers.tally_voucher_no is always populated by ingestProcessor reconciliation.)
+      JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
+        AND av.company_guid = v.company_guid
+      JOIN write_queue wq ON wq.id = av.write_queue_id
       WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
     `;
     const params = [companyGuid, userId];
