@@ -570,12 +570,12 @@ router.get('/company/years', authMiddleware, async (req, res) => {
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
     const { rows } = await query(
-      'SELECT guid, name, gstin, is_active FROM companies WHERE user_id = $1 ORDER BY is_active DESC, name ASC',
+      'SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE ORDER BY name ASC',
       [req.user.userId]
     );
     res.json({
       success: true,
-      data: rows.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: c.is_active }))
+      data: rows.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true }))
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch companies' } });
