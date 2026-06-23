@@ -243,10 +243,12 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     partyLedger, totalAmount,
     items = [], // [{ itemName, actualQty, billedQty, rate, amount, salesLedger, godown }]
     taxes = [], // [{ ledgerName, taxRate, taxAmount, taxableValue }]
-    logistics = [], // [{ ledgerName, amount }]
+    logistics = [], // [{ ledgerName, amount, taxes: [{ledgerName, taxRate, taxAmount}] }]
     isOptional = false,
     voucherType = 'Sales GST',
     original_entry_type = 'regular',
+    collect_payment = null, // { ledgerName, amount, reference } — payment collected at billing
+    dispatch_details = null, // { dispatch_from, ship_to, transport_mode, transporter_name, transporter_id, vehicle_number, vehicle_type, transport_doc_no, transport_doc_date }
   } = req.body;
 
   if (!companyGuid || !partyLedger || !items.length) {
@@ -257,6 +259,29 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const dt = tallyDate(date);
   const amt = parseFloat(totalAmount) || 0;
   const vchType = voucherType || 'Sales GST';
+
+  // Collect payment: if ledgerName + amount provided, reduce outstanding party debit
+  // and add a Dr entry for the cash/bank ledger.
+  const payAmt = collect_payment?.ledgerName && parseFloat(collect_payment.amount) > 0
+    ? parseFloat(collect_payment.amount)
+    : 0;
+  const partyNetAmt = amt - payAmt; // party outstanding = invoice total - payment received
+
+  // Build narration: append dispatch details if provided
+  let fullNarration = narration || '';
+  if (dispatch_details) {
+    const dd = dispatch_details;
+    const parts = [];
+    if (dd.dispatch_from) parts.push(`Dispatch From: ${dd.dispatch_from}`);
+    if (dd.ship_to)        parts.push(`Ship To: ${dd.ship_to}`);
+    if (dd.transport_mode) parts.push(`Mode: ${dd.transport_mode}`);
+    if (dd.transporter_name) parts.push(`Transporter: ${dd.transporter_name}`);
+    if (dd.transporter_id)   parts.push(`Transporter ID: ${dd.transporter_id}`);
+    if (dd.vehicle_number)   parts.push(`Vehicle: ${dd.vehicle_number}`);
+    if (dd.transport_doc_no) parts.push(`Doc No: ${dd.transport_doc_no}`);
+    if (dd.transport_doc_date) parts.push(`Doc Date: ${dd.transport_doc_date}`);
+    if (parts.length) fullNarration = [fullNarration, parts.join(' | ')].filter(Boolean).join(' | ');
+  }
 
   // Generate TDK reference
   const tdkRef = await generateTDKReference(companyGuid, isOptional).catch(() => null);
@@ -281,7 +306,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   <ISPOSTDATED>No</ISPOSTDATED>
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <NARRATION>${narration || ''}</NARRATION>
+  <NARRATION>${fullNarration}</NARRATION>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
 
   <LEDGERENTRIES.LIST>
@@ -290,7 +315,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
     <LEDGERNAME>${partyLedger}</LEDGERNAME>
-    <AMOUNT>${-amt}</AMOUNT>
+    <AMOUNT>${-partyNetAmt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
   // Inventory line items
@@ -335,13 +360,67 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   }
 
   // Logistics/freight entries
+  // Logistics/freight entries + per-entry taxes
   for (const lg of logistics) {
+    if (!lg.ledgerName) continue;
     xml += `
   <LEDGERENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
     <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
-    <AMOUNT>${parseFloat(lg.amount)}</AMOUNT>
+    <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
+    // Per-logistics-entry taxes (e.g. GST on freight)
+    for (const lt of (lg.taxes || [])) {
+      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
+      xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    }
+  }
+
+  // Collect Payment Now: Dr cash/bank ledger for the payment received at billing
+  if (collect_payment?.ledgerName && payAmt > 0) {
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${collect_payment.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-payAmt}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+  }
+
+  // Dispatch / EWB details
+  if (dispatch_details) {
+    const dd = dispatch_details;
+    if (dd.dispatch_from || dd.ship_to) {
+      xml += `
+  <BASICBASEPARTYDETAILS.LIST>
+    <BASICBASEPARTYNAME>${dd.ship_to || ''}</BASICBASEPARTYNAME>
+  </BASICBASEPARTYDETAILS.LIST>`;
+    }
+    if (dd.vehicle_number || dd.transport_mode || dd.transporter_name) {
+      const modeMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', not_applicable: '' };
+      const tallyMode = modeMap[dd.transport_mode?.toLowerCase()] || dd.transport_mode || '';
+      xml += `
+  <EWAYBILLDETAILS.LIST>
+    <DISTANCEINMETERS>0</DISTANCEINMETERS>
+    <VEHICLENUMBER>${dd.vehicle_number || ''}</VEHICLENUMBER>
+    <VEHICLETYPE>${dd.vehicle_type || 'Regular'}</VEHICLETYPE>
+    <TRANSPORTMODE>${tallyMode}</TRANSPORTMODE>
+    <TRANSPORTERDOCNUMBER>${dd.transport_doc_no || ''}</TRANSPORTERDOCNUMBER>
+    <TRANSPORTERID>${dd.transporter_id || ''}</TRANSPORTERID>
+    <TRANSPORTERNAME>${dd.transporter_name || ''}</TRANSPORTERNAME>
+    <DISPATCHFROMSTATE>${dd.dispatch_from || ''}</DISPATCHFROMSTATE>
+    <DESTINATIONSTATE>${dd.ship_to || ''}</DESTINATIONSTATE>
+  </EWAYBILLDETAILS.LIST>`;
+    }
   }
 
   xml += `

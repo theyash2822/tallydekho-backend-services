@@ -889,18 +889,30 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    // Recursive CTE: walk ALL descendant groups of the 4 root expense/income categories.
+    // Simple parent ILIKE was wrong — it only matched ledgers DIRECTLY under the root
+    // groups, missing any ledger under a sub-group (e.g. parent='Freight & Forwarding'
+    // which is itself under 'Indirect Expenses').
     const { rows } = await query(
-      `SELECT DISTINCT name, guid, parent
-       FROM ledgers
-       WHERE company_guid = $1
-         AND parent IS NOT NULL
-         AND (
-           parent ILIKE 'Direct Expenses%'
-           OR parent ILIKE 'Indirect Expenses%'
-           OR parent ILIKE 'Direct Incomes%'
-           OR parent ILIKE 'Indirect Incomes%'
-         )
-       ORDER BY name ASC`,
+      `WITH RECURSIVE expense_income_groups AS (
+         SELECT name FROM groups
+         WHERE company_guid = $1
+           AND (
+             name ILIKE 'Direct Expenses'
+             OR name ILIKE 'Indirect Expenses'
+             OR name ILIKE 'Direct Incomes'
+             OR name ILIKE 'Indirect Incomes'
+           )
+         UNION ALL
+         SELECT g.name FROM groups g
+         JOIN expense_income_groups eig ON g.parent = eig.name
+         WHERE g.company_guid = $1
+       )
+       SELECT DISTINCT l.name, l.guid, l.parent
+       FROM ledgers l
+       JOIN expense_income_groups eig ON l.parent = eig.name
+       WHERE l.company_guid = $1
+       ORDER BY l.name ASC`,
       [companyGuid]
     );
     const normalize = (s) => String(s || '').trim().toLowerCase();
@@ -1017,7 +1029,8 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.books_impact_status,
         av.conversion_status,
         av.e_invoice_status,
-        av.e_way_bill_status
+        av.e_way_bill_status,
+        av.tally_voucher_no as av_tally_voucher_no
       FROM write_queue wq
       LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
       WHERE wq.company_guid = $1
@@ -3221,27 +3234,56 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
-// GET /api/bank-ledgers — lightweight list of bank account ledgers (for voucher config bank dropdown)
+// GET /api/bank-ledgers — bank + cash ledgers (for payment selection in voucher forms)
+// ?type=bank  → bank only (default)
+// ?type=cash  → cash only
+// ?type=all   → bank + cash
 router.get('/bank-ledgers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const type = req.query.type || 'all'; // changed default to 'all' so payment forms get both
   try {
-    const { rows } = await query(
-      `SELECT name, closing_balance, balance_type FROM ledgers
-       WHERE company_guid=$1
-         AND (
+    let whereExtra = '';
+    if (type === 'cash') {
+      whereExtra = `AND (parent ILIKE '%Cash In Hand%' OR parent ILIKE '%Cash-In-Hand%' OR name ILIKE 'Cash')`;
+    } else if (type === 'bank') {
+      whereExtra = `AND (
            parent ILIKE '%Bank Accounts%'
            OR parent ILIKE '%Bank Account%'
            OR parent ILIKE '%Bank OD%'
            OR parent ILIKE '%Overdraft%'
            OR parent ILIKE '%Bank A/c%'
            OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
-         )
-       ORDER BY ABS(closing_balance) DESC`,
+         )`;
+    } else {
+      // all: bank + cash
+      whereExtra = `AND (
+           parent ILIKE '%Bank Accounts%'
+           OR parent ILIKE '%Bank Account%'
+           OR parent ILIKE '%Bank OD%'
+           OR parent ILIKE '%Overdraft%'
+           OR parent ILIKE '%Bank A/c%'
+           OR parent ILIKE '%Cash In Hand%'
+           OR parent ILIKE '%Cash-In-Hand%'
+           OR name ILIKE 'Cash'
+           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
+         )`;
+    }
+    const { rows } = await query(
+      `SELECT name, closing_balance, balance_type, parent FROM ledgers
+       WHERE company_guid=$1 ${whereExtra}
+       ORDER BY
+         CASE WHEN parent ILIKE '%Cash%' OR name ILIKE 'Cash' THEN 0 ELSE 1 END,
+         ABS(closing_balance) DESC`,
       [companyGuid]
     );
-    res.json({ success: true, data: rows.map(r => ({ name: r.name, balance: parseFloat(r.closing_balance||0), balance_type: r.balance_type })) });
+    res.json({ success: true, data: rows.map(r => ({
+      name: r.name,
+      balance: parseFloat(r.closing_balance||0),
+      balance_type: r.balance_type,
+      type: (r.parent?.toLowerCase().includes('cash') || r.name?.toLowerCase() === 'cash') ? 'cash' : 'bank'
+    })) });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
