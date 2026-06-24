@@ -314,7 +314,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
                            : dd.vehicle_type         || '';
 
     // 1. Top-level VOUCHER fields (go right after <NARRATION>)
-    const dispatchDate = toTallyDate(dd.transport_doc_date);
+    const dispatchDate = toTallyDate(dd.transport_doc_date || date); // fallback to invoice date if no transport doc date
     topLevelDispatchXml = [
       dispatchDate          ? `  <BILLOFLADINGDATE>${dispatchDate}</BILLOFLADINGDATE>` : '',
       tallySimpleMode       ? `  <BASICSHIPPEDBY>${tallySimpleMode}</BASICSHIPPEDBY>` : '',

@@ -937,16 +937,19 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
     const normalize = (s) => String(s || '').trim().toLowerCase();
     const LOGISTICS_KW = ['freight','transport','delivery','courier','loading','unloading','handling','cartage','hamali','logistics','forwarding','shipping','dispatch'];
     const ROUND_OFF_KW = ['round off','rounded off','rounding','roundoff'];
+    // Tax/GST ledgers belong ONLY in the tax-ledgers endpoint — exclude from charge buckets
+    const TAX_KW = ['cgst','sgst','igst','utgst','gst','cess','tds','tcs','excise','vat','service tax','customs'];
     // Pure revenue/purchase roots — ledgers under these should NOT appear in additionalCharges
-    // (they are sales/purchase ledgers, not charge types). They can still be logistics if keyword matches.
-    const REVENUE_ROOTS = ['sales accounts', 'purchase accounts'];
+    const REVENUE_ROOTS = ['sales accounts', 'purchase accounts', 'duties & taxes', 'duties and taxes'];
     const logistics = [], additional = [], roundOff = [];
     rows.forEach(r => {
       const n = normalize(r.name);
       const rootNorm = normalize(r.root_name || '');
+      // Tax ledgers go nowhere in this response — they have their own /tax/ledgers endpoint
+      if (TAX_KW.some(k => n.includes(k))) return;
       if (ROUND_OFF_KW.some(k => n.includes(k))) { roundOff.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
       if (LOGISTICS_KW.some(k => n.includes(k))) { logistics.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
-      // Skip ledgers rooted under Sales/Purchase Accounts from the additional charges bucket
+      // Skip ledgers rooted under Sales/Purchase/Tax Accounts from the additional charges bucket
       if (REVENUE_ROOTS.some(root => rootNorm.includes(root))) return;
       additional.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent });
     });
@@ -1160,6 +1163,12 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     // Party amount = the Dr entry for the party ledger (what party owes / paid)
     const partyEntry = ledgerEntries.find(e => e.ledger_name === v.party_name);
     const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(v.amount||'0');
+    // App voucher payload — dispatch_details, collect_payment, narration (from app, not Tally)
+    const { rows: avRows } = await query(
+      `SELECT payload FROM app_vouchers WHERE tally_voucher_no=$1 AND company_guid=$2 LIMIT 1`,
+      [v.voucher_number, companyGuid]
+    ).catch(() => ({ rows: [] }));
+    const avPayload = avRows[0]?.payload || null;
     res.json({
       success: true,
       data: {
@@ -1169,6 +1178,11 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
         company: co[0] || null,
         party: partyLedger[0] || null,
         ledger_entries: ledgerEntries,
+        // App-origin data (dispatch, collect_payment) — present only for TallyDekho-created vouchers
+        dispatch_details: avPayload?.dispatch_details || null,
+        collect_payment: avPayload?.collect_payment || null,
+        app_narration: avPayload?.narration || null,
+        logistics: avPayload?.logistics || null,
       }
     });
   } catch (err) {
