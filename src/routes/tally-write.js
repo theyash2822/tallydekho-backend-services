@@ -433,13 +433,16 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
 
   // Create app_voucher lifecycle record
+  let invoiceUuid = null;
   if (queueId && tdkRef) {
-    await query(
+    const avResult = await query(
       `INSERT INTO app_vouchers
        (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type, tally_sync_status, books_impact_status, party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9)`,
+       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9)
+       RETURNING invoice_uuid`,
       [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type, partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
-    ).catch(e => console.error('[app_vouchers] insert failed:', e.message));
+    ).catch(e => { console.error('[app_vouchers] insert failed:', e.message); return { rows: [] }; });
+    invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
   }
 
   try {
@@ -467,7 +470,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
         }
       });
     }
-    res.json({ status: true, queued: offline, queueId, tdkReferenceNo: tdkRef, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({ status: true, queued: offline, queueId, tdkReferenceNo: tdkRef, invoiceUuid, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
@@ -1563,5 +1566,174 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
   await updateWriteQueue(queueId, result, null);
   return result;
 }
+
+// ── Helper: build VoucherDocument from app_vouchers row + company/party info ──────────────
+async function buildVoucherDocument(av, companyRow, partyRow) {
+  const p = av.payload || {};
+  const items = (p.items || []).map((item, idx) => ({
+    id: String(idx),
+    name: item.itemName || item.name || 'Item',
+    qty: parseFloat(item.billedQty || item.actualQty || 1),
+    unit: item.unit || 'Nos',
+    rate: parseFloat(item.rate || 0),
+    discount: parseFloat(item.discount || 0),
+    taxAmount: parseFloat(item.taxAmount || 0),
+    amount: parseFloat(item.amount || 0),
+  }));
+
+  // Build tax lines from taxes array
+  const taxLines = (p.taxes || []).map(t => ({
+    description: t.ledgerName || 'Tax',
+    rate: parseFloat(t.taxRate || 0),
+    taxableAmount: parseFloat(t.taxableValue || 0),
+    total: parseFloat(t.taxAmount || 0),
+  }));
+
+  const isProvisional = !av.tally_voucher_no;
+  const invoiceNumberLabel = av.tally_voucher_no || 'Pending from TallyPrime';
+  const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
+
+  return {
+    documentType: 'sales_invoice',
+    documentNumber: invoiceNumberLabel,
+    documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
+    tdkRef: av.tdk_reference_no,
+    invoiceUuid: av.invoice_uuid,
+    postingTag,
+    isProvisional,
+    watermarkText: isProvisional ? 'Provisional / Pending Tally Posting' : null,
+    numberingMode: av.numbering_policy || 'tally_prime_series',
+    company: {
+      name: companyRow?.name || p.companyName || '',
+      address: companyRow?.address || '',
+      gstin: companyRow?.gstin || '',
+      pan: companyRow?.pan || '',
+      phone: companyRow?.phone || '',
+      email: companyRow?.email || '',
+      state: companyRow?.state || '',
+    },
+    party: {
+      name: av.party_name || p.partyLedger || '',
+      address: partyRow?.address || '',
+      gstin: partyRow?.gstin || '',
+      pan: partyRow?.pan || '',
+      phone: partyRow?.phone || '',
+    },
+    items,
+    taxLines,
+    totals: {
+      subtotal: items.reduce((s, i) => s + i.amount, 0),
+      taxTotal: taxLines.reduce((s, t) => s + t.total, 0),
+      grandTotal: parseFloat(av.total_amount || p.totalAmount || 0),
+      roundOff: parseFloat(p.roundOffAmount || 0),
+    },
+    narration: p.narration || '',
+    additionalCharges: (p.logistics || []).map(l => ({
+      description: l.ledgerName || 'Charge',
+      amount: parseFloat(l.amount || 0),
+    })),
+    paymentInfo: p.collect_payment ? {
+      collected: parseFloat(p.collect_payment.amount || 0),
+      mode: p.collect_payment.ledgerName || '',
+      reference: p.collect_payment.reference || '',
+    } : null,
+    dispatchInfo: p.dispatch_details || null,
+  };
+}
+
+// ── Helper: poll for Tally voucher number up to maxWaitMs ─────────────────────
+async function waitForTallyNumber(tdkRef, companyGuid, userId, maxWaitMs = 10000) {
+  const pollInterval = 600;
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const { rows } = await query(
+      `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
+      [tdkRef, companyGuid, userId]
+    ).catch(() => ({ rows: [] }));
+    if (rows[0]?.tally_voucher_no) return rows[0].tally_voucher_no;
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+  return null;
+}
+
+// ── GET /tally/invoice/:tdkRef/preview ───────────────────────────────────────
+router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {
+  try {
+    const { tdkRef } = req.params;
+    const { companyGuid } = req.query;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+
+    const { rows: avRows } = await query(
+      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
+      [tdkRef, companyGuid, req.user.userId]
+    );
+    if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
+    const av = avRows[0];
+
+    const [{ rows: coRows }, { rows: partyRows }] = await Promise.all([
+      query(`SELECT name, gstin, address, pan, phone, email, state FROM companies WHERE guid=$1`, [companyGuid]).catch(() => ({ rows: [] })),
+      query(`SELECT name, gstin, mailing_address AS address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1`, [companyGuid, av.party_name]).catch(() => ({ rows: [] })),
+    ]);
+
+    const doc = await buildVoucherDocument(av, coRows[0], partyRows[0]);
+
+    res.json({ status: true, data: doc });
+  } catch (e) {
+    console.error('[invoice/preview]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── POST /tally/invoice/:tdkRef/share-pdf ────────────────────────────────────
+// Returns invoice snapshot (provisional or final) after optionally waiting for Tally number.
+router.post('/invoice/:tdkRef/share-pdf', authMiddleware, async (req, res) => {
+  try {
+    const { tdkRef } = req.params;
+    const { companyGuid, waitForTallyNumber: shouldWait = true, maxWaitMs = 10000 } = req.body;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+
+    // Check current state first
+    const { rows: avRows } = await query(
+      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
+      [tdkRef, companyGuid, req.user.userId]
+    );
+    if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
+    let av = avRows[0];
+
+    // If we need to wait and no Tally number yet → poll
+    if (shouldWait && !av.tally_voucher_no && av.numbering_policy === 'tally_prime_series') {
+      const tallyNo = await waitForTallyNumber(tdkRef, companyGuid, req.user.userId, maxWaitMs);
+      if (tallyNo) {
+        // Refresh row
+        const { rows: fresh } = await query(
+          `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1`, [tdkRef]
+        ).catch(() => ({ rows: [] }));
+        if (fresh[0]) av = fresh[0];
+      }
+    }
+
+    const [{ rows: coRows }, { rows: partyRows }] = await Promise.all([
+      query(`SELECT name, gstin, address, pan, phone, email, state FROM companies WHERE guid=$1`, [companyGuid]).catch(() => ({ rows: [] })),
+      query(`SELECT name, gstin, mailing_address AS address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1`, [companyGuid, av.party_name]).catch(() => ({ rows: [] })),
+    ]);
+
+    const doc = await buildVoucherDocument(av, coRows[0], partyRows[0]);
+    const pdfType = av.tally_voucher_no ? 'final' : 'provisional';
+
+    res.json({
+      status: true,
+      data: {
+        ...doc,
+        pdfType,
+        fileName: pdfType === 'final'
+          ? `Invoice-${av.tally_voucher_no}.pdf`
+          : `Provisional-${tdkRef}.pdf`,
+      },
+    });
+  } catch (e) {
+    console.error('[invoice/share-pdf]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
 
 export default router;

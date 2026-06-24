@@ -850,12 +850,14 @@ export async function initSchema() {
         voucher_date            DATE,
         payload                 JSONB,
         sync_error              TEXT,
+        invoice_uuid            UUID DEFAULT gen_random_uuid() UNIQUE,
         created_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_company ON app_vouchers(company_guid);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid    ON app_vouchers(invoice_uuid);
 
       -- ── Company Compliance Config (E-Invoice, E-Way Bill, Numbering Policy) ──
       CREATE TABLE IF NOT EXISTS company_compliance_config (

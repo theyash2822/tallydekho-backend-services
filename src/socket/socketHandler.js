@@ -40,7 +40,15 @@ export function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo) {
     booksImpactStatus: 'posted',
     timestamp: new Date().toISOString(),
   });
-  console.log(`[socket] voucher:tallySynced emitted for ${tdkRef}`);
+  // Spec-compliant event for the invoice preview/share flow
+  _io.to(`company:${companyGuid}`).emit('invoice_posting_updated', {
+    referenceNumber: tdkRef,
+    postingTag: 'Posted',
+    invoiceNumberLabel: tallyVoucherNo,
+    tallyVoucherNo,
+    timestamp: new Date().toISOString(),
+  });
+  console.log(`[socket] voucher:tallySynced + invoice_posting_updated emitted for ${tdkRef}`);
 }
 
 const connectedClients = new Map(); // token/deviceId → socket

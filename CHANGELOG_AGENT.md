@@ -326,3 +326,21 @@ _Add new entries at top._
 - processStocks(): auto-seeds `stock_barcodes` with `source='tally'` when alias looks like barcode
 
 ### Commit: `df00776` → tallydekho-backend-services
+
+## 2026-06-24 — Invoice PDF Before Tally Sync Flow (Phase A+B)
+
+### Backend Changes
+- `src/db/schema.js`: Added `invoice_uuid UUID DEFAULT gen_random_uuid() UNIQUE` to app_vouchers CREATE TABLE
+- `src/socket/socketHandler.js`: `emitVoucherSynced()` now also emits `invoice_posting_updated` with `{referenceNumber, postingTag, invoiceNumberLabel, tallyVoucherNo}`
+- `src/routes/tally-write.js`:
+  - `POST /voucher/sales`: INSERT now RETURNs `invoice_uuid`, returned in response as `invoiceUuid`
+  - `buildVoucherDocument()` helper: builds VoucherDocument from app_vouchers + company/ledger joins
+  - `waitForTallyNumber()` helper: polls every 600ms up to maxWaitMs for tally_voucher_no
+  - NEW `GET /tally/invoice/:tdkRef/preview`: returns VoucherDocument snapshot
+  - NEW `POST /tally/invoice/:tdkRef/share-pdf`: waits up to 10s, returns provisional/final data
+- DB migration already applied: `ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS invoice_uuid UUID DEFAULT gen_random_uuid() UNIQUE`
+
+### Architecture Decision
+- No new tables created — spec's `invoices` → `app_vouchers`, `tally_sync_outbox` → `write_queue`
+- PDF generation on-device (expo-print) not backend (no puppeteer/PDF library installed)
+- Backend handles the 10s wait logic + provisional/final decision
