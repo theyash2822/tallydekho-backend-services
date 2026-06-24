@@ -236,6 +236,28 @@ async function generateTDKReference(companyGuid, isOptional, voucherTypeCode = '
   return `TDK-${prefix}-${year}-${String(seq).padStart(4, '0')}`;
 }
 
+// ── TallyDekho Series Invoice Number Generator ────────────────────────────────
+// Returns formatted invoice number e.g. TD/SAL/26-27/00001
+// Used when numbering_policy = 'tallydekho_series'
+async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL') {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const curYear = now.getFullYear();
+  const startYear = month >= 4 ? curYear : curYear - 1; // April = start of Indian FY
+  const fiscalShort = `${String(startYear).slice(2)}-${String(startYear + 1).slice(2)}`;
+  const prefix = `TDINV-${voucherTypeCode}`;
+  const { rows } = await query(
+    `INSERT INTO tdk_reference_counters (company_guid, voucher_prefix, fiscal_year, last_seq)
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT (company_guid, voucher_prefix, fiscal_year)
+     DO UPDATE SET last_seq = tdk_reference_counters.last_seq + 1
+     RETURNING last_seq`,
+    [companyGuid, prefix, startYear]
+  );
+  const seq = rows[0].last_seq;
+  return `TD/${voucherTypeCode}/${fiscalShort}/${String(seq).padStart(5, '0')}`;
+}
+
 // ── POST /tally/voucher/sales ─────────────────────────────────────────────
 router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const {
@@ -247,8 +269,9 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     isOptional = false,
     voucherType = 'Sales GST',
     original_entry_type = 'regular',
-    collect_payment = null, // { ledgerName, amount, reference } — payment collected at billing
-    dispatch_details = null, // { dispatch_from, ship_to, transport_mode, transporter_name, transporter_id, vehicle_number, vehicle_type, transport_doc_no, transport_doc_date }
+    collect_payment = null,
+    dispatch_details = null,
+    numbering_policy = 'tally_prime_series', // 'tally_prime_series' | 'tallydekho_series'
   } = req.body;
 
   if (!companyGuid || !partyLedger || !items.length) {
@@ -286,6 +309,15 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   // Generate TDK reference
   const tdkRef = await generateTDKReference(companyGuid, isOptional).catch(() => null);
 
+  // TallyDekho Series: generate invoice number immediately (we own the sequence)
+  // This number is stable and final — no 10s wait needed for Share PDF
+  let tdkInvoiceNo = null;
+  let effectiveVoucherNumber = voucherNumber || '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'SAL').catch(() => null);
+    if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
+  }
+
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -299,7 +331,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
+  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
   <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
@@ -437,10 +469,15 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   if (queueId && tdkRef) {
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type, tally_sync_status, books_impact_status, party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9)
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type, partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
+      [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type,
+       numbering_policy,
+       tdkInvoiceNo || null,     // pre-set for tallydekho_series; null for tally_prime_series
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
     ).catch(e => { console.error('[app_vouchers] insert failed:', e.message); return { rows: [] }; });
     invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
   }
@@ -470,7 +507,16 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
         }
       });
     }
-    res.json({ status: true, queued: offline, queueId, tdkReferenceNo: tdkRef, invoiceUuid, message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({
+      status: true, queued: offline, queueId,
+      tdkReferenceNo: tdkRef, invoiceUuid,
+      invoiceNumber: tdkInvoiceNo || result?.voucherNumber || null, // immediate for TD series
+      numberingPolicy: numbering_policy,
+      message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : (isOptional ? 'Optional entry saved' : 'Sales invoice created'),
+      data: result,
+      voucherNumber: result?.voucherNumber || null,
+      tallyId: result?.tallyId || null,
+    });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
@@ -1335,19 +1381,33 @@ export async function retrySingleEntry(entryId, userId) {
   }
 }
 
+// Phase C: per-user debounce map — prevents hammering Tally with retries
+const _retryDebounce = new Map(); // userId → lastRunMs
+const RETRY_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
+const RETRY_MAX_PER_RUN  = 25; // cap per startup/reconnect
+
 export async function retryOfflineEntries(userId, companyGuid) {
+  // Debounce: skip if already ran within the last 5 minutes for this user
+  const lastRun = _retryDebounce.get(userId) || 0;
+  if (Date.now() - lastRun < RETRY_DEBOUNCE_MS) {
+    console.log(`[write_queue] retryOfflineEntries debounced for user ${userId} (last run ${Math.round((Date.now()-lastRun)/1000)}s ago)`);
+    return;
+  }
+  _retryDebounce.set(userId, Date.now());
+
   try {
     // companyGuid may be null when called on desktop reconnect — fetch ALL pending for this user
     // Only retry 'desktop_offline' and 'failed' entries.
     // Do NOT include 'pending' or 'processing' — those are actively being forwarded
     // and picking them up here would cause duplicate entries in Tally.
+    // Phase C: capped at RETRY_MAX_PER_RUN entries per run
     const { rows } = companyGuid
       ? await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','failed') AND attempt_count < 5 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT) ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
           [userId, companyGuid]
         )
       : await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5 ORDER BY created_at ASC LIMIT 20`,
+          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT) ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
           [userId]
         );
     if (!rows.length) return;
@@ -1566,6 +1626,190 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
   await updateWriteQueue(queueId, result, null);
   return result;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// PHASE C — Outbox Pull / Claim / Result (targeted desktop posting)
+// Desktop pulls pending writebacks, claims one, posts to Tally, reports result
+// Only processes 'desktop_offline' entries (entries where desktop was offline at submit)
+// ────────────────────────────────────────────────────────────────────────────
+const LOCK_TTL_SECONDS = 300; // 5 minutes — if desktop crashes, entry re-opens after this
+
+// Helper: resolve userId from device-id header (desktop auth)
+async function resolveDesktopUser(req, res) {
+  const deviceId = req.headers['device-id'] || req.headers['x-device-id'] || req.body?.deviceId;
+  if (!deviceId) { res.status(401).json({ status: false, message: 'device-id header required' }); return null; }
+  const { rows } = await query(`SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1`, [deviceId]);
+  if (!rows[0]) { res.status(403).json({ status: false, message: 'Device not paired' }); return null; }
+  return { userId: rows[0].user_id, deviceId };
+}
+
+// POST /tally/desktop/writeback/pending — desktop pulls its pending offline entries
+router.post('/desktop/writeback/pending', async (req, res) => {
+  try {
+    const desktop = await resolveDesktopUser(req, res);
+    if (!desktop) return;
+    const { companyGuid, limit = 10 } = req.body;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    const maxLimit = Math.min(parseInt(limit) || 10, 25);
+    const now = Math.floor(Date.now() / 1000);
+
+    const { rows } = await query(
+      `SELECT id, company_guid, entry_type, entry_label, payload, attempt_count
+       FROM write_queue
+       WHERE user_id=$1 AND company_guid=$2
+         AND status IN ('desktop_offline','failed')
+         AND attempt_count < 5
+         AND (lock_expires_at IS NULL OR lock_expires_at < $3)
+       ORDER BY created_at ASC LIMIT $4`,
+      [desktop.userId, companyGuid, now, maxLimit]
+    );
+
+    res.json({
+      status: true,
+      data: { items: rows.map(r => ({
+        outboxId:        r.id,
+        entityType:      r.entry_type,
+        entityLabel:     r.entry_label,
+        companyGuid:     r.company_guid,
+        referenceNumber: r.payload ? (JSON.parse(r.payload || '{}')?.reference || '') : '',
+        attemptCount:    r.attempt_count,
+      })), count: rows.length },
+    });
+  } catch (e) {
+    console.error('[writeback/pending]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// POST /tally/desktop/writeback/:outboxId/claim — lock entry + return XML for posting
+router.post('/desktop/writeback/:outboxId/claim', async (req, res) => {
+  try {
+    const desktop = await resolveDesktopUser(req, res);
+    if (!desktop) return;
+    const { outboxId } = req.params;
+    const now = Math.floor(Date.now() / 1000);
+    const lockExpiresAt = now + LOCK_TTL_SECONDS;
+
+    const { rows } = await query(
+      `UPDATE write_queue
+       SET locked_by_device_id=$1, locked_at=$2, lock_expires_at=$3, status='processing',
+           updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+       WHERE id=$4 AND user_id=$5
+         AND status IN ('desktop_offline','failed')
+         AND (lock_expires_at IS NULL OR lock_expires_at < $2)
+       RETURNING id, xml, payload, entry_type, company_guid`,
+      [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.userId]
+    );
+
+    if (!rows[0]) return res.status(409).json({ status: false, message: 'Entry already claimed or not found' });
+    const entry = rows[0];
+
+    res.json({
+      status: true,
+      data: {
+        claimed:       true,
+        outboxId:      entry.id,
+        lockExpiresAt: new Date(lockExpiresAt * 1000).toISOString(),
+        xml:           entry.xml,
+        entityType:    entry.entry_type,
+        companyGuid:   entry.company_guid,
+      },
+    });
+  } catch (e) {
+    console.error('[writeback/claim]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// POST /tally/desktop/writeback/:outboxId/result — desktop reports Tally result
+router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
+  try {
+    const desktop = await resolveDesktopUser(req, res);
+    if (!desktop) return;
+    const { outboxId } = req.params;
+    const { success, tallyVoucherNumber, tallyVoucherGuid, tallyAlterId, errorCode, errorMessage } = req.body;
+
+    // Verify this device owns the lock
+    const { rows: lockRows } = await query(
+      `SELECT id, company_guid FROM write_queue WHERE id=$1 AND locked_by_device_id=$2 AND user_id=$3`,
+      [outboxId, desktop.deviceId, desktop.userId]
+    );
+    if (!lockRows[0]) return res.status(403).json({ status: false, message: 'Not the lock owner or not found' });
+    const { company_guid } = lockRows[0];
+
+    if (success) {
+      await query(
+        `UPDATE write_queue SET status='success', tally_voucher_number=$1, tally_id=$2,
+         locked_by_device_id=NULL, locked_at=NULL, lock_expires_at=NULL,
+         error_message=NULL, attempt_count=attempt_count+1,
+         updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$3`,
+        [tallyVoucherNumber || null, tallyAlterId || null, outboxId]
+      );
+      if (tallyVoucherNumber) {
+        const { rows: avRows } = await query(
+          `UPDATE app_vouchers SET tally_voucher_no=$1, tally_guid=$2,
+           tally_sync_status='synced', books_impact_status='posted',
+           updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+           WHERE write_queue_id=$3 AND tally_sync_status!='synced'
+           RETURNING tdk_reference_no`,
+          [tallyVoucherNumber, tallyVoucherGuid || null, outboxId]
+        ).catch(() => ({ rows: [] }));
+        if (avRows[0]?.tdk_reference_no) {
+          _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber);
+        }
+      }
+      res.json({ status: true, message: 'Result recorded. Invoice posted.' });
+    } else {
+      await query(
+        `UPDATE write_queue SET status='failed', error_message=$1,
+         locked_by_device_id=NULL, locked_at=NULL, lock_expires_at=NULL,
+         attempt_count=attempt_count+1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`,
+        [`[${errorCode || 'ERROR'}] ${errorMessage || 'Unknown error'}`, outboxId]
+      );
+      res.json({ status: true, message: 'Failure recorded.' });
+    }
+  } catch (e) {
+    console.error('[writeback/result]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// POST /tally/invoice/:tdkRef/pdf-log — mobile logs a PDF generation event
+router.post('/invoice/:tdkRef/pdf-log', authMiddleware, async (req, res) => {
+  try {
+    const { tdkRef } = req.params;
+    const { companyGuid, pdfType = 'provisional', invoiceNumber, invoiceNumberLabel, watermark, fileName } = req.body;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+
+    // Lookup the invoice
+    const { rows: avRows } = await query(
+      `SELECT invoice_uuid, books_impact_status FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
+      [tdkRef, companyGuid, req.user.userId]
+    );
+    if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
+
+    // Get next version number
+    const { rows: vRows } = await query(
+      `SELECT COALESCE(MAX(version_no), 0) + 1 AS next_ver FROM invoice_pdf_versions WHERE tdk_reference_no=$1`,
+      [tdkRef]
+    );
+    const versionNo = vRows[0]?.next_ver || 1;
+
+    await query(
+      `INSERT INTO invoice_pdf_versions (tdk_reference_no, invoice_uuid, company_guid, user_id, version_no, pdf_type, posting_tag, invoice_number, invoice_number_label, watermark, file_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (tdk_reference_no, version_no) DO NOTHING`,
+      [tdkRef, avRows[0].invoice_uuid, companyGuid, req.user.userId, versionNo,
+       pdfType, avRows[0].books_impact_status === 'posted' ? 'Posted' : 'Not Posted',
+       invoiceNumber || null, invoiceNumberLabel || 'Pending from TallyPrime', watermark || null, fileName || null]
+    );
+
+    res.json({ status: true, data: { versionNo, pdfType } });
+  } catch (e) {
+    console.error('[invoice/pdf-log]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
 
 // ── Helper: build VoucherDocument from app_vouchers row + company/party info ──────────────
 async function buildVoucherDocument(av, companyRow, partyRow) {

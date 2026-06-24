@@ -403,12 +403,17 @@ export async function initSchema() {
         attempt_count   INTEGER DEFAULT 0,
         created_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         updated_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        source          TEXT DEFAULT 'web'  -- 'web', 'mobile'
+        source          TEXT DEFAULT 'web',  -- 'web', 'mobile'
+        -- Phase C: outbox claim/lock (prevents duplicate desktop processing)
+        locked_by_device_id TEXT,
+        locked_at           BIGINT,
+        lock_expires_at     BIGINT
       );
       CREATE INDEX IF NOT EXISTS idx_wq_company   ON write_queue(company_guid);
       CREATE INDEX IF NOT EXISTS idx_wq_user      ON write_queue(user_id);
       CREATE INDEX IF NOT EXISTS idx_wq_status    ON write_queue(status);
       CREATE INDEX IF NOT EXISTS idx_wq_created   ON write_queue(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_wq_lock      ON write_queue(status, lock_expires_at) WHERE status IN ('desktop_offline','pending');
 
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
@@ -663,6 +668,16 @@ export async function initSchema() {
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS reorder_level     DECIMAL(15,4) DEFAULT 0;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
 
+      -- Phase A+B+C: app_vouchers new columns (invoice_uuid, numbering_policy, tally_voucher_no)
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS invoice_uuid     UUID DEFAULT gen_random_uuid() UNIQUE;
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS numbering_policy TEXT NOT NULL DEFAULT 'tally_prime_series';
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid ON app_vouchers(invoice_uuid);
+
+      -- Phase C: write_queue claim/lock columns
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_by_device_id TEXT;
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_at           BIGINT;
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS lock_expires_at     BIGINT;
+
       -- stock_fy_valuation — FY-specific opening/closing stock VALUES direct from Tally
       -- Source: StockValuation.xml (per FY, uses Tally's internal costing: FIFO/avg)
       -- This is the source of truth for P&L Opening Stock and Closing Stock
@@ -858,6 +873,26 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid    ON app_vouchers(invoice_uuid);
+
+      -- ── Invoice PDF Versions (Phase C) ──────────────────────────────────────
+      CREATE TABLE IF NOT EXISTS invoice_pdf_versions (
+        id                  BIGSERIAL PRIMARY KEY,
+        tdk_reference_no    TEXT NOT NULL,
+        invoice_uuid        UUID,
+        company_guid        TEXT NOT NULL,
+        user_id             INTEGER REFERENCES users(id),
+        version_no          INTEGER NOT NULL DEFAULT 1,
+        pdf_type            TEXT NOT NULL DEFAULT 'provisional', -- draft|provisional|final|einvoice|ewaybill
+        posting_tag         TEXT NOT NULL DEFAULT 'Not Posted',
+        invoice_number      TEXT,
+        invoice_number_label TEXT NOT NULL DEFAULT 'Pending from TallyPrime',
+        watermark           TEXT,
+        file_name           TEXT,
+        generated_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE (tdk_reference_no, version_no)
+      );
+      CREATE INDEX IF NOT EXISTS idx_pdf_ver_tdk     ON invoice_pdf_versions(tdk_reference_no);
+      CREATE INDEX IF NOT EXISTS idx_pdf_ver_company ON invoice_pdf_versions(company_guid);
 
       -- ── Company Compliance Config (E-Invoice, E-Way Bill, Numbering Policy) ──
       CREATE TABLE IF NOT EXISTS company_compliance_config (

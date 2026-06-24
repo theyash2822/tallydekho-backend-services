@@ -70,10 +70,25 @@ export function setupSocket(io) {
         socket.emit('registered', { status: true });
         // Auto-retry offline entries
         query('SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
-          .then(({ rows }) => {
-            if (rows[0] && _retryOfflineEntries) {
+          .then(async ({ rows }) => {
+            if (!rows[0]) return;
+            const userId = rows[0].user_id;
+            if (_retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-              _retryOfflineEntries(rows[0].user_id, null);
+              _retryOfflineEntries(userId, null);
+            }
+            // Phase C: emit lightweight wake-up if pending offline entries exist
+            const { rows: pendingRows } = await query(
+              `SELECT company_guid, COUNT(*) AS cnt FROM write_queue
+               WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
+               AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)
+               GROUP BY company_guid`,
+              [userId]
+            ).catch(() => ({ rows: [] }));
+            for (const p of pendingRows) {
+              socket.emit('pending_tally_writeback_available', {
+                companyGuid: p.company_guid, count: parseInt(p.cnt), entityType: 'mixed',
+              });
             }
           }).catch(() => {});
         return;
