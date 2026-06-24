@@ -868,12 +868,25 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     const { rows } = await query(
-      `SELECT name, guid FROM ledgers
-       WHERE company_guid = $1
-         AND (parent ILIKE '%GST%' OR parent ILIKE '%Tax%' OR parent ILIKE '%Duty%'
-              OR name ILIKE '%CGST%' OR name ILIKE '%SGST%' OR name ILIKE '%IGST%'
-              OR name ILIKE '%UTGST%' OR name ILIKE '%GST%')
-       ORDER BY name ASC`,
+      `WITH RECURSIVE tax_groups AS (
+         SELECT name FROM groups
+         WHERE company_guid = $1
+           AND (name ILIKE '%Duties%' OR name ILIKE '%Tax%' OR name ILIKE '%GST%')
+         UNION ALL
+         SELECT g.name FROM groups g
+         JOIN tax_groups tg ON g.parent = tg.name
+         WHERE g.company_guid = $1
+       )
+       SELECT DISTINCT l.name, l.guid FROM ledgers l
+       WHERE l.company_guid = $1
+         AND (
+           l.parent IN (SELECT name FROM tax_groups)
+           OR l.parent ILIKE '%GST%' OR l.parent ILIKE '%Tax%' OR l.parent ILIKE '%Duty%' OR l.parent ILIKE '%Duties%'
+           OR l.name ILIKE '%CGST%' OR l.name ILIKE '%SGST%' OR l.name ILIKE '%IGST%'
+           OR l.name ILIKE '%UTGST%' OR l.name ILIKE '%GST%' OR l.name ILIKE '%Cess%'
+           OR l.name ILIKE '%TDS%' OR l.name ILIKE '%TCS%'
+         )
+       ORDER BY l.name ASC`,
       [companyGuid]
     );
     res.json({ status: true, data: rows });
@@ -902,6 +915,10 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
              OR name ILIKE 'Indirect Expenses'
              OR name ILIKE 'Direct Incomes'
              OR name ILIKE 'Indirect Incomes'
+             OR name ILIKE '%Duties%'
+             OR name ILIKE '%Taxes%'
+             OR name ILIKE 'Sales Accounts'
+             OR name ILIKE 'Purchase Accounts'
            )
          UNION ALL
          SELECT g.name FROM groups g
@@ -5570,17 +5587,16 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
     // Net qty per warehouse from stock_transactions
     const { rows } = await query(`
       SELECT
-        st.warehouse                                                            AS name,
+        COALESCE(NULLIF(st.warehouse, ''), 'Main Location') AS name,
         SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) AS qty
       FROM stock_transactions st
       WHERE st.stock_guid = $1 AND st.company_guid = $2
-        AND st.warehouse IS NOT NULL AND st.warehouse != ''
         AND st.voucher_type != 'Physical Stock'
-      GROUP BY st.warehouse
-      HAVING SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) != 0
+      GROUP BY COALESCE(NULLIF(st.warehouse, ''), 'Main Location')
+      HAVING SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) > 0
       ORDER BY qty DESC
     `, [stockName, companyGuid]);
-    const warehouses = rows.map(r => ({ name: r.name, qty: parseFloat(r.qty) })).filter(r => r.name);
+    const warehouses = rows.map(r => ({ name: r.name, qty: parseFloat(r.qty) }));
     res.json({ success: true, data: { warehouses, totalQty } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
