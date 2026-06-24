@@ -867,6 +867,7 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
   try {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
     const { rows } = await query(
       `WITH RECURSIVE tax_groups AS (
          SELECT name FROM groups
@@ -908,7 +909,8 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
     // which is itself under 'Indirect Expenses').
     const { rows } = await query(
       `WITH RECURSIVE expense_income_groups AS (
-         SELECT name FROM groups
+         -- Anchor: root group names are carried forward so we know the origin of each ledger
+         SELECT name, name AS root_name FROM groups
          WHERE company_guid = $1
            AND (
              name ILIKE 'Direct Expenses'
@@ -921,11 +923,11 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
              OR name ILIKE 'Purchase Accounts'
            )
          UNION ALL
-         SELECT g.name FROM groups g
+         SELECT g.name, eig.root_name FROM groups g
          JOIN expense_income_groups eig ON g.parent = eig.name
          WHERE g.company_guid = $1
        )
-       SELECT DISTINCT l.name, l.guid, l.parent
+       SELECT DISTINCT l.name, l.guid, l.parent, eig.root_name
        FROM ledgers l
        JOIN expense_income_groups eig ON l.parent = eig.name
        WHERE l.company_guid = $1
@@ -935,11 +937,17 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
     const normalize = (s) => String(s || '').trim().toLowerCase();
     const LOGISTICS_KW = ['freight','transport','delivery','courier','loading','unloading','handling','cartage','hamali','logistics','forwarding','shipping','dispatch'];
     const ROUND_OFF_KW = ['round off','rounded off','rounding','roundoff'];
+    // Pure revenue/purchase roots — ledgers under these should NOT appear in additionalCharges
+    // (they are sales/purchase ledgers, not charge types). They can still be logistics if keyword matches.
+    const REVENUE_ROOTS = ['sales accounts', 'purchase accounts'];
     const logistics = [], additional = [], roundOff = [];
     rows.forEach(r => {
       const n = normalize(r.name);
+      const rootNorm = normalize(r.root_name || '');
       if (ROUND_OFF_KW.some(k => n.includes(k))) { roundOff.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
       if (LOGISTICS_KW.some(k => n.includes(k))) { logistics.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent }); return; }
+      // Skip ledgers rooted under Sales/Purchase Accounts from the additional charges bucket
+      if (REVENUE_ROOTS.some(root => rootNorm.includes(root))) return;
       additional.push({ ledgerName: r.name, guid: r.guid, parentGroup: r.parent });
     });
     res.json({ status: true, data: { logisticsCharges: logistics, additionalCharges: additional, roundOffLedgers: roundOff, allCharges: [...logistics, ...additional, ...roundOff] } });
