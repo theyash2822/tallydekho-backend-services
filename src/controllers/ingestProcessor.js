@@ -5,6 +5,59 @@ import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifie
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
 import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
 
+// ── Dispatch / EWB Extraction ────────────────────────────────────────────────
+// Extracts dispatch + transport details from a TallyPrime voucher record.
+// Field names validated against real TallyPrime XML export (2026-06-24).
+function extractDispatchDetails(r) {
+  // EWAYBILLDETAILS.LIST comes in as EWAYBILLDETAILS or EwayBillDetails etc.
+  const ewbRaw = r.EWAYBILLDETAILS || r['EWAYBILLDETAILS.LIST'] || r.EwayBillDetails || r.ewayBillDetails;
+  const ewb = ewbRaw ? (Array.isArray(ewbRaw) ? ewbRaw[0] : ewbRaw) : null;
+
+  // TRANSPORTDETAILS.LIST nested inside EWAYBILLDETAILS
+  const tdRaw = ewb ? (ewb.TRANSPORTDETAILS || ewb['TRANSPORTDETAILS.LIST'] || ewb.TransportDetails) : null;
+  const td = tdRaw ? (Array.isArray(tdRaw) ? tdRaw[0] : tdRaw) : null;
+
+  // Consignor address list
+  const consignorAddrRaw = ewb ? (ewb['CONSIGNORADDRESS.LIST'] || ewb.CONSIGNORADDRESS_LIST) : null;
+  const consignorAddr = consignorAddrRaw
+    ? (Array.isArray(consignorAddrRaw) ? consignorAddrRaw[0] : consignorAddrRaw)
+    : null;
+
+  // Consignee address list
+  const consigneeAddrRaw = ewb ? (ewb['CONSIGNEEADDRESS.LIST'] || ewb.CONSIGNEEADDRESS_LIST) : null;
+  const consigneeAddr = consigneeAddrRaw
+    ? (Array.isArray(consigneeAddrRaw) ? consigneeAddrRaw[0] : consigneeAddrRaw)
+    : null;
+
+  const details = {
+    // Dispatch From
+    dispatch_from_address : consignorAddr?.CONSIGNORADDRESS || null,
+    dispatch_from_place   : ewb?.CONSIGNORPLACE   || null,
+    dispatch_from_state   : ewb?.SHIPPEDFROMSTATE  || null,
+    dispatch_from_pincode : ewb?.CONSIGNORPINCODE  || null,
+    // Ship To
+    ship_to_address       : consigneeAddr?.CONSIGNEEADDRESS || null,
+    ship_to_place         : ewb?.CONSIGNEEPLACE    || null,
+    ship_to_state         : ewb?.SHIPPEDTOSTATE    || null,
+    // Document
+    document_type         : ewb?.DOCUMENTTYPE      || null,
+    // Transport (from TRANSPORTDETAILS.LIST)
+    transport_mode        : td?.TRANSPORTMODE      || null,
+    transporter_name      : td?.TRANSPORTERNAME    || null,
+    transporter_id        : td?.TRANSPORTERID      || null,
+    vehicle_number        : td?.VEHICLENUMBER      || r.BASICSHIPVESSELNO || null,
+    vehicle_type          : td?.VEHICLETYPE        || null,
+    transport_doc_date    : td?.DOCUMENTDATE       || r.BILLOFLADINGDATE  || null,
+    // Top-level dispatch fields
+    transport_doc_no      : r.BASICSHIPDOCUMENTNO  || null,
+    transport_mode_simple : r.BASICSHIPPEDBY       || null,
+    ship_to_destination   : r.BASICFINALDESTINATION || null,
+  };
+
+  // Return null if nothing found (avoid storing empty objects)
+  return Object.values(details).some(v => v !== null) ? details : null;
+}
+
 // ── Tax Extraction ────────────────────────────────────────────────────────────
 // Extract and save tax transactions from voucher ledger entries.
 // Called after voucher + ledger entries are committed. Never throws — isolates
@@ -498,9 +551,12 @@ async function processVouchers(data, companyGuid) {
       }
 
       try {
+        // Extract dispatch / EWB details from TallyPrime XML
+        const dispatchDetails = extractDispatchDetails(r);
+
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
@@ -517,6 +573,7 @@ async function processVouchers(data, companyGuid) {
             alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
+            dispatch_details    = COALESCE(EXCLUDED.dispatch_details, vouchers.dispatch_details),
             synced_at           = EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, deriveVoucherTypeParent(voucherType), date,
@@ -532,6 +589,7 @@ async function processVouchers(data, companyGuid) {
           JSON.stringify(r).slice(0, 10000),
           now(),
           r._FINANCIAL_YEAR || null,
+          dispatchDetails ? JSON.stringify(dispatchDetails) : null,
         ]);
         saved++;
         voucherRowsForTax.push({
@@ -2018,9 +2076,10 @@ async function processAllVoucher(data, companyGuid) {
           .reduce((s, e) => s + parseFloat(e.AMOUNT || e.Amount || 0), 0);
       }
       try {
+        const dispatchDetails2 = extractDispatchDetails(r);
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year, dispatch_details)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
@@ -2035,6 +2094,7 @@ async function processAllVoucher(data, companyGuid) {
             alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
+            dispatch_details    = COALESCE(EXCLUDED.dispatch_details, vouchers.dispatch_details),
             synced_at           = EXCLUDED.synced_at
         `, [
           guid, companyGuid,
@@ -2050,6 +2110,7 @@ async function processAllVoucher(data, companyGuid) {
           JSON.stringify(r).slice(0, 5000),
           now(),
           r._FINANCIAL_YEAR || null,
+          dispatchDetails2 ? JSON.stringify(dispatchDetails2) : null,
         ]);
         saved++;
         // Save AllLedgerEntries to voucher_ledger_entries (proper Dr/Cr from amount sign)

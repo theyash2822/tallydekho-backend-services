@@ -290,20 +290,83 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
     : 0;
   const partyNetAmt = amt - payAmt; // party outstanding = invoice total - payment received
 
-  // Build narration: append dispatch details if provided
-  let fullNarration = narration || '';
+  // Narration — clean. Dispatch/EWB data goes in EWAYBILLDETAILS.LIST, not here.
+  const fullNarration = narration || '';
+
+  // ── Dispatch / EWB XML fragments ─────────────────────────────────────────
+  // Helper: YYYYMMDD format for TallyPrime date fields
+  const toTallyDate = (d) => d ? String(d).replace(/-/g, '') : '';
+
+  let topLevelDispatchXml = '';
+  let ewbDetailsXml = '';
   if (dispatch_details) {
     const dd = dispatch_details;
-    const parts = [];
-    if (dd.dispatch_from) parts.push(`Dispatch From: ${dd.dispatch_from}`);
-    if (dd.ship_to)        parts.push(`Ship To: ${dd.ship_to}`);
-    if (dd.transport_mode) parts.push(`Mode: ${dd.transport_mode}`);
-    if (dd.transporter_name) parts.push(`Transporter: ${dd.transporter_name}`);
-    if (dd.transporter_id)   parts.push(`Transporter ID: ${dd.transporter_id}`);
-    if (dd.vehicle_number)   parts.push(`Vehicle: ${dd.vehicle_number}`);
-    if (dd.transport_doc_no) parts.push(`Doc No: ${dd.transport_doc_no}`);
-    if (dd.transport_doc_date) parts.push(`Doc Date: ${dd.transport_doc_date}`);
-    if (parts.length) fullNarration = [fullNarration, parts.join(' | ')].filter(Boolean).join(' | ');
+    // Transport mode: TallyPrime top-level = simple word; TRANSPORTDETAILS.LIST = coded
+    const modeSimpleMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', 'not_applicable': '', 'not applicable': '' };
+    const modeCodeMap   = { road: '1 - Road', rail: '2 - Rail', air: '3 - Air', ship: '4 - Ship' };
+    const modeKey        = (dd.transport_mode || '').toLowerCase().replace(' ', '_');
+    const tallySimpleMode = modeSimpleMap[modeKey] ?? dd.transport_mode ?? '';
+    const tallyCodedMode  = modeCodeMap[modeKey] ?? '';
+    // Vehicle type: TallyPrime expects coded string
+    const vtKey = (dd.vehicle_type || '').toLowerCase();
+    const tallyVehicleType = vtKey.includes('over') ? 'O - Over Dimensional Cargo (ODC)'
+                           : vtKey === 'regular'     ? 'R - Regular'
+                           : dd.vehicle_type         || '';
+
+    // 1. Top-level VOUCHER fields (go right after <NARRATION>)
+    const dispatchDate = toTallyDate(dd.transport_doc_date);
+    topLevelDispatchXml = [
+      dispatchDate          ? `  <BILLOFLADINGDATE>${dispatchDate}</BILLOFLADINGDATE>` : '',
+      tallySimpleMode       ? `  <BASICSHIPPEDBY>${tallySimpleMode}</BASICSHIPPEDBY>` : '',
+      dd.transport_doc_no   ? `  <BASICSHIPDOCUMENTNO>${dd.transport_doc_no}</BASICSHIPDOCUMENTNO>` : '',
+      dd.ship_to            ? `  <BASICFINALDESTINATION>${dd.ship_to}</BASICFINALDESTINATION>` : '',
+      dd.vehicle_number     ? `  <BASICSHIPVESSELNO>${dd.vehicle_number}</BASICSHIPVESSELNO>` : '',
+    ].filter(Boolean).join('\n');
+
+    // 2. EWAYBILLDETAILS.LIST with nested TRANSPORTDETAILS.LIST (validated against real TallyPrime export)
+    const hasTransport = dd.vehicle_number || tallyCodedMode || dd.transporter_name || dd.transporter_id;
+    ewbDetailsXml = `
+  <EWAYBILLDETAILS.LIST>
+    <CONSIGNORADDRESS.LIST TYPE="String">
+      <CONSIGNORADDRESS>${dd.dispatch_from || ''}</CONSIGNORADDRESS>
+    </CONSIGNORADDRESS.LIST>
+    <CONSIGNEEADDRESS.LIST TYPE="String">
+      <CONSIGNEEADDRESS>${dd.ship_to || ''}</CONSIGNEEADDRESS>
+    </CONSIGNEEADDRESS.LIST>
+    <DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
+    <SUBTYPE>Supply</SUBTYPE>
+    <CONSIGNORPLACE>${dd.dispatch_from || ''}</CONSIGNORPLACE>
+    <CONSIGNEEPLACE>${dd.ship_to || ''}</CONSIGNEEPLACE>
+    <SHIPPEDFROMSTATE>${dd.dispatch_from_state || ''}</SHIPPEDFROMSTATE>
+    <SHIPPEDTOSTATE>${dd.ship_to_state || ''}</SHIPPEDTOSTATE>
+    <ISCANCELLED>No</ISCANCELLED>
+    <IGNOREGSTINVALIDATION>No</IGNOREGSTINVALIDATION>
+    <ISCANCELPENDING>No</ISCANCELPENDING>
+    <IGNOREGENERATIONVALIDATION>No</IGNOREGENERATIONVALIDATION>
+    <ISEXPORTEDFORGENERATION>No</ISEXPORTEDFORGENERATION>
+    <INTRASTATEAPPLICABILITY>No</INTRASTATEAPPLICABILITY>${hasTransport ? `
+    <TRANSPORTDETAILS.LIST>
+      <DOCUMENTDATE>${dispatchDate}</DOCUMENTDATE>
+      <TRANSPORTERID>${dd.transporter_id || ''}</TRANSPORTERID>
+      <TRANSPORTERNAME>${dd.transporter_name || ''}</TRANSPORTERNAME>
+      <TRANSPORTMODE>${tallyCodedMode}</TRANSPORTMODE>
+      <VEHICLENUMBER>${dd.vehicle_number || ''}</VEHICLENUMBER>
+      <OLDVEHICLETYPE>${tallyVehicleType}</OLDVEHICLETYPE>
+      <VEHICLETYPE>${tallyVehicleType}</VEHICLETYPE>
+      <IGNOREVEHICLENOVALIDATION>No</IGNOREVEHICLENOVALIDATION>
+      <ISTRANSIDPENDING>No</ISTRANSIDPENDING>
+      <ISTRANSIDUPDATED>No</ISTRANSIDUPDATED>
+      <IGNORETRANSIDVALIDATION>No</IGNORETRANSIDVALIDATION>
+      <ISEXPORTEDFORTRANSPORTERID>No</ISEXPORTEDFORTRANSPORTERID>
+      <ISPARTBPENDING>No</ISPARTBPENDING>
+      <ISPARTBUPDATED>No</ISPARTBUPDATED>
+      <IGNOREPARTBVALIDATION>No</IGNOREPARTBVALIDATION>
+      <ISEXPORTEDFORPARTB>No</ISEXPORTEDFORPARTB>
+    </TRANSPORTDETAILS.LIST>` : ''}
+    <EXTENSIONDETAILS.LIST></EXTENSIONDETAILS.LIST>
+    <MULTIVEHICLEDETAILS.LIST></MULTIVEHICLEDETAILS.LIST>
+    <STATEWISETHRESHOLD.LIST></STATEWISETHRESHOLD.LIST>
+  </EWAYBILLDETAILS.LIST>`;
   }
 
   // Generate TDK reference
@@ -339,6 +402,7 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${fullNarration}</NARRATION>
+${topLevelDispatchXml}
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
 
   <LEDGERENTRIES.LIST>
@@ -428,32 +492,8 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   </LEDGERENTRIES.LIST>`;
   }
 
-  // Dispatch / EWB details
-  if (dispatch_details) {
-    const dd = dispatch_details;
-    if (dd.dispatch_from || dd.ship_to) {
-      xml += `
-  <BASICBASEPARTYDETAILS.LIST>
-    <BASICBASEPARTYNAME>${dd.ship_to || ''}</BASICBASEPARTYNAME>
-  </BASICBASEPARTYDETAILS.LIST>`;
-    }
-    if (dd.vehicle_number || dd.transport_mode || dd.transporter_name) {
-      const modeMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', not_applicable: '' };
-      const tallyMode = modeMap[dd.transport_mode?.toLowerCase()] || dd.transport_mode || '';
-      xml += `
-  <EWAYBILLDETAILS.LIST>
-    <DISTANCEINMETERS>0</DISTANCEINMETERS>
-    <VEHICLENUMBER>${dd.vehicle_number || ''}</VEHICLENUMBER>
-    <VEHICLETYPE>${dd.vehicle_type || 'Regular'}</VEHICLETYPE>
-    <TRANSPORTMODE>${tallyMode}</TRANSPORTMODE>
-    <TRANSPORTERDOCNUMBER>${dd.transport_doc_no || ''}</TRANSPORTERDOCNUMBER>
-    <TRANSPORTERID>${dd.transporter_id || ''}</TRANSPORTERID>
-    <TRANSPORTERNAME>${dd.transporter_name || ''}</TRANSPORTERNAME>
-    <DISPATCHFROMSTATE>${dd.dispatch_from || ''}</DISPATCHFROMSTATE>
-    <DESTINATIONSTATE>${dd.ship_to || ''}</DESTINATIONSTATE>
-  </EWAYBILLDETAILS.LIST>`;
-    }
-  }
+  // Dispatch / EWB — pre-computed above, append now
+  if (ewbDetailsXml) xml += ewbDetailsXml;
 
   xml += `
 </VOUCHER>
@@ -1881,7 +1921,7 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       mode: p.collect_payment.ledgerName || '',
       reference: p.collect_payment.reference || '',
     } : null,
-    dispatchInfo: p.dispatch_details || null,
+    dispatchDetails: p.dispatch_details || null,
   };
 }
 
