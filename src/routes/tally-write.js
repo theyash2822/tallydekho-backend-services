@@ -892,16 +892,15 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
 router.post('/master/party', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName,
-    // accept both 'name' (legacy) and 'partyName' (mobile v2)
     name: _name, partyName,
     parent = 'Sundry Debtors', address = '', state = '',
     country = 'India', gstin = '', email = '', phone = '',
-    // accept both 'gstRegType' (legacy) and 'gstType' (mobile v2)
     gstRegType: _gstRegType, gstType,
     pincode = '', isBillWise = 'Yes',
     mailingName: _mailingName,
     openingBalance = 0, isCr = false,
     creditDays = 0,
+    bankDetails = null,
   } = req.body;
 
   const name = _name || partyName;
@@ -927,6 +926,18 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   };
   const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
 
+  // Build bank details XML block
+  const bankXml = bankDetails?.accountNo ? `
+<LEDGERBANKALLOCATIONS.LIST>
+  <BANKACCNO>${bankDetails.accountNo}</BANKACCNO>
+  <BANKDETAILS>${bankDetails.accountNo}</BANKDETAILS>
+  <BANKNAME>${bankDetails.bankName || ''}</BANKNAME>
+  <IFSCODE>${bankDetails.ifsc || ''}</IFSCODE>
+  <BANKBRANCHNAME>${bankDetails.branch || ''}</BANKBRANCHNAME>
+  <BANKACCHOLDERSHIPNAME>${bankDetails.beneficiaryName || name}</BANKACCHOLDERSHIPNAME>
+  <BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
+</LEDGERBANKALLOCATIONS.LIST>` : '';
+
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -936,22 +947,25 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<LEDGER NAME="${name}" RESERVEDNAME="">
-  <NAME>${name}</NAME>
-  <PARENT>${parent}</PARENT>
-  <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
-  <COUNTRYNAME>${country}</COUNTRYNAME>
-  ${state ? `<LEDSTATENAME>${state}</LEDSTATENAME>` : ''}
-  ${pincode ? `<PINCODE>${pincode}</PINCODE>` : ''}
-  ${email ? `<EMAIL>${email}</EMAIL>` : ''}
-  ${phone ? `<LEDGERMOBILE>${phone}</LEDGERMOBILE>` : ''}
-  <GSTREGISTRATIONTYPE>${gstRegTypeFinal}</GSTREGISTRATIONTYPE>
-  ${gstin ? `<PARTYGSTIN>${gstin}</PARTYGSTIN>
-  <GSTIN.LIST TYPE="String"><GSTIN>${gstin}</GSTIN></GSTIN.LIST>` : ''}
-  ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
-  ${creditDays > 0 ? `<CREDITPERIOD>${creditDays} Days</CREDITPERIOD>` : ''}
-  ${address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : ''}
-  <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${mailingName}</MAILINGNAME></MAILINGNAME.LIST>
+<LEDGER>
+<NAME>${name}</NAME>
+${address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : ''}
+<MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${mailingName}</MAILINGNAME></MAILINGNAME.LIST>
+${email ? `<EMAIL>${email}</EMAIL>` : ''}
+${phone ? `<LEDGERMOBILE>${phone}</LEDGERMOBILE>` : ''}
+${state ? `<PRIORSTATENAME>${state}</PRIORSTATENAME>` : ''}
+${pincode ? `<PINCODE>${pincode}</PINCODE>` : ''}
+<COUNTRYNAME>${country}</COUNTRYNAME>
+<GSTREGISTRATIONTYPE>${gstRegTypeFinal}</GSTREGISTRATIONTYPE>
+<VATDEALERTYPE>${gstRegTypeFinal}</VATDEALERTYPE>
+<PARENT>${parent}</PARENT>
+<COUNTRYOFRESIDENCE>${country}</COUNTRYOFRESIDENCE>
+${gstin ? `<PARTYGSTIN>${gstin}</PARTYGSTIN>` : ''}
+${state ? `<LEDSTATENAME>${state}</LEDSTATENAME>` : ''}
+<ISBILLWISEON>${isBillWise}</ISBILLWISEON>
+${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
+${parseInt(creditDays) > 0 ? `<CREDITPERIOD>${parseInt(creditDays)} Days</CREDITPERIOD>` : ''}
+${bankXml}
 </LEDGER>
 </TALLYMESSAGE>
 </REQUESTDATA>
