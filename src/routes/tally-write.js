@@ -951,6 +951,16 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
+
+    // Immediately insert into local ledgers table so getParties returns it
+    // without waiting for the next Tally sync. Tally sync will overwrite with real GUID.
+    query(
+      `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, opening_balance, closing_balance, balance_type)
+       VALUES (gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $6, 'Dr')
+       ON CONFLICT DO NOTHING`,
+      [companyGuid, name, gstin || '', req.body.pan || '', address || '', obAmt]
+    ).catch(() => {}); // fire-and-forget, don't block response
+
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
