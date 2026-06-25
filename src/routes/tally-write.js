@@ -892,14 +892,29 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
 router.post('/master/party', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName,
-    name, parent = 'Sundry Debtors', address = '', state = '',
+    // accept both 'name' (legacy) and 'partyName' (mobile v2)
+    name: _name, partyName,
+    parent = 'Sundry Debtors', address = '', state = '',
     country = 'India', gstin = '', email = '', phone = '',
-    gstRegType = 'Regular', pincode = '', isBillWise = 'Yes',
+    // accept both 'gstRegType' (legacy) and 'gstType' (mobile v2)
+    gstRegType: _gstRegType, gstType,
+    pincode = '', isBillWise = 'Yes',
+    mailingName: _mailingName,
+    openingBalance = 0, isCr = false,
+    creditDays = 0,
   } = req.body;
+
+  const name = _name || partyName;
+  const gstRegType = _gstRegType || gstType || 'Regular';
+  const mailingName = _mailingName || name;
 
   if (!companyGuid || !name) {
     return res.status(400).json({ status: false, message: 'companyGuid and name required' });
   }
+
+  // Opening balance: Tally expects positive number + Dr/Cr suffix
+  const obAmt = parseFloat(openingBalance) || 0;
+  const obFormatted = obAmt !== 0 ? (isCr ? obAmt : -obAmt).toFixed(2) : '0';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -922,8 +937,10 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   <PARTYGSTIN>${gstin}</PARTYGSTIN>
   <LEDSTATENAME>${state}</LEDSTATENAME>
   <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
+  ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
+  ${creditDays > 0 ? `<CREDITPERIOD>${creditDays} Days</CREDITPERIOD>` : ''}
   ${address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : ''}
-  <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${name}</MAILINGNAME></MAILINGNAME.LIST>
+  <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${mailingName}</MAILINGNAME></MAILINGNAME.LIST>
 </LEDGER>
 </TALLYMESSAGE>
 </REQUESTDATA>
