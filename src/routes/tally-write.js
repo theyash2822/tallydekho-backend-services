@@ -916,6 +916,17 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   const obAmt = parseFloat(openingBalance) || 0;
   const obFormatted = obAmt !== 0 ? (isCr ? obAmt : -obAmt).toFixed(2) : '0';
 
+  // Map mobile GST type values to Tally Prime-compatible values
+  const gstTypeMap = {
+    'Unregistered': 'Unregistered/Consumer',
+    'Regular': 'Regular',
+    'Composition': 'Composition',
+    'Consumer': 'Consumer',
+    'SEZ': 'SEZ',
+    'Overseas': 'Overseas',
+  };
+  const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
+
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -925,18 +936,18 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<LEDGER>
+<LEDGER NAME="${name}" RESERVEDNAME="">
   <NAME>${name}</NAME>
   <PARENT>${parent}</PARENT>
-  <EMAIL>${email}</EMAIL>
-  <LEDGERMOBILE>${phone}</LEDGERMOBILE>
-  <PRIORSTATENAME>${state}</PRIORSTATENAME>
-  <PINCODE>${pincode}</PINCODE>
-  <COUNTRYNAME>${country}</COUNTRYNAME>
-  <GSTREGISTRATIONTYPE>${gstRegType}</GSTREGISTRATIONTYPE>
-  <PARTYGSTIN>${gstin}</PARTYGSTIN>
-  <LEDSTATENAME>${state}</LEDSTATENAME>
   <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
+  <COUNTRYNAME>${country}</COUNTRYNAME>
+  ${state ? `<LEDSTATENAME>${state}</LEDSTATENAME>` : ''}
+  ${pincode ? `<PINCODE>${pincode}</PINCODE>` : ''}
+  ${email ? `<EMAIL>${email}</EMAIL>` : ''}
+  ${phone ? `<LEDGERMOBILE>${phone}</LEDGERMOBILE>` : ''}
+  <GSTREGISTRATIONTYPE>${gstRegTypeFinal}</GSTREGISTRATIONTYPE>
+  ${gstin ? `<PARTYGSTIN>${gstin}</PARTYGSTIN>
+  <GSTIN.LIST TYPE="String"><GSTIN>${gstin}</GSTIN></GSTIN.LIST>` : ''}
   ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
   ${creditDays > 0 ? `<CREDITPERIOD>${creditDays} Days</CREDITPERIOD>` : ''}
   ${address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : ''}
