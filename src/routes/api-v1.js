@@ -3251,7 +3251,7 @@ router.get('/parties', authMiddleware, async (req, res) => {
     let idx = 3;
     if (type === 'customer') { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Debtor%'); }
     if (type === 'vendor')   { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Creditor%'); }
-    q += ' ORDER BY name LIMIT 50';
+    q += ' ORDER BY name LIMIT 500';
     const { rows } = await query(q, params);
     res.json({ success: true, data: rows });
   } catch (err) {
