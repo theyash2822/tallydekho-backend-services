@@ -926,17 +926,13 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   };
   const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
 
-  // Build bank details XML block
+  // Bank details — direct child elements of <LEDGER> (Tally Prime format, not a LIST)
   const bankXml = bankDetails?.accountNo ? `
-<LEDGERBANKALLOCATIONS.LIST>
-  <BANKACCNO>${bankDetails.accountNo}</BANKACCNO>
-  <BANKDETAILS>${bankDetails.accountNo}</BANKDETAILS>
-  <BANKNAME>${bankDetails.bankName || ''}</BANKNAME>
-  <IFSCODE>${bankDetails.ifsc || ''}</IFSCODE>
-  <BANKBRANCHNAME>${bankDetails.branch || ''}</BANKBRANCHNAME>
-  <BANKACCHOLDERSHIPNAME>${bankDetails.beneficiaryName || name}</BANKACCHOLDERSHIPNAME>
-  <BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
-</LEDGERBANKALLOCATIONS.LIST>` : '';
+<BANKDETAILS>${bankDetails.accountNo}</BANKDETAILS>
+<IFSCODE>${bankDetails.ifsc || ''}</IFSCODE>
+<BANKBRANCHNAME>${bankDetails.branch || ''}</BANKBRANCHNAME>
+<BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
+<BANKACCOUNTHOLDER>${bankDetails.beneficiaryName || name}</BANKACCOUNTHOLDER>` : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
