@@ -943,6 +943,16 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     ? `<ADDRESS.LIST TYPE="String">\n${addressLines.map(l => `<ADDRESS>${escapeXml(l)}</ADDRESS>`).join('\n')}\n</ADDRESS.LIST>`
     : '';
 
+  // GST registration details list — required for GSTIN to save in TallyPrime
+  // PARTYGSTIN alone is a computed field and is ignored on import; must use LEDGSTREGDETAILS.LIST
+  const _gstDate = (() => { const d = new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; })();
+  const gstDetailsXml = gstRegTypeFinal ? `
+<LEDGSTREGDETAILS.LIST>
+  <APPLICABLEFROM>${_gstDate}</APPLICABLEFROM>
+  <REGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</REGISTRATIONTYPE>
+  ${gstin ? `<GSTIN.LIST TYPE="String"><GSTIN>${escapeXml(gstin)}</GSTIN></GSTIN.LIST>` : '<GSTIN.LIST TYPE="String"></GSTIN.LIST>'}
+</LEDGSTREGDETAILS.LIST>` : '';
+
   // Bank details — wrapped in LEDGERBANKALLOCATIONS.LIST (restored from NenA working XML)
   const _bankAccNo = bankDetails?.accountNo || bankDetails?.accountNumber || '';
   const bankXml = (bankDetails && (_bankAccNo || bankDetails?.bankName || bankDetails?.ifsc)) ? `
@@ -979,9 +989,11 @@ ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>` : ''}
 ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>` : ''}
 ${state ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>` : ''}
 ${pan ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>` : ''}
+${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>` : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${parseInt(creditDays) > 0 ? `<CREDITPERIOD>${parseInt(creditDays)} Days</CREDITPERIOD>` : ''}
+${gstDetailsXml}
 ${bankXml}
 </LEDGER>
 </TALLYMESSAGE>
@@ -996,11 +1008,14 @@ ${bankXml}
 
     // Immediately insert into local ledgers table so getParties returns it
     // without waiting for the next Tally sync. Tally sync will overwrite with real GUID.
+    // Immediate insert — skip if a ledger with same name already exists (prevents duplicate before sync)
     query(
       `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, opening_balance, closing_balance, balance_type)
-       VALUES (gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $6, 'Dr')
-       ON CONFLICT DO NOTHING`,
-      [companyGuid, name, gstin || '', req.body.pan || '', address || '', obAmt]
+       SELECT gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $6, 'Dr'
+       WHERE NOT EXISTS (
+         SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+       )`,
+      [companyGuid, name, gstin || '', pan || '', address || '', obAmt]
     ).catch(() => {}); // fire-and-forget, don't block response
 
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });

@@ -1,5 +1,26 @@
 # CHANGELOG_AGENT.md
 
+## 2026-06-26 — Ledger Master XML Fix (POST /tally/master/party)
+
+### Fixed
+- `escapeXml()` helper added — protects against `&`, `<`, `>`, `"`, `'` in all user-supplied values
+- Address now split on `\r?\n` into multiple `<ADDRESS>` tags inside `ADDRESS.LIST` (was single string)
+- Bank details restored to `LEDGERBANKALLOCATIONS.LIST` wrapper (was incorrectly regressed to direct LEDGER children)
+- Bank tags corrected: `BANKACCNO` + `BANKDETAILS` (both), `BANKNAME`, `IFSCODE`, `BANKBRANCHNAME`, `BANKACCHOLDERSHIPNAME`
+- Removed wrong `BANKACCOUNTHOLDER` tag
+- Added `pan` to destructuring from `req.body`
+- Added `<INCOMETAXNUMBER>` to XML when `pan` is present
+- `escapeXml()` applied to all user values: name, mailingName, state, country, pincode, gstType, gstin, parent, pan, companyName, all bank fields
+- Removed unused `email`/`phone` conditional XML tags (never populated from mobile)
+
+### Files Changed
+- `src/routes/tally-write.js` — `POST /tally/master/party` route only
+
+### Commits
+- `8d45359` → tallydekho-backend-services
+
+---
+
 ## 2026-06-06 — Stock Settings — Backend API + DB Schema
 
 ### Added
