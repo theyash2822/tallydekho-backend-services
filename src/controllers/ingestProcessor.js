@@ -230,6 +230,86 @@ function tallyName(r) {
   return '';
 }
 
+// ── NATIVEMETHOD field extractors ─────────────────────────────────────────
+// In Tally NATIVEMETHOD (LedgerFull.xml), GSTIN/address/state come in nested
+// LIST structures rather than as direct fields.  These helpers check both
+// the flat (old COLLECTION) path and the nested NATIVEMETHOD path.
+
+function extractNativeGstin(r) {
+  // Flat path (COLLECTION format / direct field)
+  if (r.GSTIN && typeof r.GSTIN === 'string') return r.GSTIN;
+  if (r.PartyGSTIN && typeof r.PartyGSTIN === 'string') return r.PartyGSTIN;
+  // NATIVEMETHOD: GSTREGISTRATIONDETAILS.LIST → GSTREGISTRATIONDETAILS → GSTIN
+  const raw = r['GSTREGISTRATIONDETAILS.LIST'];
+  if (raw) {
+    const item = Array.isArray(raw) ? raw[0] : raw;
+    const det = item?.GSTREGISTRATIONDETAILS;
+    if (det) {
+      const d = Array.isArray(det) ? det[0] : det;
+      if (d?.GSTIN) return d.GSTIN;
+    }
+  }
+  return null;
+}
+
+function extractNativeGstRegType(r) {
+  // Flat path
+  if (r.GSTREGISTRATIONTYPE) return r.GSTREGISTRATIONTYPE;
+  if (r.Gstregistrationtype) return r.Gstregistrationtype;
+  if (r.GSTRegistrationType) return r.GSTRegistrationType;
+  // NATIVEMETHOD nested path — same list as GSTIN
+  const raw = r['GSTREGISTRATIONDETAILS.LIST'];
+  if (raw) {
+    const item = Array.isArray(raw) ? raw[0] : raw;
+    const det = item?.GSTREGISTRATIONDETAILS;
+    if (det) {
+      const d = Array.isArray(det) ? det[0] : det;
+      if (d?.REGISTRATIONTYPE) return d.REGISTRATIONTYPE;
+      if (d?.GSTREGISTRATIONTYPE) return d.GSTREGISTRATIONTYPE;
+    }
+  }
+  return null;
+}
+
+function extractNativeAddress(r) {
+  // Flat path (COLLECTION format)
+  if (r.MAILINGADDRESS && typeof r.MAILINGADDRESS === 'string') return r.MAILINGADDRESS;
+  if (r.Address && typeof r.Address === 'string') return r.Address;
+  // NATIVEMETHOD: MAILINGADDRESS.LIST → MAILINGADDRESS (string or array)
+  const mal = r['MAILINGADDRESS.LIST'];
+  if (mal) {
+    const item = Array.isArray(mal) ? mal[0] : mal;
+    const ma = item?.MAILINGADDRESS;
+    if (ma) return Array.isArray(ma) ? ma.filter(Boolean).join(', ') : String(ma);
+  }
+  // Fallback: ADDRESS.LIST
+  const al = r['ADDRESS.LIST'];
+  if (al) {
+    const item = Array.isArray(al) ? al[0] : al;
+    const a = item?.ADDRESS;
+    if (a) return Array.isArray(a) ? a.filter(Boolean).join(', ') : String(a);
+  }
+  return null;
+}
+
+function extractNativeStateName(r) {
+  if (r.LEDSTATENAME) return r.LEDSTATENAME;
+  if (r.LedStateName) return r.LedStateName;
+  if (r.StateName) return r.StateName;
+  // NATIVEMETHOD: LEDSTATEDETAILS.LIST → LEDSTATEDETAILS → STATENAME
+  const raw = r['LEDSTATEDETAILS.LIST'];
+  if (raw) {
+    const item = Array.isArray(raw) ? raw[0] : raw;
+    const det = item?.LEDSTATEDETAILS;
+    if (det) {
+      const d = Array.isArray(det) ? det[0] : det;
+      if (d?.STATENAME) return d.STATENAME;
+      if (d?.NAME) return d.NAME;
+    }
+  }
+  return null;
+}
+
 function normalizeDate(val) {
   if (!val) return null;
   const s = String(val).trim();
@@ -1105,17 +1185,17 @@ async function processFullLedger(data, companyGuid) {
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
           r.ALIAS || r.Alias || r.OnlyAlias || null,
-          r.GSTIN || r.PartyGSTIN || null,
+          extractNativeGstin(r),
           r.ITPAN || r.PAN || r.IncomeTaxNumber || null,
           r.PHONE || r.Phone || r.LedPhone || r.LedgerPhone || null,
           r.EMAIL || r.Email || null,
-          r.MAILINGADDRESS || r.Address || null,
+          extractNativeAddress(r),
           Math.abs(parseFloat(String(r.OPENINGBALANCE ?? r.OpeningBalance ?? '0').replace(/[^0-9.-]/g, '')) || 0),
           Math.abs(balNum), balType,
           !!(r.ISREVENUE === 'Yes' || r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
           parseInt(r.ALTERID || r.AlterId || 0), now(),
-          r.GSTREGISTRATIONTYPE || r.Gstregistrationtype || r.GSTRegistrationType || null,
-          r.LEDSTATENAME || r.LedStateName || r.StateName || null,
+          extractNativeGstRegType(r),
+          extractNativeStateName(r),
         ]);
         saved++;
       } catch (e) { console.warn('[DB] FullLedger insert failed:', e.message); }
