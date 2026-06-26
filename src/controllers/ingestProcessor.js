@@ -225,7 +225,11 @@ function tallyName(r) {
   const ll = r['LANGUAGENAME.LIST'];
   if (ll) {
     const nll = Array.isArray(ll) ? ll[0]?.['NAME.LIST'] : ll['NAME.LIST'];
-    if (nll) return Array.isArray(nll) ? nll[0]?.NAME || nll[0] : nll.NAME || nll;
+    if (nll) {
+      // Guard: always coerce to string — nll or nll[0] could be an object
+      const raw = Array.isArray(nll) ? nll[0]?.NAME || nll[0] : nll.NAME || nll;
+      if (raw != null) return typeof raw === 'string' ? raw : (typeof raw === 'object' ? JSON.stringify(raw) : String(raw));
+    }
   }
   return '';
 }
@@ -1156,6 +1160,7 @@ async function processFullLedger(data, companyGuid) {
       if (!name) continue;
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
       if (r.LedgerName && !r.Name && !r.NAME) continue;
+
 
       // ISDEEMEDPOSITIVE=1 means the ledger's natural balance is Dr (assets/expenses)
       // This is more reliable than the sign of CLOSINGBALANCE
