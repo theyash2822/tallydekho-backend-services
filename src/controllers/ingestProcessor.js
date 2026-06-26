@@ -300,6 +300,9 @@ function extractNativeStateName(r) {
   if (r.LEDSTATENAME) return r.LEDSTATENAME;
   if (r.LedStateName) return r.LedStateName;
   if (r.StateName) return r.StateName;
+  // NATIVEMETHOD flat fields for mailing state
+  if (r.MAILINGSTATE) return r.MAILINGSTATE;
+  if (r.MailingState) return r.MailingState;
   // NATIVEMETHOD: LEDSTATEDETAILS.LIST → LEDSTATEDETAILS → STATENAME
   const raw = r['LEDSTATEDETAILS.LIST'];
   if (raw) {
@@ -1160,8 +1163,6 @@ async function processFullLedger(data, companyGuid) {
       if (!name) continue;
       if (r.BASEUNITS || r.COLLECTION_NAME === 'StockItem') continue;
       if (r.LedgerName && !r.Name && !r.NAME) continue;
-
-
       // ISDEEMEDPOSITIVE=1 means the ledger's natural balance is Dr (assets/expenses)
       // This is more reliable than the sign of CLOSINGBALANCE
       const isDeemedPositive = r.ISDEEMEDPOSITIVE === 1 || r.ISDEEMEDPOSITIVE === '1' ||
