@@ -31,6 +31,14 @@ const buildXML = (template, vars) => {
   return xml;
 };
 
+// ── Helper: escape XML special characters ────────────────────────────────────
+const escapeXml = (value = '') => String(value)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&apos;');
+
 // ── Helper: forward to Tally via device ──────────────────────────────────────
 const forwardToTally = async (companyGuid, userId, xmlBody) => {
   const { rows } = await query(
@@ -901,6 +909,7 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     openingBalance = 0, isCr = false,
     creditDays = 0,
     bankDetails = null,
+    pan = '',
   } = req.body;
 
   const name = _name || partyName;
@@ -926,38 +935,50 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   };
   const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
 
-  // Bank details — direct child elements of <LEDGER> (Tally Prime format, not a LIST)
-  const bankXml = bankDetails?.accountNo ? `
-<BANKDETAILS>${bankDetails.accountNo}</BANKDETAILS>
-<IFSCODE>${bankDetails.ifsc || ''}</IFSCODE>
-<BANKBRANCHNAME>${bankDetails.branch || ''}</BANKBRANCHNAME>
-<BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
-<BANKACCOUNTHOLDER>${bankDetails.beneficiaryName || name}</BANKACCOUNTHOLDER>` : '';
+  // Build address lines — split multiline string into separate ADDRESS tags
+  const addressLines = address
+    ? String(address).split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    : [];
+  const addressXml = addressLines.length
+    ? `<ADDRESS.LIST TYPE="String">\n${addressLines.map(l => `<ADDRESS>${escapeXml(l)}</ADDRESS>`).join('\n')}\n</ADDRESS.LIST>`
+    : '';
+
+  // Bank details — wrapped in LEDGERBANKALLOCATIONS.LIST (restored from NenA working XML)
+  const _bankAccNo = bankDetails?.accountNo || bankDetails?.accountNumber || '';
+  const bankXml = (bankDetails && (_bankAccNo || bankDetails?.bankName || bankDetails?.ifsc)) ? `
+<LEDGERBANKALLOCATIONS.LIST>
+${_bankAccNo ? `  <BANKACCNO>${escapeXml(_bankAccNo)}</BANKACCNO>` : ''}
+${_bankAccNo ? `  <BANKDETAILS>${escapeXml(_bankAccNo)}</BANKDETAILS>` : ''}
+${bankDetails.bankName ? `  <BANKNAME>${escapeXml(bankDetails.bankName)}</BANKNAME>` : ''}
+${(bankDetails.ifsc || bankDetails.ifscCode) ? `  <IFSCODE>${escapeXml(bankDetails.ifsc || bankDetails.ifscCode || '')}</IFSCODE>` : ''}
+${(bankDetails.branch || bankDetails.branchName) ? `  <BANKBRANCHNAME>${escapeXml(bankDetails.branch || bankDetails.branchName || '')}</BANKBRANCHNAME>` : ''}
+${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHOLDERSHIPNAME>${escapeXml(bankDetails.beneficiaryName || bankDetails.accountHolderName || '')}</BANKACCHOLDERSHIPNAME>` : ''}
+  <BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
+</LEDGERBANKALLOCATIONS.LIST>` : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>All Masters</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <LEDGER>
-<NAME>${name}</NAME>
-${address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : ''}
-<MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${mailingName}</MAILINGNAME></MAILINGNAME.LIST>
-${email ? `<EMAIL>${email}</EMAIL>` : ''}
-${phone ? `<LEDGERMOBILE>${phone}</LEDGERMOBILE>` : ''}
-${state ? `<PRIORSTATENAME>${state}</PRIORSTATENAME>` : ''}
-${pincode ? `<PINCODE>${pincode}</PINCODE>` : ''}
-<COUNTRYNAME>${country}</COUNTRYNAME>
-<GSTREGISTRATIONTYPE>${gstRegTypeFinal}</GSTREGISTRATIONTYPE>
-<VATDEALERTYPE>${gstRegTypeFinal}</VATDEALERTYPE>
-<PARENT>${parent}</PARENT>
-<COUNTRYOFRESIDENCE>${country}</COUNTRYOFRESIDENCE>
-${gstin ? `<PARTYGSTIN>${gstin}</PARTYGSTIN>` : ''}
-${state ? `<LEDSTATENAME>${state}</LEDSTATENAME>` : ''}
+<NAME>${escapeXml(name)}</NAME>
+${addressXml}
+<MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME></MAILINGNAME.LIST>
+${state ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>` : ''}
+${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>` : ''}
+<COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>
+<GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+<VATDEALERTYPE>${escapeXml(gstRegTypeFinal)}</VATDEALERTYPE>
+<PARENT>${escapeXml(parent)}</PARENT>
+<COUNTRYOFRESIDENCE>${escapeXml(country)}</COUNTRYOFRESIDENCE>
+${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>` : ''}
+${state ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>` : ''}
+${pan ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>` : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${parseInt(creditDays) > 0 ? `<CREDITPERIOD>${parseInt(creditDays)} Days</CREDITPERIOD>` : ''}
