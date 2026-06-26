@@ -242,16 +242,22 @@ function tallyName(r) {
 function extractNativeGstin(r) {
   // Flat path (COLLECTION format / direct field)
   if (r.GSTIN && typeof r.GSTIN === 'string') return r.GSTIN;
+  if (r.PARTYGSTIN && typeof r.PARTYGSTIN === 'string') return r.PARTYGSTIN;
   if (r.PartyGSTIN && typeof r.PartyGSTIN === 'string') return r.PartyGSTIN;
-  // NATIVEMETHOD: GSTREGISTRATIONDETAILS.LIST → GSTREGISTRATIONDETAILS → GSTIN
-  const raw = r['GSTREGISTRATIONDETAILS.LIST'];
-  if (raw) {
+  if (r.GSTREGNO && typeof r.GSTREGNO === 'string') return r.GSTREGNO;
+  if (r.GSTRegNo && typeof r.GSTRegNo === 'string') return r.GSTRegNo;
+  if (r.GSTREGNUMBER && typeof r.GSTREGNUMBER === 'string') return r.GSTREGNUMBER;
+  if (r.GSTREGISTRATIONNO && typeof r.GSTREGISTRATIONNO === 'string') return r.GSTREGISTRATIONNO;
+  // NATIVEMETHOD: GSTREGISTRATIONDETAILS.LIST → GSTREGISTRATIONDETAILS → GSTIN/GSTINNo/GSTRegNo
+  for (const listKey of ['GSTREGISTRATIONDETAILS.LIST', 'GSTRegistrationDetails.LIST', 'GSTREGISTRATIONDETAILS']) {
+    const raw = r[listKey];
+    if (!raw) continue;
     const item = Array.isArray(raw) ? raw[0] : raw;
-    const det = item?.GSTREGISTRATIONDETAILS;
-    if (det) {
-      const d = Array.isArray(det) ? det[0] : det;
-      if (d?.GSTIN) return d.GSTIN;
-    }
+    const det = item?.GSTREGISTRATIONDETAILS || item?.GSTRegistrationDetails || item;
+    if (!det) continue;
+    const d = Array.isArray(det) ? det[0] : det;
+    const gstin = d?.GSTIN || d?.GSTINNo || d?.GSTINNO || d?.GSTRegNo || d?.GSTREGNO || d?.GSTREGNUMBER || d?.REGISTRATIONNO;
+    if (gstin && typeof gstin === 'string' && gstin.trim()) return gstin.trim();
   }
   return null;
 }
@@ -479,6 +485,16 @@ async function processMasters(data, companyGuid) {
       // Tally convention: positive balance = Cr, negative = Dr (same as LFB parsing)
       const balType = balStr.includes('Cr') ? 'Cr' : (balStr.includes('Dr') ? 'Dr' : (balNum >= 0 ? 'Cr' : 'Dr'));
 
+      // Skip inserting from processMasters if a company-prefixed GUID row already exists for this name
+      // (prevents ghost duplicates from Master.xml overwriting or duplicating LedgerFull.xml rows)
+      const isCompanyPrefixedGuid = guid.startsWith(companyGuid);
+      if (!isCompanyPrefixedGuid) {
+        const existing = await client.query(
+          `SELECT 1 FROM ledgers WHERE company_guid=$1 AND name=$2 AND guid LIKE $3 LIMIT 1`,
+          [companyGuid, name, companyGuid + '%']
+        );
+        if (existing.rows.length > 0) { continue; } // proper row exists — skip ghost
+      }
       try {
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name)
@@ -494,7 +510,7 @@ async function processMasters(data, companyGuid) {
         `, [
           guid, companyGuid, name, parent,
           r.ALIAS || r.LANGUAGENAME2 || null,
-          r.GSTIN || r.PARTYGSTIN || null,
+          extractNativeGstin(r),
           r.PAN || r.INCOMETAXNUMBER || null,
           r.LEDPHONE || r.PHONE || null,
           r.EMAIL || null,
@@ -503,7 +519,7 @@ async function processMasters(data, companyGuid) {
           Math.abs(balNum), balType,
           parseInt(r.AlterId || r.ALTERID || 0),
           now(),
-          r.GSTREGISTRATIONTYPE || r.Gstregistrationtype || r.GSTRegistrationType || null,
+          extractNativeGstRegType(r),
           r.LEDSTATENAME || r.LedStateName || r.STATENAME || null,
         ]);
         saved++;
@@ -1193,6 +1209,7 @@ async function processFullLedger(data, companyGuid) {
           r.ALIAS || r.Alias || r.OnlyAlias || null,
           extractNativeGstin(r),
           r.ITPAN || r.PAN || r.IncomeTaxNumber || null,
+          // DEBUG: log raw GST fields for any ledger with null GSTIN (helps diagnose missing GSTINs)
           r.PHONE || r.Phone || r.LedPhone || r.LedgerPhone || null,
           r.EMAIL || r.Email || null,
           extractNativeAddress(r),
@@ -1204,6 +1221,16 @@ async function processFullLedger(data, companyGuid) {
           extractNativeStateName(r),
         ]);
         saved++;
+        // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction
+        if (!extractNativeGstin(r)) {
+          const gstKeys = Object.entries(r).filter(([k]) =>
+            k.toLowerCase().includes('gst') || k.toLowerCase().includes('gstin') ||
+            k.toLowerCase().includes('registration') || k.toLowerCase().includes('statutory')
+          );
+          if (gstKeys.length > 0) {
+            console.log(`[GST-DEBUG] ${name} — raw GST fields:`, JSON.stringify(Object.fromEntries(gstKeys)).slice(0, 500));
+          }
+        }
       } catch (e) { console.warn('[DB] FullLedger insert failed:', e.message); }
     }
     await client.query('COMMIT');
