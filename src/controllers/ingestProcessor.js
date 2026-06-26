@@ -208,7 +208,7 @@ function _collectObjects(obj, keys, results, depth) {
   }
 }
 
-// Extract name from Tally record — handles both plain NAME and LANGUAGENAME.LIST multi-lang wrapper
+// Extract name from Tally record — handles plain NAME, NAME.LIST (NATIVEMETHOD), and LANGUAGENAME.LIST multi-lang wrapper
 function tallyName(r) {
   // Guard: xml2js returns arrays when duplicate <Name> tags exist (e.g. item has alias in same field)
   const pickFirst = (v) => Array.isArray(v) ? (v[0] || '') : v;
@@ -216,10 +216,16 @@ function tallyName(r) {
   if (r.Name) return pickFirst(r.Name);
   if (r.name) return pickFirst(r.name);
   if (r.LEDGERNAME) return r.LEDGERNAME;
+  // NATIVEMETHOD format: Name field comes as <NAME.LIST><NAME>...</NAME></NAME.LIST>
+  const nl = r['NAME.LIST'];
+  if (nl) {
+    const nameVal = Array.isArray(nl) ? nl[0]?.NAME : nl?.NAME;
+    if (nameVal) return typeof nameVal === 'string' ? nameVal : String(nameVal);
+  }
   const ll = r['LANGUAGENAME.LIST'];
   if (ll) {
-    const nl = Array.isArray(ll) ? ll[0]?.['NAME.LIST'] : ll['NAME.LIST'];
-    if (nl) return Array.isArray(nl) ? nl[0]?.NAME || nl[0] : nl.NAME || nl;
+    const nll = Array.isArray(ll) ? ll[0]?.['NAME.LIST'] : ll['NAME.LIST'];
+    if (nll) return Array.isArray(nll) ? nll[0]?.NAME || nll[0] : nll.NAME || nll;
   }
   return '';
 }
@@ -1015,12 +1021,46 @@ async function processFullLedger(data, companyGuid) {
     console.log('[INGEST] processFullLedger called, records:', data.length, 'sample keys:', Object.keys(data[0] || {}).join(', '));
     let expandedData = data;
     if (data.length <= 3) {
-      const found = findNestedArray(data[0], ['LEDGER', 'Ledger']);
-      console.log('[INGEST] FullLedger findNestedArray result:', found.length, 'items');
+      let found = [];
+
+      // Parse BODY JSON string (normalizeEnvelope coerces objects to JSON strings)
+      const bodyStr = data[0]?.BODY;
+      let bodyObj = null;
+      if (typeof bodyStr === 'string' && bodyStr.startsWith('{')) {
+        try { bodyObj = JSON.parse(bodyStr); } catch {}
+      }
+
+      if (bodyObj) {
+        // Case 1: NATIVEMETHOD format — DATA.TALLYMESSAGE is an array, each item wraps one LEDGER
+        // Tally Prime returns each master in its own <TALLYMESSAGE> block with NATIVEMETHOD
+        const tallymsg = bodyObj?.DATA?.TALLYMESSAGE;
+        if (Array.isArray(tallymsg) && tallymsg.length > 0) {
+          for (const msg of tallymsg) {
+            const ledger = msg?.LEDGER || msg?.Ledger;
+            if (ledger && typeof ledger === 'object') found.push(ledger);
+          }
+          console.log('[INGEST] FullLedger TALLYMESSAGE array expanded:', found.length, 'ledgers');
+        }
+        // Case 2: Regular COLLECTION format — DATA.COLLECTION.LEDGER is an array
+        if (found.length === 0) {
+          const collection = bodyObj?.DATA?.COLLECTION;
+          if (collection) {
+            const ledgers = collection?.LEDGER || collection?.Ledger;
+            if (Array.isArray(ledgers)) found = ledgers;
+            else if (ledgers && typeof ledgers === 'object') found = [ledgers];
+          }
+        }
+      }
+
+      // Case 3: Fallback to recursive findNestedArray (old behaviour)
+      if (found.length === 0) {
+        found = findNestedArray(data[0], ['LEDGER', 'Ledger']);
+        console.log('[INGEST] FullLedger findNestedArray fallback result:', found.length, 'items');
+      }
+
       if (found.length > 0) {
         expandedData = found;
         console.log('[INGEST] FullLedger expanded:', expandedData.length, 'ledgers');
-
       } else {
         console.log('[INGEST] FullLedger raw data[0] (no LEDGER found):', JSON.stringify(data[0]).slice(0, 1200));
       }
