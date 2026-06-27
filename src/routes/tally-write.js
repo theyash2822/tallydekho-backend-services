@@ -952,8 +952,9 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 <LEDGSTREGDETAILS.LIST>
   <APPLICABLEFROM>${_gstDate}</APPLICABLEFROM>
   <GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+  ${state ? `<STATE>${escapeXml(state)}</STATE>` : ''}
+  ${state ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>` : ''}
   ${gstin ? `<GSTIN>${escapeXml(gstin)}</GSTIN>` : ''}
-  ${state ? `<STATENAME>${escapeXml(state)}</STATENAME>` : ''}
   ${pan   ? `<PANNO>${escapeXml(pan)}</PANNO>`         : ''}
 </LEDGSTREGDETAILS.LIST>` : '';
 
