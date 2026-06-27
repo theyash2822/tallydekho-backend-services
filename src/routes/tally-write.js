@@ -1020,6 +1020,7 @@ ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`                 : ''}
 ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`             : ''}
 ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>`     : ''}
 ${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>`         : ''}
+${email ? `<EMAIL>${escapeXml(email)}</EMAIL>`                       : ''}
 ${email ? `<LEDGEREMAIL>${escapeXml(email)}</LEDGEREMAIL>`           : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}

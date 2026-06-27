@@ -518,14 +518,14 @@ async function processMasters(data, companyGuid) {
           extractNativeGstin(r),
           r.PAN || r.INCOMETAXNUMBER || null,
           r.LEDGERMOBILE || r.LedgerMobile || r.LEDPHONE || r.PHONE || null,
-          r.LEDGEREMAIL || r.LedgerEmail || r.EMAIL || null,
+          r.LEDGEREMAIL || r.LedgerEmail || r.EMAIL || r.Email || null,
           extractNativeAddress(r),
           parseFloat(String(r.OPENINGBALANCE || '0').replace(/[^0-9.-]/g, '')) || 0,
           Math.abs(balNum), balType,
           parseInt(r.AlterId || r.ALTERID || 0),
           now(),
           extractNativeGstRegType(r),
-          r.LEDSTATENAME || r.LedStateName || r.STATENAME || null,
+          r.LEDSTATENAME || r.LedStateName || r.STATENAME || r.MAILINGSTATE || null,
         ]);
         saved++;
       } catch (e) {
