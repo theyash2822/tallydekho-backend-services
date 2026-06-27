@@ -1198,7 +1198,7 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { search = '', nature, group, page = 1, limit = 50 } = req.query;
+  const { search = '', nature, group, page = 1, limit = 200 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
   // If FY params provided, compute FY-specific closing balance (opening + net movement)
   const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
