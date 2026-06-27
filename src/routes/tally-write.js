@@ -902,13 +902,13 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     companyGuid, companyName,
     name: _name, partyName,
     parent = 'Sundry Debtors', address = '', state = '',
-    country = 'India', gstin = '', email = '', phone = '',
+    country = 'India', gstin = '', email = '', phone = '', website = '',
     gstRegType: _gstRegType, gstType,
     pincode = '', isBillWise = 'Yes',
     mailingName: _mailingName,
     openingBalance = 0, isCr = false,
-    creditDays = 0,
     bankDetails = null,
+    vatDetails = null,
     pan = '',
   } = req.body;
 
@@ -926,12 +926,13 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 
   // Map mobile GST type values to Tally Prime-compatible values
   const gstTypeMap = {
-    'Unregistered': 'Unregistered/Consumer',
-    'Regular': 'Regular',
-    'Composition': 'Composition',
-    'Consumer': 'Consumer',
-    'SEZ': 'SEZ',
-    'Overseas': 'Overseas',
+    'Unregistered':          'Unregistered/Consumer',
+    'Unregistered/Consumer': 'Unregistered/Consumer',
+    'Regular':               'Regular',
+    'Composition':           'Composition',
+    'Consumer':              'Consumer',
+    'SEZ':                   'SEZ',
+    'Overseas':              'Overseas',
   };
   const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
 
@@ -945,13 +946,23 @@ router.post('/master/party', authMiddleware, async (req, res) => {
 
   // GST registration details list — required for GSTIN to save in TallyPrime
   // PARTYGSTIN alone is a computed field and is ignored on import; must use LEDGSTREGDETAILS.LIST
+  // Field names confirmed: GSTREGISTRATIONTYPE (not REGISTRATIONTYPE), direct <GSTIN> tag (not GSTIN.LIST)
   const _gstDate = (() => { const d = new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; })();
   const gstDetailsXml = gstRegTypeFinal ? `
 <LEDGSTREGDETAILS.LIST>
   <APPLICABLEFROM>${_gstDate}</APPLICABLEFROM>
-  <REGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</REGISTRATIONTYPE>
-  ${gstin ? `<GSTIN.LIST TYPE="String"><GSTIN>${escapeXml(gstin)}</GSTIN></GSTIN.LIST>` : '<GSTIN.LIST TYPE="String"></GSTIN.LIST>'}
+  <GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+  ${gstin ? `<GSTIN>${escapeXml(gstin)}</GSTIN>` : ''}
+  ${state ? `<STATENAME>${escapeXml(state)}</STATENAME>` : ''}
+  ${pan   ? `<PANNO>${escapeXml(pan)}</PANNO>`         : ''}
 </LEDGSTREGDETAILS.LIST>` : '';
+
+  // VAT fields (legacy, only when vatDetails provided)
+  const vatXml = vatDetails ? `
+${vatDetails.dealerType  ? `<VATDEALERTYPE>${escapeXml(vatDetails.dealerType)}</VATDEALERTYPE>`         : ''}
+${vatDetails.vatTin     ? `<STATEVATTINNUMBER>${escapeXml(vatDetails.vatTin)}</STATEVATTINNUMBER>`     : ''}
+${vatDetails.cstNo      ? `<CSTNUMBER>${escapeXml(vatDetails.cstNo)}</CSTNUMBER>`                     : ''}
+${vatDetails.formCApplicable ? `<ISAGAINST_FORM_C>Yes</ISAGAINST_FORM_C>`                           : ''}` : '';
 
   // Bank details — wrapped in LEDGERBANKALLOCATIONS.LIST (restored from NenA working XML)
   const _bankAccNo = bankDetails?.accountNo || bankDetails?.accountNumber || '';
@@ -975,24 +986,26 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<LEDGER>
+<LEDGER NAME="${escapeXml(name)}" ACTION="Create">
 <NAME>${escapeXml(name)}</NAME>
 ${addressXml}
 <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME></MAILINGNAME.LIST>
-${state ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>` : ''}
-${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>` : ''}
+${state   ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>`     : ''}
+${state   ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>`         : ''}
+${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`               : ''}
+${state   ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>`       : ''}
+${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`                 : ''}
 <COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>
-<GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
-<VATDEALERTYPE>${escapeXml(gstRegTypeFinal)}</VATDEALERTYPE>
-<PARENT>${escapeXml(parent)}</PARENT>
 <COUNTRYOFRESIDENCE>${escapeXml(country)}</COUNTRYOFRESIDENCE>
-${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>` : ''}
-${state ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>` : ''}
-${pan ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>` : ''}
-${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>` : ''}
+<GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+<PARENT>${escapeXml(parent)}</PARENT>
+${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`             : ''}
+${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>`     : ''}
+${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>`         : ''}
+${email ? `<LEDGEREMAIL>${escapeXml(email)}</LEDGEREMAIL>`           : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
-${parseInt(creditDays) > 0 ? `<CREDITPERIOD>${parseInt(creditDays)} Days</CREDITPERIOD>` : ''}
+${vatXml}
 ${gstDetailsXml}
 ${bankXml}
 </LEDGER>
