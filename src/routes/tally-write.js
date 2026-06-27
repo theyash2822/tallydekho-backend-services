@@ -964,7 +964,7 @@ ${vatDetails.vatTin     ? `<STATEVATTINNUMBER>${escapeXml(vatDetails.vatTin)}</S
 ${vatDetails.cstNo      ? `<CSTNUMBER>${escapeXml(vatDetails.cstNo)}</CSTNUMBER>`                     : ''}
 ${vatDetails.formCApplicable ? `<ISAGAINST_FORM_C>Yes</ISAGAINST_FORM_C>`                           : ''}` : '';
 
-  // Bank details — wrapped in LEDGERBANKALLOCATIONS.LIST (restored from NenA working XML)
+  // Bank details — wrapped in LEDGERBANKALLOCATIONS.LIST
   const _bankAccNo = bankDetails?.accountNo || bankDetails?.accountNumber || '';
   const bankXml = (bankDetails && (_bankAccNo || bankDetails?.bankName || bankDetails?.ifsc)) ? `
 <LEDGERBANKALLOCATIONS.LIST>
@@ -976,6 +976,24 @@ ${(bankDetails.branch || bankDetails.branchName) ? `  <BANKBRANCHNAME>${escapeXm
 ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHOLDERSHIPNAME>${escapeXml(bankDetails.beneficiaryName || bankDetails.accountHolderName || '')}</BANKACCHOLDERSHIPNAME>` : ''}
   <BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
 </LEDGERBANKALLOCATIONS.LIST>` : '';
+
+  // LEDMULTIADDRESSLIST.LIST — TallyPrime 3.0+ stores mailing address, contact, and
+  // GST details per-address in this block. Flat ADDRESS.LIST alone does not save
+  // in TallyPrime 3.0+. We send BOTH structures for maximum compatibility.
+  const multiAddrXml = (address || state || email) ? `
+<LEDMULTIADDRESSLIST.LIST>
+  ${addressXml}
+  <ADDRESSNAME>Primary</ADDRESSNAME>
+  <MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME>
+  <COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>
+  ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`   : ''}
+  ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`     : ''}
+  ${email   ? `<EMAILID>${escapeXml(email)}</EMAILID>`       : ''}
+  ${phone   ? `<PHONENUMBER>${escapeXml(phone)}</PHONENUMBER>` : ''}
+  <GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+  ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`   : ''}
+  ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>` : ''}
+</LEDMULTIADDRESSLIST.LIST>` : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -1006,6 +1024,7 @@ ${email ? `<LEDGEREMAIL>${escapeXml(email)}</LEDGEREMAIL>`           : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${vatXml}
+${multiAddrXml}
 ${gstDetailsXml}
 ${bankXml}
 </LEDGER>
