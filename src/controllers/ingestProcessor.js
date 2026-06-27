@@ -496,6 +496,11 @@ async function processMasters(data, companyGuid) {
         if (existing.rows.length > 0) { continue; } // proper row exists — skip ghost
       }
       try {
+        // Remove any placeholder row (random UUID from immediate tally-write insert) before inserting real Tally row
+        await client.query(
+          `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
+          [companyGuid, name, guid]
+        );
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
@@ -1191,6 +1196,11 @@ async function processFullLedger(data, companyGuid) {
       const balType = isDeemedPositive ? 'Dr' : (balNum < 0 ? 'Dr' : 'Cr');
 
       try {
+        // Remove any placeholder row (random UUID from immediate tally-write insert) before inserting real Tally row
+        await client.query(
+          `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
+          [companyGuid, name, guid]
+        );
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
             opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name)
