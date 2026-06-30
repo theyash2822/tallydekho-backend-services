@@ -667,28 +667,34 @@ async function processVouchers(data, companyGuid) {
       try {
         // Extract dispatch / EWB details from TallyPrime XML
         const dispatchDetails = extractDispatchDetails(r);
+        // Extract first bill allocation (Phase B, 2026-06-30) — used by reconciler
+        // to match Receipts to parent Sales invoices via BILLTYPE=Agst Ref + NAME=TDK-SAL…
+        const billAlloc = extractFirstBillAllocation(r);
 
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
-            voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
-            voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
-            voucher_type_parent = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
-            date                = COALESCE(EXCLUDED.date, vouchers.date),
-            party_name          = COALESCE(EXCLUDED.party_name, vouchers.party_name),
-            party_guid          = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
-            amount              = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
-            narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
-            reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
-            is_cancelled        = EXCLUDED.is_cancelled,
-            is_optional         = EXCLUDED.is_optional OR vouchers.is_optional,
-            alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
-            raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
-            financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
-            dispatch_details    = COALESCE(EXCLUDED.dispatch_details, vouchers.dispatch_details),
-            synced_at           = EXCLUDED.synced_at
+            voucher_number        = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+            voucher_type          = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
+            voucher_type_parent   = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
+            date                  = COALESCE(EXCLUDED.date, vouchers.date),
+            party_name            = COALESCE(EXCLUDED.party_name, vouchers.party_name),
+            party_guid            = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
+            amount                = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
+            narration             = COALESCE(EXCLUDED.narration, vouchers.narration),
+            reference             = COALESCE(EXCLUDED.reference, vouchers.reference),
+            is_cancelled          = EXCLUDED.is_cancelled,
+            is_optional           = EXCLUDED.is_optional OR vouchers.is_optional,
+            alter_id              = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
+            raw_data              = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            financial_year        = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
+            dispatch_details      = COALESCE(EXCLUDED.dispatch_details, vouchers.dispatch_details),
+            bill_ref_name         = COALESCE(EXCLUDED.bill_ref_name, vouchers.bill_ref_name),
+            bill_type             = COALESCE(EXCLUDED.bill_type, vouchers.bill_type),
+            bill_allocated_amount = COALESCE(EXCLUDED.bill_allocated_amount, vouchers.bill_allocated_amount),
+            synced_at             = EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, deriveVoucherTypeParent(voucherType), date,
           // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml
@@ -704,6 +710,9 @@ async function processVouchers(data, companyGuid) {
           now(),
           r._FINANCIAL_YEAR || null,
           dispatchDetails ? JSON.stringify(dispatchDetails) : null,
+          billAlloc?.bill_ref_name || null,
+          billAlloc?.bill_type || null,
+          billAlloc?.bill_allocated_amount ?? null,
         ]);
         saved++;
         voucherRowsForTax.push({
@@ -832,6 +841,84 @@ async function processVouchers(data, companyGuid) {
       } catch (regRecErr) {
         console.error('[reconcile] regular TDK error:', regRecErr.message);
       }
+
+      // ── Receipt reconciliation (Phase B, 2026-06-30) ─────────────────────────
+      // Tally drops top-level <REFERENCE> on Receipt vouchers, so the standard reconciler
+      // above never matches them. Two fallbacks (in priority order):
+      //   1. Parse narration anchor:  "TDK Receipt: <RCP-ref> | Against Invoice: <SAL-ref>"
+      //   2. Match BILLTYPE=Agst Ref + bill_ref_name = parent SAL ref (already extracted above)
+      // Either path must produce a UNIQUE match — receipts with identical date+party+amount
+      // are otherwise indistinguishable.
+      try {
+        const voucherTypeLower = (voucherType || '').toLowerCase();
+        if (voucherNumber && voucherTypeLower.includes('receipt')) {
+          const narration = r.Narration || r.NARRATION || r.narration || '';
+          const parsed = parseTdkReceiptNarration(narration);
+          let rcpRef = parsed?.rcpRef || null;
+
+          // Fallback: use bill allocation Agst Ref → lookup the unique queued receipt
+          if (!rcpRef && billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name?.startsWith('TDK-')) {
+            const partyName = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
+            const recAmt = parseFloat(amount) || 0;
+            const { rows: candidateRows } = await dbQuery(
+              `SELECT av.tdk_reference_no
+                 FROM app_vouchers av
+                 JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
+                WHERE av.company_guid    = $1
+                  AND av.voucher_type    = 'receipt'
+                  AND parent.tdk_reference_no = $2
+                  AND av.tally_voucher_no IS NULL
+                  AND av.party_name      = $3
+                  AND ABS(av.total_amount - $4) < 1
+                  AND av.voucher_date    = $5::date`,
+              [companyGuid, billAlloc.bill_ref_name, partyName, recAmt, date]
+            );
+            if (candidateRows.length === 1) {
+              rcpRef = candidateRows[0].tdk_reference_no;
+            } else if (candidateRows.length > 1) {
+              console.warn(`[reconcile] Receipt ambiguous match for parent ${billAlloc.bill_ref_name}: ${candidateRows.length} candidates — needs_manual_reconciliation`);
+              // Phase E: mark all ambiguous candidates so they don't get silently re-matched.
+              try {
+                await dbQuery(
+                  `UPDATE app_vouchers
+                      SET tally_sync_status = 'needs_manual_reconciliation',
+                          sync_error        = $1,
+                          updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
+                    WHERE tdk_reference_no = ANY($2::text[])
+                      AND company_guid     = $3
+                      AND tally_voucher_no IS NULL`,
+                  [`Ambiguous bill-allocation match for parent ${billAlloc.bill_ref_name} (${candidateRows.length} candidates)`,
+                   candidateRows.map(c => c.tdk_reference_no), companyGuid]
+                );
+              } catch (markErr) {
+                console.warn('[reconcile] Could not mark ambiguous receipts:', markErr.message);
+              }
+            }
+          }
+
+          if (rcpRef) {
+            const { rows: recRows } = await dbQuery(
+              `UPDATE app_vouchers
+                  SET tally_voucher_no    = $1,
+                      tally_sync_status   = 'synced',
+                      books_impact_status = 'posted',
+                      updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE tdk_reference_no = $2
+                  AND company_guid     = $3
+                  AND voucher_type     = 'receipt'
+                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
+                RETURNING company_guid, tdk_reference_no`,
+              [voucherNumber, rcpRef, companyGuid]
+            );
+            if (recRows.length > 0) {
+              emitVoucherSynced(recRows[0].company_guid, recRows[0].tdk_reference_no, voucherNumber);
+              console.log(`[reconcile] Receipt synced: ${rcpRef} → ${voucherNumber}`);
+            }
+          }
+        }
+      } catch (rcpErr) {
+        console.error('[reconcile] receipt error:', rcpErr.message);
+      }
     }
 
     await client.query('COMMIT');
@@ -869,6 +956,34 @@ async function processVouchers(data, companyGuid) {
       }
     } catch (batchReconErr) {
       console.warn('[reconcile] Batch JOIN reconciliation error (non-fatal):', batchReconErr.message);
+    }
+
+    // Phase B (2026-06-30) — Sales fallback by bill_ref_name (BILLTYPE='New Ref').
+    // For Sales vouchers where Tally drops top-level <REFERENCE> but preserves our
+    // <BILLALLOCATIONS.LIST><NAME>TDK-SAL-…</NAME><BILLTYPE>New Ref</BILLTYPE>.
+    try {
+      const { rows: salesBillRows } = await dbQuery(`
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = v.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM vouchers v
+        WHERE v.bill_ref_name  = av.tdk_reference_no
+          AND v.bill_type      = 'New Ref'
+          AND v.company_guid   = av.company_guid
+          AND av.company_guid  = $1
+          AND av.tally_voucher_no IS NULL
+          AND v.voucher_number IS NOT NULL
+          AND v.voucher_number != ''
+        RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
+      `, [companyGuid]);
+      for (const row of salesBillRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Sales bill-ref reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (salesBillErr) {
+      console.warn('[reconcile] Sales bill-ref reconciliation error (non-fatal):', salesBillErr.message);
     }
 
     // Tax extraction — runs after COMMIT so ledger entries are visible
@@ -1250,6 +1365,55 @@ async function processFullLedger(data, companyGuid) {
 }
 
 // Parse AllLedgerEntries from a voucher record — handles JSON string or array
+// ── Bill Allocation Extraction (Phase B, 2026-06-30) ─────────────────────────
+// Parses BILLALLOCATIONS.LIST from the FIRST party-flagged ledger entry. Returns:
+//   { bill_ref_name, bill_type, bill_allocated_amount } or null.
+// We only need the first allocation per voucher for Sales+Receipt single-bill flows;
+// multi-bill receipts (one receipt settling N invoices) are a future enhancement that
+// will need a child table.
+function extractFirstBillAllocation(r) {
+  const partyEntry = (() => {
+    const all = [
+      ...(Array.isArray(r.ALLLEDGERENTRIES) ? r.ALLLEDGERENTRIES : (r.ALLLEDGERENTRIES ? [r.ALLLEDGERENTRIES] : [])),
+      ...(Array.isArray(r.AllLedgerEntries) ? r.AllLedgerEntries : (r.AllLedgerEntries ? [r.AllLedgerEntries] : [])),
+      ...(Array.isArray(r.LEDGERENTRIES) ? r.LEDGERENTRIES : (r.LEDGERENTRIES ? [r.LEDGERENTRIES] : [])),
+      ...(Array.isArray(r.LedgerEntries) ? r.LedgerEntries : (r.LedgerEntries ? [r.LedgerEntries] : [])),
+    ];
+    // Prefer one with ISPARTYLEDGER=Yes AND a BILLALLOCATIONS.LIST present
+    for (const e of all) {
+      const isParty = e?.ISPARTYLEDGER === 'Yes' || e?.IsPartyLedger === 'Yes';
+      const ba = e?.BILLALLOCATIONS || e?.BillAllocations;
+      if (isParty && ba) return e;
+    }
+    // Fallback: first entry with allocations
+    for (const e of all) {
+      const ba = e?.BILLALLOCATIONS || e?.BillAllocations;
+      if (ba) return e;
+    }
+    return null;
+  })();
+  if (!partyEntry) return null;
+  const baRaw = partyEntry.BILLALLOCATIONS || partyEntry.BillAllocations;
+  const ba = Array.isArray(baRaw) ? baRaw[0] : baRaw;
+  if (!ba) return null;
+  const name = ba.NAME || ba.Name || ba.name;
+  const type = ba.BILLTYPE || ba.BillType || ba.billType;
+  const amtRaw = ba.AMOUNT ?? ba.Amount ?? ba.amount;
+  const amount = typeof amtRaw === 'string'
+    ? parseFloat(String(amtRaw).replace('(-)', '-').replace(/[^0-9.-]/g, ''))
+    : parseFloat(amtRaw || 0);
+  if (!name || !type) return null;
+  return { bill_ref_name: String(name).trim(), bill_type: String(type).trim(), bill_allocated_amount: isNaN(amount) ? null : amount };
+}
+
+// Parse "TDK Receipt: TDK-RCP-2026-0001 | Against Invoice: TDK-SAL-2026-0027" from narration.
+function parseTdkReceiptNarration(narration) {
+  if (!narration || typeof narration !== 'string') return null;
+  const m = narration.match(/TDK Receipt:\s*(TDK-(?:OPT-)?RCP-\d{4}-\d+)\s*\|\s*Against Invoice:\s*(TDK-(?:OPT-)?SAL-\d{4}-\d+)/i);
+  if (!m) return null;
+  return { rcpRef: m[1], salRef: m[2] };
+}
+
 function parseLedgerEntries(r) {
   // Parse both AllLedgerEntries AND LedgerEntries — merge and deduplicate
   // AllLedgerEntries = main P&L entries; LedgerEntries = sub-entries some Tally versions use

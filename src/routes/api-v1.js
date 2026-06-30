@@ -1065,9 +1065,13 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.conversion_status,
         av.e_invoice_status,
         av.e_way_bill_status,
-        av.tally_voucher_no as av_tally_voucher_no
+        av.tally_voucher_no as av_tally_voucher_no,
+        av.parent_invoice_uuid,
+        parent_av.tdk_reference_no as parent_tdk_reference_no,
+        parent_av.tally_voucher_no as parent_tally_voucher_no
       FROM write_queue wq
       LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
+      LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
       WHERE wq.company_guid = $1
         AND wq.user_id = $2
         AND (

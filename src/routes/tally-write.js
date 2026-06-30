@@ -280,7 +280,10 @@ async function createReceiptForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP');
-  const narration = `Payment received against invoice ${parentTdkRef}`;
+  // Machine-parseable narration anchor so the reconciler can recover the RCP ref from
+  // Tally even if Tally drops <REFERENCE> on Receipt vouchers (it usually does).
+  // Format must stay stable: "TDK Receipt: <RCP-ref> | Against Invoice: <SAL-ref>"
+  const narration = `TDK Receipt: ${rcpTdkRef} | Against Invoice: ${parentTdkRef}`;
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -303,6 +306,12 @@ async function createReceiptForInvoice({
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
+    <BILLALLOCATIONS.LIST>
+      <NAME>${parentTdkRef}</NAME>
+      <BILLTYPE>Agst Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${amt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
     <LEDGERNAME>${bankLedger}</LEDGERNAME>
@@ -341,8 +350,26 @@ async function createReceiptForInvoice({
     return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null };
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
-    console.error(`[receipt-pair] Failed for ${parentTdkRef}:`, e.message);
-    return { ok: false, error: e.message, queueId: qId, tdkRef: rcpTdkRef, receiptUuid };
+    // Phase E: Tally rejects BILLALLOCATIONS.LIST when the customer ledger has
+    // "Maintain bill-by-bill = No". Detect common phrasings so the surface error is actionable.
+    const msg = String(e.message || '');
+    const isBillWise = /bill[- ]?wise|bill[- ]?by[- ]?bill|maintain bill/i.test(msg);
+    if (isBillWise) {
+      console.error(`[receipt-pair] Tally rejected receipt for ${parentTdkRef} — customer ledger likely has 'Maintain bill-by-bill = No'. Enable it in Tally and retry.`);
+      // Mark receipt app_voucher as needs_manual_reconciliation
+      if (receiptUuid) {
+        try {
+          await query(
+            `UPDATE app_vouchers SET tally_sync_status='needs_manual_reconciliation', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+              WHERE invoice_uuid=$2`,
+            [`Tally rejected receipt: customer ledger missing 'Maintain bill-by-bill'. ${msg}`.slice(0, 500), receiptUuid]
+          );
+        } catch {}
+      }
+    } else {
+      console.error(`[receipt-pair] Failed for ${parentTdkRef}:`, msg);
+    }
+    return { ok: false, error: msg, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, billWiseError: isBillWise };
   }
 }
 
@@ -501,7 +528,13 @@ ${topLevelDispatchXml}
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
     <LEDGERNAME>${partyLedger}</LEDGERNAME>
-    <AMOUNT>${-partyNetAmt}</AMOUNT>
+    <AMOUNT>${-partyNetAmt}</AMOUNT>${tdkRef ? `
+    <BILLALLOCATIONS.LIST>
+      <NAME>${tdkRef}</NAME>
+      <BILLTYPE>New Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${-partyNetAmt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>` : ''}
   </LEDGERENTRIES.LIST>`;
 
   // Inventory line items

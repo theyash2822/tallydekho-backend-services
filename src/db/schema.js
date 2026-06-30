@@ -678,6 +678,14 @@ export async function initSchema() {
       ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS parent_invoice_uuid UUID;
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent ON app_vouchers(parent_invoice_uuid);
 
+      -- Bill-wise allocation (Phase B+C, 2026-06-30): cached from Tally's BILLALLOCATIONS.LIST so
+      -- the reconciler can match Receipts (where Tally drops top-level <REFERENCE>) by Agst Ref linkage.
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_ref_name         TEXT;
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_type             TEXT;  -- 'New Ref' | 'Agst Ref' | 'On Account' | 'Advance'
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_allocated_amount DECIMAL(15,4);
+      CREATE INDEX IF NOT EXISTS idx_vouchers_bill_ref
+        ON vouchers(company_guid, bill_type, bill_ref_name);
+
       -- Phase C: write_queue claim/lock columns
       ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_by_device_id TEXT;
       ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_at           BIGINT;
