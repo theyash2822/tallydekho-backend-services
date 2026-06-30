@@ -673,6 +673,11 @@ export async function initSchema() {
       ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS numbering_policy TEXT NOT NULL DEFAULT 'tally_prime_series';
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid ON app_vouchers(invoice_uuid);
 
+      -- Invoice+Receipt split (2026-06-30): links a Receipt app_voucher to its parent Sales Invoice
+      -- via Sales Invoice's invoice_uuid. NULL for all standalone vouchers (invoices, regular receipts).
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS parent_invoice_uuid UUID;
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent ON app_vouchers(parent_invoice_uuid);
+
       -- Phase C: write_queue claim/lock columns
       ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_by_device_id TEXT;
       ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS locked_at           BIGINT;
@@ -866,6 +871,7 @@ export async function initSchema() {
         payload                 JSONB,
         sync_error              TEXT,
         invoice_uuid            UUID DEFAULT gen_random_uuid() UNIQUE,
+        parent_invoice_uuid     UUID,  -- Receipt → Sales Invoice link (Invoice+Receipt split, 2026-06-30)
         created_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
@@ -873,6 +879,7 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid    ON app_vouchers(invoice_uuid);
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent  ON app_vouchers(parent_invoice_uuid);
 
       -- ── Invoice PDF Versions (Phase C) ──────────────────────────────────────
       CREATE TABLE IF NOT EXISTS invoice_pdf_versions (

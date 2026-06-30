@@ -266,7 +266,87 @@ async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL') {
   return `TD/${voucherTypeCode}/${fiscalShort}/${String(seq).padStart(5, '0')}`;
 }
 
-// ── POST /tally/voucher/sales ─────────────────────────────────────────────
+// ── createReceiptForInvoice ── helper that pairs a Receipt voucher with a Sales Invoice
+// when Collect Payment Now is enabled. Builds its own Receipt XML, logs to write_queue,
+// creates a child app_voucher row linked via parent_invoice_uuid, and forwards to Tally.
+async function createReceiptForInvoice({
+  companyGuid, companyName, userId, date,
+  partyLedger, bankLedger, amount, parentInvoiceUuid, parentTdkRef,
+  isOptional = false, reference,
+}) {
+  if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
+    throw new Error('createReceiptForInvoice: missing required fields');
+  }
+  const amt = parseFloat(amount);
+  const isOpt = isOptional ? 'Yes' : 'No';
+  const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP');
+  const narration = `Payment received against invoice ${parentTdkRef}`;
+
+  const xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="Receipt" ACTION="Create">
+  <DATE>${tallyDate(date)}</DATE>
+  <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+  <NARRATION>${narration}</NARRATION>
+  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <REFERENCE>${reference || parentTdkRef || ''}</REFERENCE>
+  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <ALLLEDGERENTRIES.LIST>
+    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <AMOUNT>${amt}</AMOUNT>
+  </ALLLEDGERENTRIES.LIST>
+  <ALLLEDGERENTRIES.LIST>
+    <LEDGERNAME>${bankLedger}</LEDGERNAME>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <AMOUNT>${-amt}</AMOUNT>
+  </ALLLEDGERENTRIES.LIST>
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const label = `${partyLedger} ← ${bankLedger} (linked: ${parentTdkRef})`;
+  const payload = { companyGuid, companyName, date, partyLedger, bankLedger, amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration };
+  const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml).catch(() => null);
+
+  // Create child app_voucher (linked to invoice via parent_invoice_uuid)
+  let receiptUuid = null;
+  if (qId) {
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid)
+       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10)
+       RETURNING invoice_uuid`,
+      [companyGuid, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid]
+    ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    receiptUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+  }
+
+  try {
+    const result = await forwardToTally(companyGuid, userId, xml);
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null };
+  } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
+    console.error(`[receipt-pair] Failed for ${parentTdkRef}:`, e.message);
+    return { ok: false, error: e.message, queueId: qId, tdkRef: rcpTdkRef, receiptUuid };
+  }
+}
+
+// ── POST /tally/voucher/sales ───────────────────────────────────
 router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
@@ -291,12 +371,14 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const amt = parseFloat(totalAmount) || 0;
   const vchType = voucherType || 'Sales GST';
 
-  // Collect payment: if ledgerName + amount provided, reduce outstanding party debit
-  // and add a Dr entry for the cash/bank ledger.
+  // Collect Payment Now: the payment is recorded as a SEPARATE Receipt voucher (created
+  // after this invoice posts). The Sales Invoice itself is always a clean party debit for
+  // the full invoice amount — no Cash/Bank leg here. This gives proper party ledger trail
+  // (invoice + receipt both show under the customer in Tally).
   const payAmt = collect_payment?.ledgerName && parseFloat(collect_payment.amount) > 0
     ? parseFloat(collect_payment.amount)
     : 0;
-  const partyNetAmt = amt - payAmt; // party outstanding = invoice total - payment received
+  const partyNetAmt = amt; // party always debited for the full invoice amount
 
   // Narration — clean. Dispatch/EWB data goes in EWAYBILLDETAILS.LIST, not here.
   const fullNarration = narration || '';
@@ -488,17 +570,8 @@ ${topLevelDispatchXml}
     }
   }
 
-  // Collect Payment Now: Dr cash/bank ledger for the payment received at billing
-  if (collect_payment?.ledgerName && payAmt > 0) {
-    xml += `
-  <LEDGERENTRIES.LIST>
-    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${collect_payment.ledgerName}</LEDGERNAME>
-    <AMOUNT>${-payAmt}</AMOUNT>
-  </LEDGERENTRIES.LIST>`;
-  }
+  // (Collect Payment Now is handled by a SEPARATE Receipt voucher after this invoice posts —
+  // see createReceiptForInvoice() helper. Invoice XML stays clean.)
 
   // Dispatch / EWB — pre-computed above, append now
   if (ewbDetailsXml) xml += ewbDetailsXml;
@@ -534,6 +607,28 @@ ${topLevelDispatchXml}
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
+
+    // ── Paired Receipt Voucher (when Collect Payment Now is enabled) ──
+    // Create a separate Receipt voucher linked to this invoice so the party ledger
+    // shows both Invoice (Dr) and Receipt (Cr) as distinct entries.
+    let receiptResult = null;
+    if (!offline && collect_payment?.ledgerName && payAmt > 0 && invoiceUuid) {
+      try {
+        receiptResult = await createReceiptForInvoice({
+          companyGuid, companyName, userId: req.user.userId, date,
+          partyLedger, bankLedger: collect_payment.ledgerName, amount: payAmt,
+          parentInvoiceUuid: invoiceUuid, parentTdkRef: tdkRef,
+          isOptional, reference: reference,
+        });
+        if (receiptResult?.ok) {
+          console.log(`[receipt-pair] Created receipt ${receiptResult.tdkRef} for invoice ${tdkRef}`);
+        }
+      } catch (rcpErr) {
+        console.error(`[receipt-pair] Helper threw for ${tdkRef}:`, rcpErr.message);
+        receiptResult = { ok: false, error: rcpErr.message };
+      }
+    }
+
     // After a successful Tally write (desktop online), signal desktop to sync back the new voucher.
     // This ensures app_vouchers.tally_voucher_no is populated without waiting for the next full sync.
     if (!offline && _socketService?.connectedClients) {
@@ -564,6 +659,7 @@ ${topLevelDispatchXml}
       data: result,
       voucherNumber: result?.voucherNumber || null,
       tallyId: result?.tallyId || null,
+      receipt: receiptResult ? { ok: receiptResult.ok, tdkRef: receiptResult.tdkRef, error: receiptResult.error || null } : null,
     });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);

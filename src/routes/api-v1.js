@@ -1018,7 +1018,10 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.conversion_status,
         av.e_invoice_status,
         av.e_way_bill_status,
-        av.tally_voucher_no as av_tally_voucher_no
+        av.tally_voucher_no as av_tally_voucher_no,
+        av.parent_invoice_uuid,
+        parent_av.tdk_reference_no as parent_tdk_reference_no,
+        parent_av.tally_voucher_no as parent_tally_voucher_no
       FROM vouchers v
       -- Primary join path: via app_vouchers.tally_voucher_no (Tally's ImportData rarely returns
       -- voucher number in callback, so write_queue.tally_voucher_number is often empty.
@@ -1026,6 +1029,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
         AND av.company_guid = v.company_guid
       JOIN write_queue wq ON wq.id = av.write_queue_id
+      LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
       WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
     `;
     const params = [companyGuid, userId];
