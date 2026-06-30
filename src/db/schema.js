@@ -128,6 +128,10 @@ export async function initSchema() {
         alter_id        INTEGER DEFAULT 0,
         raw_data        TEXT,
         synced_at       BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        -- Bill-wise allocation cache (Phase B+C, 2026-06-30) — also added via ALTER block below for existing DBs.
+        bill_ref_name          TEXT,
+        bill_type              TEXT,  -- 'New Ref' | 'Agst Ref' | 'On Account' | 'Advance'
+        bill_allocated_amount  DECIMAL(15,4),
         UNIQUE(guid, company_guid)
       );
 
