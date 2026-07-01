@@ -453,18 +453,31 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
 
     // 2. EWAYBILLDETAILS.LIST with nested TRANSPORTDETAILS.LIST (validated against real TallyPrime export)
     const hasTransport = dd.vehicle_number || tallyCodedMode || dd.transporter_name || dd.transporter_id;
+
+    // Build multi-line CONSIGNOR/CONSIGNEE address blocks (addr1 + addr2 as separate <ADDRESS> tags)
+    const consignorLines = [dd.dispatch_from_address1, dd.dispatch_from_address2].map(l => (l || '').trim()).filter(Boolean);
+    const consigneeLines = [dd.ship_to_address1,       dd.ship_to_address2      ].map(l => (l || '').trim()).filter(Boolean);
+    const consignorAddrXml = consignorLines.length
+      ? consignorLines.map(l => `      <CONSIGNORADDRESS>${l}</CONSIGNORADDRESS>`).join('\n')
+      : `      <CONSIGNORADDRESS>${dd.dispatch_from || ''}</CONSIGNORADDRESS>`;
+    const consigneeAddrXml = consigneeLines.length
+      ? consigneeLines.map(l => `      <CONSIGNEEADDRESS>${l}</CONSIGNEEADDRESS>`).join('\n')
+      : `      <CONSIGNEEADDRESS>${dd.ship_to || ''}</CONSIGNEEADDRESS>`;
+
     ewbDetailsXml = `
   <EWAYBILLDETAILS.LIST>
     <CONSIGNORADDRESS.LIST TYPE="String">
-      <CONSIGNORADDRESS>${dd.dispatch_from || ''}</CONSIGNORADDRESS>
+${consignorAddrXml}
     </CONSIGNORADDRESS.LIST>
     <CONSIGNEEADDRESS.LIST TYPE="String">
-      <CONSIGNEEADDRESS>${dd.ship_to || ''}</CONSIGNEEADDRESS>
+${consigneeAddrXml}
     </CONSIGNEEADDRESS.LIST>
     <DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
     <SUBTYPE>Supply</SUBTYPE>
     <CONSIGNORPLACE>${dd.dispatch_from || ''}</CONSIGNORPLACE>
     <CONSIGNEEPLACE>${dd.ship_to || ''}</CONSIGNEEPLACE>
+    <CONSIGNORPINCODE>${dd.dispatch_from_pincode || ''}</CONSIGNORPINCODE>
+    <CONSIGNEEPINCODE>${dd.ship_to_pincode || ''}</CONSIGNEEPINCODE>
     <SHIPPEDFROMSTATE>${dd.dispatch_from_state || ''}</SHIPPEDFROMSTATE>
     <SHIPPEDTOSTATE>${dd.ship_to_state || ''}</SHIPPEDTOSTATE>
     <ISCANCELLED>No</ISCANCELLED>
@@ -1200,13 +1213,13 @@ ${bankXml}
     // without waiting for the next Tally sync. Tally sync will overwrite with real GUID.
     // Immediate insert — skip if a ledger with same name already exists (prevents duplicate before sync)
     query(
-      `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, opening_balance, closing_balance, balance_type)
-       SELECT gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $6, 'Dr'
+      `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, state_name, pincode, gst_registration_type, opening_balance, closing_balance, balance_type)
+       SELECT gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $7, $8, $9, $9, 'Dr'
        WHERE NOT EXISTS (
          SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
        )`,
-      [companyGuid, name, gstin || '', pan || '', address || '', obAmt]
-    ).catch(() => {}); // fire-and-forget, don't block response
+      [companyGuid, name, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt]
+    ).catch((e) => { console.warn('[party-immediate-insert]', e.message); }); // fire-and-forget, don't block response
 
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {

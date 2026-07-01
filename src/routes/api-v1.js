@@ -3276,7 +3276,7 @@ router.get('/parties', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { search = '', type } = req.query;
   try {
-    let q = `SELECT guid, name, gstin, gst_registration_type, parent FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2)`;
+    let q = `SELECT guid, name, gstin, gst_registration_type, parent, address, state_name, pincode FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2)`;
     const params = [companyGuid, `%${search}%`];
     let idx = 3;
     if (type === 'customer') { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Debtor%'); }

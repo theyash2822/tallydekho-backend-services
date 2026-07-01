@@ -302,6 +302,24 @@ function extractNativeAddress(r) {
   return null;
 }
 
+// PINCODE extraction — checks flat + nested LEDMULTIADDRESSLIST / MAILINGDETAILS paths.
+// Tally XML variants: PINCODE, Pincode, MailingPinCode, or nested inside LEDMULTIADDRESSLIST.LIST
+function extractNativePincode(r) {
+  if (r.PINCODE)     return String(r.PINCODE).trim();
+  if (r.Pincode)     return String(r.Pincode).trim();
+  if (r.PinCode)     return String(r.PinCode).trim();
+  if (r.MAILINGPINCODE) return String(r.MAILINGPINCODE).trim();
+  if (r.MailingPincode) return String(r.MailingPincode).trim();
+  // Nested: LEDMULTIADDRESSLIST.LIST → LEDMULTIADDRESSLIST → PINCODE
+  const mal = r['LEDMULTIADDRESSLIST.LIST'];
+  if (mal) {
+    const item = Array.isArray(mal) ? mal[0] : mal;
+    const p = item?.LEDMULTIADDRESSLIST?.PINCODE || item?.PINCODE;
+    if (p) return String(p).trim();
+  }
+  return null;
+}
+
 function extractNativeStateName(r) {
   if (r.LEDSTATENAME) return r.LEDSTATENAME;
   if (r.LedStateName) return r.LedStateName;
@@ -502,8 +520,8 @@ async function processMasters(data, companyGuid) {
           [companyGuid, name, guid]
         );
         await client.query(`
-          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -511,7 +529,8 @@ async function processMasters(data, companyGuid) {
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, alter_id=EXCLUDED.alter_id,
             synced_at=EXCLUDED.synced_at,
-            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name
+            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
+            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode)
         `, [
           guid, companyGuid, name, parent,
           r.ALIAS || r.LANGUAGENAME2 || null,
@@ -526,6 +545,7 @@ async function processMasters(data, companyGuid) {
           now(),
           extractNativeGstRegType(r),
           r.LEDSTATENAME || r.LedStateName || r.STATENAME || r.MAILINGSTATE || null,
+          extractNativePincode(r),
         ]);
         saved++;
       } catch (e) {
@@ -1396,8 +1416,8 @@ async function processFullLedger(data, companyGuid) {
         );
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
-            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -1405,7 +1425,8 @@ async function processFullLedger(data, companyGuid) {
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, is_revenue=EXCLUDED.is_revenue,
             alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
-            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name
+            gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
+            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode)
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
@@ -1422,6 +1443,7 @@ async function processFullLedger(data, companyGuid) {
           parseInt(r.ALTERID || r.AlterId || 0), now(),
           extractNativeGstRegType(r),
           extractNativeStateName(r),
+          extractNativePincode(r),
         ]);
         saved++;
         // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction

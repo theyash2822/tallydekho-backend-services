@@ -466,6 +466,7 @@ export async function initSchema() {
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS device_id TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS synced_at BIGINT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS pincode TEXT;
 
       -- ledgers migrations (columns referenced in routes but missing from schema)
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS mobile TEXT;
@@ -478,6 +479,7 @@ export async function initSchema() {
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS address TEXT;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS opening_balance NUMERIC(18,4) DEFAULT 0;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS alter_id BIGINT DEFAULT 0;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS pincode TEXT;
 
       -- vouchers migrations (E-Invoice / E-Way Bill columns)
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;
