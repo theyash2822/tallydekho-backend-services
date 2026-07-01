@@ -1,5 +1,26 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-01 (R2) — my-entries JOIN fanout fix + sort tiebreak
+
+### Fixed
+- **Receipt JOIN Cartesian fanout** — `GET /vouchers/my-entries` was returning 40+ duplicate rows per Receipt because Tally Receipt `voucher_number` uses sequential integers (`'1','2','3'...`) that collide across years/types. Live proof: `TDK-RCP-2026-0003` fanned out to 44 rows, `TDK-RCP-2026-0004` to 42 rows. Sales unaffected (globally-unique `TD2731-3-2026`-style numbers).
+  - Added two disambiguators to the primary JOIN:
+    - `av.voucher_date::text = v.date`
+    - voucher_type-aware clause: `receipt → Receipt`, `sales_invoice → Sales%`, others fall through unchanged.
+  - Fanout crushed to exactly 1 row per app_voucher (formal QA subagent verified live).
+- **Same-day ordering** — `ORDER BY v.date DESC` left same-day rows tied → Postgres returned them in physical row order, pushing fresh Sales+Receipt pairs BELOW older entries from the same day. Added `v.id DESC` tiebreak (auto-increment PK guarantees newest-first).
+
+### Files Changed
+- `src/routes/api-v1.js` — `GET /vouchers/my-entries` JOIN + ORDER BY only.
+
+### QA
+🟢 GREEN (formal subagent R2, ~3 min) — static checks pass, live smoke test confirms 44→1 and 42→1 collapse, ordering verified.
+
+### Commits
+- `f9a744f` → tallydekho-backend-services
+
+---
+
 ## 2026-07-01 — Receipt Batch Reconciler + Phase 2a sync:request payload
 
 ### Fixed
