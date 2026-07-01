@@ -1,5 +1,26 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-01 (R3) — my-entries sort corrected: Invoice → Receipt within pair
+
+### Fixed
+- **R2 sorted intra-pair backwards.** `ORDER BY v.date DESC, v.id DESC` put Receipt above its Sales because `v.id` is Tally-side auto-increment on the `vouchers` table — Receipt is always written to Tally AFTER Sales, so it got higher v.id.
+- **R3:** `ORDER BY av.created_at DESC, av.id ASC` — app-side entry timestamp (Sales + chained Receipt share the second) + app-side auto-increment ASC (Sales inserted first → lower id → sorts first) = correct business entry sequence.
+- Added `av.created_at`, `av.id` to SELECT projection (Postgres requires DISTINCT sort columns in SELECT).
+
+### Files
+- `src/routes/api-v1.js` — GET /vouchers/my-entries only.
+
+### QA
+🟡 YELLOW (formal subagent R3) — static + live smoke pass, correct top-4 sequence verified. YELLOW note: old test-data pairs whose two inserts cross a 1-second boundary sort Receipt above Sales (av.created_at differs → av.id tiebreak doesn't fire). Cosmetic; all new pairs correct.
+
+### Follow-up (deferred)
+Align `created_at` explicitly when inserting Sales + chained Receipt in `tally-write.js` — pass shared timestamp to both `app_vouchers` INSERTs to guarantee intra-pair sort direction forever.
+
+### Commits
+- `b797d7f` → tallydekho-backend-services
+
+---
+
 ## 2026-07-01 (R2) — my-entries JOIN fanout fix + sort tiebreak
 
 ### Fixed
