@@ -1020,6 +1020,8 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.e_way_bill_status,
         av.tally_voucher_no as av_tally_voucher_no,
         av.parent_invoice_uuid,
+        av.created_at as av_created_at,
+        av.id as av_id,
         parent_av.tdk_reference_no as parent_tdk_reference_no,
         parent_av.tally_voucher_no as parent_tally_voucher_no
       FROM vouchers v
@@ -1050,11 +1052,12 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
     if (type) { q += ` AND v.voucher_type ILIKE $${idx++}`; params.push(`%${type}%`); }
-    // ORDER BY v.date DESC alone leaves same-day rows tied — Postgres then returns them in
-    // physical row order (usually oldest first), which pushes fresh Sales+Receipt pairs BELOW
-    // older entries from the same day. Adding v.id DESC as tiebreak ensures newest sync
-    // (highest auto-increment id) appears first within a same-date cluster.
-    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${idx++} OFFSET $${idx}`;
+    // Sort by entry timestamp (app_vouchers.created_at DESC) so the freshest user
+    // action lands at the top. Tiebreak av.id ASC preserves the intra-pair sequence:
+    // when a Sales+Receipt pair share the same created_at, the Sales row (inserted first,
+    // lower id) appears above its Receipt — matching the real business flow order the
+    // user entered them in.
+    q += ` ORDER BY av.created_at DESC, av.id ASC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows: postedRows } = await query(q, params);
 
