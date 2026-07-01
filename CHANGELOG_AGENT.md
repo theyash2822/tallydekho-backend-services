@@ -1,5 +1,36 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-01 (R5) — Dispatch/EWB address lines + pincode (Sales Invoice)
+
+### Context
+User asked to extend Dispatch/E-Way Bill Details in Sales Create Invoice — currently only State + City were sent. NIC EWB requires address line 1/2 + 6-digit pincode for both `from` and `to`. Existing 342 ledgers had no pincode column; company profile did not surface pincode. Went with option (b): add pincode to schema, backfill via ingestProcessor on next sync.
+
+### Added
+- **schema.js** — `ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS pincode TEXT;` and `ALTER TABLE companies ADD COLUMN IF NOT EXISTS pincode TEXT;` (both idempotent, safe re-run)
+- **ingestProcessor.js** — `extractNativePincode(r)` helper (checks 5 flat variants + nested LEDMULTIADDRESSLIST); wired into both INSERT paths (processMasters + processFullLedger); ON CONFLICT uses `COALESCE(EXCLUDED.pincode, ledgers.pincode)` to preserve existing pincode when Tally doesn't emit one
+- **api-v1.js** — `/parties` SELECT now returns `address, state_name, pincode` alongside gstin/gst_reg_type
+- **tally-write.js** — party immediate-insert now saves `state_name`, `pincode`, `gst_registration_type` (was previously dropped, blocking prefill until next Tally sync); sales voucher EWAYBILLDETAILS.LIST XML now emits multi-line `<CONSIGNORADDRESS>`/`<CONSIGNEEADDRESS>` (one tag per line) + `<CONSIGNORPINCODE>` + `<CONSIGNEEPINCODE>` with backward-compatible fallback to single-line city when addr1/addr2 both empty
+- **ewbGenerator.js** — NIC EWB payload now uses `dispatchDetails.dispatch_from_address1 || dispatch_from` for `fromAddr1`, adds `fromAddr2`, uses `parseInt(dispatchDetails.dispatch_from_pincode) || parseInt(company.pincode) || 0` for `fromPincode`. Symmetric changes for `toAddr1/toAddr2/toPincode`.
+
+### QA
+GREEN — QA agent ran static checks (`node -c` × 5 files + `npx tsc --noEmit`), API contract diff, party data-flow trace, prefill guard analysis, theme/color leak scan, schema idempotency check. One safe fix applied by QA (companies.pincode migration was a pre-existing latent gap — added).
+
+### Follow-up (non-blocking)
+1. `PUT/PATCH /company/profile` accepts only `gstin, address, state, email, formal_name` — should also accept `pincode` so users can set it once. Existing companies will have NULL pincode until this or a Tally re-sync populates it.
+2. `companies.state_code` is referenced by `api-v1.js:3611` but missing from `schema.js` — pre-existing gap, out of scope for this change.
+
+### Files
+- `src/db/schema.js`
+- `src/controllers/ingestProcessor.js`
+- `src/routes/api-v1.js`
+- `src/routes/tally-write.js`
+- `src/utils/ewbGenerator.js`
+
+### Commit
+`1292538` on `main`
+
+---
+
 ## 2026-07-01 (R4) — Cross-month sort fix + Invoice/Receipt pair timestamp alignment
 
 ### Context
