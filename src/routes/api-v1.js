@@ -1052,12 +1052,14 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
     if (type) { q += ` AND v.voucher_type ILIKE $${idx++}`; params.push(`%${type}%`); }
-    // Sort by entry timestamp (app_vouchers.created_at DESC) so the freshest user
-    // action lands at the top. Tiebreak av.id ASC preserves the intra-pair sequence:
-    // when a Sales+Receipt pair share the same created_at, the Sales row (inserted first,
-    // lower id) appears above its Receipt — matching the real business flow order the
-    // user entered them in.
-    q += ` ORDER BY av.created_at DESC, av.id ASC LIMIT $${idx++} OFFSET $${idx}`;
+    // Sort by BUSINESS DATE first (v.date DESC) so current month is always on top,
+    // then by entry timestamp (av.created_at DESC) so freshest same-day action lands above
+    // older same-day entries. Final tiebreak av.id ASC preserves intra-pair sequence:
+    // when a Sales+Receipt pair share the same date + created_at, Sales (lower id, inserted
+    // first) appears above its Receipt — matching the real business flow order.
+    // 2026-07-01 fix: was `av.created_at DESC, av.id ASC` alone which broke cross-month
+    // ordering (June rows re-touched after July creation floated above July entries).
+    q += ` ORDER BY v.date DESC, av.created_at DESC, av.id ASC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows: postedRows } = await query(q, params);
 
