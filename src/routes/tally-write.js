@@ -273,6 +273,8 @@ async function createReceiptForInvoice({
   companyGuid, companyName, userId, date,
   partyLedger, bankLedger, amount, parentInvoiceUuid, parentTdkRef,
   isOptional = false, reference,
+  parentCreatedAt = null,   // 2026-07-01 R4: share timestamp with parent Sales invoice
+                            // so audit-trail sort keeps Invoice → Receipt sequence.
 }) {
   if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
     throw new Error('createReceiptForInvoice: missing required fields');
@@ -328,17 +330,26 @@ async function createReceiptForInvoice({
   const payload = { companyGuid, companyName, date, partyLedger, bankLedger, amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration };
   const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml).catch(() => null);
 
-  // Create child app_voucher (linked to invoice via parent_invoice_uuid)
+  // Create child app_voucher (linked to invoice via parent_invoice_uuid).
+  // 2026-07-01 R4: explicitly set created_at to match the parent Sales invoice's timestamp
+  // when provided. This keeps the pair's audit-trail sort stable (Invoice → Receipt within
+  // pair via av.id ASC tiebreak). Fallback to DB default (EXTRACT(EPOCH FROM NOW())) when
+  // parent timestamp isn't passed — preserves prior behavior for legacy callers.
   let receiptUuid = null;
   if (qId) {
+    const createdAtSql = parentCreatedAt
+      ? `$11::bigint`
+      : `EXTRACT(EPOCH FROM NOW())::bigint`;
+    const insertParams = [companyGuid, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
+    if (parentCreatedAt) insertParams.push(parentCreatedAt);
     const avResult = await query(
       `INSERT INTO app_vouchers
        (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
-        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid)
-       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10)
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid, created_at)
+       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10, ${createdAtSql})
        RETURNING invoice_uuid`,
-      [companyGuid, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
-       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid]
+      insertParams
     ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
     receiptUuid = avResult?.rows?.[0]?.invoice_uuid || null;
   }
@@ -618,8 +629,11 @@ ${topLevelDispatchXml}
   const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
 
-  // Create app_voucher lifecycle record
+  // Create app_voucher lifecycle record.
+  // 2026-07-01 R4: RETURNING created_at as well so we can pass the same timestamp to
+  // any chained Receipt — keeps intra-pair sort stable in audit-trail.
   let invoiceUuid = null;
+  let invoiceCreatedAt = null;
   if (queueId && tdkRef) {
     const avResult = await query(
       `INSERT INTO app_vouchers
@@ -627,13 +641,14 @@ ${topLevelDispatchXml}
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
-       RETURNING invoice_uuid`,
+       RETURNING invoice_uuid, created_at`,
       [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type,
        numbering_policy,
        tdkInvoiceNo || null,     // pre-set for tallydekho_series; null for tally_prime_series
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
     ).catch(e => { console.error('[app_vouchers] insert failed:', e.message); return { rows: [] }; });
-    invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+    invoiceUuid      = avResult?.rows?.[0]?.invoice_uuid || null;
+    invoiceCreatedAt = avResult?.rows?.[0]?.created_at   || null;
   }
 
   try {
@@ -652,6 +667,7 @@ ${topLevelDispatchXml}
           partyLedger, bankLedger: collect_payment.ledgerName, amount: payAmt,
           parentInvoiceUuid: invoiceUuid, parentTdkRef: tdkRef,
           isOptional, reference: reference,
+          parentCreatedAt: invoiceCreatedAt,   // R4: share parent Sales timestamp
         });
         if (receiptResult?.ok) {
           console.log(`[receipt-pair] Created receipt ${receiptResult.tdkRef} for invoice ${tdkRef}`);
