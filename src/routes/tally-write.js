@@ -347,7 +347,7 @@ async function createReceiptForInvoice({
     const result = await forwardToTally(companyGuid, userId, xml);
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
-    return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null };
+    return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
     // Phase E: Tally rejects BILLALLOCATIONS.LIST when the customer ledger has
@@ -674,8 +674,19 @@ ${topLevelDispatchXml}
           if (devRows[0]?.device_id) {
             const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
             if (ds?.connected) {
-              ds.emit('sync:request', { reason: 'voucher_created', tdkRef, companyGuid });
-              console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef}`);
+              // Targeted single-voucher sync (2026-06-30): pass Tally MASTERIDs so desktop
+              // can fetch ONLY the new voucher(s) via SingleVoucher.xml. Falls back to full
+              // sync on the desktop side if any MASTERID is missing.
+              const tallyIds = [result?.tallyId, receiptResult?.tallyId].filter(Boolean);
+              ds.emit('sync:request', {
+                reason: 'voucher_created',
+                tdkRef,
+                companyGuid,
+                companyName,
+                tallyIds,
+                rcpTdkRef: receiptResult?.tdkRef || null,
+              });
+              console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef} (tallyIds: ${tallyIds.join(',') || 'none — full sync'})`);
             }
           }
         } catch (syncErr) {

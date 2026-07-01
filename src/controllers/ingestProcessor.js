@@ -986,6 +986,84 @@ async function processVouchers(data, companyGuid) {
       console.warn('[reconcile] Sales bill-ref reconciliation error (non-fatal):', salesBillErr.message);
     }
 
+    // Phase B follow-up (2026-07-01) — Receipt batch reconciler.
+    // The per-record Receipt reconciler above (line ~845) can miss when:
+    //   • Receipt row was inserted via SimplifiedVoucher.xml (no voucher_number yet)
+    //     and enriched later via AllVoucher.xml (which doesn't re-trigger per-record reconciliation),
+    //   • the per-record path was added AFTER the row was first ingested (retro backfill).
+    // Strategy A: match via narration anchor 'TDK Receipt: <RCP> | Against Invoice: <SAL>' — unique per receipt.
+    // Strategy B: match Receipt via bill_type='Agst Ref' + bill_ref_name=<parent SAL> — uniqueness enforced.
+    // Both idempotent (tally_voucher_no IS NULL guard).
+    try {
+      // Strategy A — narration-anchored (primary; TDK-RCP ref is unique)
+      const { rows: rcpNarrRows } = await dbQuery(`
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = v.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM vouchers v
+        WHERE v.company_guid   = av.company_guid
+          AND av.company_guid  = $1
+          AND av.voucher_type  = 'receipt'
+          AND av.tally_voucher_no IS NULL
+          AND v.voucher_number IS NOT NULL
+          AND v.voucher_number != ''
+          AND v.narration ~ ('TDK Receipt:\\s*' || av.tdk_reference_no || '\\s*\\|')
+        RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
+      `, [companyGuid]);
+      for (const row of rcpNarrRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Receipt narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (rcpNarrErr) {
+      console.warn('[reconcile] Receipt narration reconciliation error (non-fatal):', rcpNarrErr.message);
+    }
+
+    try {
+      // Strategy B — bill-allocation fallback (Agst Ref + parent match + uniqueness by party/amount/date).
+      // Only fires when narration path missed (e.g. user edited narration in Tally).
+      const { rows: rcpBillRows } = await dbQuery(`
+        WITH candidates AS (
+          SELECT
+            av.company_guid,
+            av.tdk_reference_no,
+            v.voucher_number,
+            COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
+          FROM app_vouchers av
+          JOIN app_vouchers parent  ON parent.invoice_uuid = av.parent_invoice_uuid
+          JOIN vouchers v ON v.company_guid = av.company_guid
+                          AND v.bill_type = 'Agst Ref'
+                          AND v.bill_ref_name = parent.tdk_reference_no
+                          AND v.voucher_number IS NOT NULL
+                          AND v.voucher_number != ''
+                          AND v.party_name = av.party_name
+                          AND ABS(v.amount - av.total_amount) < 1
+                          AND v.date = av.voucher_date::text
+          WHERE av.company_guid    = $1
+            AND av.voucher_type    = 'receipt'
+            AND av.tally_voucher_no IS NULL
+        )
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = c.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM candidates c
+        WHERE av.tdk_reference_no = c.tdk_reference_no
+          AND av.company_guid     = c.company_guid
+          AND c.match_count       = 1
+          AND av.tally_voucher_no IS NULL
+        RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
+      `, [companyGuid]);
+      for (const row of rcpBillRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Receipt bill-alloc reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (rcpBillErr) {
+      console.warn('[reconcile] Receipt bill-alloc reconciliation error (non-fatal):', rcpBillErr.message);
+    }
+
     // Tax extraction — runs after COMMIT so ledger entries are visible
     // Never blocks or throws; failures are logged only
     for (const { guid: vGuid, row } of voucherRowsForTax) {
