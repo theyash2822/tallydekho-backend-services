@@ -1026,8 +1026,21 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       -- Primary join path: via app_vouchers.tally_voucher_no (Tally's ImportData rarely returns
       -- voucher number in callback, so write_queue.tally_voucher_number is often empty.
       -- app_vouchers.tally_voucher_no is always populated by ingestProcessor reconciliation.)
+      --
+      -- IMPORTANT (2026-07-01): Tally Receipt voucher_numbers are sequential ('1','2','3'...)
+      -- and collide with every other Receipt/Contra/Journal/etc across ALL years. Sales invoice
+      -- numbers (e.g. 'TD2731-3-2026') are globally unique so they don't collide. Without the
+      -- date+voucher_type disambiguators below, a single Receipt row would fan out to 40+
+      -- Tally rows across the years (Cartesian collision). The extra JOIN predicates collapse
+      -- the fanout to exactly 1 Tally row per app_voucher.
       JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
         AND av.company_guid = v.company_guid
+        AND av.voucher_date::text = v.date
+        AND (
+          (av.voucher_type = 'receipt'       AND v.voucher_type ILIKE 'Receipt')
+          OR (av.voucher_type = 'sales_invoice' AND v.voucher_type ILIKE 'Sales%')
+          OR av.voucher_type NOT IN ('receipt','sales_invoice')
+        )
       JOIN write_queue wq ON wq.id = av.write_queue_id
       LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
       WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
@@ -1037,7 +1050,11 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
     if (type) { q += ` AND v.voucher_type ILIKE $${idx++}`; params.push(`%${type}%`); }
-    q += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    // ORDER BY v.date DESC alone leaves same-day rows tied — Postgres then returns them in
+    // physical row order (usually oldest first), which pushes fresh Sales+Receipt pairs BELOW
+    // older entries from the same day. Adding v.id DESC as tiebreak ensures newest sync
+    // (highest auto-increment id) appears first within a same-date cluster.
+    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows: postedRows } = await query(q, params);
 
