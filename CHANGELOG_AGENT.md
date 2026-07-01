@@ -1,5 +1,53 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-01 (R4) — Cross-month sort fix + Invoice/Receipt pair timestamp alignment
+
+### Context
+User reported after R3 shipped: June entries above July in Audit Trail. R3 sort ordered only by `av.created_at` — no business-date primary key. If any June row's `created_at` got bumped after July rows existed, it floated above July. **Forensic audit also uncovered a deeper bug in the mobile merge layer + 28 stale `failed` write_queue rows from May 27—June 24 that were pushing themselves to the top via naive `[...pending, ...posted]` concat.** Backend fix here is one of four fixes in R4.
+
+### Fixed
+- **R4a** `src/routes/api-v1.js` — `/vouchers/my-entries` ORDER BY now `v.date DESC, av.created_at DESC, av.id ASC`:
+  - Primary: business date (v.date is TEXT `YYYY-MM-DD` — lexicographic DESC works)
+  - Secondary: entry timestamp (freshest same-day on top)
+  - Tertiary: av.id ASC (Invoice→Receipt intra-pair sequence preserved)
+- **R4b** `src/routes/tally-write.js` — Invoice+Receipt pair now shares `created_at`:
+  - `createReceiptForInvoice()` accepts optional `parentCreatedAt` param
+  - Sales invoice INSERT now `RETURNING created_at`; captured into `invoiceCreatedAt`
+  - `invoiceCreatedAt` passed as `parentCreatedAt` when chaining Receipt → both share timestamp → av.id ASC tiebreak fires cleanly
+  - Fallback (`parentCreatedAt=null`) fires `EXTRACT(EPOCH FROM NOW())::bigint` — legacy callers unchanged
+  - Closes R3 YELLOW-flag edge case (1-sec boundary breaking pair order)
+
+### Data operation (not a code commit)
+- Soft-archived 28 stale `failed` write_queue rows from user=11 / company=`2272cb4f-...` older than 2026-06-25:
+  ```sql
+  UPDATE write_queue SET status='archived', updated_at=EXTRACT(epoch FROM now())::bigint
+  WHERE user_id=11 AND company_guid='2272cb4f-...' AND status='failed'
+    AND created_at < EXTRACT(epoch FROM '2026-06-25'::date)::bigint;
+  ```
+- Reversible: `status='archived'` doesn't match mobile filters or backend retry logic — hidden but recoverable.
+
+### QA
+- **R4a:** Sonnet subagent 🟡 YELLOW — correctly flagged uncommitted `tally-write.js` drift; I unbundled before push.
+- **R4b:** Sonnet LITE-mode subagent (3-min time-box) 🟢 GREEN — SQL placeholders match, `node -c` clean, column-type bigint-consistent.
+
+### Live-verified
+```
+GET /api/vouchers/my-entries?userId=11&limit=10
+→ total: 10, pending: 22 (down from 50)
+→ top rows: SAL-0030 (07-01), RCP-0004 (07-01), SAL-0029 (07-01), RCP-0003 (07-01), SAL-0028 (06-30), …
+```
+
+### Commits
+- `008c78a` — fix(my-entries): sort by business date first
+- `2dbf825` — fix(tally-write): share created_at between Invoice+Receipt pair
+
+### Lessons
+- When user reports sort/order bug, inspect the ACTUAL rendered layer (mobile), not just the query feeding it.
+- Naive `[...arrayA, ...arrayB]` merges are landmines when either side can hold stale entries.
+- Stale `failed` write_queue rows are UX debt. Follow-up: nightly auto-archive job for `failed > 30d`.
+
+---
+
 ## 2026-07-01 (R3) — my-entries sort corrected: Invoice → Receipt within pair
 
 ### Fixed
