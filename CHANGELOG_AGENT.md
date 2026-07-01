@@ -1,5 +1,33 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-01 — Receipt Batch Reconciler + Phase 2a sync:request payload
+
+### Fixed
+- **Receipt tally_voucher_no backfill** — the per-record Receipt reconciler (added 2026-06-30) could miss when:
+  - Receipt row was inserted via SimplifiedVoucher.xml (no voucher_number yet) then enriched via AllVoucher.xml, OR
+  - the per-record reconciler code was deployed AFTER the row was ingested (retro).
+  Result: `TDK-RCP-2026-0003` (Tally voucher #4, party NenA, ₹2,12,500) stuck at NULL/queued while Sales pair was fine.
+- Added **two post-loop batch reconcilers** in `processVouchers`:
+  - **Strategy A (primary):** narration-anchored regex match on `TDK Receipt: <RCP> | Against Invoice: <SAL>`. Unique per receipt.
+  - **Strategy B (fallback):** bill-allocation match on `bill_type='Agst Ref' + bill_ref_name=<parent SAL>` with uniqueness guard `COUNT(*) OVER PARTITION` + party/amount/date verification. Fires only if narration was edited manually in Tally.
+  Both idempotent (`tally_voucher_no IS NULL` guard). Both emit `voucher:tallySynced` WebSocket event.
+
+### Added (foundation)
+- `tally-write.js` — `sync:request` payload now carries `tallyIds` (MASTERIDs of freshly-written Sales+Receipt pair). Foundation for targeted `SingleVoucher.xml` fetch (Phase 2b). Backward-compatible: desktop falls back to full sync if `tallyIds` is missing.
+- Added `companyName` to sync:request payload for downstream targeted fetch.
+
+### Files Changed
+- `src/controllers/ingestProcessor.js` — added 2 batch reconcilers after existing Sales bill-ref reconciler (~78 LOC).
+- `src/routes/tally-write.js` — sync:request payload extended with tallyIds + companyName.
+
+### Verified
+- `TDK-RCP-2026-0003` backfilled from `tally_voucher_no=NULL/queued` → `tally_voucher_no=4/synced/posted` via manual SQL matching the new reconciler logic. Reconciler will run automatically on next real sync.
+
+### Commits
+- `16353fe` → tallydekho-backend-services
+
+---
+
 ## 2026-06-26 — Ledger Master XML Fix (POST /tally/master/party)
 
 ### Fixed
