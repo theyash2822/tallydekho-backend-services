@@ -1127,10 +1127,17 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   ${pan   ? `<PANNO>${escapeXml(pan)}</PANNO>`         : ''}
 </LEDGSTREGDETAILS.LIST>` : '';
 
-  // VAT fields (legacy, only when vatDetails provided)
+  // VAT fields (legacy pre-GST). 2026-07-06 R3: dealer-type saved but TIN/CST
+  // were silently dropped in Tally 6.2. Fix: add correct tag names per Tally's
+  // ledger master schema. VAT does NOT historise in Tally 6.2 (confirmed with
+  // user: no history popup on VAT Details page) — flat tags remain correct.
+  // Belt-and-suspenders: try TIN in 3 tag variants + CST in 2 tag variants.
   const vatXml = vatDetails ? `
 ${vatDetails.dealerType  ? `<VATDEALERTYPE>${escapeXml(vatDetails.dealerType)}</VATDEALERTYPE>`         : ''}
+${vatDetails.vatTin     ? `<VATTINNUMBER>${escapeXml(vatDetails.vatTin)}</VATTINNUMBER>`               : ''}
 ${vatDetails.vatTin     ? `<STATEVATTINNUMBER>${escapeXml(vatDetails.vatTin)}</STATEVATTINNUMBER>`     : ''}
+${vatDetails.vatTin     ? `<SALESTAXNUMBER>${escapeXml(vatDetails.vatTin)}</SALESTAXNUMBER>`           : ''}
+${vatDetails.cstNo      ? `<INTERSTATESTNUMBER>${escapeXml(vatDetails.cstNo)}</INTERSTATESTNUMBER>`   : ''}
 ${vatDetails.cstNo      ? `<CSTNUMBER>${escapeXml(vatDetails.cstNo)}</CSTNUMBER>`                     : ''}
 ${vatDetails.formCApplicable ? `<ISAGAINST_FORM_C>Yes</ISAGAINST_FORM_C>`                           : ''}` : '';
 
@@ -1228,6 +1235,10 @@ ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>`     : ''}
 ${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>`         : ''}
 ${email ? `<EMAIL>${escapeXml(email)}</EMAIL>`                       : ''}
 ${email ? `<LEDGEREMAIL>${escapeXml(email)}</LEDGEREMAIL>`           : ''}
+${website ? `<WEBSITE>${escapeXml(website)}</WEBSITE>`               : ''}
+${website ? `<LEDGERWEBSITE>${escapeXml(website)}</LEDGERWEBSITE>`   : ''}
+${website ? `<CONTACTWEBSITE>${escapeXml(website)}</CONTACTWEBSITE>` : ''}
+${website ? `<HOMEPAGE>${escapeXml(website)}</HOMEPAGE>`             : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${vatXml}
