@@ -1,5 +1,51 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-06 R3 — Website tags + VAT TIN/CST tag broadening (POST /master/party)
+
+### Context
+After R2 mailing win (State + Country now populated in Tally 6.2 History), user did device verification and reported 3 remaining gaps: (a) Website field never saved to Tally (backend received but silently dropped it — per 2026-06-27 decision), (b) VAT Details popup showed Type of Dealer = Regular working but VAT TIN No + CST No were blank, (c) Bank Details not needed on customer ledgers. This changelog covers (a) and (b); item (c) is a mobile-side change (see tallydekho-mobile-V4 changelog).
+
+### Added
+- **tally-write.js Website tags (4 variants):** Inside `<LEDGER>` XML right after email tags: `<WEBSITE>` + `<LEDGERWEBSITE>` + `<CONTACTWEBSITE>` + `<HOMEPAGE>`. All conditional on `website` truthy. Belt-and-suspenders — Tally silently drops unknown tags, so extras are safe.
+- **tally-write.js VAT TIN/CST broadening:** VAT block stays flat (user confirmed no History popup on VAT Details page — VAT does NOT historise in Tally 6.2). Added 3 TIN variants + 1 new CST variant:
+  - TIN goes to `<VATTINNUMBER>` (user research suggests this is real Tally field) + `<STATEVATTINNUMBER>` (kept from before) + `<SALESTAXNUMBER>` (Tally 'Sales Tax No.' field, per user example) — all pointing to `vatDetails.vatTin`
+  - CST goes to `<INTERSTATESTNUMBER>` (Inter-State ST No. = CST semantically, likely winner) + `<CSTNUMBER>` (kept from before) — both pointing to `vatDetails.cstNo`
+  - `<VATDEALERTYPE>` unchanged (already saving correctly)
+  - `<ISAGAINST_FORM_C>` unchanged
+
+### Not changed
+- `LEDMAILINGDETAILS.LIST` wrapper (R2 win intact)
+- GST / Bank / PAN / Phone / Email blocks
+- Mobile payload (website already sent since 2026-06-27; vatDetails structure already correct)
+- DB schema, route contract
+
+### QA
+🟢 GREEN — LITE subagent (11 checks all passed): backend syntax, Website tag block position + count + escapeXml usage, VAT tag order + duplication check, mobile TypeScript 0 errors, git diff scope (2 repos, only expected files), backend health 200, R2 mailing regression sanity (all 4 country + 5 state variants inside wrapper intact).
+
+### Strongest bets on winning tag names
+- **Website:** `<WEBSITE>` or `<LEDGERWEBSITE>` — no strong prior evidence
+- **VAT TIN:** `<VATTINNUMBER>` (matches user research)
+- **CST:** `<INTERSTATESTNUMBER>` (semantically aligned with Tally's 'Inter-State ST No.' label)
+
+### Files
+- `src/routes/tally-write.js`
+
+### Commit
+`5343e8c` on `main`
+
+### 🔴 Pending user device verification
+Create fresh test ledger via mobile with Website filled + VAT Details toggle ON + VAT TIN + CST filled. Then in Tally:
+1. Alter the ledger → flat view: **Website** field should now show a value.
+2. Alter → Set/Alter VAT Details → Yes → VAT Details popup: **VAT TIN No.** + **CST No.** should now show values (not blank).
+3. Type of Dealer stays 'Regular' (already working).
+
+**Possible outcomes:**
+- 🟢 All 3 fields populated → R4 cleanup: trim to just the winning tag names.
+- 🟡 Some populated, some blank → tells us which tag won → trim losers.
+- 🔴 None populated → different approach needed (maybe country pre-existing master issue since VAT unlocks only when country/state present).
+
+---
+
 ## 2026-07-06 R2 — State + Country tag broadening inside LEDMAILINGDETAILS.LIST (POST /master/party)
 
 ### Context
