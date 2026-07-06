@@ -12,7 +12,6 @@ import { initSchema } from './db/schema.js';
 import { startScheduler } from './services/scheduler.js';
 import { setupSocket } from './socket/socketHandler.js';
 import tallyWriteRoutes, { setTallyWriteSocket } from './routes/tally-write.js';
-import tallyReadRoutes, { setTallyReadSocket } from './routes/tally-read.js';
 import authRoutes from './routes/auth.js';
 import aiRoutes from './routes/ai.js';
 import pairingRoutes from './routes/pairing.js';
@@ -66,7 +65,6 @@ app.use('/app/ai', aiRoutes);
 app.use('/api/ai', aiRoutes); // also accessible via /api prefix for mobile
 app.use('/desktop', pairingRoutes);
 app.use('/tally', tallyWriteRoutes);
-app.use('/api/tally', tallyReadRoutes);
 app.use('/api', apiV1Routes);
 app.use('/', ingestRoutes);
 
@@ -93,7 +91,6 @@ app.use((err, req, res, next) => {
 // ── Wire socket into ingest routes ─────────────────────────────────────────
 setSocketService(socketService);
 setTallyWriteSocket(socketService);
-setTallyReadSocket(socketService);
 setPairingSocket(socketService);
 setApiSocket(socketService);
 
