@@ -1147,23 +1147,45 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
   <BANKACCHOLDERSHIPTYPE>Proprietor</BANKACCHOLDERSHIPTYPE>
 </LEDGERBANKALLOCATIONS.LIST>` : '';
 
-  // LEDMULTIADDRESSLIST.LIST — TallyPrime 3.0+ stores mailing address, contact, and
-  // GST details per-address in this block. Flat ADDRESS.LIST alone does not save
-  // in TallyPrime 3.0+. We send BOTH structures for maximum compatibility.
-  const multiAddrXml = (address || state || email) ? `
-<LEDMULTIADDRESSLIST.LIST>
+  // 2026-07-06 — Tally 6.2 mailing details historisation fix.
+  // From TallyPrime 6.2, Mailing Details is a dated history collection
+  // (Ledger Alter -> "Mailing Details (History)" popup, columns:
+  //  Applicable From | Name | Update Address | State | Country | Pincode).
+  // Flat top-level ADDRESS.LIST / LEDSTATENAME / COUNTRYNAME / PINCODE tags
+  // are silently ignored unless a history entry with UpdateAddress=Yes exists.
+  // Same pattern as LEDGSTREGDETAILS.LIST -- dated wrapper with APPLICABLEFROM.
+  // Flat tags below are KEPT as fallback (harmless if 6.2 ignores them).
+  const _mailDate = _gstDate; // same YYYYMMDD as GST (today)
+  const hasMailingData = addressLines.length || state || country || pincode;
+  const mailingDetailsXml = hasMailingData ? `
+<LEDMAILINGDETAILS.LIST>
+  <APPLICABLEFROM>${_mailDate}</APPLICABLEFROM>
+  <LEDGERMAILINGNAME>${escapeXml(mailingName)}</LEDGERMAILINGNAME>
+  <ISUPDATINGADDRESS>Yes</ISUPDATINGADDRESS>
   ${addressXml}
-  <ADDRESSNAME>Primary</ADDRESSNAME>
-  <MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME>
-  <COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>
-  ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`   : ''}
-  ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`     : ''}
-  ${email   ? `<EMAILID>${escapeXml(email)}</EMAILID>`       : ''}
-  ${phone   ? `<PHONENUMBER>${escapeXml(phone)}</PHONENUMBER>` : ''}
-  <GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
-  ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`   : ''}
-  ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>` : ''}
-</LEDMULTIADDRESSLIST.LIST>` : '';
+  ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`     : ''}
+  ${country ? `<COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>` : ''}
+  ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`         : ''}
+</LEDMAILINGDETAILS.LIST>` : '';
+
+  // 2026-07-02 — Mailing Details fix (Yash financial services debug).
+  // Old approach: sent flat ADDRESS.LIST + LEDMULTIADDRESSLIST.LIST both in same
+  // <LEDGER> block. Field ordering had <PARENT> AFTER mailing fields. Result:
+  // Tally accepted NAME/GSTIN/PAN/email/phone/bank but silently dropped
+  // address/state/country/pincode from Mailing Details.
+  //
+  // Root causes fixed:
+  //   1. Removed LEDMULTIADDRESSLIST.LIST entirely — that block requires the
+  //      multi-address feature enabled in Tally, and when off it poisons the
+  //      whole mailing import (Tally 3.0+ quirk).
+  //   2. Field ordering — <PARENT> now placed IMMEDIATELY after <NAME> so Tally
+  //      resolves the group hierarchy before applying field bindings.
+  //   3. MAILINGNAME.LIST + ADDRESS.LIST both wrapped with TYPE="String" (was
+  //      already there on flat block — kept; inconsistent inner block gone).
+  //
+  // NOTE: LEDMULTIADDRESSLIST.LIST removal is intentional. If a customer
+  // later needs multi-address support, re-add it behind a company config flag
+  // (only send when Tally company has 'Maintain multiple mailing details' = Yes).
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -1176,17 +1198,17 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <LEDGER NAME="${escapeXml(name)}" ACTION="Create">
 <NAME>${escapeXml(name)}</NAME>
-${addressXml}
+<PARENT>${escapeXml(parent)}</PARENT>
 <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME></MAILINGNAME.LIST>
-${state   ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>`     : ''}
-${state   ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>`         : ''}
-${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`               : ''}
-${state   ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>`       : ''}
+${addressXml}
 ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`                 : ''}
 <COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>
 <COUNTRYOFRESIDENCE>${escapeXml(country)}</COUNTRYOFRESIDENCE>
+${state   ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>`         : ''}
+${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`               : ''}
+${state   ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>`     : ''}
+${state   ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>`       : ''}
 <GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
-<PARENT>${escapeXml(parent)}</PARENT>
 ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`             : ''}
 ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>`     : ''}
 ${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>`         : ''}
@@ -1195,9 +1217,9 @@ ${email ? `<LEDGEREMAIL>${escapeXml(email)}</LEDGEREMAIL>`           : ''}
 <ISBILLWISEON>${isBillWise}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${vatXml}
-${multiAddrXml}
 ${gstDetailsXml}
 ${bankXml}
+${mailingDetailsXml}
 </LEDGER>
 </TALLYMESSAGE>
 </REQUESTDATA>
