@@ -930,6 +930,27 @@ export async function initSchema() {
         -- 'manual' | 'auto' | 'ask_after_irn'
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
+
+      -- 2026-07-06 R6 — Tally master fetch cache (country + state).
+      -- Populated by GET /api/tally/masters/countries + /states endpoints.
+      -- One-time fetch per company; read from cache forever.
+      CREATE TABLE IF NOT EXISTS tally_country_master (
+        company_guid  TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        fetched_at    BIGINT NOT NULL,
+        PRIMARY KEY (company_guid, name)
+      );
+
+      CREATE TABLE IF NOT EXISTS tally_state_master (
+        company_guid    TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        country         TEXT NOT NULL DEFAULT '',
+        gst_state_code  TEXT,
+        fetched_at      BIGINT NOT NULL,
+        PRIMARY KEY (company_guid, name, country)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tally_state_country ON tally_state_master (company_guid, country);
     `);
     console.log('✅ PostgreSQL schema initialized');
   } finally {
