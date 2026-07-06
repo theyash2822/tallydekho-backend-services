@@ -21,6 +21,7 @@
 // Scope: per-company (companyGuid required via query param)
 
 import { Router } from 'express';
+import { randomUUID } from 'crypto';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 
@@ -99,28 +100,37 @@ const isMetaValue = (s) => {
 
 // ── Helper: forward XML to desktop via WebSocket, return raw XML response ────
 async function fetchFromTallyViaDesktop(companyGuid, userId, xmlBody) {
+  console.log('[tally-read] fetchFromTallyViaDesktop start', { companyGuid, userId, xmlLen: xmlBody?.length });
   const { rows } = await query(
     'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
     [userId]
   );
   const device = rows[0];
+  console.log('[tally-read] device lookup', { found: !!device, deviceId: device?.device_id?.slice(0, 12) });
   if (!device) throw new Error('No paired desktop found');
 
   if (!_socketService || !_socketService.connectedClients) {
+    console.log('[tally-read] socket service check FAIL', { hasService: !!_socketService, hasMap: !!_socketService?.connectedClients });
     throw new Error('Socket service not initialised');
   }
-  const desktopSocket = _socketService.connectedClients.get('desktop_' + device.device_id);
+  const socketKey = 'desktop_' + device.device_id;
+  const desktopSocket = _socketService.connectedClients.get(socketKey);
+  const allKeys = Array.from(_socketService.connectedClients.keys()).map(k => k.length > 40 ? k.slice(0, 20) + '...' : k);
+  console.log('[tally-read] socket lookup', { socketKey: socketKey.slice(0, 30) + '...', found: !!desktopSocket, connected: desktopSocket?.connected, allKeys });
   if (!desktopSocket || !desktopSocket.connected) {
     throw new Error('Desktop not connected');
   }
 
-  const jobId = require('crypto').randomUUID();
+  const jobId = randomUUID();
+  console.log('[tally-read] emitting tally:read event', { jobId });
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
+      console.log('[tally-read] TIMEOUT after 5s', { jobId });
       reject(new Error('Tally read timeout (5s) — Tally may not be running'));
     }, 5000);
     desktopSocket.emit('tally:read', { jobId, xml: xmlBody }, (result) => {
       clearTimeout(timeout);
+      console.log('[tally-read] callback received', { jobId, status: result?.status, dataLen: result?.data?.length, msg: result?.message });
       if (result && result.status && result.data) {
         resolve(result.data);
       } else {
@@ -253,9 +263,12 @@ router.get('/masters/countries', authMiddleware, async (req, res) => {
     }
 
     // Cache miss — try live fetch (graceful degradation on failure)
+    console.log('[tally-read] countries cache MISS, attempting live fetch');
     try {
       const xml = await fetchFromTallyViaDesktop(companyGuid, req.user.userId, XML_COUNTRIES);
+      console.log('[tally-read] countries xml received', { xmlLen: xml?.length, preview: (xml || '').slice(0, 300) });
       const parsed = parseCountriesXml(xml);
+      console.log('[tally-read] countries parsed', { count: parsed.length, sample: parsed.slice(0, 5) });
       if (parsed.length > 0) {
         const rows = parsed.map(name => ({ name }));
         await writeCountriesCache(companyGuid, rows);
@@ -264,6 +277,7 @@ router.get('/masters/countries', authMiddleware, async (req, res) => {
       // Parsed empty — return empty and let mobile fall back to hardcoded
       return res.json({ status: true, source: 'live_empty', data: [] });
     } catch (fetchErr) {
+      console.log('[tally-read] countries fetch FAILED', { msg: fetchErr.message });
       // Desktop offline / Tally not reachable / timeout — return empty
       return res.json({
         status: true,
@@ -292,9 +306,12 @@ router.get('/masters/states', authMiddleware, async (req, res) => {
     }
 
     // Cache miss — try live fetch
+    console.log('[tally-read] states cache MISS, attempting live fetch');
     try {
       const xml = await fetchFromTallyViaDesktop(companyGuid, req.user.userId, XML_STATES);
+      console.log('[tally-read] states xml received', { xmlLen: xml?.length, preview: (xml || '').slice(0, 500) });
       const parsed = parseStatesXml(xml);
+      console.log('[tally-read] states parsed', { count: parsed.length, sample: parsed.slice(0, 3) });
       if (parsed.length > 0) {
         await writeStatesCache(companyGuid, parsed);
         // Return filtered by country if requested
@@ -309,6 +326,7 @@ router.get('/masters/states', authMiddleware, async (req, res) => {
       }
       return res.json({ status: true, source: 'live_empty', data: [] });
     } catch (fetchErr) {
+      console.log('[tally-read] states fetch FAILED', { msg: fetchErr.message });
       return res.json({
         status: true,
         source: 'fallback',
