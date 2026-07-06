@@ -1,5 +1,47 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-06 — Tally 6.2 mailing details historisation fix (POST /master/party)
+
+### Context
+User reported (with screenshots) that new ledgers created via mobile app (`ledger/create.tsx` + `create-invoice.tsx > AddCustomerDrawer`) had NAME + GSTIN saving to Tally correctly, but Address / State / Country / Pincode were being silently dropped. Alter view showed the new **Mailing Details (History)** popup with a single row: `UpdateAddress=No, State=Not Applicable, Country=Not Applicable, Pincode=blank`. TallyPrime 6.2 changed Mailing Details from a flat block to a dated history collection (same pattern as GST since 6.0). Old flat top-level tags are silently ignored by 6.2 unless a history entry with `UpdateAddress=Yes` exists.
+
+### Added
+- **tally-write.js** — New `LEDMAILINGDETAILS.LIST` dated wrapper block emitted inside `<LEDGER>` XML, right after `${bankXml}`. Contains `<APPLICABLEFROM>` (today YYYYMMDD, same helper as GST `_gstDate`), `<LEDGERMAILINGNAME>`, `<ISUPDATINGADDRESS>Yes</ISUPDATINGADDRESS>` (flips the 'Update Address' flag in the History popup from No -> Yes), `<ADDRESS.LIST TYPE="String">` with per-line `<ADDRESS>` children, `<STATENAME>`, `<COUNTRYNAME>`, `<PINCODE>`. Emitted only when `hasMailingData` (addressLines.length || state || country || pincode) is truthy so no empty block is sent when payload is bare.
+
+### Consolidated (2026-07-02 unstaged fixes committed today)
+- **tally-write.js** — `LEDMULTIADDRESSLIST.LIST` block removed entirely. It requires the 'Maintain multiple mailing details for company and ledgers = Yes' feature enabled in the Tally company; when off, the block poisoned the whole mailing import.
+- **tally-write.js** — `<PARENT>` tag moved to immediately after `<NAME>` so Tally resolves the group hierarchy before applying field bindings.
+
+### Kept (fallback, harmless if 6.2 ignores)
+All flat top-level tags: `<LEDSTATENAME>`, `<STATENAME>`, `<PRIORSTATENAME>`, `<PLACEOFSUPPLY>`, `<COUNTRYNAME>`, `<COUNTRYOFRESIDENCE>`, `<PINCODE>`, `<ADDRESS.LIST TYPE="String">`. Still needed for pre-6.2 Tally versions and for the flat Alter-view display of the current history row.
+
+### Not changed
+- Mobile payload (already carries address, state, country, pincode)
+- DB schema
+- Route contract (`POST /master/party`)
+- 3 well-known gotchas the user flagged — all already handled: (a) LEDSTATENAME is primary, (b) ADDRESS.LIST has TYPE="String", (c) LEDMULTIADDRESSLIST.LIST removed.
+
+### QA
+🟢 GREEN — LITE subagent (29s): `node --check` OK, `mailingDetailsXml` const uses `_gstDate` correctly, `${mailingDetailsXml}` interpolated exactly once right after `${bankXml}`, all flat fallback tags intact, `hasMailingData` defensive guard present, backend health 200, git diff scoped to single file.
+
+### Highest-risk guesses (may need one iteration)
+- Wrapper tag name: `LEDMAILINGDETAILS.LIST` (best guess from Tally `LED*` naming convention)
+- Flag tag name: `ISUPDATINGADDRESS` (to flip Update Address No -> Yes)
+- Mailing name inside wrapper: `LEDGERMAILINGNAME`
+
+If wrong, State/Country will still show 'Not Applicable' in Alter -> History. Fallbacks to try in order: `MAILINGDETAILS.LIST` -> `LEDMULTIADDRESSLIST.LIST` (re-enable behind company flag) -> `ADDRESSDETAILS.LIST`. Trivial one-tag tweak per iteration.
+
+### Files
+- `src/routes/tally-write.js`
+
+### Commit
+`934a75e` on `main`
+
+### 🔴 Pending user verification (device test)
+Create one test ledger via mobile with full address (line 1 + line 2 + state + country=India + pincode). Then in Tally: Alter the ledger -> More Details -> Mailing Details (History) -> the new row should show `UpdateAddress=Yes` with State/Country/Pincode populated. Flat Alter view should also show Address/State/Country/Pincode.
+
+---
+
 ## 2026-07-01 (R5) — Dispatch/EWB address lines + pincode (Sales Invoice)
 
 ### Context
