@@ -1,5 +1,42 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-06 R2 — State + Country tag broadening inside LEDMAILINGDETAILS.LIST (POST /master/party)
+
+### Context
+R1 (commit `934a75e`) got Address + Pincode saving correctly inside TallyPrime 6.2's Mailing Details History collection. But State + Country still showed "Not Applicable" in the History row — because `<STATENAME>` and `<COUNTRYNAME>` are likely wrong tag names INSIDE the historised wrapper. Our working GST block (`LEDGSTREGDETAILS.LIST`) uses `<STATE>`, not `<STATENAME>` — that's the Tally convention inside `.LIST` wrappers. Belt-and-suspenders: throw multiple tag variants for both fields, country-first ordering (Tally UI dependency: pick country → unlocks state list).
+
+### Changed
+- **tally-write.js** — Broadened tag coverage inside the existing `LEDMAILINGDETAILS.LIST` wrapper block. Country variants: `<COUNTRYNAME>` + `<COUNTRYOFRESIDENCE>` + `<COUNTRY>` + `<LEDCOUNTRYNAME>` (4 total, emitted BEFORE address block). State variants: `<LEDSTATENAME>` + `<STATENAME>` + `<STATE>` + `<PLACEOFSUPPLY>` + `<PRIORSTATENAME>` (5 total, emitted AFTER address block). All conditional on truthy value — no empty tags emitted. Tally silently drops unknown tags, so extras are safe.
+
+### Not changed
+- Address / Pincode inside wrapper (both working from R1)
+- `APPLICABLEFROM`, `LEDGERMAILINGNAME`, `ISUPDATINGADDRESS=Yes` (all working from R1)
+- Flat top-level tags (kept as fallback for pre-6.2)
+- GST / Bank / PAN / Phone / Email blocks
+- Mobile payload, DB schema, route contract
+
+### QA
+🟢 GREEN — LITE subagent (all 6 checks passed): syntax OK, wrapper structure intact, tag order correct, no regressions to R1 wins, `git diff --stat` scoped to single file (+17/-3), backend health 200.
+
+### Bet on which tag wins
+- **State:** strongest bet is `<STATE>` (matches GST historised pattern).
+- **Country:** strongest bet is `<COUNTRYOFRESIDENCE>` (Tally's traditional ledger master field name).
+
+### Files
+- `src/routes/tally-write.js`
+
+### Commit
+`f4e7018` on `main`
+
+### 🔴 Pending user verification (device test)
+Create one fresh test ledger via mobile with full address + state (Rajasthan / MP / whatever) + country=India + pincode. Then in Tally: Alter → More Details → Mailing Details (History) popup. Expected: new row shows `UpdateAddress=Yes` + State + Country populated (not "Not Applicable"). Also verify flat Alter view shows State + Country.
+
+**If both light up:** 🟢 done. R3 (cleanup): trim to just the winning tag names.
+**If only one lights up:** 🟡 tells us which set won → trim the loser → focus on the failing field.
+**If neither lights up:** 🔴 hypothesis C confirmed (Tally requires country/state master preload) → different approach: add `<COUNTRY>` + `<STATE>` master creation XML before ledger XML.
+
+---
+
 ## 2026-07-06 — Tally 6.2 mailing details historisation fix (POST /master/party)
 
 ### Context
