@@ -1157,15 +1157,29 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
   // Flat tags below are KEPT as fallback (harmless if 6.2 ignores them).
   const _mailDate = _gstDate; // same YYYYMMDD as GST (today)
   const hasMailingData = addressLines.length || state || country || pincode;
+  // 2026-07-06 R2 — State + Country still "Not Applicable" after R1.
+  // Address + Pincode saved OK, proving wrapper is right. State/Country need
+  // broader tag coverage inside the wrapper. GST historised block uses <STATE>
+  // (not <STATENAME>) — that's the strongest bet. Country tags order:
+  // COUNTRY-first (Tally UI dependency: pick country -> unlocks state list).
+  // Belt-and-suspenders: 4 country variants + 5 state variants. Tally silently
+  // drops unknown tags, so extras are safe.
   const mailingDetailsXml = hasMailingData ? `
 <LEDMAILINGDETAILS.LIST>
   <APPLICABLEFROM>${_mailDate}</APPLICABLEFROM>
   <LEDGERMAILINGNAME>${escapeXml(mailingName)}</LEDGERMAILINGNAME>
   <ISUPDATINGADDRESS>Yes</ISUPDATINGADDRESS>
+  ${country ? `<COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>`               : ''}
+  ${country ? `<COUNTRYOFRESIDENCE>${escapeXml(country)}</COUNTRYOFRESIDENCE>` : ''}
+  ${country ? `<COUNTRY>${escapeXml(country)}</COUNTRY>`                       : ''}
+  ${country ? `<LEDCOUNTRYNAME>${escapeXml(country)}</LEDCOUNTRYNAME>`         : ''}
   ${addressXml}
-  ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`     : ''}
-  ${country ? `<COUNTRYNAME>${escapeXml(country)}</COUNTRYNAME>` : ''}
-  ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`         : ''}
+  ${state   ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>`     : ''}
+  ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`           : ''}
+  ${state   ? `<STATE>${escapeXml(state)}</STATE>`                   : ''}
+  ${state   ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>`   : ''}
+  ${state   ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>` : ''}
+  ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`             : ''}
 </LEDMAILINGDETAILS.LIST>` : '';
 
   // 2026-07-02 — Mailing Details fix (Yash financial services debug).
