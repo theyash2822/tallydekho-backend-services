@@ -3289,6 +3289,31 @@ router.get('/parties', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/party/outstanding-bills?companyGuid=...&ledger=<name>
+// Returns bill_outstanding rows for a single party ledger. Used by Receipt Voucher
+// Create screen (2026-07-09) to build the multi-bill allocation UI.
+router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  const ledger = req.query.ledger || req.query.partyLedger || '';
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!ledger)      return res.status(400).json({ success: false, error: { code: 'MISSING_LEDGER',  message: 'ledger required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows } = await query(
+      `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
+         FROM bill_outstanding
+        WHERE company_guid=$1 AND ledger_name=$2 AND COALESCE(pending_amount,0) > 0
+        ORDER BY bill_date ASC NULLS LAST, id ASC
+        LIMIT 500`,
+      [companyGuid, ledger]
+    );
+    const total = rows.reduce((s, r) => s + (parseFloat(r.pending_amount) || 0), 0);
+    res.json({ success: true, data: { bills: rows, totalPending: total } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // KPI DETAIL VIEWS
 // ══════════════════════════════════════════════════════════════════════════════

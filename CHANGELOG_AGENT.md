@@ -639,3 +639,16 @@ _Add new entries at top._
 - No new tables created — spec's `invoices` → `app_vouchers`, `tally_sync_outbox` → `write_queue`
 - PDF generation on-device (expo-print) not backend (no puppeteer/PDF library installed)
 - Backend handles the 10s wait logic + provisional/final decision
+
+## 2026-07-09 — Receipt Voucher rewrite (multi-bill, instrument, preview, numbering)
+
+**`src/routes/tally-write.js`:**
+- Extended `buildVoucherDocument` with `isReceipt` branch — returns receipt-shaped doc (`documentType: 'receipt'`, `receipt.billAllocations`, `receipt.instrument`) before falling through to sales invoice logic. Existing `/tally/invoice/:tdkRef/preview` endpoint now serves receipts too.
+- **Full rewrite of `POST /voucher/receipt`**: accepts multi-block `billAllocations[]` (Agst Ref + On Account/Advance leftover), `instrumentDetails`, `paymentMethod`, `ledgerAccount`, `entryType`, `numbering_policy`. Emits multi-block `<BILLALLOCATIONS.LIST>` matching Tally's native receipt XML pattern (verified against user-supplied Voucher #9 reference). Emits `<BANKALLOCATIONS.LIST>` for Cheque/NEFT/RTGS with instrument no + date + bank name + transaction type. Numbering via `generateTDKReference(guid, opt, 'RCP')` + `generateTDSeriesNumber(guid, 'RCP')`. Inserts into `app_vouchers` so preview/share work identically to Sales Invoice. Fixed pre-existing bug: bank leg had `<ISPARTYLEDGER>Yes</ISPARTYLEDGER>` — now `No`. Full XML escaping on all user inputs.
+- Response: `{ status, queued, tdkRef, receiptUuid, voucherNumber, numberingPolicy, ... }`.
+- `createReceiptForInvoice` (2026-06-30 Collect Payment Now flow) **unchanged**.
+
+**`src/routes/api-v1.js`:**
+- Added `GET /party/outstanding-bills?companyGuid=&ledger=` reading `bill_outstanding` (existing table) filtered by ledger + `pending_amount > 0`. Returns `{ bills, totalPending }`.
+
+**QA:** 🟢 GREEN (LITE, 18/18 checks). Backend PID 17279 on :3001.
