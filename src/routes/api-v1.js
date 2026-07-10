@@ -3299,13 +3299,24 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
   if (!ledger)      return res.status(400).json({ success: false, error: { code: 'MISSING_LEDGER',  message: 'ledger required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
+    // bill_type stores DrCr indicator (from working TDL response). For a customer
+    // (Sundry Debtor), pending Dr balance = amount they owe us (typical Receipt
+    // Voucher case). We return absolute pending value so mobile UI can show a
+    // clean positive amount, plus bill_type so mobile can filter/label.
+    const drOnly = String(req.query.drOnly || '').toLowerCase() === 'true';
+    const params = [companyGuid, ledger];
+    let where = 'company_guid=$1 AND ledger_name=$2 AND ABS(COALESCE(pending_amount,0)) > 0.005';
+    if (drOnly) { where += " AND bill_type IN ('Dr','Debit')"; }
     const { rows } = await query(
-      `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
+      `SELECT bill_name, bill_date, due_date,
+              ABS(amount)::numeric         AS amount,
+              ABS(pending_amount)::numeric AS pending_amount,
+              bill_type
          FROM bill_outstanding
-        WHERE company_guid=$1 AND ledger_name=$2 AND COALESCE(pending_amount,0) > 0
+        WHERE ${where}
         ORDER BY bill_date ASC NULLS LAST, id ASC
         LIMIT 500`,
-      [companyGuid, ledger]
+      params
     );
     const total = rows.reduce((s, r) => s + (parseFloat(r.pending_amount) || 0), 0);
     res.json({ success: true, data: { bills: rows, totalPending: total } });

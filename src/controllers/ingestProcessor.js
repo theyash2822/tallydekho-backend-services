@@ -1929,14 +1929,31 @@ async function processGSTDetails(data, companyGuid) {
 }
 
 async function processBillOutstanding(data, companyGuid) {
+  // Working TDL (TDKBillOutstandingWorking) returns BILLROW rows with fields:
+  //   LedgerName, BillName, BillDate, DueDate, Amount, PendingAmount, DrCr, LedgerParent
+  // We store DrCr in the existing `bill_type` column (free-form TEXT) so the
+  // Receipt Voucher bill picker can filter Dr-only.
   const client = await getClient();
   try {
     await client.query('BEGIN');
+    // Full-refresh strategy: TDL returns the complete pending-bill snapshot per
+    // sync, so wipe this company's existing rows before insert. Otherwise
+    // partial-paid or cleared bills would linger forever.
+    await client.query(`DELETE FROM bill_outstanding WHERE company_guid = $1`, [companyGuid]);
     let saved = 0;
+    let skippedZero = 0;
+    let skippedEmpty = 0;
     for (const r of data) {
-      const ledgerName = r.LedgerName || r.LEDGERNAME || '';
-      const billName = r.BillName || r.BILLNAME || '';
-      if (!ledgerName) continue;
+      const ledgerName = String(r.LedgerName || r.LEDGERNAME || '').trim();
+      const billName   = String(r.BillName   || r.BILLNAME   || '').trim();
+      if (!ledgerName || !billName) { skippedEmpty++; continue; }
+
+      // parseFloat("14,000.00") returns 14; strip commas first (Tally amount format).
+      const amount        = parseFloat(String(r.Amount        || '0').replace(/,/g, '')) || 0;
+      const pendingAmount = parseFloat(String(r.PendingAmount || '0').replace(/,/g, '')) || 0;
+      if (Math.abs(pendingAmount) < 0.005) { skippedZero++; continue; }
+
+      const drCr = String(r.DrCr || r.DRCR || '').trim() || (pendingAmount < 0 ? 'Dr' : 'Cr');
       try {
         await client.query(`
           INSERT INTO bill_outstanding
@@ -1945,14 +1962,14 @@ async function processBillOutstanding(data, companyGuid) {
         `, [
           r.VoucherGuid || null, companyGuid, ledgerName, billName,
           normalizeDate(r.BillDate), normalizeDate(r.DueDate),
-          parseFloat(r.Amount || 0), parseFloat(r.PendingAmount || 0),
-          r.BillType || null, parseInt(r.AlterId || 0), now(),
+          amount, pendingAmount,
+          drCr, parseInt(r.AlterId || 0), now(),
         ]);
         saved++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+      } catch (e) { console.warn("[DB] BillOutstanding insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
-    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} for ${companyGuid}`);
+    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} for ${companyGuid} (skipped empty=${skippedEmpty}, zero-pending=${skippedZero})`);
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BillOutstanding failed:', e.message); }
   finally { client.release(); }
 }
