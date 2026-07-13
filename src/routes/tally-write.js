@@ -108,29 +108,63 @@ const updateWriteQueue = async (id, result, error) => {
       [id, result?.message || 'Tally rejected the entry']
     );
   } else {
+    let resolvedVoucherNumber = result?.voucherNumber || null;
+    const tallyId = result?.tallyId || null;
+
+    // When Tally Series is used, import ack often returns LASTVCHID only (no VOUCHERNUMBER).
+    // Backfill number from vouchers table via TDK narration/reference anchor when available.
+    if (!resolvedVoucherNumber) {
+      try {
+        const { rows: avLookup } = await query(
+          `SELECT company_guid, tdk_reference_no FROM app_vouchers WHERE write_queue_id = $1 LIMIT 1`,
+          [id]
+        );
+        const tdkRef = avLookup[0]?.tdk_reference_no;
+        const companyGuid = avLookup[0]?.company_guid;
+        if (tdkRef && companyGuid) {
+          const { rows: vRows } = await query(
+            `SELECT voucher_number FROM vouchers
+              WHERE company_guid = $1
+                AND (
+                  narration ILIKE '%' || $2 || '%'
+                  OR COALESCE(reference,'') ILIKE '%' || $2 || '%'
+                )
+                AND COALESCE(is_cancelled, false) = false
+              ORDER BY date DESC NULLS LAST, alter_id DESC NULLS LAST
+              LIMIT 1`,
+            [companyGuid, tdkRef]
+          );
+          if (vRows[0]?.voucher_number) resolvedVoucherNumber = String(vRows[0].voucher_number);
+        }
+      } catch (e) {
+        console.warn('[app_vouchers] voucher number backfill lookup failed:', e.message);
+      }
+    }
+
     await query(
       `UPDATE write_queue SET status = 'success', tally_voucher_number = $2, tally_id = $3,
        error_message = NULL, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
-      [id, result?.voucherNumber || null, result?.tallyId || null]
+      [id, resolvedVoucherNumber || null, tallyId]
     );
-    // Sync app_vouchers lifecycle record when write_queue succeeds
-    if (result?.voucherNumber) {
-      const avResult = await query(`
-        UPDATE app_vouchers
-        SET tally_voucher_no      = $1,
-            tally_sync_status     = 'synced',
-            books_impact_status   = 'posted',
-            updated_at            = EXTRACT(EPOCH FROM NOW())::BIGINT
-        WHERE write_queue_id = $2
-          AND tally_sync_status != 'synced'
-        RETURNING company_guid, tdk_reference_no
-      `, [result.voucherNumber, id]).catch(e => { console.error('[app_vouchers sync]', e.message); return { rows: [] }; });
-      const avRows = avResult?.rows ?? [];
-      if (avRows.length > 0) {
-        const { company_guid, tdk_reference_no } = avRows[0];
-        _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, result.voucherNumber);
-      }
 
+    // Always mark app_vouchers posted on successful Tally write (number may arrive later via sync).
+    const avResult = await query(`
+      UPDATE app_vouchers
+      SET tally_voucher_no      = COALESCE($1, tally_voucher_no),
+          tally_sync_status     = 'synced',
+          books_impact_status   = 'posted',
+          updated_at            = EXTRACT(EPOCH FROM NOW())::BIGINT
+      WHERE write_queue_id = $2
+      RETURNING company_guid, tdk_reference_no, tally_voucher_no
+    `, [resolvedVoucherNumber || null, id]).catch(e => { console.error('[app_vouchers sync]', e.message); return { rows: [] }; });
+    const avRows = avResult?.rows ?? [];
+    const emitNo = resolvedVoucherNumber || avRows[0]?.tally_voucher_no || null;
+    if (avRows.length > 0 && emitNo) {
+      const { company_guid, tdk_reference_no } = avRows[0];
+      _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, emitNo);
+    }
+
+    if (resolvedVoucherNumber) {
       // Auto-IRN: if e_invoice_mode = 'auto' and e_invoice_applicable = 'applicable_configured', trigger IRN
       setImmediate(async () => {
         try {
@@ -152,7 +186,7 @@ const updateWriteQueue = async (id, result, error) => {
           // Get voucherGuid for this write_queue entry
           const { rows: vRows } = await query(
             `SELECT guid FROM vouchers WHERE company_guid = $1 AND voucher_number = $2`,
-            [companyGuid, result.voucherNumber]
+            [companyGuid, resolvedVoucherNumber]
           ).catch(() => ({ rows: [] }));
           if (!vRows[0]?.guid) return;
 
@@ -170,16 +204,16 @@ const updateWriteQueue = async (id, result, error) => {
           ).catch(() => ({ rows: [] }));
 
           if (einvoiceCreds?.gstin && coRows[0] && voucherRows[0]) {
-            console.log(`[auto-IRN] Triggering for ${result.voucherNumber}`);
+            console.log(`[auto-IRN] Triggering for ${resolvedVoucherNumber}`);
             await generateIRN(companyGuid, voucherRows[0], coRows[0], einvoiceCreds);
-            console.log(`[auto-IRN] Success for ${result.voucherNumber}`);
+            console.log(`[auto-IRN] Success for ${resolvedVoucherNumber}`);
             await query(
               `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $1 AND tally_voucher_no = $2`,
-              [companyGuid, result.voucherNumber]
+              [companyGuid, resolvedVoucherNumber]
             ).catch(() => {});
           }
         } catch (autoErr) {
-          console.error(`[auto-IRN] Failed for ${result.voucherNumber}:`, autoErr.message);
+          console.error(`[auto-IRN] Failed for ${resolvedVoucherNumber}:`, autoErr.message);
         }
       });
 
@@ -207,7 +241,7 @@ const updateWriteQueue = async (id, result, error) => {
              FROM vouchers v
              LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_guid = v.company_guid
              WHERE v.company_guid = $1 AND v.voucher_number = $2`,
-            [companyGuid, result.voucherNumber]
+            [companyGuid, resolvedVoucherNumber]
           ).catch(() => ({ rows: [] }));
           if (!vRowsEWB[0]) return;
 
@@ -219,9 +253,9 @@ const updateWriteQueue = async (id, result, error) => {
           const ewbCreds = ewbUserRows[0]?.integration_settings?.ewaybill || {};
 
           await generateEWB(companyGuid, vRowsEWB[0], coRowsEWB[0], ewbCreds, dispatchDetails);
-          console.log(`[auto-EWB] Success for ${result.voucherNumber}`);
+          console.log(`[auto-EWB] Success for ${resolvedVoucherNumber}`);
         } catch (ewbErr) {
-          console.error(`[auto-EWB] Failed for ${result.voucherNumber}:`, ewbErr.message);
+          console.error(`[auto-EWB] Failed for ${resolvedVoucherNumber}:`, ewbErr.message);
         }
       });
     }
@@ -926,22 +960,17 @@ ${bankAllocXml}
   const label = `${partyLedger} ← ${cashOrBankLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'receipt', label, amt, persistPayload, xml).catch(() => null);
 
-  const primaryBill = blocks.find(b => b.billType === 'Agst Ref' && b.billRefName);
   let receiptUuid = null;
   if (qId && tdkRef) {
     const av = await query(
       `INSERT INTO app_vouchers
        (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
-        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload,
-        bill_ref_name, bill_type, bill_allocated_amount)
-       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11,$12,$13)
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
        RETURNING invoice_uuid`,
       [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, partyLedger, amt, date ? new Date(date) : null,
-       JSON.stringify(persistPayload),
-       primaryBill?.billRefName || null,
-       primaryBill?.billType || (blocks[0]?.billType || null),
-       primaryBill ? parseFloat(primaryBill.amount || 0) : (blocks[0] ? parseFloat(blocks[0].amount || 0) : null)]
+       JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
     receiptUuid = av?.rows?.[0]?.invoice_uuid || null;
   }
@@ -949,6 +978,15 @@ ${bankAllocXml}
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
+    // Prefer live ack number; else read what updateWriteQueue may have backfilled onto app_vouchers.
+    let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
+    }
     const offline = result?.status === 'desktop_offline';
     res.json({
       status: true,
@@ -958,7 +996,7 @@ ${bankAllocXml}
       tdkReferenceNo: tdkRef,
       receiptUuid,
       invoiceUuid: receiptUuid,
-      voucherNumber: result?.voucherNumber || effectiveVoucherNumber || null,
+      voucherNumber,
       numberingPolicy: numbering_policy,
       message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional receipt saved' : 'Receipt created'),
       data: result,

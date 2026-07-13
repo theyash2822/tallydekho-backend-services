@@ -1,5 +1,28 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-13 — Receipt preview Not Posted / missing number fix
+
+### Context
+`TDK-RCP-2026-0007` posted in Tally as voucher **#10**, but mobile preview showed **Not Posted** / no receipt number.
+
+### Root cause
+1. `POST /voucher/receipt` inserted `bill_ref_name` / `bill_type` / `bill_allocated_amount` into `app_vouchers` — columns do not exist → silent insert failure → no lifecycle row.
+2. `updateWriteQueue` only marked Posted when Tally ack included `voucherNumber` (often missing for Tally Series; only LASTVCHID).
+
+### Fix
+- Removed unused bill_* columns from receipt `app_vouchers` INSERT (bill data stays in `payload` JSON).
+- On write success: always set `tally_sync_status=synced` + `books_impact_status=posted`; backfill voucher number from `vouchers` via TDK narration/reference when ack has no number.
+- Backfilled `TDK-RCP-2026-0007` → Posted / #10.
+
+### Files
+- `src/routes/tally-write.js`
+
+### Test
+- Preview `TDK-RCP-2026-0007` → Posted + receipt number 10.
+- New receipt create → `app_vouchers` row created; status Posted after Tally write.
+
+---
+
 ## 2026-07-13 — BillOutstanding ingest full-refresh + ABS outstanding API
 
 ### Context
