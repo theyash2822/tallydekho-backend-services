@@ -1,5 +1,21 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-13 — False Posted: empty Tally create (CREATED=0) + Payment bill merge
+
+### Context
+`TDK-PAY-2026-0001` showed **Posted** in audit trail but was **not** in Tally. `write_queue.tally_id='0'` / CREATED=0 was treated as success.
+
+### Fix
+- `updateWriteQueue`: never mark Posted when `created===0` or `tallyId==='0'`; on failure flip `app_vouchers` to `not_posted`.
+- Payment bill XML: merge duplicate Agst Ref names (Tally rejects duplicate bill NAME).
+- Outstanding API: collapse duplicate `bill_name` rows per ledger.
+- Data repair: `TDK-PAY-2026-0001` → failed / not_posted.
+
+### Files
+- `src/routes/tally-write.js`, `src/routes/api-v1.js`
+
+---
+
 ## 2026-07-13 — Payment Voucher rewrite (Receipt parity)
 
 ### Added / Changed

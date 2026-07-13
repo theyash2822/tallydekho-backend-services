@@ -3319,11 +3319,28 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
         LIMIT 500`,
       params
     );
-    const bills = rows.map((r) => ({
+    const billsRaw = rows.map((r) => ({
       ...r,
       amount: Math.abs(parseFloat(r.amount) || 0),
       pending_amount: Math.abs(parseFloat(r.pending_amount) || 0),
     }));
+    // Collapse duplicate bill_name rows (same ledger can have >1 outstanding row per ref).
+    const byName = new Map();
+    for (const b of billsRaw) {
+      const key = String(b.bill_name || '');
+      const prev = byName.get(key);
+      if (!prev) {
+        byName.set(key, { ...b });
+      } else {
+        prev.pending_amount += b.pending_amount;
+        prev.amount += b.amount;
+        // Keep earliest bill_date
+        if (b.bill_date && (!prev.bill_date || String(b.bill_date) < String(prev.bill_date))) {
+          prev.bill_date = b.bill_date;
+        }
+      }
+    }
+    const bills = [...byName.values()];
     const total = bills.reduce((s, r) => s + (parseFloat(r.pending_amount) || 0), 0);
     res.json({ success: true, data: { bills, totalPending: total } });
   } catch (err) {

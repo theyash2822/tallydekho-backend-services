@@ -102,11 +102,43 @@ const updateWriteQueue = async (id, result, error) => {
   } else if (result?.status === false) {
     // Tally rejected the entry (LINEERROR or other Tally-side failure) — mark as failed, NOT success.
     // This was the silent failure bug: Tally rejections were being marked 'success'.
+    const errMsg = result?.message || 'Tally rejected the entry';
     await query(
       `UPDATE write_queue SET status = 'failed', error_message = $2,
        attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
-      [id, result?.message || 'Tally rejected the entry']
+      [id, errMsg]
     );
+    await query(
+      `UPDATE app_vouchers
+          SET tally_sync_status   = 'failed',
+              books_impact_status = 'not_posted',
+              sync_error          = $2,
+              updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE write_queue_id = $1`,
+      [id, String(errMsg).slice(0, 500)]
+    ).catch(() => {});
+  } else if (
+    // Defense: empty Tally create (CREATED=0 / LASTVCHID=0) must never become Posted.
+    // Desktop now rejects these, but older desktops may still return status:true.
+    (typeof result?.created === 'number' && result.created === 0 && !(result.altered > 0))
+    || String(result?.tallyId || '') === '0'
+  ) {
+    const errMsg = result?.message || 'Tally did not create the voucher (empty import result)';
+    await query(
+      `UPDATE write_queue SET status = 'failed', error_message = $2, tally_id = NULL,
+       attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, errMsg]
+    );
+    await query(
+      `UPDATE app_vouchers
+          SET tally_sync_status   = 'failed',
+              books_impact_status = 'not_posted',
+              sync_error          = $2,
+              tally_voucher_no    = NULL,
+              updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE write_queue_id = $1`,
+      [id, String(errMsg).slice(0, 500)]
+    ).catch(() => {});
   } else {
     let resolvedVoucherNumber = result?.voucherNumber || null;
     const tallyId = result?.tallyId || null;
@@ -913,7 +945,22 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
   const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
 
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
-  const blocks = Array.isArray(billAllocations) ? billAllocations : [];
+  const blocksRaw = Array.isArray(billAllocations) ? billAllocations : [];
+  // Merge duplicate Agst Ref names (bill_outstanding can have duplicate bill_name rows).
+  // Tally rejects Payment imports that repeat the same bill NAME → CREATED=0 / false Posted.
+  const merged = new Map();
+  for (const b of blocksRaw) {
+    const bType = b.billType || 'On Account';
+    const bAmt = Math.abs(parseFloat(b.amount) || 0);
+    if (!bAmt) continue;
+    const key = bType === 'Agst Ref' && b.billRefName
+      ? `Agst:${String(b.billRefName)}`
+      : `${bType}:${merged.size}`;
+    const prev = merged.get(key);
+    if (prev) prev.amount += bAmt;
+    else merged.set(key, { billRefName: b.billRefName || null, billType: bType, amount: bAmt });
+  }
+  const blocks = [...merged.values()];
   // Payment party leg is debit (negative) — bill allocation amounts match the debit sign.
   const billXml = blocks.map(b => {
     const bAmt = Math.abs(parseFloat(b.amount) || 0);
