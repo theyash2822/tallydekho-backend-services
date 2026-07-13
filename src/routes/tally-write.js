@@ -418,6 +418,107 @@ async function createReceiptForInvoice({
   }
 }
 
+// ── createPaymentForInvoice ── pairs a Payment voucher with a Purchase Invoice
+// when Make Payment Now is enabled (mirror of createReceiptForInvoice).
+async function createPaymentForInvoice({
+  companyGuid, companyName, userId, date,
+  partyLedger, bankLedger, amount, parentInvoiceUuid, parentTdkRef,
+  isOptional = false, reference,
+  parentCreatedAt = null,
+}) {
+  if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
+    throw new Error('createPaymentForInvoice: missing required fields');
+  }
+  const amt = parseFloat(amount);
+  const isOpt = isOptional ? 'Yes' : 'No';
+  const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY');
+  const narration = `TDK Payment: ${payTdkRef} | Against Invoice: ${parentTdkRef}`;
+
+  const xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="Payment" ACTION="Create">
+  <DATE>${tallyDate(date)}</DATE>
+  <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
+  <NARRATION>${narration}</NARRATION>
+  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <REFERENCE>${reference || parentTdkRef || ''}</REFERENCE>
+  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <ALLLEDGERENTRIES.LIST>
+    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <AMOUNT>${-amt}</AMOUNT>
+    <BILLALLOCATIONS.LIST>
+      <NAME>${parentTdkRef}</NAME>
+      <BILLTYPE>Agst Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${-amt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>
+  </ALLLEDGERENTRIES.LIST>
+  <ALLLEDGERENTRIES.LIST>
+    <LEDGERNAME>${bankLedger}</LEDGERNAME>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <AMOUNT>${amt}</AMOUNT>
+  </ALLLEDGERENTRIES.LIST>
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const label = `${partyLedger} → ${bankLedger} (linked: ${parentTdkRef})`;
+  const payload = {
+    companyGuid, companyName, date, partyLedger, bankLedger, ledgerAccount: bankLedger,
+    amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration,
+    paymentMethod: 'Bank', billAllocations: [{ billRefName: parentTdkRef, billType: 'Agst Ref', amount: amt }],
+  };
+  const qId = await logWriteQueue(userId, companyGuid, 'payment', label, amt, payload, xml).catch(() => null);
+
+  let paymentUuid = null;
+  if (qId) {
+    const createdAtSql = parentCreatedAt ? `$11::bigint` : `EXTRACT(EPOCH FROM NOW())::bigint`;
+    const insertParams = [companyGuid, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
+    if (parentCreatedAt) insertParams.push(parentCreatedAt);
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid, created_at)
+       VALUES ($1,$2,$3,'payment',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10, ${createdAtSql})
+       RETURNING invoice_uuid`,
+      insertParams
+    ).catch(e => { console.error('[payment-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    paymentUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+  }
+
+  try {
+    const result = await forwardToTally(companyGuid, userId, xml);
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    return { ok: true, queued: offline, queueId: qId, tdkRef: payTdkRef, paymentUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
+  } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
+    const msg = String(e.message || '');
+    const isBillWise = /bill[- ]?wise|bill[- ]?by[- ]?bill|maintain bill/i.test(msg);
+    if (isBillWise && paymentUuid) {
+      try {
+        await query(
+          `UPDATE app_vouchers SET tally_sync_status='needs_manual_reconciliation', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE invoice_uuid=$2`,
+          [`Tally rejected payment: party ledger missing 'Maintain bill-by-bill'. ${msg}`.slice(0, 500), paymentUuid]
+        );
+      } catch {}
+    }
+    return { ok: false, error: msg, queueId: qId, tdkRef: payTdkRef, paymentUuid, billWiseError: isBillWise };
+  }
+}
+
 // ── POST /tally/voucher/sales ───────────────────────────────────
 router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const {
@@ -775,61 +876,175 @@ ${topLevelDispatchXml}
 });
 
 // ── POST /tally/voucher/payment ───────────────────────────────────────────────
+// 2026-07-13 rewrite: Receipt parity — multi-bill allocation, instrument details,
+// numbering policy, app_vouchers, preview/share flow. Cash/Bank leg ISPARTYLEDGER=No.
 router.post('/voucher/payment', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, narration,
-    partyLedger, bankLedger, amount, isOptional = false,
+    companyGuid, companyName, date, narration, reference,
+    partyLedger, ledgerAccount, bankLedger,
+    paymentMethod = 'Cash',
+    amount,
+    billAllocations = [],
+    instrumentDetails = null,
+    entryType = 'regular',
+    isOptional: isOptionalLegacy,
+    numbering_policy = 'tally_prime_series',
   } = req.body;
 
-  if (!companyGuid || !partyLedger || !bankLedger || !amount) {
-    return res.status(400).json({ status: false, message: 'partyLedger, bankLedger and amount required' });
+  const cashOrBankLedger = ledgerAccount || bankLedger;
+  if (!companyGuid || !partyLedger || !cashOrBankLedger || !amount) {
+    return res.status(400).json({ status: false, message: 'partyLedger, ledgerAccount and amount required' });
   }
 
+  const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
-  const amt = parseFloat(amount);
+  const amt = parseFloat(amount) || 0;
+  const dt = tallyDate(date);
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY').catch(() => null);
+  let tdkVoucherNo = null;
+  let effectiveVoucherNumber = '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PAY').catch(() => null);
+    if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+  }
+
+  const anchorLine = tdkRef ? `TDK Payment: ${tdkRef}` : '';
+  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const blocks = Array.isArray(billAllocations) ? billAllocations : [];
+  // Payment party leg is debit (negative) — bill allocation amounts match the debit sign.
+  const billXml = blocks.map(b => {
+    const bAmt = Math.abs(parseFloat(b.amount) || 0);
+    const bType = b.billType || 'On Account';
+    const nameTag = (bType === 'Agst Ref' && b.billRefName) ? `<NAME>${esc(b.billRefName)}</NAME>` : '';
+    return `    <BILLALLOCATIONS.LIST>
+      ${nameTag}
+      <BILLTYPE>${esc(bType)}</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${-bAmt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>`;
+  }).join('\n');
+
+  const methodToTxnType = { Cheque: 'Cheque', NEFT: 'Electronic Cheque', RTGS: 'Electronic Cheque', UPI: 'Others', Bank: 'Transacted' };
+  const wantsBankAlloc = paymentMethod && paymentMethod !== 'Cash' && instrumentDetails;
+  const bankAllocXml = wantsBankAlloc ? `    <BANKALLOCATIONS.LIST>
+      <DATE>${tallyDate(instrumentDetails.instrumentDate || date)}</DATE>
+      <INSTRUMENTDATE>${tallyDate(instrumentDetails.instrumentDate || date)}</INSTRUMENTDATE>
+      <INSTRUMENTNUMBER>${esc(instrumentDetails.instrumentNo || reference || '')}</INSTRUMENTNUMBER>
+      <BANKNAME>${esc(instrumentDetails.bankName || '')}</BANKNAME>
+      <TRANSACTIONTYPE>${esc(instrumentDetails.transactionType || methodToTxnType[paymentMethod] || 'Others')}</TRANSACTIONTYPE>
+      <PAYMENTFAVOURING>${esc(partyLedger)}</PAYMENTFAVOURING>
+      <AMOUNT>${amt}</AMOUNT>
+    </BANKALLOCATIONS.LIST>` : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <VOUCHER VCHTYPE="Payment" ACTION="Create">
-  <DATE>${tallyDate(date)}</DATE>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
-  <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
-  <NARRATION>${narration || ''}</NARRATION>
+  <VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  <REFERENCE>${esc(tdkRef || reference || '')}</REFERENCE>
+  <NARRATION>${esc(fullNarration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <PARTYLEDGERNAME>${esc(partyLedger)}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(partyLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
+${billXml}
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${bankLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(cashOrBankLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <ISPARTYLEDGER>No</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
+${bankAllocXml}
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'payment', `${partyLedger} -> ${bankLedger}`, amt, req.body, xml).catch(() => null);
+  const persistPayload = {
+    ...req.body,
+    tdkRef,
+    numbering_policy,
+    entryType: isOptional ? 'optional' : 'regular',
+    paymentMethod,
+    ledgerAccount: cashOrBankLedger,
+    billAllocations: blocks,
+    instrumentDetails: instrumentDetails || null,
+    narration: fullNarration,
+  };
+
+  const label = `${partyLedger} → ${cashOrBankLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'payment', label, amt, persistPayload, xml).catch(() => null);
+
+  let paymentUuid = null;
+  if (qId && tdkRef) {
+    const av = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'payment',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+       numbering_policy, partyLedger, amt, date ? new Date(date) : null,
+       JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[payment-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    paymentUuid = av?.rows?.[0]?.invoice_uuid || null;
+  }
+
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
+    let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
+    }
     const offline = result?.status === 'desktop_offline';
-    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional payment saved' : 'Payment created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      tdkRef,
+      tdkReferenceNo: tdkRef,
+      paymentUuid,
+      invoiceUuid: paymentUuid,
+      voucherNumber,
+      numberingPolicy: numbering_policy,
+      message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional payment saved' : 'Payment created'),
+      data: result,
+      tallyId: result?.tallyId || null,
+    });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
-    res.status(500).json({ status: false, message: e.message });
+    const msg = String(e.message || '');
+    const isBillWise = /bill[- ]?wise|bill[- ]?by[- ]?bill|maintain bill/i.test(msg);
+    if (isBillWise && paymentUuid) {
+      try {
+        await query(
+          `UPDATE app_vouchers SET tally_sync_status='needs_manual_reconciliation', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE invoice_uuid=$2`,
+          [`Tally rejected payment: party ledger missing 'Maintain bill-by-bill'. ${msg}`.slice(0, 500), paymentUuid]
+        );
+      } catch {}
+    }
+    res.status(500).json({ status: false, message: msg, billWiseError: isBillWise, tdkRef });
   }
 });
 
@@ -1525,21 +1740,83 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
 
 // POST /tally/voucher/purchase
 router.post('/voucher/purchase', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, date, voucherNumber, reference, narration, partyLedger, totalAmount, items = [], taxes = [], isOptional = false, voucherType = 'Purchase GST' } = req.body;
+  const {
+    companyGuid, companyName, date, voucherNumber, reference, narration,
+    partyLedger, totalAmount, items = [], taxes = [], isOptional = false,
+    voucherType = 'Purchase GST', make_payment = null,
+  } = req.body;
   if (!companyGuid || !partyLedger) return res.status(400).json({ status: false, message: 'partyLedger required' });
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(totalAmount) || 0;
   const dt = tallyDate(date);
   const vchType = voucherType || 'Purchase GST';
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${vchType}" ACTION="Create"><VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><REFERENCE>${reference||''}</REFERENCE><ISINVOICE>Yes</ISINVOICE><ISCANCELLED>No</ISCANCELLED><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration||''}</NARRATION><PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME><LEDGERENTRIES.LIST><REMOVEZEROENTRIES>No</REMOVEZEROENTRIES><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><ISPARTYLEDGER>Yes</ISPARTYLEDGER><LEDGERNAME>${partyLedger}</LEDGERNAME><AMOUNT>${amt}</AMOUNT></LEDGERENTRIES.LIST>`;
+  const payAmt = make_payment?.ledgerName && parseFloat(make_payment.amount) > 0
+    ? parseFloat(make_payment.amount) : 0;
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PUR').catch(() => null);
+  const fullNarration = [tdkRef ? `TDK Purchase: ${tdkRef}` : '', narration].filter(Boolean).join(' | ');
+
+  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${vchType}" ACTION="Create"><VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><REFERENCE>${tdkRef || reference||''}</REFERENCE><ISINVOICE>Yes</ISINVOICE><ISCANCELLED>No</ISCANCELLED><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${fullNarration||''}</NARRATION><PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME><LEDGERENTRIES.LIST><REMOVEZEROENTRIES>No</REMOVEZEROENTRIES><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><ISPARTYLEDGER>Yes</ISPARTYLEDGER><LEDGERNAME>${partyLedger}</LEDGERNAME><AMOUNT>${amt}</AMOUNT></LEDGERENTRIES.LIST>`;
   for (const item of items) {
     const ia = parseFloat(item.amount)||0;
     xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${item.purchaseLedger||'Purchase Account GST'}</LEDGERNAME><AMOUNT>${-ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
   }
   for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional purchase saved' : 'Purchase invoice created'), data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
+
+  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration };
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml).catch(() => null);
+
+  let invoiceUuid = null;
+  let invoiceCreatedAt = null;
+  if (qId && tdkRef) {
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'purchase_invoice',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9)
+       RETURNING invoice_uuid, created_at`,
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[purchase-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+    invoiceCreatedAt = avResult?.rows?.[0]?.created_at || null;
+  }
+
+  try {
+    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, r, null);
+    const off = r?.status === 'desktop_offline';
+
+    let paymentResult = null;
+    if (!off && make_payment?.ledgerName && payAmt > 0 && invoiceUuid && tdkRef) {
+      try {
+        paymentResult = await createPaymentForInvoice({
+          companyGuid, companyName, userId: req.user.userId, date,
+          partyLedger, bankLedger: make_payment.ledgerName, amount: payAmt,
+          parentInvoiceUuid: invoiceUuid, parentTdkRef: tdkRef,
+          isOptional, reference: make_payment.reference || reference,
+          parentCreatedAt: invoiceCreatedAt,
+        });
+        if (paymentResult?.ok) {
+          console.log(`[payment-pair] Created payment ${paymentResult.tdkRef} for purchase ${tdkRef}`);
+        }
+      } catch (payErr) {
+        console.error(`[payment-pair] Helper threw for ${tdkRef}:`, payErr.message);
+        paymentResult = { ok: false, error: payErr.message };
+      }
+    }
+
+    res.json({
+      status: true, queued: off, queueId: qId, tdkRef, invoiceUuid,
+      payment: paymentResult,
+      message: off ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional purchase saved' : 'Purchase invoice created'),
+      data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null,
+    });
+  } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
 });
 
 
@@ -2348,17 +2625,35 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, async (req, res) => {
 // ── Helper: build VoucherDocument from app_vouchers row + company/party info ──────────────
 async function buildVoucherDocument(av, companyRow, partyRow) {
   const p = av.payload || {};
-  const isReceipt = (av.voucher_type || '').toLowerCase() === 'receipt';
+  const vType = (av.voucher_type || '').toLowerCase();
+  const isReceipt = vType === 'receipt';
+  const isPayment = vType === 'payment';
 
-  // ── Receipt document (2026-07-09) ─────────────────────────────────────────
-  if (isReceipt) {
+  // ── Receipt / Payment document (shared shape; payment uses `payment` key) ──
+  if (isReceipt || isPayment) {
     const isProvisional = !av.tally_voucher_no;
     const documentNumber = av.tally_voucher_no || 'Pending from TallyPrime';
     const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
     const billAllocations = Array.isArray(p.billAllocations) ? p.billAllocations : [];
     const instrument = p.instrumentDetails || null;
+    const moneyBlock = {
+      amount: parseFloat(av.total_amount || p.amount || 0),
+      paymentMethod: p.paymentMethod || 'Cash',
+      ledgerAccount: p.ledgerAccount || p.bankLedger || '',
+      billAllocations: billAllocations.map(b => ({
+        billRefName: b.billRefName || null,
+        billType:    b.billType || 'On Account',
+        amount:      Math.abs(parseFloat(b.amount || 0)),
+      })),
+      instrument: instrument ? {
+        instrumentNo:   instrument.instrumentNo || '',
+        instrumentDate: instrument.instrumentDate || '',
+        bankName:       instrument.bankName || '',
+        transactionType: instrument.transactionType || '',
+      } : null,
+    };
     return {
-      documentType: 'receipt',
+      documentType: isPayment ? 'payment' : 'receipt',
       documentNumber,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
@@ -2386,22 +2681,8 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       totals: {
         grandTotal: parseFloat(av.total_amount || p.amount || 0),
       },
-      receipt: {
-        amount: parseFloat(av.total_amount || p.amount || 0),
-        paymentMethod: p.paymentMethod || 'Cash',
-        ledgerAccount: p.ledgerAccount || p.bankLedger || '',
-        billAllocations: billAllocations.map(b => ({
-          billRefName: b.billRefName || null,
-          billType:    b.billType || 'On Account',
-          amount:      parseFloat(b.amount || 0),
-        })),
-        instrument: instrument ? {
-          instrumentNo:   instrument.instrumentNo || '',
-          instrumentDate: instrument.instrumentDate || '',
-          bankName:       instrument.bankName || '',
-          transactionType: instrument.transactionType || '',
-        } : null,
-      },
+      receipt: isReceipt ? moneyBlock : undefined,
+      payment: isPayment ? moneyBlock : undefined,
       narration: p.narration || '',
     };
   }

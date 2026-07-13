@@ -3289,28 +3289,32 @@ router.get('/parties', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/party/outstanding-bills?companyGuid=...&ledger=<name>&drOnly=true
-// Returns bill_outstanding rows for a single party ledger. Used by Receipt Voucher
-// Create screen (2026-07-09) to build the multi-bill allocation UI.
+// GET /api/party/outstanding-bills?companyGuid=...&ledger=<name>&drOnly=true|crOnly=true
+// Returns bill_outstanding rows for a single party ledger.
+// Receipt uses drOnly (receivables); Payment uses crOnly (payables).
 router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   const ledger = req.query.ledger || req.query.partyLedger || '';
   const drOnly = String(req.query.drOnly || '').toLowerCase() === 'true' || req.query.drOnly === '1';
+  const crOnly = String(req.query.crOnly || '').toLowerCase() === 'true' || req.query.crOnly === '1';
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!ledger)      return res.status(400).json({ success: false, error: { code: 'MISSING_LEDGER',  message: 'ledger required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const params = [companyGuid, ledger];
-    let drFilter = '';
+    let sideFilter = '';
     if (drOnly) {
       // Receivables for Receipt: Dr type, or negative pending (legacy rows without bill_type)
-      drFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)`;
+      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)`;
+    } else if (crOnly) {
+      // Payables for Payment: Cr type, or positive pending (legacy rows without bill_type)
+      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'CR' OR COALESCE(pending_amount,0) > 0)`;
     }
     const { rows } = await query(
       `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
          FROM bill_outstanding
         WHERE company_guid=$1 AND ledger_name=$2 AND ABS(COALESCE(pending_amount,0)) > 0.005
-        ${drFilter}
+        ${sideFilter}
         ORDER BY bill_date ASC NULLS LAST, id ASC
         LIMIT 500`,
       params

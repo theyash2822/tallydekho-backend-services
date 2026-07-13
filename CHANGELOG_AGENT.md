@@ -1,5 +1,24 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-13 — Payment Voucher rewrite (Receipt parity)
+
+### Added / Changed
+- `POST /tally/voucher/payment`: multi-bill allocations, instruments, TDK-PAY refs, `app_vouchers`, Settings numbering (`PAY`), cash/bank `ISPARTYLEDGER=No`.
+- `createPaymentForInvoice`: pairs Payment with Purchase when Make Payment Now is on.
+- `POST /tally/voucher/purchase`: TDK-PUR + `app_vouchers` + `make_payment` pairing.
+- `GET /party/outstanding-bills?crOnly=true`: Cr payables for Payment UI.
+- `buildVoucherDocument`: payment preview branch (reuses `/invoice/:tdkRef/preview`).
+
+### Files
+- `src/routes/tally-write.js`
+- `src/routes/api-v1.js`
+
+### Test
+- Create Payment with Cr bills + Cash → TDK-PAY row Posted after Tally write.
+- Purchase with `make_payment` → paired Payment against PUR TDK ref.
+
+---
+
 ## 2026-07-13 — Outstanding polish: date parse + drOnly for Receipt
 
 ### Changed
