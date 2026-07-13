@@ -3302,13 +3302,18 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
     const { rows } = await query(
       `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
          FROM bill_outstanding
-        WHERE company_guid=$1 AND ledger_name=$2 AND COALESCE(pending_amount,0) > 0
+        WHERE company_guid=$1 AND ledger_name=$2 AND ABS(COALESCE(pending_amount,0)) > 0.005
         ORDER BY bill_date ASC NULLS LAST, id ASC
         LIMIT 500`,
       [companyGuid, ledger]
     );
-    const total = rows.reduce((s, r) => s + (parseFloat(r.pending_amount) || 0), 0);
-    res.json({ success: true, data: { bills: rows, totalPending: total } });
+    const bills = rows.map((r) => ({
+      ...r,
+      amount: Math.abs(parseFloat(r.amount) || 0),
+      pending_amount: Math.abs(parseFloat(r.pending_amount) || 0),
+    }));
+    const total = bills.reduce((s, r) => s + (parseFloat(r.pending_amount) || 0), 0);
+    res.json({ success: true, data: { bills, totalPending: total } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }

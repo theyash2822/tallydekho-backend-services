@@ -1930,13 +1930,24 @@ async function processGSTDetails(data, companyGuid) {
 
 async function processBillOutstanding(data, companyGuid) {
   const client = await getClient();
+  const parseAmt = (v) => {
+    if (v == null || v === '') return 0;
+    const n = parseFloat(String(v).replace(/,/g, '').trim());
+    return Number.isFinite(n) ? n : 0;
+  };
   try {
     await client.query('BEGIN');
+    await client.query('DELETE FROM bill_outstanding WHERE company_guid=$1', [companyGuid]);
     let saved = 0;
+    let skipped = 0;
     for (const r of data) {
-      const ledgerName = r.LedgerName || r.LEDGERNAME || '';
-      const billName = r.BillName || r.BILLNAME || '';
-      if (!ledgerName) continue;
+      const ledgerName = String(r.LedgerName || r.LEDGERNAME || '').trim();
+      const billName = String(r.BillName || r.BILLNAME || '').trim();
+      if (!ledgerName || !billName) { skipped++; continue; }
+      const pending = parseAmt(r.PendingAmount ?? r.PENDINGAMOUNT);
+      if (Math.abs(pending) < 0.005) { skipped++; continue; }
+      const amount = parseAmt(r.Amount ?? r.AMOUNT);
+      const drCr = String(r.DrCr || r.DRCR || r.BillType || r.BILLTYPE || '').trim() || null;
       try {
         await client.query(`
           INSERT INTO bill_outstanding
@@ -1945,14 +1956,14 @@ async function processBillOutstanding(data, companyGuid) {
         `, [
           r.VoucherGuid || null, companyGuid, ledgerName, billName,
           normalizeDate(r.BillDate), normalizeDate(r.DueDate),
-          parseFloat(r.Amount || 0), parseFloat(r.PendingAmount || 0),
-          r.BillType || null, parseInt(r.AlterId || 0), now(),
+          amount, pending,
+          drCr, parseInt(r.AlterId || 0) || 0, now(),
         ]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
     await client.query('COMMIT');
-    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} for ${companyGuid}`);
+    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} (skipped ${skipped}) for ${companyGuid}`);
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BillOutstanding failed:', e.message); }
   finally { client.release(); }
 }

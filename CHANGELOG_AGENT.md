@@ -1,5 +1,23 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-13 — BillOutstanding ingest full-refresh + ABS outstanding API
+
+### Context
+Receipt bill picker empty because `bill_outstanding` stayed at 0. Desktop Option B ships minimal TDL; backend must accept BILLROW payloads cleanly and expose Dr balances (often negative pending).
+
+### Changed
+- `ingestProcessor.js` `processBillOutstanding`: DELETE+INSERT per company; strip commas; skip empty ledger/bill; skip ~0 pending; store Dr/Cr in `bill_type`.
+- `api-v1.js` `GET /party/outstanding-bills`: filter `ABS(pending_amount) > 0.005`; return ABS amounts for mobile UI.
+
+### Files
+- `src/controllers/ingestProcessor.js`
+- `src/routes/api-v1.js`
+
+### QA
+`node --check` both files. Device Hard Sync verification pending (DB count + Aai Gee ledger).
+
+---
+
 ## 2026-07-06 R3 — Website tags + VAT TIN/CST tag broadening (POST /master/party)
 
 ### Context
