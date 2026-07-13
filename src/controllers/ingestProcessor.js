@@ -347,6 +347,26 @@ function normalizeDate(val) {
   if (s.includes('\xf1') || s === '') return null;
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
   if (/^\d{8}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  // YYYY-MM-DD from $$PyrlYYYYMMDDFormat with dash
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  // 31-Mar-17 / 31-Mar-2017 (Tally Name/Uni Date Field exports)
+  const mdy = s.match(/^(\d{1,2})[-/\s]([A-Za-z]{3})[-/\s](\d{2,4})$/);
+  if (mdy) {
+    const months = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+    const mon = months[mdy[2].toLowerCase()];
+    if (mon == null) return null;
+    let y = parseInt(mdy[3], 10);
+    if (y < 100) y += y >= 70 ? 1900 : 2000;
+    const d = parseInt(mdy[1], 10);
+    const dt = new Date(Date.UTC(y, mon, d));
+    if (Number.isNaN(dt.getTime())) return null;
+    return dt.toISOString().slice(0, 10);
+  }
+  // DD/MM/YYYY
+  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmy) {
+    return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  }
   return null;
 }
 

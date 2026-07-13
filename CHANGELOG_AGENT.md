@@ -1,5 +1,17 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-13 — Outstanding polish: date parse + drOnly for Receipt
+
+### Changed
+- `ingestProcessor.js` `normalizeDate`: parse `31-Mar-17` / `DD/MM/YYYY` / dashed YYYYMMDD.
+- `api-v1.js` `GET /party/outstanding-bills?drOnly=true`: filter Dr receivables for Receipt UI.
+
+### Files
+- `src/controllers/ingestProcessor.js`
+- `src/routes/api-v1.js`
+
+---
+
 ## 2026-07-13 — Receipt preview Not Posted / missing number fix
 
 ### Context
