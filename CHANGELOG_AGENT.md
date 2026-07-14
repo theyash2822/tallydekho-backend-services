@@ -1,5 +1,20 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-14 — Journal voucher rewrite + Depreciation on Asset
+
+### Context
+Journal create was a stub (wrong API keys, fake JV no). Need single Dr+Cr parity with Payment/Receipt, plus Income-tax WDV depreciation helper.
+
+### Added / Changed
+- `POST /tally/voucher/journal`: TDK-JOR / OPT-JOR, `app_vouchers`, numbering policy, narration anchor `TDK Journal:`, omit empty VOUCHERNUMBER, optional `depreciationMeta` in payload.
+- `buildVoucherDocument`: journal preview branch (Dr/Cr + depreciation meta).
+- Ingest: Journal narration reconciler (per-row + batch).
+
+### Files
+- `src/routes/tally-write.js`, `src/controllers/ingestProcessor.js`
+
+---
+
 ## 2026-07-14 — Payment leftover Advance NAME + number sync
 
 ### Context

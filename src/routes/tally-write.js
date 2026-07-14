@@ -1307,45 +1307,72 @@ ${bankAllocXml}
 });
 
 // ── POST /tally/voucher/journal ───────────────────────────────────────────────
+// 2026-07-14 rewrite: Payment/Receipt parity — single Dr+Cr pair, TDK-JOR,
+// app_vouchers, numbering, optional. Depreciation meta stored in payload only.
 router.post('/voucher/journal', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, narration, reference,
-    drLedger, crLedger, amount, isOptional = false,
+    companyGuid, companyName, date, narration, reference,
+    drLedger, crLedger, amount,
+    entryType = 'regular',
+    isOptional: isOptionalLegacy,
+    numbering_policy = 'tally_prime_series',
+    depreciationMeta = null,
+    isPartyDr = false,
+    isPartyCr = false,
   } = req.body;
 
   if (!companyGuid || !drLedger || !crLedger || !amount) {
     return res.status(400).json({ status: false, message: 'drLedger, crLedger and amount required' });
   }
 
+  const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
-  const amt = parseFloat(amount);
+  const amt = parseFloat(amount) || 0;
+  if (!(amt > 0)) {
+    return res.status(400).json({ status: false, message: 'amount must be greater than 0' });
+  }
+  const dt = tallyDate(date);
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
 
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'JOR').catch(() => null);
+  let tdkVoucherNo = null;
+  let effectiveVoucherNumber = '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'JOR').catch(() => null);
+    if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+  }
+
+  const anchorLine = tdkRef ? `TDK Journal: ${tdkRef}` : '';
+  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+
+  // Reference XML: Dr leg ISDEEMEDPOSITIVE=Yes + negative amount; Cr = No + positive.
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <VOUCHER VCHTYPE="Journal" ACTION="Create">
-  <DATE>${tallyDate(date)}</DATE>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>
-  <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
-  <NARRATION>${narration || ''}</NARRATION>
-  <REFERENCE>${reference || ''}</REFERENCE>
+  ${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}
+  <REFERENCE>${esc(tdkRef || reference || '')}</REFERENCE>
+  <NARRATION>${esc(fullNarration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${drLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(drLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>${isPartyDr ? 'Yes' : 'No'}</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${crLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(crLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>${isPartyCr ? 'Yes' : 'No'}</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
@@ -1353,15 +1380,67 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'journal', narration || `${drLedger} / ${crLedger}`, amt, req.body, xml).catch(() => null);
+  const persistPayload = {
+    ...req.body,
+    tdkRef,
+    numbering_policy,
+    entryType: isOptional ? 'optional' : 'regular',
+    drLedger,
+    crLedger,
+    amount: amt,
+    narration: fullNarration,
+    depreciationMeta: depreciationMeta || null,
+  };
+
+  const label = `${drLedger} / ${crLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'journal', label, amt, persistPayload, xml).catch(() => null);
+
+  let journalUuid = null;
+  if (qId && tdkRef) {
+    const av = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'journal',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+       numbering_policy, tdkVoucherNo || null,
+       drLedger, amt, date ? new Date(date) : null,
+       JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[journal-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    journalUuid = av?.rows?.[0]?.invoice_uuid || null;
+  }
+
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
+    let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
+    }
     const offline = result?.status === 'desktop_offline';
-    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional journal saved' : 'Journal entry created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      tdkRef,
+      tdkReferenceNo: tdkRef,
+      journalUuid,
+      invoiceUuid: journalUuid,
+      voucherNumber,
+      numberingPolicy: numbering_policy,
+      message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional journal saved' : 'Journal created'),
+      data: result,
+      tallyId: result?.tallyId || null,
+    });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
-    res.status(500).json({ status: false, message: e.message });
+    res.status(500).json({ status: false, message: e.message, tdkRef });
   }
 });
 
@@ -2701,6 +2780,58 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const vType = (av.voucher_type || '').toLowerCase();
   const isReceipt = vType === 'receipt';
   const isPayment = vType === 'payment';
+  const isJournal = vType === 'journal';
+
+  // ── Journal document (single Dr+Cr pair) ───────────────────────────────────
+  if (isJournal) {
+    const hasNumber = !!av.tally_voucher_no;
+    const isPosted = av.books_impact_status === 'posted';
+    const numberPending = isPosted && !hasNumber;
+    const documentNumber = hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
+    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    return {
+      documentType: 'journal',
+      documentNumber,
+      documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
+      tdkRef: av.tdk_reference_no,
+      invoiceUuid: av.invoice_uuid,
+      postingTag,
+      isProvisional: !hasNumber,
+      numberPending,
+      watermarkText: numberPending
+        ? 'Posted — Tally series number pending sync'
+        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
+      numberingMode: av.numbering_policy || 'tally_prime_series',
+      company: {
+        name: companyRow?.name || p.companyName || '',
+        address: companyRow?.address || '',
+        gstin: companyRow?.gstin || '',
+        pan: companyRow?.pan || '',
+        phone: companyRow?.phone || '',
+        email: companyRow?.email || '',
+        state: companyRow?.state || '',
+      },
+      party: {
+        name: av.party_name || p.drLedger || '',
+        address: '',
+        gstin: '',
+        pan: '',
+        phone: '',
+      },
+      totals: {
+        grandTotal: parseFloat(av.total_amount || p.amount || 0),
+      },
+      journal: {
+        drLedger: p.drLedger || av.party_name || '',
+        crLedger: p.crLedger || '',
+        amount: parseFloat(av.total_amount || p.amount || 0),
+        depreciationMeta: p.depreciationMeta || null,
+      },
+      narration: p.narration || '',
+    };
+  }
 
   // ── Receipt / Payment document (shared shape; payment uses `payment` key) ──
   if (isReceipt || isPayment) {

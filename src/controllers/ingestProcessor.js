@@ -913,6 +913,36 @@ async function processVouchers(data, companyGuid) {
         console.error('[reconcile] payment error:', payRecErr.message);
       }
 
+      // ── Journal reconciliation (2026-07-14) ──────────────────────────────────
+      try {
+        const voucherTypeLowerJ = (voucherType || '').toLowerCase();
+        if (voucherNumber && voucherTypeLowerJ.includes('journal')) {
+          const narration = r.Narration || r.NARRATION || r.narration || '';
+          const m = narration.match(/TDK Journal:\s*(TDK-(?:OPT-)?JOR-\d{4}-\d+)/i);
+          if (m?.[1]) {
+            const { rows: jorRows } = await dbQuery(
+              `UPDATE app_vouchers
+                  SET tally_voucher_no    = $1,
+                      tally_sync_status   = 'synced',
+                      books_impact_status = 'posted',
+                      updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE tdk_reference_no = $2
+                  AND company_guid     = $3
+                  AND voucher_type     = 'journal'
+                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
+                RETURNING company_guid, tdk_reference_no`,
+              [voucherNumber, m[1], companyGuid]
+            );
+            if (jorRows[0]) {
+              emitVoucherSynced(jorRows[0].company_guid, jorRows[0].tdk_reference_no, voucherNumber);
+              console.log(`[reconcile] Journal synced: ${m[1]} → ${voucherNumber}`);
+            }
+          }
+        }
+      } catch (jorRecErr) {
+        console.error('[reconcile] journal error:', jorRecErr.message);
+      }
+
       // ── Receipt reconciliation (Phase B, 2026-06-30) ─────────────────────────
       // Tally drops top-level <REFERENCE> on Receipt vouchers, so the standard reconciler
       // above never matches them. Two fallbacks (in priority order):
@@ -1117,6 +1147,32 @@ async function processVouchers(data, companyGuid) {
       }
     } catch (payNarrErr) {
       console.warn('[reconcile] Payment narration reconciliation error (non-fatal):', payNarrErr.message);
+    }
+
+    // Journal narration reconciler (2026-07-14)
+    try {
+      const { rows: jorNarrRows } = await dbQuery(`
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = v.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM vouchers v
+        WHERE v.company_guid   = av.company_guid
+          AND av.company_guid  = $1
+          AND av.voucher_type  = 'journal'
+          AND av.tally_voucher_no IS NULL
+          AND v.voucher_number IS NOT NULL
+          AND v.voucher_number != ''
+          AND v.narration ~ ('TDK Journal:\\s*' || av.tdk_reference_no)
+        RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
+      `, [companyGuid]);
+      for (const row of jorNarrRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Journal narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (jorNarrErr) {
+      console.warn('[reconcile] Journal narration reconciliation error (non-fatal):', jorNarrErr.message);
     }
 
     try {
