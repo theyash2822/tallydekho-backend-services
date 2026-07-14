@@ -102,7 +102,9 @@ const updateWriteQueue = async (id, result, error) => {
   } else if (result?.status === false) {
     // Tally rejected the entry (LINEERROR or other Tally-side failure) — mark as failed, NOT success.
     // This was the silent failure bug: Tally rejections were being marked 'success'.
-    const errMsg = result?.message || 'Tally rejected the entry';
+    const raw = typeof result?.data === 'string' ? result.data : '';
+    const detail = raw ? ` | tally: ${raw.replace(/\s+/g, ' ').slice(0, 1200)}` : '';
+    const errMsg = `${result?.message || 'Tally rejected the entry'}${detail}`.slice(0, 1800);
     await query(
       `UPDATE write_queue SET status = 'failed', error_message = $2,
        attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
@@ -497,7 +499,7 @@ async function createPaymentForInvoice({
   <ALLLEDGERENTRIES.LIST>
     <LEDGERNAME>${bankLedger}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
@@ -909,7 +911,7 @@ ${topLevelDispatchXml}
 
 // ── POST /tally/voucher/payment ───────────────────────────────────────────────
 // 2026-07-13 rewrite: Receipt parity — multi-bill allocation, instrument details,
-// numbering policy, app_vouchers, preview/share flow. Cash/Bank leg ISPARTYLEDGER=No.
+// numbering policy, app_vouchers, preview/share flow. Cash/Bank leg ISPARTYLEDGER=Yes (Tally export parity).
 router.post('/voucher/payment', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, date, narration, reference,
@@ -948,24 +950,36 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
   const blocksRaw = Array.isArray(billAllocations) ? billAllocations : [];
   // Merge duplicate Agst Ref names (bill_outstanding can have duplicate bill_name rows).
   // Tally rejects Payment imports that repeat the same bill NAME → CREATED=0 / false Posted.
+  // Advance MUST have <NAME> (Tally reference XML); On Account must NOT. Auto-name nameless Advance.
+  const autoAdvName = () => {
+    const seq = (tdkRef || '').split('-').pop() || String(Date.now()).slice(-4);
+    return `TDK-ADV-${seq}`;
+  };
   const merged = new Map();
   for (const b of blocksRaw) {
     const bType = b.billType || 'On Account';
     const bAmt = Math.abs(parseFloat(b.amount) || 0);
     if (!bAmt) continue;
-    const key = bType === 'Agst Ref' && b.billRefName
-      ? `Agst:${String(b.billRefName)}`
-      : `${bType}:${merged.size}`;
+    let billRefName = b.billRefName || null;
+    if (bType === 'Advance' && !billRefName) billRefName = autoAdvName();
+    if (bType === 'On Account') billRefName = null;
+    const key = bType === 'Agst Ref' && billRefName
+      ? `Agst:${String(billRefName)}`
+      : bType === 'Advance' && billRefName
+        ? `Adv:${String(billRefName)}`
+        : `${bType}:${merged.size}`;
     const prev = merged.get(key);
     if (prev) prev.amount += bAmt;
-    else merged.set(key, { billRefName: b.billRefName || null, billType: bType, amount: bAmt });
+    else merged.set(key, { billRefName, billType: bType, amount: bAmt });
   }
   const blocks = [...merged.values()];
   // Payment party leg is debit (negative) — bill allocation amounts match the debit sign.
   const billXml = blocks.map(b => {
     const bAmt = Math.abs(parseFloat(b.amount) || 0);
     const bType = b.billType || 'On Account';
-    const nameTag = (bType === 'Agst Ref' && b.billRefName) ? `<NAME>${esc(b.billRefName)}</NAME>` : '';
+    // Agst Ref + Advance need NAME; On Account has no NAME (matches Tally export).
+    const needsName = (bType === 'Agst Ref' || bType === 'Advance') && b.billRefName;
+    const nameTag = needsName ? `<NAME>${esc(b.billRefName)}</NAME>` : '';
     return `    <BILLALLOCATIONS.LIST>
       ${nameTag}
       <BILLTYPE>${esc(bType)}</BILLTYPE>
@@ -999,7 +1013,7 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
-  <VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  ${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}
   <REFERENCE>${esc(tdkRef || reference || '')}</REFERENCE>
   <NARRATION>${esc(fullNarration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
@@ -1014,7 +1028,7 @@ ${billXml}
   <ALLLEDGERENTRIES.LIST>
     <LEDGERNAME>${esc(cashOrBankLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
 ${bankAllocXml}
   </ALLLEDGERENTRIES.LIST>
@@ -1145,11 +1159,23 @@ router.post('/voucher/receipt', authMiddleware, async (req, res) => {
   const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
 
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
-  const blocks = Array.isArray(billAllocations) ? billAllocations : [];
+  // Same Advance NAME rule as Payment (Tally requires <NAME> for Advance leftover).
+  const autoAdvNameRcp = () => {
+    const seq = (tdkRef || '').split('-').pop() || String(Date.now()).slice(-4);
+    return `TDK-ADV-${seq}`;
+  };
+  const blocks = (Array.isArray(billAllocations) ? billAllocations : []).map(b => {
+    const bType = b.billType || 'On Account';
+    let billRefName = b.billRefName || null;
+    if (bType === 'Advance' && !billRefName) billRefName = autoAdvNameRcp();
+    if (bType === 'On Account') billRefName = null;
+    return { ...b, billType: bType, billRefName };
+  });
   const billXml = blocks.map(b => {
     const bAmt = parseFloat(b.amount) || 0;
     const bType = b.billType || 'On Account';
-    const nameTag = (bType === 'Agst Ref' && b.billRefName) ? `<NAME>${esc(b.billRefName)}</NAME>` : '';
+    const needsName = (bType === 'Agst Ref' || bType === 'Advance') && b.billRefName;
+    const nameTag = needsName ? `<NAME>${esc(b.billRefName)}</NAME>` : '';
     return `    <BILLALLOCATIONS.LIST>
       ${nameTag}
       <BILLTYPE>${esc(bType)}</BILLTYPE>
@@ -1183,7 +1209,7 @@ router.post('/voucher/receipt', authMiddleware, async (req, res) => {
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
-  <VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  ${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}
   <REFERENCE>${esc(tdkRef || reference || '')}</REFERENCE>
   <NARRATION>${esc(fullNarration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
@@ -2678,9 +2704,14 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
 
   // ── Receipt / Payment document (shared shape; payment uses `payment` key) ──
   if (isReceipt || isPayment) {
-    const isProvisional = !av.tally_voucher_no;
-    const documentNumber = av.tally_voucher_no || 'Pending from TallyPrime';
-    const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
+    const hasNumber = !!av.tally_voucher_no;
+    const isPosted = av.books_impact_status === 'posted';
+    // Posted in books but series not synced yet → not a "failed" provisional create
+    const numberPending = isPosted && !hasNumber;
+    const documentNumber = hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
+    const postingTag = isPosted ? 'Posted' : 'Not Posted';
     const billAllocations = Array.isArray(p.billAllocations) ? p.billAllocations : [];
     const instrument = p.instrumentDetails || null;
     const moneyBlock = {
@@ -2706,8 +2737,11 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
       postingTag,
-      isProvisional,
-      watermarkText: isProvisional ? 'Provisional / Pending Tally Posting' : null,
+      isProvisional: !hasNumber,
+      numberPending,
+      watermarkText: numberPending
+        ? 'Posted — Tally series number pending sync'
+        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
       numberingMode: av.numbering_policy || 'tally_prime_series',
       company: {
         name: companyRow?.name || p.companyName || '',

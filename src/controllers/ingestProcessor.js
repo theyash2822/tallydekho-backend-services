@@ -882,6 +882,37 @@ async function processVouchers(data, companyGuid) {
         console.error('[reconcile] regular TDK error:', regRecErr.message);
       }
 
+      // ── Payment reconciliation (2026-07-14) ─────────────────────────────────
+      // Tally drops top-level <REFERENCE> on Payment; parse narration like Receipt.
+      try {
+        const voucherTypeLower = (voucherType || '').toLowerCase();
+        if (voucherNumber && voucherTypeLower.includes('payment')) {
+          const narration = r.Narration || r.NARRATION || r.narration || '';
+          const m = narration.match(/TDK Payment:\s*(TDK-(?:OPT-)?PAY-\d{4}-\d+)/i);
+          if (m?.[1]) {
+            const { rows: payRows } = await dbQuery(
+              `UPDATE app_vouchers
+                  SET tally_voucher_no    = $1,
+                      tally_sync_status   = 'synced',
+                      books_impact_status = 'posted',
+                      updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE tdk_reference_no = $2
+                  AND company_guid     = $3
+                  AND voucher_type     = 'payment'
+                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
+                RETURNING company_guid, tdk_reference_no`,
+              [voucherNumber, m[1], companyGuid]
+            );
+            if (payRows[0]) {
+              emitVoucherSynced(payRows[0].company_guid, payRows[0].tdk_reference_no, voucherNumber);
+              console.log(`[reconcile] Payment synced: ${m[1]} → ${voucherNumber}`);
+            }
+          }
+        }
+      } catch (payRecErr) {
+        console.error('[reconcile] payment error:', payRecErr.message);
+      }
+
       // ── Receipt reconciliation (Phase B, 2026-06-30) ─────────────────────────
       // Tally drops top-level <REFERENCE> on Receipt vouchers, so the standard reconciler
       // above never matches them. Two fallbacks (in priority order):
@@ -1058,6 +1089,34 @@ async function processVouchers(data, companyGuid) {
       }
     } catch (rcpNarrErr) {
       console.warn('[reconcile] Receipt narration reconciliation error (non-fatal):', rcpNarrErr.message);
+    }
+
+    // Payment narration reconciler (2026-07-14) — mirror of Receipt.
+    // Tally drops Payment <REFERENCE>; number lives only in narration:
+    //   "TDK Payment: TDK-PAY-2026-0003 | …"
+    try {
+      const { rows: payNarrRows } = await dbQuery(`
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = v.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM vouchers v
+        WHERE v.company_guid   = av.company_guid
+          AND av.company_guid  = $1
+          AND av.voucher_type  = 'payment'
+          AND av.tally_voucher_no IS NULL
+          AND v.voucher_number IS NOT NULL
+          AND v.voucher_number != ''
+          AND v.narration ~ ('TDK Payment:\\s*' || av.tdk_reference_no)
+        RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
+      `, [companyGuid]);
+      for (const row of payNarrRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Payment narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (payNarrErr) {
+      console.warn('[reconcile] Payment narration reconciliation error (non-fatal):', payNarrErr.message);
     }
 
     try {

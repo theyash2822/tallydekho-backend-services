@@ -1,5 +1,23 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-14 — Payment leftover Advance NAME + number sync
+
+### Context
+Multi-bill Payment (`TDK-PAY-2026-0002`) failed with Tally exception: Advance leftover sent **without** `<NAME>` (reference export uses named Advance; On Account has no NAME). Preview showed "Pending" for Posted `TDK-PAY-2026-0003` because Payment had no narration reconciler (Tally drops `<REFERENCE>`).
+
+### Fix
+- Payment + Receipt XML: Advance auto-`TDK-ADV-…` NAME; On Account strips NAME.
+- Cash/Bank Payment leg `ISPARTYLEDGER=Yes` (export parity).
+- Payment narration reconciler (per-row + batch) mirrors Receipt.
+- Preview: `numberPending` / “Posted — Tally series number pending sync”.
+- Persist truncated Tally response on write_queue failure.
+- Data: `TDK-PAY-2026-0003` → `tally_voucher_no=2`.
+
+### Files
+- `src/routes/tally-write.js`, `src/controllers/ingestProcessor.js`
+
+---
+
 ## 2026-07-13 — False Posted: empty Tally create (CREATED=0) + Payment bill merge
 
 ### Context
