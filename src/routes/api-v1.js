@@ -1041,7 +1041,14 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         AND (
           (av.voucher_type = 'receipt'       AND v.voucher_type ILIKE 'Receipt')
           OR (av.voucher_type = 'sales_invoice' AND v.voucher_type ILIKE 'Sales%')
-          OR av.voucher_type NOT IN ('receipt','sales_invoice')
+          OR (av.voucher_type = 'payment'       AND v.voucher_type ILIKE 'Payment')
+          OR (av.voucher_type = 'journal'       AND v.voucher_type ILIKE 'Journal')
+          OR (av.voucher_type = 'contra'        AND v.voucher_type ILIKE 'Contra')
+          OR (av.voucher_type = 'purchase'      AND v.voucher_type ILIKE 'Purchase%')
+          OR (
+            av.voucher_type NOT IN ('receipt','sales_invoice','payment','journal','contra','purchase')
+            AND LOWER(COALESCE(v.voucher_type,'')) LIKE '%' || REPLACE(av.voucher_type, '_', ' ') || '%'
+          )
         )
       JOIN write_queue wq ON wq.id = av.write_queue_id
       LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
