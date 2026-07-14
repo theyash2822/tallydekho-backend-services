@@ -943,7 +943,38 @@ async function processVouchers(data, companyGuid) {
         console.error('[reconcile] journal error:', jorRecErr.message);
       }
 
+      // ── Contra reconciliation (2026-07-14) ───────────────────────────────────
+      try {
+        const voucherTypeLowerC = (voucherType || '').toLowerCase();
+        if (voucherNumber && voucherTypeLowerC.includes('contra')) {
+          const narration = r.Narration || r.NARRATION || r.narration || '';
+          const m = narration.match(/TDK Contra:\s*(TDK-(?:OPT-)?CON-\d{4}-\d+)/i);
+          if (m?.[1]) {
+            const { rows: conRows } = await dbQuery(
+              `UPDATE app_vouchers
+                  SET tally_voucher_no    = $1,
+                      tally_sync_status   = 'synced',
+                      books_impact_status = 'posted',
+                      updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE tdk_reference_no = $2
+                  AND company_guid     = $3
+                  AND voucher_type     = 'contra'
+                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
+                RETURNING company_guid, tdk_reference_no`,
+              [voucherNumber, m[1], companyGuid]
+            );
+            if (conRows[0]) {
+              emitVoucherSynced(conRows[0].company_guid, conRows[0].tdk_reference_no, voucherNumber);
+              console.log(`[reconcile] Contra synced: ${m[1]} → ${voucherNumber}`);
+            }
+          }
+        }
+      } catch (conRecErr) {
+        console.error('[reconcile] contra error:', conRecErr.message);
+      }
+
       // ── Receipt reconciliation (Phase B, 2026-06-30) ─────────────────────────
+
       // Tally drops top-level <REFERENCE> on Receipt vouchers, so the standard reconciler
       // above never matches them. Two fallbacks (in priority order):
       //   1. Parse narration anchor:  "TDK Receipt: <RCP-ref> | Against Invoice: <SAL-ref>"

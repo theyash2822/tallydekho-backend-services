@@ -1445,60 +1445,229 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
 });
 
 // ── POST /tally/voucher/contra ────────────────────────────────────────────────
+// 2026-07-14 rewrite: Source(From)=Cr → Destination(To)=Dr, TDK-CON, BANKALLOCATIONS,
+// optional matched CASHDENOMINATION (Contra_2), app_vouchers, numbering.
 router.post('/voucher/contra', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, narration,
-    fromLedger, toLedger, amount, isOptional = false,
+    companyGuid, companyName, date, narration, reference,
+    fromLedger, toLedger, amount,
+    entryType = 'regular',
+    isOptional: isOptionalLegacy,
+    numbering_policy = 'tally_prime_series',
+    contraKind = null, // cash_deposit | cash_withdrawal | bank_transfer | cash_transfer
+    instrumentDetails = null,
+    cashCount = null, // { used, matched, denominations: { [note]: qty }, counted }
+    fromIsCash = false,
+    toIsCash = false,
+    fromIsBank = false,
+    toIsBank = false,
   } = req.body;
 
   if (!companyGuid || !fromLedger || !toLedger || !amount) {
     return res.status(400).json({ status: false, message: 'fromLedger, toLedger and amount required' });
   }
 
+  const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
-  const amt = parseFloat(amount);
+  const amt = parseFloat(amount) || 0;
+  if (!(amt > 0)) {
+    return res.status(400).json({ status: false, message: 'amount must be greater than 0' });
+  }
+  const dt = tallyDate(date);
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CON').catch(() => null);
+  let tdkVoucherNo = null;
+  let effectiveVoucherNumber = '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'CON').catch(() => null);
+    if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+  }
+
+  const anchorLine = tdkRef ? `TDK Contra: ${tdkRef}` : '';
+  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+
+  // Infer kind if client omitted
+  let kind = contraKind;
+  if (!kind) {
+    if (fromIsCash && toIsBank) kind = 'cash_deposit';
+    else if (fromIsBank && toIsCash) kind = 'cash_withdrawal';
+    else if (fromIsBank && toIsBank) kind = 'bank_transfer';
+    else if (fromIsCash && toIsCash) kind = 'cash_transfer';
+    else kind = 'cash_transfer';
+  }
+
+  const txnTypeDefault = kind === 'cash_deposit' ? 'Cash'
+    : kind === 'bank_transfer' ? 'Inter Bank Transfer'
+    : kind === 'cash_withdrawal' ? 'Cheque'
+    : 'Cash';
+
+  const inst = instrumentDetails || {};
+  const instrumentNo = String(inst.instrumentNo || reference || '').trim();
+  const instrumentDate = tallyDate(inst.instrumentDate || date);
+  const txnType = String(inst.transactionType || txnTypeDefault);
+
+  // CASHDENOMINATION: only when cash count used + matched (never send mismatch).
+  // Contra_2: 0-100-409-… = 100×500 + 409×100 → slots [2000,500,100,50,20,10,5,2,1].
+  // UI may include 200 notes; fold them into the 100 slot (2×) for Tally.
+  const denomSlots = [2000, 500, 100, 50, 20, 10, 5, 2, 1, 0, 0, 0];
+  let cashDenomStr = null;
+  if (cashCount && cashCount.used && cashCount.matched && cashCount.denominations) {
+    const denoms = { ...(cashCount.denominations || {}) };
+    const twoHundreds = Math.max(0, parseInt(denoms['200'] ?? denoms[200] ?? 0, 10) || 0);
+    if (twoHundreds > 0) {
+      const hundreds = Math.max(0, parseInt(denoms['100'] ?? denoms[100] ?? 0, 10) || 0);
+      denoms['100'] = hundreds + twoHundreds * 2;
+      delete denoms['200'];
+      delete denoms[200];
+    }
+    const counts = denomSlots.map((face) => {
+      if (!face) return 0;
+      return Math.max(0, parseInt(denoms[String(face)] ?? denoms[face] ?? 0, 10) || 0);
+    });
+    cashDenomStr = counts.join('-');
+  }
+
+  const makeBankAlloc = (signedAmt, favouring, withDenom) => {
+    const uniqueName = `tdk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const denomTag = withDenom && cashDenomStr
+      ? `\n        <CASHDENOMINATION>${cashDenomStr}</CASHDENOMINATION>`
+      : '';
+    const instrTag = instrumentNo
+      ? `\n        <INSTRUMENTNUMBER>${esc(instrumentNo)}</INSTRUMENTNUMBER>`
+      : '';
+    const favourTag = favouring
+      ? `\n        <PAYMENTFAVOURING>${esc(favouring)}</PAYMENTFAVOURING>`
+      : '';
+    return `    <BANKALLOCATIONS.LIST>
+      <DATE>${dt}</DATE>
+      <INSTRUMENTDATE>${instrumentDate}</INSTRUMENTDATE>
+      <NAME>${uniqueName}</NAME>
+      <TRANSACTIONTYPE>${esc(txnType)}</TRANSACTIONTYPE>${favourTag}${instrTag}
+      <STATUS>No</STATUS>
+      <PAYMENTMODE>Transacted</PAYMENTMODE>
+      <ISCONNECTEDPAYMENT>No</ISCONNECTEDPAYMENT>
+      <ISSPLIT>No</ISSPLIT>
+      <ISCONTRACTUSED>No</ISCONTRACTUSED>
+      <ISACCEPTEDWITHWARNING>No</ISACCEPTEDWITHWARNING>
+      <ISTRANSFORCED>No</ISTRANSFORCED>${denomTag}
+      <AMOUNT>${signedAmt}</AMOUNT>
+    </BANKALLOCATIONS.LIST>`;
+  };
+
+  // From = Cr (+amt); To = Dr (−amt). Attach BANKALLOCATIONS on bank legs.
+  // Deposit (cash→bank): denom on bank Dr (matches Contra_2).
+  // Withdrawal (bank→cash): bank alloc on bank Cr with cheque.
+  const fromBankAlloc = fromIsBank
+    ? makeBankAlloc(amt, kind === 'cash_withdrawal' ? 'Self' : toLedger, false)
+    : '';
+  const toBankAlloc = toIsBank
+    ? makeBankAlloc(-amt, fromLedger, kind === 'cash_deposit' && !!cashDenomStr)
+    : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <VOUCHER VCHTYPE="Contra" ACTION="Create">
-  <DATE>${tallyDate(date)}</DATE>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Contra</VOUCHERTYPENAME>
-  <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
-  <NARRATION>${narration || ''}</NARRATION>
+  ${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}
+  <REFERENCE>${esc(tdkRef || reference || '')}</REFERENCE>
+  <NARRATION>${esc(fullNarration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <PARTYLEDGERNAME>${esc(toLedger)}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${fromLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(fromLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
+${fromBankAlloc}
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${toLedger}</LEDGERNAME>
+    <LEDGERNAME>${esc(toLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
+${toBankAlloc}
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'contra', `${fromLedger} -> ${toLedger}`, parseFloat(amount)||0, req.body, xml).catch(() => null);
+  const persistPayload = {
+    ...req.body,
+    tdkRef,
+    numbering_policy,
+    entryType: isOptional ? 'optional' : 'regular',
+    fromLedger,
+    toLedger,
+    amount: amt,
+    contraKind: kind,
+    narration: fullNarration,
+    instrumentDetails: inst,
+    cashCount: cashCount && cashCount.used && cashCount.matched
+      ? cashCount
+      : (cashCount?.used ? { ...cashCount, matched: false } : null),
+    cashDenomStr,
+  };
+
+  const label = `${fromLedger} → ${toLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'contra', label, amt, persistPayload, xml).catch(() => null);
+
+  let contraUuid = null;
+  if (qId && tdkRef) {
+    const av = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'contra',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+       numbering_policy, tdkVoucherNo || null,
+       fromLedger, amt, date ? new Date(date) : null,
+       JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[contra-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    contraUuid = av?.rows?.[0]?.invoice_uuid || null;
+  }
+
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
+    let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
+    }
     const offline = result?.status === 'desktop_offline';
-    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional contra saved' : 'Contra entry created'), data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      tdkRef,
+      tdkReferenceNo: tdkRef,
+      contraUuid,
+      invoiceUuid: contraUuid,
+      voucherNumber,
+      numberingPolicy: numbering_policy,
+      message: offline ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional contra saved' : 'Contra created'),
+      data: result,
+      tallyId: result?.tallyId || null,
+    });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
-    res.status(500).json({ status: false, message: e.message });
+    res.status(500).json({ status: false, message: e.message, tdkRef });
   }
 });
 
@@ -2781,6 +2950,61 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const isReceipt = vType === 'receipt';
   const isPayment = vType === 'payment';
   const isJournal = vType === 'journal';
+  const isContra = vType === 'contra';
+
+  // ── Contra document (Source Cr → Destination Dr) ───────────────────────────
+  if (isContra) {
+    const hasNumber = !!av.tally_voucher_no;
+    const isPosted = av.books_impact_status === 'posted';
+    const numberPending = isPosted && !hasNumber;
+    const documentNumber = hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
+    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    return {
+      documentType: 'contra',
+      documentNumber,
+      documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
+      tdkRef: av.tdk_reference_no,
+      invoiceUuid: av.invoice_uuid,
+      postingTag,
+      isProvisional: !hasNumber,
+      numberPending,
+      watermarkText: numberPending
+        ? 'Posted — Tally series number pending sync'
+        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
+      numberingMode: av.numbering_policy || 'tally_prime_series',
+      company: {
+        name: companyRow?.name || p.companyName || '',
+        address: companyRow?.address || '',
+        gstin: companyRow?.gstin || '',
+        pan: companyRow?.pan || '',
+        phone: companyRow?.phone || '',
+        email: companyRow?.email || '',
+        state: companyRow?.state || '',
+      },
+      party: {
+        name: av.party_name || p.fromLedger || '',
+        address: '',
+        gstin: '',
+        pan: '',
+        phone: '',
+      },
+      totals: {
+        grandTotal: parseFloat(av.total_amount || p.amount || 0),
+      },
+      contra: {
+        fromLedger: p.fromLedger || av.party_name || '',
+        toLedger: p.toLedger || '',
+        amount: parseFloat(av.total_amount || p.amount || 0),
+        contraKind: p.contraKind || null,
+        instrumentDetails: p.instrumentDetails || null,
+        cashCount: p.cashCount || null,
+        cashDenomStr: p.cashDenomStr || null,
+      },
+      narration: p.narration || '',
+    };
+  }
 
   // ── Journal document (single Dr+Cr pair) ───────────────────────────────────
   if (isJournal) {

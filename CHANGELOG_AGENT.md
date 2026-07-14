@@ -1,5 +1,20 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-14 — Contra voucher rewrite (TDK-CON + CASHDENOMINATION)
+
+### Context
+Contra create was a thin From/To XML without TDK refs, BANKALLOCATIONS, or cash denomination. Mobile was a free-text stub.
+
+### Added / Changed
+- `POST /tally/voucher/contra`: TDK-CON / OPT-CON, `app_vouchers`, numbering, narration anchor `TDK Contra:`, BANKALLOCATIONS on bank legs, CASHDENOMINATION only when cash count used+matched (Contra_2 slot order; fold ₹200→100×2).
+- `buildVoucherDocument`: contra preview branch (from/to, kind, instrument, cashCount).
+- Ingest: Contra narration reconciler.
+
+### Files
+- `src/routes/tally-write.js`, `src/controllers/ingestProcessor.js`
+
+---
+
 ## 2026-07-14 — Journal voucher rewrite + Depreciation on Asset
 
 ### Context
