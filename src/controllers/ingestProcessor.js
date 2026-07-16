@@ -704,12 +704,14 @@ async function processVouchers(data, companyGuid) {
           .reduce((s, e) => s + Math.abs(parseFloat(e.AMOUNT || e.Amount || 0)), 0) / 2;
       }
 
+      // Hoisted so Payment/Receipt Strategy A (bill allocation) can read it after the insert try.
+      let billAlloc = null;
       try {
         // Extract dispatch / EWB details from TallyPrime XML
         const dispatchDetails = extractDispatchDetails(r);
         // Extract first bill allocation (Phase B, 2026-06-30) — used by reconciler
         // to match Receipts to parent Sales invoices via BILLTYPE=Agst Ref + NAME=TDK-SAL…
-        const billAlloc = extractFirstBillAllocation(r);
+        billAlloc = extractFirstBillAllocation(r);
 
         await client.query(`
           INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount)
@@ -892,20 +894,21 @@ async function processVouchers(data, companyGuid) {
         if (voucherNumber && voucherTypeLower.includes('payment')) {
           const partyName = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
           const payAmt = parseFloat(amount) || 0;
-          if (!partyName) return;
+          // Must continue — return would abort processVouchers mid-transaction (no COMMIT).
+          if (!partyName) continue;
 
           let payRef = null;
           let ambiguousRefs = null;
 
           // Strategy A — paired payment: parent SAL ref comes from BILLALLOCATIONS
-          if (billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name?.startsWith('TDK-')) {
+          if (billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name) {
             const { rows: candidateRows } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
                 WHERE av.company_guid    = $1
                   AND av.voucher_type    = 'payment'
-                  AND parent.tdk_reference_no = $2
+                  AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $3
                   AND ABS(av.total_amount - $4) < 1
