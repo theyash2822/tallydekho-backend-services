@@ -883,13 +883,66 @@ async function processVouchers(data, companyGuid) {
       }
 
       // ── Payment reconciliation (2026-07-14) ─────────────────────────────────
-      // Tally drops top-level <REFERENCE> on Payment; parse narration like Receipt.
+      // Tally drops top-level <REFERENCE> on Payment. Reconcile without relying on
+      // narration-based anchors by using:
+      //  1) Parent link from BILLALLOCATIONS (Agst Ref → parent SAL ref)
+      //  2) Otherwise unique (party_name + voucher_date + amount) match
       try {
         const voucherTypeLower = (voucherType || '').toLowerCase();
         if (voucherNumber && voucherTypeLower.includes('payment')) {
-          const narration = r.Narration || r.NARRATION || r.narration || '';
-          const m = narration.match(/TDK Payment:\s*(TDK-(?:OPT-)?PAY-\d{4}-\d+)/i);
-          if (m?.[1]) {
+          const partyName = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
+          const payAmt = parseFloat(amount) || 0;
+          if (!partyName) return;
+
+          let payRef = null;
+          let ambiguousRefs = null;
+
+          // Strategy A — paired payment: parent SAL ref comes from BILLALLOCATIONS
+          if (billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name?.startsWith('TDK-')) {
+            const { rows: candidateRows } = await dbQuery(
+              `SELECT av.tdk_reference_no
+                 FROM app_vouchers av
+                 JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
+                WHERE av.company_guid    = $1
+                  AND av.voucher_type    = 'payment'
+                  AND parent.tdk_reference_no = $2
+                  AND av.tally_voucher_no IS NULL
+                  AND av.party_name      = $3
+                  AND ABS(av.total_amount - $4) < 1
+                  AND av.voucher_date    = $5::date`,
+              [companyGuid, billAlloc.bill_ref_name, partyName, payAmt, date]
+            ).catch(() => ({ rows: [] }));
+
+            if (candidateRows.length === 1) {
+              payRef = candidateRows[0].tdk_reference_no;
+            } else if (candidateRows.length > 1) {
+              ambiguousRefs = candidateRows.map(c => c.tdk_reference_no);
+            }
+          }
+
+          // Strategy B — direct payment: unique (party + date + amount)
+          if (!payRef) {
+            const { rows: candidateRows2 } = await dbQuery(
+              `SELECT av.tdk_reference_no
+                 FROM app_vouchers av
+                WHERE av.company_guid    = $1
+                  AND av.voucher_type    = 'payment'
+                  AND av.tally_voucher_no IS NULL
+                  AND av.party_name      = $2
+                  AND ABS(av.total_amount - $3) < 1
+                  AND av.voucher_date    = $4::date`,
+              [companyGuid, partyName, payAmt, date]
+            ).catch(() => ({ rows: [] }));
+
+            if (candidateRows2.length === 1) {
+              payRef = candidateRows2[0].tdk_reference_no;
+              ambiguousRefs = null;
+            } else if (candidateRows2.length > 1) {
+              ambiguousRefs = candidateRows2.map(c => c.tdk_reference_no);
+            }
+          }
+
+          if (payRef) {
             const { rows: payRows } = await dbQuery(
               `UPDATE app_vouchers
                   SET tally_voucher_no    = $1,
@@ -901,12 +954,24 @@ async function processVouchers(data, companyGuid) {
                   AND voucher_type     = 'payment'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
-              [voucherNumber, m[1], companyGuid]
+              [voucherNumber, payRef, companyGuid]
             );
             if (payRows[0]) {
               emitVoucherSynced(payRows[0].company_guid, payRows[0].tdk_reference_no, voucherNumber);
-              console.log(`[reconcile] Payment synced: ${m[1]} → ${voucherNumber}`);
+              console.log(`[reconcile] Payment synced: ${payRef} → ${voucherNumber}`);
             }
+          } else if (ambiguousRefs && ambiguousRefs.length > 1) {
+            // Prevent repeated re-attempts for ambiguous matches.
+            await dbQuery(
+              `UPDATE app_vouchers
+                  SET tally_sync_status = 'needs_manual_reconciliation',
+                      sync_error        = $1,
+                      updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE tdk_reference_no = ANY($2::text[])
+                  AND company_guid     = $3
+                  AND tally_voucher_no IS NULL`,
+              [`Ambiguous payment match for party '${partyName}' (date=${date}, amount=${payAmt}) (${ambiguousRefs.length} candidates)`, ambiguousRefs, companyGuid]
+            ).catch(() => {});
           }
         }
       } catch (payRecErr) {
@@ -975,30 +1040,35 @@ async function processVouchers(data, companyGuid) {
 
       // ── Receipt reconciliation (Phase B, 2026-06-30) ─────────────────────────
 
-      // Tally drops top-level <REFERENCE> on Receipt vouchers, so the standard reconciler
-      // above never matches them. Two fallbacks (in priority order):
-      //   1. Parse narration anchor:  "TDK Receipt: <RCP-ref> | Against Invoice: <SAL-ref>"
-      //   2. Match BILLTYPE=Agst Ref + bill_ref_name = parent SAL ref (already extracted above)
-      // Either path must produce a UNIQUE match — receipts with identical date+party+amount
-      // are otherwise indistinguishable.
+      // Tally often drops top-level <REFERENCE> on Receipt vouchers and SimplifiedVoucher.xml
+      // omits BILLALLOCATIONS — so the generic REFERENCE reconciler above may not match.
+      // Fallback priority:
+      //   1. Narration anchor (legacy): "TDK Receipt: <RCP-ref> ..."
+      //   2. Bill allocation Agst Ref → parent SAL (TDK or Tally invoice number)
+      //   3. Unique Receipt match on party + date + amount (Collect Payment Now path)
       try {
         const voucherTypeLower = (voucherType || '').toLowerCase();
         if (voucherNumber && voucherTypeLower.includes('receipt')) {
           const narration = r.Narration || r.NARRATION || r.narration || '';
           const parsed = parseTdkReceiptNarration(narration);
           let rcpRef = parsed?.rcpRef || null;
+          if (!rcpRef) {
+            const m = narration.match(/TDK Receipt:\s*(TDK-(?:OPT-)?RCP-\d{4}-\d+)/i);
+            if (m?.[1]) rcpRef = m[1];
+          }
+
+          const partyName = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
+          const recAmt = parseFloat(amount) || 0;
 
           // Fallback: use bill allocation Agst Ref → lookup the unique queued receipt
-          if (!rcpRef && billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name?.startsWith('TDK-')) {
-            const partyName = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
-            const recAmt = parseFloat(amount) || 0;
+          if (!rcpRef && billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name) {
             const { rows: candidateRows } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
                 WHERE av.company_guid    = $1
                   AND av.voucher_type    = 'receipt'
-                  AND parent.tdk_reference_no = $2
+                  AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $3
                   AND ABS(av.total_amount - $4) < 1
@@ -1025,6 +1095,27 @@ async function processVouchers(data, companyGuid) {
               } catch (markErr) {
                 console.warn('[reconcile] Could not mark ambiguous receipts:', markErr.message);
               }
+            }
+          }
+
+          // Fallback: SimplifiedVoucher.xml has no REFERENCE/bill_ref — match unique Receipt
+          // by party + date + amount (must filter voucher_type=Receipt to avoid Sales collision).
+          if (!rcpRef && partyName && recAmt > 0 && date) {
+            const { rows: candidateRows2 } = await dbQuery(
+              `SELECT av.tdk_reference_no
+                 FROM app_vouchers av
+                WHERE av.company_guid    = $1
+                  AND av.voucher_type    = 'receipt'
+                  AND av.tally_voucher_no IS NULL
+                  AND av.party_name      = $2
+                  AND ABS(av.total_amount - $3) < 1
+                  AND av.voucher_date    = $4::date`,
+              [companyGuid, partyName, recAmt, date]
+            );
+            if (candidateRows2.length === 1) {
+              rcpRef = candidateRows2[0].tdk_reference_no;
+            } else if (candidateRows2.length > 1) {
+              console.warn(`[reconcile] Receipt ambiguous party/date/amount match for ${partyName}: ${candidateRows2.length} candidates`);
             }
           }
 
@@ -1141,7 +1232,7 @@ async function processVouchers(data, companyGuid) {
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
-          AND v.narration ~ ('TDK Receipt:\\s*' || av.tdk_reference_no || '\\s*\\|')
+          AND v.narration ~ ('TDK Receipt:\\s*' || av.tdk_reference_no)
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
       `, [companyGuid]);
       for (const row of rcpNarrRows) {
@@ -1220,7 +1311,8 @@ async function processVouchers(data, companyGuid) {
           JOIN app_vouchers parent  ON parent.invoice_uuid = av.parent_invoice_uuid
           JOIN vouchers v ON v.company_guid = av.company_guid
                           AND v.bill_type = 'Agst Ref'
-                          AND v.bill_ref_name = parent.tdk_reference_no
+                          AND (v.bill_ref_name = parent.tdk_reference_no
+                               OR v.bill_ref_name = parent.tally_voucher_no)
                           AND v.voucher_number IS NOT NULL
                           AND v.voucher_number != ''
                           AND v.party_name = av.party_name
@@ -1248,6 +1340,94 @@ async function processVouchers(data, companyGuid) {
       }
     } catch (rcpBillErr) {
       console.warn('[reconcile] Receipt bill-alloc reconciliation error (non-fatal):', rcpBillErr.message);
+    }
+
+    // Strategy C — unique Receipt match on party + date + amount (Collect Payment Now /
+    // SimplifiedVoucher.xml path where REFERENCE and bill_ref_name are absent).
+    try {
+      const { rows: rcpPartyRows } = await dbQuery(`
+        WITH candidates AS (
+          SELECT
+            av.company_guid,
+            av.tdk_reference_no,
+            v.voucher_number,
+            COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
+          FROM app_vouchers av
+          JOIN vouchers v ON v.company_guid = av.company_guid
+                          AND v.party_name = av.party_name
+                          AND ABS(v.amount - av.total_amount) < 1
+                          AND v.date = av.voucher_date::text
+                          AND v.voucher_type ILIKE 'Receipt%'
+                          AND v.voucher_number IS NOT NULL
+                          AND v.voucher_number != ''
+          WHERE av.company_guid    = $1
+            AND av.voucher_type    = 'receipt'
+            AND av.tally_voucher_no IS NULL
+        )
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = c.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM candidates c
+        WHERE av.tdk_reference_no = c.tdk_reference_no
+          AND av.company_guid     = c.company_guid
+          AND c.match_count       = 1
+          AND av.tally_voucher_no IS NULL
+        RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
+      `, [companyGuid]);
+      for (const row of rcpPartyRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Receipt party/date reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (rcpPartyErr) {
+      console.warn('[reconcile] Receipt party/date reconciliation error (non-fatal):', rcpPartyErr.message);
+    }
+
+    // Strategy C for Payment / Journal / Contra — unique (type + date + amount [+ party when present]).
+    // Used only when REFERENCE is still missing after Simplified/AllVoucher sync.
+    try {
+      const { rows: otherPartyRows } = await dbQuery(`
+        WITH candidates AS (
+          SELECT
+            av.company_guid,
+            av.tdk_reference_no,
+            v.voucher_number,
+            COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
+          FROM app_vouchers av
+          JOIN vouchers v ON v.company_guid = av.company_guid
+                          AND ABS(v.amount - av.total_amount) < 1
+                          AND v.date = av.voucher_date::text
+                          AND v.voucher_number IS NOT NULL
+                          AND v.voucher_number != ''
+                          AND (
+                            (av.voucher_type = 'payment' AND v.voucher_type ILIKE 'Payment%'
+                              AND (av.party_name IS NULL OR v.party_name = av.party_name))
+                            OR (av.voucher_type = 'journal' AND v.voucher_type ILIKE 'Journal%')
+                            OR (av.voucher_type = 'contra'  AND v.voucher_type ILIKE 'Contra%')
+                          )
+          WHERE av.company_guid = $1
+            AND av.voucher_type IN ('payment', 'journal', 'contra')
+            AND av.tally_voucher_no IS NULL
+        )
+        UPDATE app_vouchers av
+        SET tally_voucher_no    = c.voucher_number,
+            tally_sync_status   = 'synced',
+            books_impact_status = 'posted',
+            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+        FROM candidates c
+        WHERE av.tdk_reference_no = c.tdk_reference_no
+          AND av.company_guid     = c.company_guid
+          AND c.match_count       = 1
+          AND av.tally_voucher_no IS NULL
+        RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
+      `, [companyGuid]);
+      for (const row of otherPartyRows) {
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        console.log(`[reconcile] Voucher type/date reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
+      }
+    } catch (otherPartyErr) {
+      console.warn('[reconcile] Payment/Journal/Contra type/date reconciliation error (non-fatal):', otherPartyErr.message);
     }
 
     // Tax extraction — runs after COMMIT so ledger entries are visible

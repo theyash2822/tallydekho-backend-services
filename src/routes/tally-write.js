@@ -14,6 +14,32 @@ const require = createRequire(import.meta.url);
 let _socketService = null;
 export function setTallyWriteSocket(s) { _socketService = s; }
 
+/** Ask desktop to pull newly created voucher(s) via SingleVoucher.xml (REFERENCE + number). */
+async function requestDesktopSyncAfterWrite({ userId, companyGuid, companyName, tdkRef, tallyIds = [], extra = {} }) {
+  if (!_socketService?.connectedClients) return;
+  try {
+    const { rows: devRows } = await query(
+      'SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE ORDER BY last_seen DESC LIMIT 1',
+      [userId]
+    );
+    if (!devRows[0]?.device_id) return;
+    const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
+    if (!ds?.connected) return;
+    const ids = (Array.isArray(tallyIds) ? tallyIds : []).map(String).filter(Boolean);
+    ds.emit('sync:request', {
+      reason: 'voucher_created',
+      tdkRef,
+      companyGuid,
+      companyName,
+      tallyIds: ids,
+      ...extra,
+    });
+    console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef} (tallyIds: ${ids.join(',') || 'none — full sync'})`);
+  } catch (syncErr) {
+    console.warn('[sync:request] Could not trigger desktop sync:', syncErr.message);
+  }
+}
+
 const router = Router();
 
 // ── Helper: format date YYYYMMDD ──────────────────────────────────────────────
@@ -350,10 +376,9 @@ async function createReceiptForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP');
-  // Machine-parseable narration anchor so the reconciler can recover the RCP ref from
-  // Tally even if Tally drops <REFERENCE> on Receipt vouchers (it usually does).
-  // Format must stay stable: "TDK Receipt: <RCP-ref> | Against Invoice: <SAL-ref>"
-  const narration = `TDK Receipt: ${rcpTdkRef} | Against Invoice: ${parentTdkRef}`;
+  // Keep narration user/business-friendly (no TDK ids). Receipt reconciliation uses
+  // BILLALLOCATIONS.LIST (Agst Ref → parent SAL ref) instead.
+  const narration = 'Receipt against invoice';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -369,7 +394,7 @@ async function createReceiptForInvoice({
   <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
   <NARRATION>${narration}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <REFERENCE>${reference || parentTdkRef || ''}</REFERENCE>
+  <REFERENCE>${reference || rcpTdkRef || ''}</REFERENCE>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
     <LEDGERNAME>${partyLedger}</LEDGERNAME>
@@ -466,7 +491,9 @@ async function createPaymentForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY');
-  const narration = `TDK Payment: ${payTdkRef} | Against Invoice: ${parentTdkRef}`;
+  // Keep narration user/business-friendly (no TDK ids). Payment reconciliation uses
+  // BILLALLOCATIONS (Agst Ref) and/or unique (party+date+amount) matching.
+  const narration = 'Payment against invoice';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -482,7 +509,7 @@ async function createPaymentForInvoice({
   <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
   <NARRATION>${narration}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <REFERENCE>${reference || parentTdkRef || ''}</REFERENCE>
+  <REFERENCE>${reference || payTdkRef || ''}</REFERENCE>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
     <LEDGERNAME>${partyLedger}</LEDGERNAME>
@@ -862,34 +889,16 @@ ${topLevelDispatchXml}
 
     // After a successful Tally write (desktop online), signal desktop to sync back the new voucher.
     // This ensures app_vouchers.tally_voucher_no is populated without waiting for the next full sync.
-    if (!offline && _socketService?.connectedClients) {
-      setImmediate(async () => {
-        try {
-          const { rows: devRows } = await query(
-            'SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE ORDER BY last_seen DESC LIMIT 1',
-            [req.user.userId]
-          );
-          if (devRows[0]?.device_id) {
-            const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
-            if (ds?.connected) {
-              // Targeted single-voucher sync (2026-06-30): pass Tally MASTERIDs so desktop
-              // can fetch ONLY the new voucher(s) via SingleVoucher.xml. Falls back to full
-              // sync on the desktop side if any MASTERID is missing.
-              const tallyIds = [result?.tallyId, receiptResult?.tallyId].filter(Boolean);
-              ds.emit('sync:request', {
-                reason: 'voucher_created',
-                tdkRef,
-                companyGuid,
-                companyName,
-                tallyIds,
-                rcpTdkRef: receiptResult?.tdkRef || null,
-              });
-              console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef} (tallyIds: ${tallyIds.join(',') || 'none — full sync'})`);
-            }
-          }
-        } catch (syncErr) {
-          console.warn('[sync:request] Could not trigger desktop sync:', syncErr.message);
-        }
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId, receiptResult?.tallyId],
+          extra: { rcpTdkRef: receiptResult?.tdkRef || null },
+        });
       });
     }
     res.json({
@@ -943,8 +952,8 @@ router.post('/voucher/payment', authMiddleware, async (req, res) => {
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
-  const anchorLine = tdkRef ? `TDK Payment: ${tdkRef}` : '';
-  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+  // Keep narration user/business-friendly (no TDK ids).
+  const fullNarration = narration || '';
 
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
   const blocksRaw = Array.isArray(billAllocations) ? billAllocations : [];
@@ -1079,6 +1088,17 @@ ${bankAllocXml}
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
     const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+        });
+      });
+    }
     res.json({
       status: true,
       queued: offline,
@@ -1155,8 +1175,8 @@ router.post('/voucher/receipt', authMiddleware, async (req, res) => {
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
-  const anchorLine = tdkRef ? `TDK Receipt: ${tdkRef}` : '';
-  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+  // Keep narration user/business-friendly (no TDK ids).
+  const fullNarration = narration || '';
 
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
   // Same Advance NAME rule as Payment (Tally requires <NAME> for Advance leftover).
@@ -1276,6 +1296,17 @@ ${bankAllocXml}
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
     const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+        });
+      });
+    }
     res.json({
       status: true,
       queued: offline,
@@ -1342,8 +1373,8 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
-  const anchorLine = tdkRef ? `TDK Journal: ${tdkRef}` : '';
-  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+  // Keep narration user/business-friendly (no TDK ids).
+  const fullNarration = narration || '';
 
   // Reference XML: Dr leg ISDEEMEDPOSITIVE=Yes + negative amount; Cr = No + positive.
   const xml = `<ENVELOPE>
@@ -1424,6 +1455,17 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
     const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+        });
+      });
+    }
     res.json({
       status: true,
       queued: offline,
@@ -1484,8 +1526,8 @@ router.post('/voucher/contra', authMiddleware, async (req, res) => {
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
-  const anchorLine = tdkRef ? `TDK Contra: ${tdkRef}` : '';
-  const fullNarration = [anchorLine, narration].filter(Boolean).join(' | ');
+  // Keep narration user/business-friendly (no TDK ids).
+  const fullNarration = narration || '';
 
   // Infer kind if client omitted
   let kind = contraKind;
@@ -1651,6 +1693,17 @@ ${toBankAlloc}
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
     const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+        });
+      });
+    }
     res.json({
       status: true,
       queued: offline,
