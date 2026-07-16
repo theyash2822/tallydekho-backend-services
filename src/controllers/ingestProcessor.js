@@ -689,8 +689,20 @@ async function processVouchers(data, companyGuid) {
       const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.VoucherType || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
       const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes' || r.ISCANCELLED === true);
-      const isOptional    = !!(r.ISOPTIONAL === 1 || r.ISOPTIONAL === '1' || r.isOptional === 1 || r.isOptional === '1' || r.IsOptional === 'Yes' || r.ISOPTIONAL === 'Yes');
+      // Optional flag may arrive under several casings from Simplified / All / Single voucher XML.
+      // Track presence separately from value — a missing/empty flag must NOT mean "became regular".
+      const optionalRaw   = r.ISOPTIONAL ?? r.isOptional ?? r.IsOptional;
+      const optionalFlagPresent = optionalRaw !== undefined && optionalRaw !== null && optionalRaw !== '';
+      const isOptional    = !!(optionalRaw === 1 || optionalRaw === '1' || optionalRaw === 'Yes' || optionalRaw === true);
       const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
+      // Thin Simplified stubs historically exported isOptional=0 without FETCHing IsOptional.
+      // Never treat those as proof of Optional→Regular conversion.
+      const xmlSource     = String(r.XML || r.xml || r._XML || '');
+      const isThinSimplified = /simplified/i.test(xmlSource) || (
+        !r.Narration && !r.NARRATION && !r.narration
+        && !(r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName)
+        && !(r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries)
+      );
 
       // Calculate amount from ledger entries (positive = debit side)
       const ledgerEntries = r.ALLLEDGERENTRIES || r.AllLedgerEntries || r.AllLedgerentries || [];
@@ -728,7 +740,16 @@ async function processVouchers(data, companyGuid) {
             narration             = COALESCE(EXCLUDED.narration, vouchers.narration),
             reference             = COALESCE(EXCLUDED.reference, vouchers.reference),
             is_cancelled          = EXCLUDED.is_cancelled,
-            is_optional           = EXCLUDED.is_optional OR vouchers.is_optional,
+            -- Accept is_optional=true from any payload. Only allow demote to false from
+            -- rich syncs (AllVoucher/SingleVoucher). Thin Simplified historically sent
+            -- isOptional=0 without FETCHing IsOptional and must not wipe true.
+            is_optional           = CASE
+                                      WHEN EXCLUDED.is_optional THEN TRUE
+                                      WHEN EXCLUDED.raw_data LIKE '%"XML":"Simplified"%'
+                                        OR EXCLUDED.raw_data LIKE '%SimplifiedVoucher%'
+                                        THEN vouchers.is_optional
+                                      ELSE EXCLUDED.is_optional
+                                    END,
             alter_id              = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data              = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year        = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
@@ -825,30 +846,65 @@ async function processVouchers(data, companyGuid) {
         console.warn('[DB] Voucher insert failed:', e.message, '| guid:', guid);
       }
 
-      // ── Optional → Regular reconciliation ────────────────────────────────────────────
-      // When Tally syncs back a voucher whose reference starts with TDK-OPT- but
-      // is now regular (ISOPTIONAL not set), update app_vouchers + emit WS event.
+      // ── TDK-OPT-* number sync + Optional → Regular (guarded) ─────────────────────────
+      // Keep optional vouchers optional until Tally positively confirms conversion.
+      // Thin Simplified rows historically always sent isOptional=0 (IsOptional not FETCHed)
+      // which falsely flipped chips to Regular + Orig. Optional while Tally still had
+      // <ISOPTIONAL>Yes</ISOPTIONAL>. Never convert from Simplified-only / missing flag.
       try {
-        const ref = r.Reference || r.REFERENCE || r.reference || '';
-        if (!isOptional && ref && ref.startsWith('TDK-OPT-')) {
-          const { rows: avRows } = await dbQuery(
-            `SELECT id, current_entry_type FROM app_vouchers
-             WHERE tdk_reference_no = $1 AND company_guid = $2`,
-            [ref, companyGuid]
-          );
-          if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
-            await dbQuery(`
-              UPDATE app_vouchers
-              SET current_entry_type  = 'regular',
-                  books_impact_status = 'posted',
-                  conversion_status   = 'converted',
-                  tally_voucher_no    = COALESCE($1, tally_voucher_no),
-                  tally_sync_status   = 'synced',
-                  updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
-              WHERE id = $2
-            `, [voucherNumber, avRows[0].id]);
-            console.log(`[reconcile] Optional→Regular: ${ref} → ${voucherNumber}`);
-            emitVoucherRegularized(companyGuid, ref, voucherNumber);
+        const ref = String(r.Reference || r.REFERENCE || r.reference || '');
+        if (ref.startsWith('TDK-OPT-')) {
+          // Always attach Tally voucher number / synced status without changing entry type.
+          if (voucherNumber) {
+            const { rows: optSyncRows } = await dbQuery(
+              `UPDATE app_vouchers
+               SET tally_voucher_no    = COALESCE($1, tally_voucher_no),
+                   tally_sync_status   = 'synced',
+                   books_impact_status = CASE
+                     WHEN current_entry_type = 'optional' THEN books_impact_status
+                     ELSE 'posted'
+                   END,
+                   updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+               WHERE tdk_reference_no = $2
+                 AND company_guid     = $3
+                 AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced' OR tally_voucher_no IS DISTINCT FROM $1)
+               RETURNING company_guid, tdk_reference_no, current_entry_type`,
+              [voucherNumber, ref, companyGuid]
+            );
+            if (optSyncRows.length > 0) {
+              emitVoucherSynced(optSyncRows[0].company_guid, optSyncRows[0].tdk_reference_no, voucherNumber);
+              console.log(`[reconcile] Optional TDK voucher synced: ${ref} → ${voucherNumber} (entry=${optSyncRows[0].current_entry_type})`);
+            }
+          }
+
+          // Convert only with positive proof: flag present, value not-optional, not thin Simplified.
+          if (
+            optionalFlagPresent
+            && !isOptional
+            && !isThinSimplified
+            && voucherNumber
+          ) {
+            const { rows: avRows } = await dbQuery(
+              `SELECT id, current_entry_type FROM app_vouchers
+               WHERE tdk_reference_no = $1 AND company_guid = $2`,
+              [ref, companyGuid]
+            );
+            if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
+              await dbQuery(`
+                UPDATE app_vouchers
+                SET current_entry_type  = 'regular',
+                    books_impact_status = 'posted',
+                    conversion_status   = 'converted',
+                    tally_voucher_no    = COALESCE($1, tally_voucher_no),
+                    tally_sync_status   = 'synced',
+                    updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+                WHERE id = $2
+              `, [voucherNumber, avRows[0].id]);
+              console.log(`[reconcile] Optional→Regular: ${ref} → ${voucherNumber}`);
+              emitVoucherRegularized(companyGuid, ref, voucherNumber);
+            }
+          } else if (ref && !isOptional && isThinSimplified) {
+            console.log(`[reconcile] Skip Optional→Regular for ${ref} (thin Simplified / untrusted isOptional=0)`);
           }
         }
       } catch (reconcileErr) {
@@ -860,7 +916,8 @@ async function processVouchers(data, companyGuid) {
       // with the assigned Tally voucher number if it hasn't been set yet.
       // This fixes the bug where the Tally voucher number never came back to the app.
       try {
-        const ref2 = r.Reference || r.REFERENCE || r.reference || '';
+        // String-safe: Tally/XML parsers can emit Reference as number (same class as OPT path bug).
+        const ref2 = String(r.Reference || r.REFERENCE || r.reference || '');
         if (voucherNumber && ref2 && ref2.startsWith('TDK-') && !ref2.startsWith('TDK-OPT-')) {
           const { rows: avRegRows } = await dbQuery(
             `UPDATE app_vouchers

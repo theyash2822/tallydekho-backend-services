@@ -1,5 +1,19 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-16 — Optional→Regular false convert guard + IsOptional FETCH trust
+
+### Context
+Optional receipts still optional in Tally (`ISOPTIONAL=Yes`) were flipped to Regular + Orig. Optional in My Entries because Simplified sync exported `isOptional:0` without FETCHing `IsOptional`, and Optional→Regular treated bare 0 as conversion.
+
+### Changed
+- `ingestProcessor.js`: String-safe ref (TDK-OPT + regular TDK paths); detect optional-flag presence; skip Optional→Regular on thin Simplified; sync TDK-OPT-* voucher numbers without changing `current_entry_type`; rich payloads may demote `vouchers.is_optional`, Simplified may only promote to true.
+- Data repair (Yash Ki Company): `TDK-OPT-RCP-2026-0001/0002` reset to `current_entry_type=optional`, `conversion_status=pending`, `books_impact_status=not_posted`; `vouchers.is_optional=true`.
+
+### Files
+- `src/controllers/ingestProcessor.js`
+
+---
+
 ## 2026-07-14 — Contra voucher rewrite (TDK-CON + CASHDENOMINATION)
 
 ### Context
