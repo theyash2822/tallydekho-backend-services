@@ -912,6 +912,10 @@ async function processVouchers(data, companyGuid) {
       }
 
       // ── Regular TDK reconciliation ─────────────────────────────────────────────────────
+      // LOCKED 2026-07-16 (DECISIONS.md — universal numbering):
+      //   1) REFERENCE match (this block) — primary for all voucher types
+      //   2) Sales bill-ref  3) Batch JOIN  4) Strategy C unique-only (last resort)
+      // Forbidden as primary: narration anchors for new writes.
       // When a TDK- (non-optional) voucher syncs back from Tally, update app_vouchers
       // with the assigned Tally voucher number if it hasn't been set yet.
       // This fixes the bug where the Tally voucher number never came back to the app.

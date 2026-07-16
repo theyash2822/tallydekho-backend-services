@@ -9,6 +9,7 @@ import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 
 import { initSchema } from './db/schema.js';
+import { seedGeoMasters } from './db/seedGeo.js';
 import { startScheduler } from './services/scheduler.js';
 import { setupSocket } from './socket/socketHandler.js';
 import tallyWriteRoutes, { setTallyWriteSocket } from './routes/tally-write.js';
@@ -96,6 +97,7 @@ setApiSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()
+  .then(() => seedGeoMasters())
   .then(() => {
     httpServer.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {

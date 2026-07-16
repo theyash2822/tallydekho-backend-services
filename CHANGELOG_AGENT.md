@@ -1,5 +1,25 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-16 — Geo masters: Tally countries/states for PartyForm
+
+### Added
+- Tables `geo_countries` / `geo_states` + seed from `data/geo_tally_states.json` (171 countries, 727 divisions)
+- `GET /api/geo/countries`, `GET /api/geo/states?country=`
+- Seed on boot via `seedGeoMasters()` (idempotent)
+
+### Behavior
+- Division label from Tally “referred as” (Province / Emirate / Division / State)
+- Spellings match Tally for COUNTRYOFRESIDENCE + LEDSTATENAME
+
+---
+
+## 2026-07-16 — Lock REFERENCE-first + Strategy C in universal numbering docs
+
+Documented ordered reconcile path in DECISIONS (brain) and ingest comment header.
+No behavior change beyond comment pointer.
+
+---
+
 ## 2026-07-16 — Optional→Regular false convert guard + IsOptional FETCH trust
 
 ### Context

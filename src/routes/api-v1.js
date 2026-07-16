@@ -37,6 +37,52 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// ─── Geo masters (Tally country / state-emirate-province) ───────────────────
+// Public to authenticated users; not company-scoped (global Tally spellings).
+router.get('/geo/countries', authMiddleware, async (_req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT name, referred_as, division_label
+       FROM geo_countries
+       ORDER BY CASE WHEN name = 'India' THEN 0 ELSE 1 END, name ASC`
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.get('/geo/states', authMiddleware, async (req, res) => {
+  try {
+    const country = String(req.query.country || '').trim();
+    if (!country) {
+      return res.status(400).json({ success: false, error: { code: 'MISSING_COUNTRY', message: 'country query required' } });
+    }
+    const { rows: co } = await query(
+      `SELECT name, referred_as, division_label FROM geo_countries WHERE name = $1`,
+      [country]
+    );
+    if (!co.length) {
+      return res.json({ success: true, data: [], meta: { country, referred_as: null, division_label: 'State' } });
+    }
+    const { rows } = await query(
+      `SELECT state_name AS name FROM geo_states WHERE country_name = $1 ORDER BY state_name ASC`,
+      [country]
+    );
+    res.json({
+      success: true,
+      data: rows,
+      meta: {
+        country: co[0].name,
+        referred_as: co[0].referred_as,
+        division_label: co[0].division_label || 'State',
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ─── Product Display Name helpers ───────────────────────────────────
 
 // Fetch the company's product_display_field setting. Returns 'name' if not set.

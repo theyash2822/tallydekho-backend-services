@@ -1,0 +1,3770 @@
+{
+  "source": "Tally TCSDV3 State Detail Report",
+  "countries": [
+    {
+      "name": "India",
+      "referred_as": "States / Union Territories",
+      "division_label": "State"
+    },
+    {
+      "name": "Kenya",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Indonesia",
+      "referred_as": "Provinces / Provinsi",
+      "division_label": "Province"
+    },
+    {
+      "name": "Tanzania",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Hong Kong",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Malaysia",
+      "referred_as": "States / Negeri / Federal Territories",
+      "division_label": "State"
+    },
+    {
+      "name": "UAE",
+      "referred_as": "Emirates",
+      "division_label": "Emirate"
+    },
+    {
+      "name": "Saudi Arabia",
+      "referred_as": "Regions / Provinces",
+      "division_label": "Region"
+    },
+    {
+      "name": "Uganda",
+      "referred_as": "Districts / Regions",
+      "division_label": "District"
+    },
+    {
+      "name": "Nigeria",
+      "referred_as": "States / Federal Capital Territory",
+      "division_label": "State"
+    },
+    {
+      "name": "Sierra Leone",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Liberia",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Bangladesh",
+      "referred_as": "Divisions",
+      "division_label": "Division"
+    },
+    {
+      "name": "Ghana",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Sri Lanka",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Myanmar (Burma)",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Malawi",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Kuwait",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Sultanate of Oman",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Botswana",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Qatar",
+      "referred_as": "Municipalities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "Egypt",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "South Africa",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Thailand",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Nepal",
+      "referred_as": "Provinces / Pradesh",
+      "division_label": "Province"
+    },
+    {
+      "name": "Zambia",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Philippines",
+      "referred_as": "Regions / Provinces",
+      "division_label": "Region"
+    },
+    {
+      "name": "Kingdom of Bahrain",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Bhutan",
+      "referred_as": "Districts / Dzongkhag",
+      "division_label": "District"
+    },
+    {
+      "name": "UK",
+      "referred_as": "Countries / Counties / Councils",
+      "division_label": "Country"
+    },
+    {
+      "name": "United States of America",
+      "referred_as": "States / Territories",
+      "division_label": "State"
+    },
+    {
+      "name": "Singapore",
+      "referred_as": "No state; use District / Region if required",
+      "division_label": "No"
+    },
+    {
+      "name": "Afghanistan",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Algeria",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Angola",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Argentina",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Australia",
+      "referred_as": "States and Territories",
+      "division_label": "State"
+    },
+    {
+      "name": "Belgium",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Benin",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Bolivia",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Brazil",
+      "referred_as": "States / Estados",
+      "division_label": "State"
+    },
+    {
+      "name": "Burkina Faso",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Burundi",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Cambodia",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Cameroon",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Canada",
+      "referred_as": "Provinces and Territories",
+      "division_label": "Province"
+    },
+    {
+      "name": "Chad",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Chile",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "China",
+      "referred_as": "Provinces / Autonomous Regions / Municipalities / SARs",
+      "division_label": "Province"
+    },
+    {
+      "name": "Colombia",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Cote d'Ivoire (Ivory Coast)",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Cuba",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Czech Republic",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Dominican Republic",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Ecuador",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Ethiopia",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "France",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Germany",
+      "referred_as": "States / Bundeslander",
+      "division_label": "State"
+    },
+    {
+      "name": "Greece",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Guatemala",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Guinea",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Haiti",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Iran",
+      "referred_as": "Provinces / Ostan",
+      "division_label": "Province"
+    },
+    {
+      "name": "Italy",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Japan",
+      "referred_as": "Prefectures",
+      "division_label": "Prefecture"
+    },
+    {
+      "name": "Kazakhstan",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Madagascar",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Mali",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Mexico",
+      "referred_as": "States / Estados",
+      "division_label": "State"
+    },
+    {
+      "name": "Morocco",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Mozambique",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Netherlands",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Niger",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "North Korea (DPRK)",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Pakistan",
+      "referred_as": "Provinces / Territories",
+      "division_label": "Province"
+    },
+    {
+      "name": "Peru",
+      "referred_as": "Regions / Departments",
+      "division_label": "Region"
+    },
+    {
+      "name": "Poland",
+      "referred_as": "Voivodeships",
+      "division_label": "Voivodeship"
+    },
+    {
+      "name": "Portugal",
+      "referred_as": "Districts / Autonomous Regions",
+      "division_label": "District"
+    },
+    {
+      "name": "Republic Of The CongoDemocratic",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Romania",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Russia",
+      "referred_as": "Federal Subjects",
+      "division_label": "Federal"
+    },
+    {
+      "name": "Rwanda",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Senegal",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "South Korea (ROK)",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Spain",
+      "referred_as": "Autonomous Communities",
+      "division_label": "Region"
+    },
+    {
+      "name": "Syria",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Tunisia",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Turkey",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Ukraine",
+      "referred_as": "Oblasts / Regions",
+      "division_label": "Oblast"
+    },
+    {
+      "name": "Uzbekistan",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Vietnam",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Venezuela",
+      "referred_as": "States",
+      "division_label": "State"
+    },
+    {
+      "name": "Yemen",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Zimbabwe",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Iraq",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Sudan",
+      "referred_as": "States",
+      "division_label": "State"
+    },
+    {
+      "name": "El Salvador",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Albania",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Armenia",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Austria",
+      "referred_as": "States / Bundeslander",
+      "division_label": "State"
+    },
+    {
+      "name": "Azerbaijan",
+      "referred_as": "Districts / Rayon",
+      "division_label": "District"
+    },
+    {
+      "name": "Barbados",
+      "referred_as": "Parishes",
+      "division_label": "Parishe"
+    },
+    {
+      "name": "Belarus",
+      "referred_as": "Regions / Oblasts",
+      "division_label": "Region"
+    },
+    {
+      "name": "Belize",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Bosnia and Herzegovina",
+      "referred_as": "Entities / District",
+      "division_label": "Entity"
+    },
+    {
+      "name": "Brunei",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Bulgaria",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Cape Verde",
+      "referred_as": "Municipalities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "Central African Republic",
+      "referred_as": "Prefectures",
+      "division_label": "Prefecture"
+    },
+    {
+      "name": "Comoros",
+      "referred_as": "Autonomous Islands",
+      "division_label": "Region"
+    },
+    {
+      "name": "Costa Rica",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Croatia",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Cyprus",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Denmark",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Djibouti",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "East Timor (Timor-Leste)",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Equatorial Guinea",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Estonia",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Fiji",
+      "referred_as": "Divisions",
+      "division_label": "Division"
+    },
+    {
+      "name": "Finland",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Gabon",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Georgia",
+      "referred_as": "Regions / Autonomous Republics",
+      "division_label": "Region"
+    },
+    {
+      "name": "Guinea-Bissau",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Guyana",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Honduras",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Hungary",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Iceland",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Ireland",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Israel",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Jamaica",
+      "referred_as": "Parishes",
+      "division_label": "Parishe"
+    },
+    {
+      "name": "Jordan",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Kosovo",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Latvia",
+      "referred_as": "Municipalities / State Cities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "Lebanon",
+      "referred_as": "Governorates",
+      "division_label": "Governorate"
+    },
+    {
+      "name": "Lesotho",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Libya",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Lithuania",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Luxembourg",
+      "referred_as": "Cantons",
+      "division_label": "Canton"
+    },
+    {
+      "name": "Macau",
+      "referred_as": "Parishes / Districts",
+      "division_label": "Parishe"
+    },
+    {
+      "name": "Maldives",
+      "referred_as": "Atolls / Cities",
+      "division_label": "Atoll"
+    },
+    {
+      "name": "Malta",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Mauritania",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Mauritius",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Moldova",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Mongolia",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Montenegro",
+      "referred_as": "Municipalities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "New Zealand",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Nicaragua",
+      "referred_as": "Departments / Autonomous Regions",
+      "division_label": "Department"
+    },
+    {
+      "name": "Norway",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Panama",
+      "referred_as": "Provinces / Comarcas",
+      "division_label": "Province"
+    },
+    {
+      "name": "Papua New Guinea",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Paraguay",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Puerto Rico",
+      "referred_as": "Municipalities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "Republic Of The Congo",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "Serbia",
+      "referred_as": "Districts / Autonomous Province",
+      "division_label": "District"
+    },
+    {
+      "name": "Slovakia",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Slovenia",
+      "referred_as": "Municipalities",
+      "division_label": "Municipality"
+    },
+    {
+      "name": "Solomon Islands",
+      "referred_as": "Provinces",
+      "division_label": "Province"
+    },
+    {
+      "name": "Suriname",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "Swaziland",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Sweden",
+      "referred_as": "Counties",
+      "division_label": "County"
+    },
+    {
+      "name": "Switzerland",
+      "referred_as": "Cantons",
+      "division_label": "Canton"
+    },
+    {
+      "name": "The Bahamas",
+      "referred_as": "Districts",
+      "division_label": "District"
+    },
+    {
+      "name": "The Gambia",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Togo",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Trinidad and Tobago",
+      "referred_as": "Regions / Municipalities",
+      "division_label": "Region"
+    },
+    {
+      "name": "Turkmenistan",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Uruguay",
+      "referred_as": "Departments",
+      "division_label": "Department"
+    },
+    {
+      "name": "West Bank and Gaza",
+      "referred_as": "Administrative Division",
+      "division_label": "Division"
+    },
+    {
+      "name": "Tajikistan",
+      "referred_as": "Regions",
+      "division_label": "Region"
+    },
+    {
+      "name": "Somalia",
+      "referred_as": "States",
+      "division_label": "State"
+    }
+  ],
+  "states": [
+    {
+      "country_name": "India",
+      "state_name": "Andaman & Nicobar Islands"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Andhra Pradesh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Arunachal Pradesh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Assam"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Bihar"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Chandigarh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Chhattisgarh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Dadra & Nagar Haveli and Daman & Diu"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Delhi"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Goa"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Gujarat"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Haryana"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Himachal Pradesh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Jammu & Kashmir"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Jharkhand"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Karnataka"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Kerala"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Lakshadweep"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Madhya Pradesh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Maharashtra"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Manipur"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Meghalaya"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Mizoram"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Nagaland"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Odisha"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Puducherry"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Punjab"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Rajasthan"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Sikkim"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Tamil Nadu"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Telangana"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Tripura"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Uttarakhand"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Uttar Pradesh"
+    },
+    {
+      "country_name": "India",
+      "state_name": "West Bengal"
+    },
+    {
+      "country_name": "India",
+      "state_name": "Ladakh"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Mombasa"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kwale"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kilifi"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Tana River"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Lamu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Taita Taveta"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Garissa"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Wajir"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Mandera"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Marsabit"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Isiolo"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Meru"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Tharaka Nithi"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Embu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kitui"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Machakos"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Makueni"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nyandarua"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nyeri"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kirinyaga"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Muranga"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kiambu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Turkana"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "West Pokot"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Samburu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Trans Nzoia"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Uasin Gishu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Elgeyo-Marakwet"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nandi"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Baringo"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Laikipia"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nakuru"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Narok"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kajiado"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kericho"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Bomet"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kakamega"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Vihiga"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Bungoma"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Busia"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Siaya"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kisumu"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Homa Bay"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Migori"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Kisii"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nyamira"
+    },
+    {
+      "country_name": "Kenya",
+      "state_name": "Nairobi City"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Nanggroe Aceh Darussalam"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sumatera Utara"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sumatera Barat"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Jambi"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Riau"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kepulauan Riau"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Bengkulu"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sumatera Selatan"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kepulauan Bangka Belitung"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Lampung"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "DKI Jakarta"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Jawa Barat"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Banten"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Jawa Tengah"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "DI Yogyakarta"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Jawa Timur"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Bali"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Nusa Tenggara Barat"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Nusa Tenggara Timur"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kalimantan Barat"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kalimantan Tengah"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kalimantan Selatan"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kalimantan Timur"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Kalimantan Utara"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sulawesi Utara"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Gorontalo"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sulawesi Tengah"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sulawesi Selatan"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sulawesi Tenggara"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Sulawesi Barat"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Maluku"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Maluku Utara"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Papua"
+    },
+    {
+      "country_name": "Indonesia",
+      "state_name": "Papua Barat"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Arusha"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Dar es Salaam"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Dodoma"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Geita"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Iringa"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Kagera"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Katavi"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Kigoma"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Kilimanjaro"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Lindi"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Manyara"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Mara"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Mbeya"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Morogoro"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Mtwara"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Mwanza"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Njombe"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Pemba North"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Pemba South"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Pwani"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Rukwa"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Ruvuma"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Shinyanga"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Simiyu"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Singida"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Songwe"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Tabora"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Tanga"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Zanzibar North"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Zanzibar South"
+    },
+    {
+      "country_name": "Tanzania",
+      "state_name": "Zanzibar Urban West"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Central and Western"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Eastern"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Southern"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Wan Chai"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Kowloon City"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Kwun Tong"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Sham Shui Po"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Wong Tai Sin"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Yau Tsim Mong"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Islands"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Kwai Tsing"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "North"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Sai Kung"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Sha Tin"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Tai Po"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Tsuen Wan"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Tuen Mun"
+    },
+    {
+      "country_name": "Hong Kong",
+      "state_name": "Yuen Long"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Johor Darul Ta'zim"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Kedah Darul Aman"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Kelantan Darul Naim"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Melacca"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Negeri Sembilan Darul Khusus"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Pahang Darul Makmur"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Penang"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Perak Darul Ridzuan"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Perlis Indera Kayangan"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Sabah"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Sarawak"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Selangor Darul Ehsan"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Terengganu Darul Iman"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Kuala Lumpur"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Labuan"
+    },
+    {
+      "country_name": "Malaysia",
+      "state_name": "Putrajaya"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Abu Dhabi"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Ajman"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Dubai"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Fujairah"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Ras al-Khaimah"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Sharjah"
+    },
+    {
+      "country_name": "UAE",
+      "state_name": "Umm al-Quwain"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Riyadh"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Makkah"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Al Madinah"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Ash-Sharqiyyah"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Al-Qassim"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Tabuk"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Asir"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Ha'il"
+    },
+    {
+      "country_name": "Saudi Arabia",
+      "state_name": "Najran"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Abim"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Adjumani"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Agago"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Alebtong"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Amolatar"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Amudat"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Amuria"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Amuru"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Apac"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Arua"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Budaka"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bududa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bugiri"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Buikwe"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bukedea"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bukomansimbi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bukwo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bulambuli"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Buliisa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bundibugyo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Bushenyi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Busia"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Butaleja"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Butambala"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Buvuma"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Buyende"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Dokolo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Gomba"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Gulu"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Hoima"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Ibanda"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Iganga"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Isingiro"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Jinja"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kaabong"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kabale"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kabarole"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kaberamaido"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kalangala"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kaliro"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kalungu"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kampala"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kamuli"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kamwenge"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kanungu"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kapchorwa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kasese"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Katakwi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Katerere"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kayunga"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kibaale"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kibingo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kiboga"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kibuku"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kiruhura"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kiryandongo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kisoro"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kitgum"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Koboko"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kole"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kotido"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kumi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kween"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kyankwanzi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kyegegwa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Kyenjojo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Lamwo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Lira"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Luuka"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Luwero"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Lwengo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Lyantonde"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Manafwa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Maracha"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Masaka"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Masindi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mayuge"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mbale"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mbarara"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mitooma"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mityana"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Moroto"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Moyo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mpigi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mubende"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Mukono"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nakapiripirit"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nakaseke"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nakasongola"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Namiyango"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Namutumba"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Napak"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nebbi"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Ngora"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nsiika"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Ntoroko"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Ntungamo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Nwoya"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Otuke"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Oyam"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Pader"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Pallisa"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Rakai"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Rukungiri"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Serere"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Sironko"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Soroti"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Ssembabule"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Tororo"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Wakiso"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Yumbe"
+    },
+    {
+      "country_name": "Uganda",
+      "state_name": "Zombo"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Abia"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Adamawa"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Anambra"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Akwa Ibom"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Bauchi"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Bayelsa"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Benue"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Borno"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Cross River"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Delta"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Ebonyi"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Enugu"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Edo"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Ekiti"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Gombe"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Imo"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Jigawa"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Kaduna"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Kano"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Katsina"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Kebbi"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Kogi"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Kwara"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Lagos"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Nasarawa"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Niger"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Ogun"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Ondo"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Osun"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Oyo"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Plateau"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Rivers"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Sokoto"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Taraba"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Yobe"
+    },
+    {
+      "country_name": "Nigeria",
+      "state_name": "Zamfara"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Kailahun"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Kenema"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Kono"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Bombali"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Kambia"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Koinadugu"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Port Loko"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Tonkolili"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Bo"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Bonthe"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Moyamba"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Pujehun"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Western Rural"
+    },
+    {
+      "country_name": "Sierra Leone",
+      "state_name": "Western Urban"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Bomi"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Bong"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Gbarpolu"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Grand Bassa"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Grand Cape Mount"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Grand Gedeh"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Grand Kru"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Lofa"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Margibi"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Maryland"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Montserrado"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Nimba"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Rivercess"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "River Gee"
+    },
+    {
+      "country_name": "Liberia",
+      "state_name": "Sinoe"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Rangpur"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Rajshahi"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Mymesingh"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Sylhet"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Dhaka"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Khulna"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Barisal"
+    },
+    {
+      "country_name": "Bangladesh",
+      "state_name": "Chittagong"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Ashanti"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Brong Ahafo"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Central"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Eastern"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Greater Accra"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Northern"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Upper East"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Upper West"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Volta"
+    },
+    {
+      "country_name": "Ghana",
+      "state_name": "Western"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Jaffna"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Kilinochchi"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Mannar"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Mullaitivu"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Vavuniya"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Puttalam"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Kurunegala"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Gampaha"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Colombo"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Kalutara"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Anuradhapura"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Polonnaruwa"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Matale"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Kandy"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Nuwara Eliya"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Kegalle"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Ratnapura"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Trincomalee"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Batticaloa"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Ampara"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Badulla"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Monaragala"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Hambantota"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Matara"
+    },
+    {
+      "country_name": "Sri Lanka",
+      "state_name": "Galle"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Ayeyarwady"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Bago"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Chin"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Kachin"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Kayah"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Kayin"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Magway"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Mandalay"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Mon"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Rakhine"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Shan"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Sagaing"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Tanintharyi"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Yangon"
+    },
+    {
+      "country_name": "Myanmar (Burma)",
+      "state_name": "Naypyidaw"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Dedza"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Dowa"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Kasungu"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Lilongwe"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Mchinji"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Nkhotakota"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Ntcheu"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Ntchisi"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Salima"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Chitipa"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Karonga"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Likoma"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Mzimba"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Nkhata Bay"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Rumphi"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Balaka"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Blantyre"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Chikwawa"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Chiradzulu"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Machinga"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Mangochi"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Mulanje"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Mwanza"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Nsanje"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Thyolo"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Phalombe"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Zomba"
+    },
+    {
+      "country_name": "Malawi",
+      "state_name": "Neno"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Al Ahmadi"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Al Farwaniyah"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Al Jahra"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Al Asimah"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Mubarak Al-Kabeer"
+    },
+    {
+      "country_name": "Kuwait",
+      "state_name": "Hawalli"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Muscat"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Dhofar"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Musandam"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Buraimi"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Dakhiliyah"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Batinah North"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Batinah South"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Shariyah North"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Shariyah South"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Dhahira"
+    },
+    {
+      "country_name": "Sultanate of Oman",
+      "state_name": "Al Wusta"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Central"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Chobe"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Francistown"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Gaborone"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Ghanzi"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Jwaneng"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Kgalagadi"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Kgatleng"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Kweneng"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Lobatse"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Ngamiland"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "North-East"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Orapa"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Selebi-Phikwe"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "South-East"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Southern"
+    },
+    {
+      "country_name": "Botswana",
+      "state_name": "Sowa"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Ad Dawhah"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Al Khawr wa adh Dhakhirah"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Al Wakrah"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Ar Rayyan"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Ash Shamal"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Ash Shahaniyah"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Az Zaayin"
+    },
+    {
+      "country_name": "Qatar",
+      "state_name": "Umm Salal"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Alexandria"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Aswan"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Asyut"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Beheira"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Beni Suef"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Cairo"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Dakahlia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Damietta"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Faiyum"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Gharbia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Giza"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Ismailia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Kafr El Sheikh"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Luxor"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Matruh"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Minya"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Monufia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "New Valley"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "North Sinai"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Port Said"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Qalyubia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Qena"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Red Sea"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Sharqia"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Sohag"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "South Sinai"
+    },
+    {
+      "country_name": "Egypt",
+      "state_name": "Suez"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Eastern Cape"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Free State"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Gauteng"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "KwaZulu-Natal"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Limpopo"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Mpumalanga"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "North West"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Northern Cape"
+    },
+    {
+      "country_name": "South Africa",
+      "state_name": "Western Cape"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Amnat Charoen"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Ang Thong"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Bangkok"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Bueng Kan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Buriram"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chachoengsao"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chai Nat"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chaiyaphum"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chanthaburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chiang Mai"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chiang Rai"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chonburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Chumphon"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Kalasin"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Kamphaeng Phet"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Kanchanaburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Khon Kaen"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Krabi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Lampang"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Lamphun"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Loei"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Lopburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Mae Hong Son"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Maha Sarakham"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Mukdahan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Nayok"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Pathom"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Phanom"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Ratchasima"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Sawan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nakhon Si Thammarat"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Narathiwat"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nong Bua Lam Phu"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nong Khai"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Nonthaburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Pathum Thani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Pattani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phang Nga"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phatthalung"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phayao"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phetchabun"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phetchaburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phichit"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phitsanulok"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phra Nakhon Si Ayutthaya"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phrae"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Phuket"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Prachinburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Prachuap Khiri Khan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Ranong"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Ratchaburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Rayong"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Roi Et"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Sa Kaeo"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Sakon Nakhon"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Samut Prakan"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Samut Sakhon"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Samut Songkhram"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Saraburi"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Satun"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Sing Buri"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Sisaket"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Songkhla"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Sukhothai"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Suphan Buri"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Surat Thani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Surin"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Tak"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Trang"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Trat"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Ubon Ratchathani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Udon Thani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Uthai Thani"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Uttaradit"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Yala"
+    },
+    {
+      "country_name": "Thailand",
+      "state_name": "Yasothon"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Koshi"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Janakpur"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Bagmati"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Gandaki"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Lumbini"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Karnali"
+    },
+    {
+      "country_name": "Nepal",
+      "state_name": "Far West"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Central"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Copperbelt"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Eastern"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Luapula"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Lusaka"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Muchinga"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "North-Western"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Northern"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Southern"
+    },
+    {
+      "country_name": "Zambia",
+      "state_name": "Western"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "National Capital Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Ilocos Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Cordillera Administrative Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Cagayan Valley"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Central Luzon"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Calabarzon"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Southwestern Tagalog Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Bicol Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Western Visayas"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Central Visayas"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Eastern Visayas"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Zamboanga Peninsula"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Northern Mindanao"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Davao Region"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Soccsksargen"
+    },
+    {
+      "country_name": "Philippines",
+      "state_name": "Caraga Region"
+    },
+    {
+      "country_name": "Kingdom of Bahrain",
+      "state_name": "Capital"
+    },
+    {
+      "country_name": "Kingdom of Bahrain",
+      "state_name": "Northern"
+    },
+    {
+      "country_name": "Kingdom of Bahrain",
+      "state_name": "Southern"
+    },
+    {
+      "country_name": "Kingdom of Bahrain",
+      "state_name": "Muharraq"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Bumthang"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Chukha"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Dagana"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Gasa"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Haa"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Lhuntse"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Mongar"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Paro"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Pemagatshel"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Punakha"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Samdrup Jongkhar"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Samtse"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Sarpang"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Thimphu"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Trashigang"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Trashiyangtse"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Trongsa"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Tsirang"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Wangdue Phodrang"
+    },
+    {
+      "country_name": "Bhutan",
+      "state_name": "Zhemgang"
+    },
+    {
+      "country_name": "UK",
+      "state_name": "England"
+    },
+    {
+      "country_name": "UK",
+      "state_name": "Scotland"
+    },
+    {
+      "country_name": "UK",
+      "state_name": "Northern Ireland"
+    },
+    {
+      "country_name": "UK",
+      "state_name": "Wales"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Alabama"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Alaska"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Arizona"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Arkansas"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "California"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Colorado"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Connecticut"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Delaware"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Florida"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Georgia"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Hawaii"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Idaho"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Illinois"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Indiana"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Iowa"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Kansas"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Kentucky"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Louisiana"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Maine"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Maryland"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Massachusetts"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Michigan"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Minnesota"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Mississippi"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Missouri"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Montana"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Nebraska"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Nevada"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "New Hampshire"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "New Jersey"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "New Mexico"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "New York"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "North Carolina"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "North Dakota"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Ohio"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Oklahoma"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Oregon"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Pennsylvania"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Rhode Island"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "South Carolina"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "South Dakota"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Tennessee"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Texas"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Utah"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Vermont"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Virginia"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Washington"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "West Virginia"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Wisconsin"
+    },
+    {
+      "country_name": "United States of America",
+      "state_name": "Wyoming"
+    }
+  ]
+}

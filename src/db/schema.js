@@ -915,6 +915,22 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_tdk     ON invoice_pdf_versions(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_company ON invoice_pdf_versions(company_guid);
 
+      -- ── Geo masters (Tally country / state-emirate-province list) ───────────
+      -- Seeded from data/geo_tally_states.json (TCSDV3 export). Spellings must
+      -- match Tally exactly for LEDSTATENAME / COUNTRYOFRESIDENCE.
+      CREATE TABLE IF NOT EXISTS geo_countries (
+        name            TEXT PRIMARY KEY,
+        referred_as     TEXT,
+        division_label  TEXT NOT NULL DEFAULT 'State',
+        created_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE TABLE IF NOT EXISTS geo_states (
+        country_name    TEXT NOT NULL REFERENCES geo_countries(name) ON DELETE CASCADE,
+        state_name      TEXT NOT NULL,
+        PRIMARY KEY (country_name, state_name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_geo_states_country ON geo_states(country_name);
+
       -- ── Company Compliance Config (E-Invoice, E-Way Bill, Numbering Policy) ──
       CREATE TABLE IF NOT EXISTS company_compliance_config (
         company_guid            TEXT PRIMARY KEY REFERENCES companies(guid) ON DELETE CASCADE,
