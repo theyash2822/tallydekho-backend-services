@@ -1819,7 +1819,7 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName,
     name: _name, partyName,
-    parent = 'Sundry Debtors', address = '', state = '',
+    parent: _parent, address = '', state = '',
     country = 'India', gstin = '', email = '', phone = '', website = '',
     gstRegType: _gstRegType, gstType,
     pincode = '', isBillWise = 'Yes',
@@ -1828,10 +1828,17 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     bankDetails = null,
     vatDetails = null,
     pan = '',
+    ledger_type,
+    dutyCategory, dutyType, dutyTaxType,
+    taxType: bodyTaxType,
+    percentage, dutyPercentage,
   } = req.body;
 
   const name = _name || partyName;
-  const gstRegType = _gstRegType || gstType || 'Regular';
+  const isDutiesLedger = ledger_type === 'duties_taxes'
+    || /duties\s*&\s*taxes/i.test(String(_parent || ''));
+  const parent = _parent || (isDutiesLedger ? 'Duties & Taxes' : 'Sundry Debtors');
+  const gstRegType = isDutiesLedger ? '' : (_gstRegType || gstType || 'Regular');
   const mailingName = _mailingName || name;
 
   if (!companyGuid || !name) {
@@ -1852,7 +1859,29 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     'SEZ':                   'SEZ',
     'Overseas':              'Overseas',
   };
-  const gstRegTypeFinal = gstTypeMap[gstRegType] || gstRegType;
+  const gstRegTypeFinal = gstRegType ? (gstTypeMap[gstRegType] || gstRegType) : '';
+
+  // Duties & Taxes statutory fields (Tally Prime: Type of Duty/Tax + conditional Tax type)
+  const dutyCategoryRaw = dutyCategory || dutyTaxType || dutyType || '';
+  const taxTypeRaw      = bodyTaxType || '';
+  const ratePct         = parseFloat(percentage ?? dutyPercentage ?? 0) || 0;
+  const GST_DUTY_HEAD_MAP = {
+    IGST:         'Integrated Tax',
+    CGST:         'Central Tax',
+    'SGST/UTGST': 'State Tax',
+    Cess:         'Cess',
+  };
+  const resolvedDutyHead = GST_DUTY_HEAD_MAP[taxTypeRaw] || taxTypeRaw;
+  let dutiesXml = '';
+  if (isDutiesLedger && dutyCategoryRaw) {
+    dutiesXml = `
+<ISBEHAVEASDUTY>Yes</ISBEHAVEASDUTY>
+<TAXTYPE>${escapeXml(dutyCategoryRaw)}</TAXTYPE>`;
+    if (taxTypeRaw && (dutyCategoryRaw === 'GST' || dutyCategoryRaw === 'Others')) {
+      dutiesXml += `\n<GSTDUTYHEAD>${escapeXml(resolvedDutyHead)}</GSTDUTYHEAD>`;
+    }
+    dutiesXml += `\n<RATEOFTAXCALCULATION>${ratePct.toFixed(2)}</RATEOFTAXCALCULATION>`;
+  }
 
   // Build address lines — split multiline string into separate ADDRESS tags
   const addressLines = address
@@ -1969,6 +1998,7 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
 <LEDGER NAME="${escapeXml(name)}" ACTION="Create">
 <NAME>${escapeXml(name)}</NAME>
 <PARENT>${escapeXml(parent)}</PARENT>
+${dutiesXml}
 <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME></MAILINGNAME.LIST>
 ${addressXml}
 ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`                 : ''}
@@ -1978,7 +2008,7 @@ ${state   ? `<LEDSTATENAME>${escapeXml(state)}</LEDSTATENAME>`         : ''}
 ${state   ? `<STATENAME>${escapeXml(state)}</STATENAME>`               : ''}
 ${state   ? `<PRIORSTATENAME>${escapeXml(state)}</PRIORSTATENAME>`     : ''}
 ${state   ? `<PLACEOFSUPPLY>${escapeXml(state)}</PLACEOFSUPPLY>`       : ''}
-<GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>
+${!isDutiesLedger && gstRegTypeFinal ? `<GSTREGISTRATIONTYPE>${escapeXml(gstRegTypeFinal)}</GSTREGISTRATIONTYPE>` : ''}
 ${gstin ? `<PARTYGSTIN>${escapeXml(gstin)}</PARTYGSTIN>`             : ''}
 ${pan   ? `<INCOMETAXNUMBER>${escapeXml(pan)}</INCOMETAXNUMBER>`     : ''}
 ${phone ? `<LEDGERMOBILE>${escapeXml(phone)}</LEDGERMOBILE>`         : ''}
@@ -2008,13 +2038,14 @@ ${mailingDetailsXml}
     // Immediately insert into local ledgers table so getParties returns it
     // without waiting for the next Tally sync. Tally sync will overwrite with real GUID.
     // Immediate insert — skip if a ledger with same name already exists (prevents duplicate before sync)
+    const balanceType = isCr ? 'Cr' : 'Dr';
     query(
       `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, state_name, pincode, gst_registration_type, opening_balance, closing_balance, balance_type)
-       SELECT gen_random_uuid()::text, $1, $2, 'Sundry Debtors', $3, $4, $5, $6, $7, $8, $9, $9, 'Dr'
+       SELECT gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11
        WHERE NOT EXISTS (
          SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
        )`,
-      [companyGuid, name, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt]
+      [companyGuid, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType]
     ).catch((e) => { console.warn('[party-immediate-insert]', e.message); }); // fire-and-forget, don't block response
 
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
