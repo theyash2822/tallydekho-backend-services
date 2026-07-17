@@ -1832,13 +1832,19 @@ router.post('/master/party', authMiddleware, async (req, res) => {
     dutyCategory, dutyType, dutyTaxType,
     taxType: bodyTaxType,
     percentage, dutyPercentage,
+    // Sales/Purchase/Income/Expense GST ledger fields (Custom Groups)
+    gstApplicable, typeOfSupply, taxability, hsnCode,
+    igstRate = 0, cgstRate = 0, sgstRate = 0,
+    inventoryValuesAffected,
   } = req.body;
 
   const name = _name || partyName;
   const isDutiesLedger = ledger_type === 'duties_taxes'
     || /duties\s*&\s*taxes/i.test(String(_parent || ''));
   const parent = _parent || (isDutiesLedger ? 'Duties & Taxes' : 'Sundry Debtors');
-  const gstRegType = isDutiesLedger ? '' : (_gstRegType || gstType || 'Regular');
+  // Party GST registration only when explicitly sent (Sales Add Customer / PartyForm).
+  // Do NOT default Regular — Cash/Bank/P&L custom ledgers must not get LEDGSTREGDETAILS.
+  const gstRegType = isDutiesLedger ? '' : (_gstRegType || gstType || '');
   const mailingName = _mailingName || name;
 
   if (!companyGuid || !name) {
@@ -1895,6 +1901,39 @@ router.post('/master/party', authMiddleware, async (req, res) => {
   // PARTYGSTIN alone is a computed field and is ignored on import; must use LEDGSTREGDETAILS.LIST
   // Field names confirmed: GSTREGISTRATIONTYPE (not REGISTRATIONTYPE), direct <GSTIN> tag (not GSTIN.LIST)
   const _gstDate = (() => { const d = new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; })();
+
+  // Sales / Purchase / Income / Expense GST ledger block (grafted from stock-item pattern)
+  const ledgerGstAppl = gstApplicable
+    || ((parseFloat(igstRate) > 0 || parseFloat(cgstRate) > 0 || parseFloat(sgstRate) > 0) ? 'Applicable' : '');
+  let ledgerGstXml = '';
+  if (ledgerGstAppl && !isDutiesLedger) {
+    ledgerGstXml = `\n<GSTAPPLICABLE>${escapeXml(ledgerGstAppl)}</GSTAPPLICABLE>`;
+    if (typeOfSupply) {
+      ledgerGstXml += `\n<GSTTYPEOFSUPPLY>${escapeXml(typeOfSupply)}</GSTTYPEOFSUPPLY>`;
+    }
+    if (inventoryValuesAffected) {
+      ledgerGstXml += `\n<INVENTORYVALUESAREFFECTED>${escapeXml(inventoryValuesAffected)}</INVENTORYVALUESAREFFECTED>`;
+    }
+    if (ledgerGstAppl === 'Applicable' && (hsnCode || taxability || igstRate || cgstRate || sgstRate)) {
+      const _ig = parseFloat(igstRate) || 0;
+      const _cg = parseFloat(cgstRate) || (_ig ? _ig / 2 : 0);
+      const _sg = parseFloat(sgstRate) || (_ig ? _ig / 2 : 0);
+      const taxabilityFinal = taxability || 'Taxable';
+      ledgerGstXml += `
+<GSTDETAILS.LIST>
+  <APPLICABLEFROM>${_gstDate}</APPLICABLEFROM>
+  ${hsnCode ? `<HSNCODE>${escapeXml(hsnCode)}</HSNCODE>` : ''}
+  <TAXABILITY>${escapeXml(taxabilityFinal)}</TAXABILITY>
+  <STATEWISEDETAILS.LIST>
+    <STATENAME>Any State</STATENAME>
+    <RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${_ig}</GSTRATE></RATEDETAILS.LIST>
+    <RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${_cg}</GSTRATE></RATEDETAILS.LIST>
+    <RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${_sg}</GSTRATE></RATEDETAILS.LIST>
+  </STATEWISEDETAILS.LIST>
+</GSTDETAILS.LIST>`;
+    }
+  }
+
   const gstDetailsXml = gstRegTypeFinal ? `
 <LEDGSTREGDETAILS.LIST>
   <APPLICABLEFROM>${_gstDate}</APPLICABLEFROM>
@@ -1999,6 +2038,7 @@ ${(bankDetails.beneficiaryName || bankDetails.accountHolderName) ? `  <BANKACCHO
 <NAME>${escapeXml(name)}</NAME>
 <PARENT>${escapeXml(parent)}</PARENT>
 ${dutiesXml}
+${ledgerGstXml}
 <MAILINGNAME.LIST TYPE="String"><MAILINGNAME>${escapeXml(mailingName)}</MAILINGNAME></MAILINGNAME.LIST>
 ${addressXml}
 ${pincode ? `<PINCODE>${escapeXml(pincode)}</PINCODE>`                 : ''}
