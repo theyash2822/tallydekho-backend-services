@@ -778,6 +778,7 @@ ${topLevelDispatchXml}
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
       <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
+      ${req.body.againstOrderNo ? `<ORDERNO>${req.body.againstOrderNo}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${itemAmt}</AMOUNT>
       <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
       <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
@@ -1727,14 +1728,37 @@ ${toBankAlloc}
 // ── POST /tally/voucher/sales-order ──────────────────────────────────────────
 router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, reference, narration,
-    partyLedger, totalAmount, items = [], taxes = [], isOptional = true,
+    companyGuid, companyName, date, dueDate, voucherNumber, reference, narration,
+    partyLedger, totalAmount,
+    items = [],
+    taxes = [],
+    logistics = [],
+    isOptional = false,
+    original_entry_type = 'regular',
+    numbering_policy = 'tally_prime_series',
+    termsText,
   } = req.body;
 
-  // Sales Order is always optional by default (quotation/order)
+  if (!companyGuid || !partyLedger || !items.length) {
+    return res.status(400).json({ status: false, message: 'companyGuid, partyLedger and items required' });
+  }
+
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(totalAmount) || 0;
   const dt = tallyDate(date);
+  const dueDt = dueDate ? tallyDate(dueDate) : dt;
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'SOR').catch(() => null);
+
+  let tdkOrderNo = null;
+  let effectiveVoucherNumber = voucherNumber || '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'SOR').catch(() => null);
+    if (tdkOrderNo) effectiveVoucherNumber = tdkOrderNo;
+  }
+
+  // Persist terms in payload for preview/share; narration stays clean for Tally
+  const persistPayload = { ...req.body, termsText: termsText || req.body.termsText || '' };
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -1749,22 +1773,27 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
   <VOUCHERTYPENAME>Sales Order</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER>
-  <REFERENCE>${reference || ''}</REFERENCE>
+  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
+  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
+  <ISPOSTDATED>No</ISPOSTDATED>
+  <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${narration || ''}</NARRATION>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
     <LEDGERNAME>${partyLedger}</LEDGERNAME>
     <AMOUNT>${-amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
   for (const item of items) {
     const itemAmt = parseFloat(item.amount) || 0;
+    const orderNoTag = effectiveVoucherNumber || '';
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -1774,15 +1803,17 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
     <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
     <RATE>${item.rate || 0}</RATE>
     <ACCOUNTINGALLOCATIONS.LIST>
+      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <LEDGERFROMITEM>No</LEDGERFROMITEM>
       <LEDGERNAME>${item.salesLedger || 'Sales Account GST'}</LEDGERNAME>
       <AMOUNT>${itemAmt}</AMOUNT>
     </ACCOUNTINGALLOCATIONS.LIST>
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
       <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      <ORDERNO>${voucherNumber || '1'}</ORDERNO>
-      <ORDERDUEDATE>${dt}</ORDERDUEDATE>
+      ${orderNoTag ? `<ORDERNO>${orderNoTag}</ORDERNO>` : '<ORDERNO/>'}
+      <ORDERDUEDATE>${dueDt}</ORDERDUEDATE>
       <AMOUNT>${itemAmt}</AMOUNT>
       <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
       <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
@@ -1791,25 +1822,97 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
   }
 
   for (const tax of taxes) {
+    if (!tax.ledgerName) continue;
     xml += `
   <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
     <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
-    <AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT>
-    <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE>
+    <AMOUNT>${parseFloat(tax.taxAmount) || 0}</AMOUNT>
+    <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue) || 0}</VATASSESSABLEVALUE>
   </LEDGERENTRIES.LIST>`;
   }
 
-  xml += `\n</VOUCHER>\n</TALLYMESSAGE>\n</REQUESTDATA>\n</IMPORTDATA></BODY></ENVELOPE>`;
+  for (const lg of logistics) {
+    if (!lg.ledgerName) continue;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    for (const lt of (lg.taxes || [])) {
+      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
+      xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    }
+  }
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'sales_order', partyLedger, amt, req.body, xml).catch(() => null);
+  xml += `
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const label = `${partyLedger}${effectiveVoucherNumber ? ' #' + effectiveVoucherNumber : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'sales_order', label, amt, persistPayload, xml).catch(() => null);
+
+  let orderUuid = null;
+  if (qId && tdkRef) {
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'sales_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, original_entry_type,
+       numbering_policy,
+       tdkOrderNo || null,
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[app_vouchers] sales_order insert failed:', e.message); return { rows: [] }; });
+    orderUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+  }
+
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
-    res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Sales order created', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
+    if (!offline && orderUuid) {
+      await query(
+        `UPDATE app_vouchers SET tally_sync_status='synced', books_impact_status='posted'
+         WHERE invoice_uuid=$1`,
+        [orderUuid]
+      ).catch(() => {});
+    }
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      message: offline ? 'Saved. Will push when desktop connects.' : 'Sales order created',
+      data: result,
+      tdkReferenceNo: tdkRef,
+      voucherNumber: tdkOrderNo || result?.voucherNumber || null,
+      tallyId: result?.tallyId || null,
+      invoiceUuid: orderUuid,
+      numbering_policy,
+    });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
+    if (orderUuid) {
+      await query(
+        `UPDATE app_vouchers SET tally_sync_status='failed' WHERE invoice_uuid=$1`,
+        [orderUuid]
+      ).catch(() => {});
+    }
     res.status(500).json({ status: false, message: e.message });
   }
 });
@@ -2322,17 +2425,315 @@ router.post('/voucher/cancel', authMiddleware, async (req, res) => {
 });
 
 router.post('/master/stock-item', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, name, groupName, category = '', unit = 'Nos', openingQty = 0, openingRate = 0, hsnCode = '', igstRate = 0, cgstRate = 0, sgstRate = 0 } = req.body;
-  if (!companyGuid || !name) return res.status(400).json({ status: false, message: 'name required' });
-  if (!groupName) return res.status(400).json({ status: false, message: 'groupName required — select a stock group from your Tally groups' });
-  const openVal = parseFloat(openingQty) * parseFloat(openingRate);
+  const {
+    companyGuid, companyName,
+    name, groupName,
+    category = '', unit = 'Nos',
+    openingQty = 0, openingRate = 0,
+    warehouse = '',
+    hsnCode = '',
+    igstRate = 0, cgstRate = 0, sgstRate = 0,
+    numbering_policy = 'tally_prime_series',
+    date,
+    // Optional barcode-on-create (Add Item → Generate Barcode toggle)
+    generateBarcode = false,
+    salePrice = 0,
+    barcodeLabel = null, // { itemName?, sku?, salePrice? } — label print prefs
+    barcodeType = 'CODE128',
+    barcodeSyncTarget = 'app_only',
+  } = req.body;
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!name) return res.status(400).json({ status: false, message: 'name required' });
+  const effectiveGroup = String(groupName || '').trim();
+  if (!effectiveGroup) return res.status(400).json({ status: false, message: 'groupName required' });
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const parentXml = `<PARENT>${esc(effectiveGroup)}</PARENT>`;
+
+  const qty = Math.max(0, Math.abs(parseFloat(openingQty) || 0));
+  const rate = Math.max(0, parseFloat(openingRate) || 0);
+  const openVal = qty * rate;
   const gstAppl = (igstRate > 0 || cgstRate > 0) ? 'Applicable' : 'Not Applicable';
-  const openXml = openingQty > 0 ? `<OPENINGBALANCE>${openingQty} ${unit}</OPENINGBALANCE><OPENINGRATE>${openingRate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '';
+  // If warehouse is provided, we will create godown-wise stock via Physical Stock voucher.
+  // Otherwise, keep Tally STOCKITEM opening balance (single/implicit godown behavior).
+  const godownOpening = qty > 0 && !!String(warehouse || '').trim();
+  const openXml = godownOpening
+    ? ''
+    : (qty > 0 ? `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '');
   const _today = new Date(); const _appFrom = `${_today.getFullYear()}${String(_today.getMonth()+1).padStart(2,'0')}${String(_today.getDate()).padStart(2,'0')}`;
   const gstXml = hsnCode ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM><HSNCODE>${hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME><PARENT>${groupName}</PARENT>${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml).catch(() => null);
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item created in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
+  try {
+    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, r, null);
+    const offItem = r?.status === 'desktop_offline';
+
+    // Optional: create godown-wise opening using Physical Stock.
+    // This fixes the "added item in different warehouse still shows in Main" issue.
+    let offOpening = false;
+    let openingQueueId = null;
+    let openingError = null;
+
+    if (godownOpening) {
+      const godown = String(warehouse || '').trim();
+      const dt = tallyDate(date || new Date().toISOString().slice(0, 10));
+      const narration = `Opening Balance | ${name} @ ${godown}`;
+      const tdkRef = await generateTDKReference(companyGuid, false, 'PHY').catch(() => null);
+      let tdkVoucherNo = null;
+      let effectiveVoucherNumber = '';
+      if (numbering_policy === 'tallydekho_series') {
+        tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY').catch(() => null);
+        if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+      }
+
+      const absQty = Math.max(0, qty);
+      const physicalXml =
+        `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC>` +
+        `<REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>` +
+        `</REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">` +
+        `<VOUCHER VCHTYPE="Physical Stock" ACTION="Create">` +
+        `<VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME>` +
+        `<DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE>` +
+        `${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}` +
+        `<REFERENCE>${esc(tdkRef || '')}</REFERENCE><ISOPTIONAL>No</ISOPTIONAL>` +
+        `<NARRATION>${esc(narration)}</NARRATION>` +
+        `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>` +
+        `<STOCKITEMNAME>${esc(name)}</STOCKITEMNAME>` +
+        `<ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY>` +
+        `<RATE>0</RATE><AMOUNT>0</AMOUNT>` +
+        `<BATCHALLOCATIONS.LIST><GODOWNNAME>${esc(godown)}</GODOWNNAME>` +
+        `<ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><AMOUNT>0</AMOUNT>` +
+        `</BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>` +
+        `</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+
+      const persistPayload = {
+        ...req.body,
+        tdkRef,
+        numbering_policy,
+        stockName: name,
+        warehouse: godown,
+        adjustmentReason: 'Opening Balance',
+        adjustmentDirection: null,
+        adjustmentQty: qty,
+        qtyBefore: 0,
+        qtyChange: qty,
+        qtyAfter: qty,
+        isIncrease: true,
+        unit,
+        note: '',
+        narration,
+        date: date || new Date().toISOString().slice(0, 10),
+      };
+
+      const label = `Opening Balance: ${name} (${qty} @ ${godown})${tdkRef ? ' (' + tdkRef + ')' : ''}`;
+      const qId2 = await logWriteQueue(
+        req.user.userId,
+        companyGuid,
+        'stock_adjustment',
+        label,
+        openVal || null,
+        persistPayload,
+        physicalXml
+      ).catch(() => null);
+
+      openingQueueId = qId2 || null;
+
+      let adjustmentId = null;
+      if (qId2 && tdkRef) {
+        const { rows: av } = await query(
+          `INSERT INTO app_vouchers
+           (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+            tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+            party_name, total_amount, voucher_date, payload)
+           VALUES ($1,$2,$3,'stock_adjustment',$4,'regular','regular','queued','not_posted',$5,$6,$7,$8,$9,$10)
+           RETURNING invoice_uuid`,
+          [
+            companyGuid, req.user.userId, qId2, tdkRef,
+            numbering_policy, tdkVoucherNo || null,
+            name, openVal || null,
+            date ? new Date(date) : null,
+            JSON.stringify(persistPayload),
+          ]
+        ).catch(e => { console.error('[opening-balance-app_voucher] insert failed:', e.message); return { rows: [] }; });
+
+        const { rows: adjRows } = await query(`
+          INSERT INTO stock_adjustments
+            (company_guid, user_id, stock_guid, stock_name, warehouse, adjustment_reason,
+             adjustment_direction, qty_before, adjustment_qty, qty_change, qty_after, note, status, write_queue_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13)
+          RETURNING id
+        `, [
+          companyGuid, req.user.userId,
+          name, name, godown, 'Opening Balance',
+          null, 0, qty, qty, qty, null, qId2,
+        ]).catch(() => ({ rows: [{}] }));
+
+        adjustmentId = adjRows?.[0]?.id || null;
+      }
+
+      try {
+        const r2 = await forwardToTally(companyGuid, req.user.userId, physicalXml);
+        await updateWriteQueue(qId2, r2, null);
+
+        offOpening = r2?.status === 'desktop_offline';
+        if (adjustmentId) {
+          const newStatus = (r2?.status === 'desktop_offline' || (r2?.message || '').includes('offline'))
+            ? 'QUEUED' : 'PUSHED_TO_TALLY';
+          await query(
+            `UPDATE stock_adjustments SET status=$1, tally_voucher_number=$2, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$3`,
+            [newStatus, r2?.voucherNumber || null, adjustmentId]
+          ).catch(() => {});
+        }
+
+        if (!offOpening) {
+          setImmediate(() => {
+            requestDesktopSyncAfterWrite({
+              userId: req.user.userId,
+              companyGuid,
+              companyName,
+              tdkRef,
+              tallyIds: [r2?.tallyId],
+            });
+          });
+        }
+      } catch (e) {
+        await updateWriteQueue(qId2, null, e.message).catch(() => {});
+        openingError = e.message;
+      }
+    }
+
+    const queued = offItem || offOpening;
+    const tallyRejected = r?.status === false
+      || (typeof r?.created === 'number' && r.created === 0 && !(r?.altered > 0) && !offItem);
+
+    // Immediate local stocks row so barcode APIs / Total Stock work before next sync.
+    // Tally sync later overwrites with the real GUID when available.
+    let stockGuid = null;
+    let barcode = null;
+    let barcodeError = null;
+    const saleRate = Math.max(0, parseFloat(salePrice) || 0);
+    const taxRate = Math.max(0, parseFloat(igstRate) || 0);
+
+    if (!tallyRejected) {
+      try {
+        const { rows: existing } = await query(
+          `SELECT guid FROM stocks WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+          [companyGuid, name]
+        );
+        if (existing[0]?.guid) {
+          stockGuid = existing[0].guid;
+          await query(
+            `UPDATE stocks SET
+               group_name = COALESCE(NULLIF($3,''), group_name),
+               unit = COALESCE(NULLIF($4,''), unit),
+               tax_rate = CASE WHEN $5 > 0 THEN $5 ELSE tax_rate END,
+               opening_qty = CASE WHEN $6 > 0 THEN $6 ELSE opening_qty END,
+               opening_rate = CASE WHEN $7 > 0 THEN $7 ELSE opening_rate END,
+               closing_qty = CASE WHEN $6 > 0 THEN $6 ELSE closing_qty END,
+               closing_rate = CASE WHEN $8 > 0 THEN $8 WHEN $7 > 0 THEN $7 ELSE closing_rate END,
+               closing_value = CASE WHEN $6 > 0 THEN ($6 * COALESCE(NULLIF($8,0), NULLIF($7,0), closing_rate, 0)) ELSE closing_value END,
+               synced_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+             WHERE company_guid = $1 AND guid = $2`,
+            [companyGuid, stockGuid, effectiveGroup, unit, taxRate, qty, rate, saleRate]
+          ).catch(() => {});
+        } else {
+          const { rows: inserted } = await query(
+            `INSERT INTO stocks (
+               guid, company_guid, name, group_name, unit, hsn, tax_rate,
+               opening_qty, opening_rate, closing_qty, closing_rate, closing_value, synced_at
+             ) VALUES (
+               gen_random_uuid()::text, $1, $2, $3, $4, $5, $6,
+               $7, $8, $7, COALESCE(NULLIF($9,0), $8, 0),
+               ($7 * COALESCE(NULLIF($9,0), $8, 0)),
+               EXTRACT(EPOCH FROM NOW())::BIGINT
+             )
+             RETURNING guid`,
+            [companyGuid, name, effectiveGroup, unit, hsnCode || null, taxRate || 0, qty, rate, saleRate]
+          );
+          stockGuid = inserted[0]?.guid || null;
+        }
+      } catch (e) {
+        console.warn('[stock-item-immediate-insert]', e.message);
+      }
+
+      // Generate barcode when Add Item toggle is ON
+      if (generateBarcode && stockGuid) {
+        try {
+          const { rows: [existingBc] } = await query(
+            `SELECT barcode FROM stock_barcodes
+             WHERE stock_guid = $1 AND company_guid = $2 AND is_primary = TRUE AND status = 'active'
+             LIMIT 1`,
+            [stockGuid, companyGuid]
+          );
+          if (existingBc?.barcode) {
+            barcode = existingBc.barcode;
+          } else {
+            const { rows: [{ cnt }] } = await query(
+              `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid = $1`,
+              [companyGuid]
+            );
+            const slug = String(companyGuid).replace(/[^A-Z0-9]/gi, '').slice(0, 4).toUpperCase().padEnd(4, 'X');
+            let tries = 0;
+            do {
+              barcode = `TDK${slug}${(cnt + tries + 1).toString().padStart(7, '0').slice(-7)}`;
+              tries += 1;
+              const { rows: [dup] } = await query(
+                `SELECT 1 FROM stock_barcodes WHERE company_guid = $1 AND barcode = $2`,
+                [companyGuid, barcode]
+              );
+              if (!dup) break;
+            } while (tries < 10);
+
+            const syncTarget = String(barcodeSyncTarget || 'app_only');
+            const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+            await query(
+              `INSERT INTO stock_barcodes
+                 (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+               VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)`,
+              [companyGuid, stockGuid, name, barcode, barcodeType || 'CODE128', syncTarget, tallyStatus]
+            );
+          }
+        } catch (e) {
+          barcode = null;
+          barcodeError = e.message;
+          console.warn('[stock-item-barcode]', e.message);
+        }
+      }
+    }
+
+    if (tallyRejected) {
+      return res.status(422).json({
+        status: false,
+        queued: false,
+        queueId: qId,
+        message: r?.message || 'Tally rejected the stock item',
+        data: r,
+      });
+    }
+
+    res.json({
+      status: true,
+      queued,
+      queueId: qId,
+      message: queued
+        ? 'Saved. Will push when desktop connects.'
+        : godownOpening
+          ? 'Stock item and godown opening created in Tally'
+          : 'Stock item created in Tally',
+      data: r,
+      voucherNumber: r?.voucherNumber || null,
+      tallyId: r?.tallyId || null,
+      openingError,
+      openingQueueId,
+      stockGuid,
+      barcode,
+      barcodeError,
+      barcodeLabel: barcodeLabel || null,
+    });
+  } catch(e) {
+    updateWriteQueue(qId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
 });
 
 // POST /tally/master/stock-item-alter — Stock Item Master Alteration (NOT a voucher)
@@ -2385,44 +2786,77 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
 });
 
 // POST /tally/voucher/stock-transfer
+// Stock Journal — multi-item; per-item fromGodown (Option A) + shared toGodown.
 router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
   const {
-    companyGuid, companyName, date, voucherNumber, narration,
+    companyGuid, companyName, date, narration, note,
     fromGodown, toGodown,
     items = [],
     isOptional = false,
+    numbering_policy = 'tally_prime_series',
   } = req.body;
-  if (!companyGuid || !fromGodown || !toGodown) {
-    return res.status(400).json({ status: false, message: 'fromGodown and toGodown required' });
+
+  if (!companyGuid || !toGodown) {
+    return res.status(400).json({ status: false, message: 'toGodown required' });
   }
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ status: false, message: 'items[] required' });
+  }
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
   const dt = tallyDate(date);
   const isOpt = isOptional ? 'Yes' : 'No';
+  const fullNarration = narration || note || '';
 
-  // Stock Journal XML — correct Tally Prime structure for godown transfers.
-  // Uses INVENTORYENTRIESOUT.LIST (outward) + INVENTORYENTRIESIN.LIST (inward)
-  // NOT ALLINVENTORYENTRIES.LIST which causes "No Entries in Voucher" rejection.
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Stock Journal" ACTION="Create"><VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber || ''}</VOUCHERNUMBER><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration || ''}</NARRATION>`;
+  const normalizedItems = items.map((it) => {
+    const src = it.fromGodown || it.sourceWarehouse || fromGodown || '';
+    return {
+      itemName: it.itemName || it.name || '',
+      qty: parseFloat(it.qty) || 1,
+      rate: parseFloat(it.rate) || 0,
+      unit: it.unit || 'pcs',
+      fromGodown: src,
+      availableQty: parseFloat(it.availableQty) || null,
+    };
+  });
 
-  for (const item of items) {
-    const qty = parseFloat(item.qty) || 1;
-    // Outward: stock leaves source godown
+  for (const it of normalizedItems) {
+    if (!it.itemName) return res.status(400).json({ status: false, message: 'Each item needs itemName' });
+    if (!it.fromGodown) return res.status(400).json({ status: false, message: `Source warehouse required for ${it.itemName}` });
+    if (it.fromGodown === toGodown) {
+      return res.status(400).json({ status: false, message: `Source and destination must differ for ${it.itemName}` });
+    }
+  }
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'STJ').catch(() => null);
+  let tdkVoucherNo = null;
+  let effectiveVoucherNumber = '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'STJ').catch(() => null);
+    if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+  }
+
+  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Stock Journal" ACTION="Create"><VOUCHERTYPENAME>Stock Journal</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE>${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}<REFERENCE>${esc(tdkRef || '')}</REFERENCE><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${esc(fullNarration)}</NARRATION>`;
+
+  for (const item of normalizedItems) {
+    const qty = item.qty;
+    const src = item.fromGodown;
     xml += `<INVENTORYENTRIESOUT.LIST>`;
-    xml += `<STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>`;
+    xml += `<STOCKITEMNAME>${esc(item.itemName)}</STOCKITEMNAME>`;
     xml += `<ACTUALQTY>-${qty}</ACTUALQTY><BILLEDQTY>-${qty}</BILLEDQTY>`;
     xml += `<RATE>0</RATE><AMOUNT>0</AMOUNT>`;
     xml += `<BATCHALLOCATIONS.LIST>`;
-    xml += `<GODOWNNAME>${fromGodown}</GODOWNNAME>`;
+    xml += `<GODOWNNAME>${esc(src)}</GODOWNNAME>`;
     xml += `<ACTUALQTY>-${qty}</ACTUALQTY><BILLEDQTY>-${qty}</BILLEDQTY>`;
     xml += `<AMOUNT>0</AMOUNT>`;
     xml += `</BATCHALLOCATIONS.LIST>`;
     xml += `</INVENTORYENTRIESOUT.LIST>`;
-    // Inward: stock enters destination godown
     xml += `<INVENTORYENTRIESIN.LIST>`;
-    xml += `<STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>`;
+    xml += `<STOCKITEMNAME>${esc(item.itemName)}</STOCKITEMNAME>`;
     xml += `<ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY>`;
     xml += `<RATE>0</RATE><AMOUNT>0</AMOUNT>`;
     xml += `<BATCHALLOCATIONS.LIST>`;
-    xml += `<GODOWNNAME>${toGodown}</GODOWNNAME>`;
+    xml += `<GODOWNNAME>${esc(toGodown)}</GODOWNNAME>`;
     xml += `<ACTUALQTY>${qty}</ACTUALQTY><BILLEDQTY>${qty}</BILLEDQTY>`;
     xml += `<AMOUNT>0</AMOUNT>`;
     xml += `</BATCHALLOCATIONS.LIST>`;
@@ -2431,18 +2865,80 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
 
   xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
 
-  // Compute transfer value = sum of (qty × rate) for all items
-  const transferValue = items.reduce((sum, item) => sum + (parseFloat(item.qty) || 0) * (parseFloat(item.rate) || 0), 0);
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', `${fromGodown} → ${toGodown}`, transferValue || null, req.body, xml).catch(() => null);
+  const transferValue = normalizedItems.reduce((sum, item) => sum + item.qty * item.rate, 0);
+  const sources = [...new Set(normalizedItems.map(i => i.fromGodown))];
+  const labelFrom = sources.length === 1 ? sources[0] : `${sources.length} sources`;
+  const persistPayload = {
+    ...req.body,
+    tdkRef,
+    numbering_policy,
+    toGodown,
+    fromGodown: sources.length === 1 ? sources[0] : fromGodown || null,
+    items: normalizedItems,
+    narration: fullNarration,
+    date: date || new Date().toISOString().slice(0, 10),
+  };
+
+  const label = `${labelFrom} → ${toGodown} (${normalizedItems.length} items)${tdkRef ? ' (' + tdkRef + ')' : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', label, transferValue || null, persistPayload, xml).catch(() => null);
+
+  let transferUuid = null;
+  if (qId && tdkRef) {
+    const av = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'stock_transfer',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+       numbering_policy, tdkVoucherNo || null,
+       `${labelFrom} → ${toGodown}`, transferValue || null, date ? new Date(date) : null,
+       JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[stock-transfer-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    transferUuid = av?.rows?.[0]?.invoice_uuid || null;
+  }
+
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
+    let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
+    }
     const off = r?.status === 'desktop_offline';
-    res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock transfer created in Tally', data: r });
-  } catch(e) {
-    // Timeout or Tally error — still mark as queued for retry
+    if (!off) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [r?.tallyId],
+        });
+      });
+    }
+    res.json({
+      status: true, queued: off, queueId: qId,
+      tdkRef, tdkReferenceNo: tdkRef,
+      transferUuid, invoiceUuid: transferUuid,
+      voucherNumber, numberingPolicy: numbering_policy,
+      message: off ? 'Saved. Will push when desktop connects.' : 'Stock transfer created in Tally',
+      data: r,
+    });
+  } catch (e) {
     await updateWriteQueue(qId, null, e.message);
-    res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
+    res.json({
+      status: true, queued: true, queueId: qId,
+      tdkRef, tdkReferenceNo: tdkRef,
+      transferUuid, invoiceUuid: transferUuid,
+      numberingPolicy: numbering_policy,
+      message: 'Saved. Will push to Tally when desktop connects.',
+    });
   }
 });
 
@@ -2462,11 +2958,15 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
     qtyBefore,
     note,
     date,
+    unit = 'pcs',
+    numbering_policy = 'tally_prime_series',
   } = req.body;
 
   if (!companyGuid || !stockName || !adjustmentQty || !adjustmentReason) {
     return res.status(400).json({ status: false, message: 'stockName, adjustmentQty, adjustmentReason required' });
   }
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
 
   // ── Determine direction ─────────────────────────────────────────────────────
   const REDUCE_REASONS = ['Damage', 'Shortage', 'Expired', 'Lost'];
@@ -2490,19 +2990,58 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
   const dt        = tallyDate(date);
   const narration = `${adjustmentReason}${adjustmentDirection ? ' - ' + adjustmentDirection : ''}${note ? ' | ' + note : ''}`;
 
+  const tdkRef = await generateTDKReference(companyGuid, false, 'PHY').catch(() => null);
+  let tdkVoucherNo = null;
+  let effectiveVoucherNumber = '';
+  if (numbering_policy === 'tallydekho_series') {
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY').catch(() => null);
+    if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
+  }
+
   // ── Build Physical Stock XML ──────────────────────────────────────────────
-  // Physical Stock sets the ABSOLUTE final quantity in a godown.
-  // Tally does not require both IN/OUT to balance — it simply overrides the physical count.
-  // qtyAfter = qtyBefore + qtyChange (computed above)
-  const absQty = Math.max(0, qtyAfter); // never negative
+  const absQty = Math.max(0, qtyAfter);
 
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Physical Stock" ACTION="Create"><VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><ISOPTIONAL>No</ISOPTIONAL><NARRATION>${narration}</NARRATION><ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${stockName}</STOCKITEMNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><RATE>0</RATE><AMOUNT>0</AMOUNT><BATCHALLOCATIONS.LIST><GODOWNNAME>${godown}</GODOWNNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><AMOUNT>0</AMOUNT></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Physical Stock" ACTION="Create"><VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE>${effectiveVoucherNumber ? `<VOUCHERNUMBER>${esc(effectiveVoucherNumber)}</VOUCHERNUMBER>` : ''}<REFERENCE>${esc(tdkRef || '')}</REFERENCE><ISOPTIONAL>No</ISOPTIONAL><NARRATION>${esc(narration)}</NARRATION><ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${esc(stockName)}</STOCKITEMNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><RATE>0</RATE><AMOUNT>0</AMOUNT><BATCHALLOCATIONS.LIST><GODOWNNAME>${esc(godown)}</GODOWNNAME><ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><AMOUNT>0</AMOUNT></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
-  // ── Log to write_queue ───────────────────────────────────────────────────────
-  const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})`;
-  // Compute adjustment value from rate if available
+  const persistPayload = {
+    ...req.body,
+    tdkRef,
+    numbering_policy,
+    stockName,
+    warehouse: godown,
+    adjustmentReason,
+    adjustmentDirection: adjustmentDirection || null,
+    adjustmentQty: qty,
+    qtyBefore: parseFloat(qtyBefore || 0),
+    qtyChange,
+    qtyAfter,
+    isIncrease,
+    unit,
+    note: note || '',
+    narration,
+    date: date || new Date().toISOString().slice(0, 10),
+  };
+
+  const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})${tdkRef ? ' (' + tdkRef + ')' : ''}`;
   const adjValue = qty * (parseFloat(req.body.rate) || 0);
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, adjValue || null, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, adjValue || null, persistPayload, xml).catch(() => null);
+
+  let adjustmentUuid = null;
+  if (qId && tdkRef) {
+    const av = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'stock_adjustment',$4,'regular','regular','queued','not_posted',$5,$6,$7,$8,$9,$10)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef,
+       numbering_policy, tdkVoucherNo || null,
+       stockName, adjValue || null, date ? new Date(date) : null,
+       JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[stock-adjustment-app_voucher] insert failed:', e.message); return { rows: [] }; });
+    adjustmentUuid = av?.rows?.[0]?.invoice_uuid || null;
+  }
 
   // ── Save audit record to stock_adjustments ───────────────────────────────────
   const { rows: adjRows } = await query(`
@@ -2527,22 +3066,51 @@ router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
     // Update adjustment status
     if (adjustmentId) {
       const newStatus = (r?.status === 'desktop_offline' || (r?.message || '').includes('offline')) ? 'QUEUED' : 'PUSHED_TO_TALLY';
-      await query(`UPDATE stock_adjustments SET status=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`, [newStatus, adjustmentId]).catch(() => {});
+      await query(`UPDATE stock_adjustments SET status=$1, tally_voucher_number=$2, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$3`, [newStatus, r?.voucherNumber || null, adjustmentId]).catch(() => {});
+    }
+    let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
+    if (!voucherNumber && tdkRef) {
+      const { rows: avFresh } = await query(
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
+        [tdkRef, companyGuid]
+      ).catch(() => ({ rows: [] }));
+      voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
     const off = r?.status === 'desktop_offline';
+    if (!off) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [r?.tallyId],
+        });
+      });
+    }
     res.json({
       status: true, queued: off, queueId: qId, adjustmentId,
+      tdkRef,
+      tdkReferenceNo: tdkRef,
+      adjustmentUuid,
+      invoiceUuid: adjustmentUuid,
+      voucherNumber,
+      numberingPolicy: numbering_policy,
       message: off ? 'Saved. Will push to Tally when desktop connects.' : 'Stock adjustment created in Tally',
-      data: r, voucherNumber: r?.voucherNumber || null,
+      data: r,
     });
   } catch(e) {
     await updateWriteQueue(qId, null, e.message);
     if (adjustmentId) {
       await query(`UPDATE stock_adjustments SET status='FAILED', error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`, [e.message, adjustmentId]).catch(() => {});
     }
-    // Still return 200 — adjustment is saved, will retry
     res.json({
       status: true, queued: true, queueId: qId, adjustmentId,
+      tdkRef,
+      tdkReferenceNo: tdkRef,
+      adjustmentUuid,
+      invoiceUuid: adjustmentUuid,
+      numberingPolicy: numbering_policy,
       message: 'Saved. Will push to Tally when desktop connects.',
     });
   }
@@ -3075,6 +3643,118 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const isPayment = vType === 'payment';
   const isJournal = vType === 'journal';
   const isContra = vType === 'contra';
+  const isStockAdjustment = vType === 'stock_adjustment';
+  const isStockTransfer = vType === 'stock_transfer';
+
+  // ── Stock Journal / stock transfer document ────────────────────────────────
+  if (isStockTransfer) {
+    const hasNumber = !!av.tally_voucher_no;
+    const isPosted = av.books_impact_status === 'posted';
+    const numberPending = isPosted && !hasNumber;
+    const documentNumber = hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
+    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    const transferItems = Array.isArray(p.items) ? p.items : [];
+    return {
+      documentType: 'stock_transfer',
+      tallyVoucherType: 'Stock Journal',
+      documentNumber,
+      documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0, 10) : (p.date || ''),
+      tdkRef: av.tdk_reference_no,
+      invoiceUuid: av.invoice_uuid,
+      postingTag,
+      isProvisional: !hasNumber,
+      numberPending,
+      watermarkText: numberPending
+        ? 'Posted — Tally series number pending sync'
+        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
+      numberingMode: av.numbering_policy || 'tally_prime_series',
+      company: {
+        name: companyRow?.name || p.companyName || '',
+        address: companyRow?.address || '',
+        gstin: companyRow?.gstin || '',
+        pan: companyRow?.pan || '',
+        phone: companyRow?.phone || '',
+        email: companyRow?.email || '',
+        state: companyRow?.state || '',
+      },
+      party: {
+        name: av.party_name || `${p.fromGodown || ''} → ${p.toGodown || ''}`,
+      },
+      totals: {
+        grandTotal: parseFloat(av.total_amount || 0),
+      },
+      stockTransfer: {
+        toGodown: p.toGodown || '',
+        fromGodown: p.fromGodown || null,
+        items: transferItems.map(it => ({
+          itemName: it.itemName || '',
+          qty: parseFloat(it.qty) || 0,
+          unit: it.unit || 'pcs',
+          fromGodown: it.fromGodown || p.fromGodown || '',
+          availableQty: it.availableQty != null ? parseFloat(it.availableQty) : null,
+        })),
+      },
+      narration: p.narration || p.note || '',
+    };
+  }
+
+  // ── Physical Stock / stock adjustment document ─────────────────────────────
+  if (isStockAdjustment) {
+    const hasNumber = !!av.tally_voucher_no;
+    const isPosted = av.books_impact_status === 'posted';
+    const numberPending = isPosted && !hasNumber;
+    const documentNumber = hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
+    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    const adjQty = parseFloat(p.adjustmentQty || 0);
+    const qtyBefore = parseFloat(p.qtyBefore || 0);
+    const qtyAfter = parseFloat(p.qtyAfter ?? (qtyBefore + (p.isIncrease ? adjQty : -adjQty)));
+    return {
+      documentType: 'stock_adjustment',
+      tallyVoucherType: 'Physical Stock',
+      documentNumber,
+      documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0, 10) : (p.date || ''),
+      tdkRef: av.tdk_reference_no,
+      invoiceUuid: av.invoice_uuid,
+      postingTag,
+      isProvisional: !hasNumber,
+      numberPending,
+      watermarkText: numberPending
+        ? 'Posted — Tally series number pending sync'
+        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
+      numberingMode: av.numbering_policy || 'tally_prime_series',
+      company: {
+        name: companyRow?.name || p.companyName || '',
+        address: companyRow?.address || '',
+        gstin: companyRow?.gstin || '',
+        pan: companyRow?.pan || '',
+        phone: companyRow?.phone || '',
+        email: companyRow?.email || '',
+        state: companyRow?.state || '',
+      },
+      party: {
+        name: p.stockName || av.party_name || '',
+      },
+      totals: {
+        grandTotal: parseFloat(av.total_amount || 0),
+      },
+      stockAdjustment: {
+        stockName: p.stockName || av.party_name || '',
+        warehouse: p.warehouse || '',
+        adjustmentReason: p.adjustmentReason || '',
+        adjustmentDirection: p.adjustmentDirection || null,
+        isIncrease: !!p.isIncrease,
+        qtyBefore,
+        adjustmentQty: adjQty,
+        qtyAfter,
+        unit: p.unit || 'pcs',
+      },
+      narration: p.note || p.narration || '',
+    };
+  }
 
   // ── Contra document (Source Cr → Destination Dr) ───────────────────────────
   if (isContra) {
@@ -3270,9 +3950,10 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const isProvisional = !av.tally_voucher_no;
   const invoiceNumberLabel = av.tally_voucher_no || 'Pending from TallyPrime';
   const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
+  const isSalesOrder = vType === 'sales_order';
 
   return {
-    documentType: 'sales_invoice',
+    documentType: isSalesOrder ? 'sales_order' : 'sales_invoice',
     documentNumber: invoiceNumberLabel,
     documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
     tdkRef: av.tdk_reference_no,
@@ -3306,16 +3987,20 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       roundOff: parseFloat(p.roundOffAmount || 0),
     },
     narration: p.narration || '',
+    termsText: p.termsText || '',
+    dueDate: p.dueDate || '',
+    rawPayload: p,
+    againstOrderNo: isSalesOrder ? (av.tally_voucher_no || p.againstOrderNo || '') : (p.againstOrderNo || ''),
     additionalCharges: (p.logistics || []).map(l => ({
       description: l.ledgerName || 'Charge',
       amount: parseFloat(l.amount || 0),
     })),
-    paymentInfo: p.collect_payment ? {
+    paymentInfo: !isSalesOrder && p.collect_payment ? {
       collected: parseFloat(p.collect_payment.amount || 0),
       mode: p.collect_payment.ledgerName || '',
       reference: p.collect_payment.reference || '',
     } : null,
-    dispatchDetails: p.dispatch_details || null,
+    dispatchDetails: !isSalesOrder ? (p.dispatch_details || null) : null,
   };
 }
 

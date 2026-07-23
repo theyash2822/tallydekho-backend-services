@@ -65,7 +65,6 @@ All: ?companyGuid&fy
 |--------|------|
 | GET | /api/sales/invoices |
 | GET | /api/sales/orders |
-| GET | /api/sales/quotations |
 | GET | /api/sales/credit-notes |
 | GET | /api/sales/delivery-notes |
 | GET | /api/sales/ewaybills |

@@ -1,5 +1,18 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-23 — Sales Order write: tdkRef, app_vouchers, against-order on Sales
+
+### Added / Changed
+- `POST /tally/voucher/sales-order`: accepts invoice-shaped payload (`items`, `taxes`, `logistics`, `dueDate`, `termsText`, `numbering_policy`, `isOptional`); generates `TDK-SOR-*` ref; inserts `app_vouchers` (`voucher_type=sales_order`); `ORDERDUEDATE` from due date
+- `POST /tally/voucher/sales`: stamps batch `<ORDERNO>` when `againstOrderNo` present (SO→SI convert link)
+- `buildVoucherDocument`: `sales_order` document type + `rawPayload` / `termsText` / `dueDate`
+- My Entries JOIN: `sales_order` ↔ Sales Order; Sales invoice match excludes `%Order%`
+
+### Notes
+- Convert before Tally number sync may omit `againstOrderNo` under `tally_prime_series` — prefer convert from order-preview after sync
+
+---
+
 ## 2026-07-16 — Geo masters: Tally countries/states for PartyForm
 
 ### Added

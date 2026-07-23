@@ -828,7 +828,6 @@ const voucherListHandler = (voucherType) => async (req, res) => {
 
 router.get('/sales/invoices',    authMiddleware, voucherListHandler('Sales'));
 router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
-router.get('/sales/quotations',  authMiddleware, voucherListHandler('Quotation'));
 router.get('/sales/credit-notes',authMiddleware, voucherListHandler('Credit Note'));
 router.get('/sales/delivery-notes', authMiddleware, voucherListHandler('Delivery Note'));
 router.get('/sales/ewaybills',   authMiddleware, voucherListHandler('Sales'));
@@ -1086,13 +1085,14 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         AND av.voucher_date::text = v.date
         AND (
           (av.voucher_type = 'receipt'       AND v.voucher_type ILIKE 'Receipt')
-          OR (av.voucher_type = 'sales_invoice' AND v.voucher_type ILIKE 'Sales%')
+          OR (av.voucher_type = 'sales_order' AND v.voucher_type ILIKE '%Sales Order%')
+          OR (av.voucher_type = 'sales_invoice' AND v.voucher_type ILIKE 'Sales%' AND v.voucher_type NOT ILIKE '%Order%')
           OR (av.voucher_type = 'payment'       AND v.voucher_type ILIKE 'Payment')
           OR (av.voucher_type = 'journal'       AND v.voucher_type ILIKE 'Journal')
           OR (av.voucher_type = 'contra'        AND v.voucher_type ILIKE 'Contra')
-          OR (av.voucher_type = 'purchase'      AND v.voucher_type ILIKE 'Purchase%')
+          OR (av.voucher_type = 'purchase'      AND v.voucher_type ILIKE 'Purchase%' AND v.voucher_type NOT ILIKE '%Order%')
           OR (
-            av.voucher_type NOT IN ('receipt','sales_invoice','payment','journal','contra','purchase')
+            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase')
             AND LOWER(COALESCE(v.voucher_type,'')) LIKE '%' || REPLACE(av.voucher_type, '_', ' ') || '%'
           )
         )
@@ -5688,21 +5688,60 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
     const stockName = sRows[0].name;
 
-    // Movement history from voucher_inventory_items
-    // GROUP BY voucher to collapse godown-split rows (same item delivered to multiple warehouses)
-    // This prevents duplicate entries when a single voucher splits qty across godowns
+    // Movement history — purchases/sales from voucher_inventory_items;
+    // Stock Journal godown transfers from stock_transactions (avoids double-counting IN+OUT legs).
     const { rows } = await query(`
-      SELECT v.voucher_number, v.voucher_type as type, v.date,
-             SUM(vi.actual_qty) as qty,
-             CASE WHEN SUM(vi.actual_qty) > 0 THEN SUM(vi.amount) / NULLIF(SUM(vi.actual_qty), 0) ELSE AVG(vi.rate) END as rate,
-             SUM(vi.amount) as amount
-      FROM voucher_inventory_items vi
-      JOIN vouchers v ON v.guid = vi.voucher_guid
-      WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
-        AND v.is_cancelled = FALSE
-        AND v.voucher_type != 'Physical Stock'  -- exclude stock audit counts; not real movements
-      GROUP BY v.id, v.voucher_number, v.voucher_type, v.date
-      ORDER BY v.date DESC, v.id DESC
+      SELECT * FROM (
+        (
+          SELECT
+            v.voucher_number,
+            v.voucher_type AS type,
+            v.date,
+            v.reference,
+            SUM(vi.actual_qty) AS qty,
+            CASE WHEN SUM(vi.actual_qty) > 0
+              THEN SUM(vi.amount) / NULLIF(SUM(vi.actual_qty), 0)
+              ELSE AVG(vi.rate) END AS rate,
+            SUM(vi.amount) AS amount,
+            FALSE AS is_transfer,
+            NULL::text AS from_warehouse,
+            NULL::text AS to_warehouse
+          FROM voucher_inventory_items vi
+          JOIN vouchers v ON v.guid = vi.voucher_guid AND v.company_guid = vi.company_guid
+          WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
+            AND v.is_cancelled = FALSE
+            AND COALESCE(v.voucher_type, '') NOT IN ('Physical Stock', 'Stock Journal')
+          GROUP BY v.id, v.voucher_number, v.voucher_type, v.date, v.reference
+        )
+        UNION ALL
+        (
+          SELECT DISTINCT ON (st_out.voucher_guid, st_out.warehouse, st_in.warehouse)
+            v.voucher_number,
+            COALESCE(v.voucher_type, 'Stock Journal') AS type,
+            v.date,
+            v.reference,
+            st_out.qty,
+            0::numeric AS rate,
+            0::numeric AS amount,
+            TRUE AS is_transfer,
+            COALESCE(NULLIF(st_out.warehouse, ''), 'Main Location') AS from_warehouse,
+            COALESCE(NULLIF(st_in.warehouse,  ''), 'Main Location') AS to_warehouse
+          FROM stock_transactions st_out
+          JOIN stock_transactions st_in
+            ON  st_out.voucher_guid = st_in.voucher_guid
+            AND st_out.company_guid = st_in.company_guid
+            AND st_out.stock_guid   = st_in.stock_guid
+            AND st_out.type         = 'outward'
+            AND st_in.type          = 'inward'
+          JOIN vouchers v ON v.guid = st_out.voucher_guid AND v.company_guid = st_out.company_guid
+          WHERE st_out.stock_guid = $1
+            AND st_out.company_guid = $2
+            AND v.is_cancelled = FALSE
+            AND COALESCE(v.voucher_type, st_out.voucher_type, '') = 'Stock Journal'
+          ORDER BY st_out.voucher_guid, st_out.warehouse, st_in.warehouse, v.date DESC
+        )
+      ) movements
+      ORDER BY date DESC, voucher_number DESC
       LIMIT $3
     `, [stockName, companyGuid, parseInt(limit)]);
 
@@ -5739,29 +5778,113 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/stocks/items/:id/godowns — warehouses where this item has stock, with net qty
+// GET /api/stocks/items/:id/godowns — per-godown on-hand qty (OB split + movements, reconciled to closing_qty)
 router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: sRows } = await query('SELECT name, closing_qty FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
+    const { rows: sRows } = await query(
+      'SELECT name, closing_qty, unit FROM stocks WHERE guid=$1 AND company_guid=$2',
+      [req.params.id, companyGuid]
+    );
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
-    const stockName  = sRows[0].name;
-    const totalQty   = parseFloat(sRows[0].closing_qty || 0);
-    // Net qty per warehouse from stock_transactions
+    const stockName = sRows[0].name;
+    const totalQty  = parseFloat(sRows[0].closing_qty || 0);
+    const unit      = sRows[0].unit || 'pcs';
+
+    // Per-godown = opening-balance rows + net movements (excl OB + Physical Stock).
+    // If no opening-balance rows exist (e.g. item created with godown-wise opening),
+    // fall back to Physical Stock as the base.
     const { rows } = await query(`
-      SELECT
-        COALESCE(NULLIF(st.warehouse, ''), 'Main Location') AS name,
-        SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) AS qty
-      FROM stock_transactions st
-      WHERE st.stock_guid = $1 AND st.company_guid = $2
-        AND st.voucher_type != 'Physical Stock'
-      GROUP BY COALESCE(NULLIF(st.warehouse, ''), 'Main Location')
-      HAVING SUM(CASE WHEN st.type='inward' THEN ABS(st.qty) ELSE -ABS(st.qty) END) > 0
+      WITH ob AS (
+        SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
+               SUM(qty) AS qty
+        FROM stock_transactions
+        WHERE stock_guid = $1 AND company_guid = $2
+          AND voucher_type = 'Opening Balance'
+        GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
+      ),
+      ps AS (
+        SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
+               SUM(qty) AS qty
+        FROM stock_transactions
+        WHERE stock_guid = $1 AND company_guid = $2
+          AND voucher_type = 'Physical Stock'
+        GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
+      ),
+      has_ob AS (
+        SELECT COUNT(*)::int AS cnt
+        FROM stock_transactions
+        WHERE stock_guid = $1 AND company_guid = $2
+          AND voucher_type = 'Opening Balance'
+      ),
+      mov AS (
+        SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
+               SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS qty
+        FROM stock_transactions
+        WHERE stock_guid = $1 AND company_guid = $2
+          AND COALESCE(voucher_type, '') NOT IN ('Physical Stock', 'Opening Balance')
+        GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
+      ),
+      names AS (
+        SELECT wh FROM ob
+        UNION
+        SELECT wh FROM ps
+        UNION
+        SELECT wh FROM mov
+      ),
+      combined AS (
+        SELECT
+          names.wh AS name,
+          ROUND(
+            (
+              (CASE WHEN has_ob.cnt > 0 THEN COALESCE(ob.qty, 0) ELSE COALESCE(ps.qty, 0) END)
+              + COALESCE(mov.qty, 0)
+            )::numeric,
+            4
+          ) AS qty
+        FROM names
+        CROSS JOIN has_ob
+        LEFT JOIN ob  ON ob.wh  = names.wh
+        LEFT JOIN ps  ON ps.wh  = names.wh
+        LEFT JOIN mov ON mov.wh = names.wh
+      )
+      SELECT name, qty
+      FROM combined
+      WHERE qty > 0.0001
       ORDER BY qty DESC
     `, [stockName, companyGuid]);
-    const warehouses = rows.map(r => ({ name: r.name, qty: parseFloat(r.qty) }));
-    res.json({ success: true, data: { warehouses, totalQty } });
+
+    let warehouses = rows.map(r => ({
+      name: r.name,
+      qty:  parseFloat(r.qty),
+      pct:  0,
+    }));
+
+    const godownSum = warehouses.reduce((s, w) => s + w.qty, 0);
+    const gap = Math.round((totalQty - godownSum) * 10000) / 10000;
+    const reconciled = Math.abs(gap) < 0.01;
+
+    if (!reconciled && gap > 0.01) {
+      warehouses.push({ name: 'Unassigned', qty: gap, pct: 0 });
+    }
+
+    warehouses = warehouses.map(w => ({
+      ...w,
+      pct: totalQty > 0 ? Math.round((w.qty / totalQty) * 1000) / 10 : 0,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        warehouses,
+        totalQty,
+        godownSum: Math.round(godownSum * 10000) / 10000,
+        reconciled,
+        unassignedQty: reconciled ? 0 : gap,
+        unit,
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }

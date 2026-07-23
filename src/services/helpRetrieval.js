@@ -55,7 +55,7 @@ const KB_MODULES = [
       'voucher', 'invoice', 'sales invoice', 'purchase invoice', 'create invoice',
       'credit note', 'debit note', 'payment voucher', 'receipt voucher', 'journal',
       'contra', 'new entry', 'add entry', 'create sales', 'create purchase',
-      'delivery note', 'quotation', 'estimate', 'sales order', 'purchase order',
+      'delivery note', 'sales order', 'purchase order',
       'draft', 'optional entry', 'edit voucher', 'delete voucher', 'daybook',
     ],
   },

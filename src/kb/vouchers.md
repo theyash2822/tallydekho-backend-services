@@ -12,7 +12,6 @@
 - Sales Order
 - Purchase Order
 - Delivery Note
-- Quotation / Estimate
 
 ## Creating a Sales Invoice
 1. Tap Sales tab → tap the + (plus) button

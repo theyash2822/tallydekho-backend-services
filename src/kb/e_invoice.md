@@ -11,7 +11,7 @@ It involves generating an Invoice Reference Number (IRN) from the GST portal.
 
 ## Pending IRN List
 - Shows sales invoices eligible for E-Invoice but without an IRN yet
-- Eligibility: Sales invoices (not Sales Orders, Delivery Notes, or Quotations)
+- Eligibility: Sales invoices (not Sales Orders or Delivery Notes)
 - Date gated: only shows invoices from 01-Oct-2020 onwards (government mandate start date)
 
 ## Generated IRN List

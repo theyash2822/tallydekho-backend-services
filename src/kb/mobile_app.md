@@ -2,7 +2,7 @@
 
 ## Bottom Navigation Tabs
 1. **Dashboard** — KPI summary, sync status, quick actions
-2. **Sales** — Sales invoices, orders, credit notes, delivery notes, quotations
+2. **Sales** — Sales invoices, orders, credit notes, delivery notes
 3. **Purchase** — Purchase invoices, orders, debit notes
 4. **Stocks** — Inventory overview, stock detail, warehouses
 5. **Reports** — Financial reports, compliance, AI Insights, daybook

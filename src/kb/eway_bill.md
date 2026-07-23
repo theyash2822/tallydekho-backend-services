@@ -12,7 +12,7 @@ A unique EWB number must be generated before goods move.
 ## Pending EWB List
 - Sales and Purchase invoices eligible for EWB but without an EWB number
 - Date gated: only from 01-April-2018 (EWB mandate start date)
-- Excludes: Sales Orders, Delivery Notes, Quotations (not eligible)
+- Excludes: Sales Orders, Delivery Notes (not eligible)
 
 ## Generated EWB List
 - Invoices with an EWB number assigned
