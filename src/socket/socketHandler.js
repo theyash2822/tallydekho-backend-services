@@ -103,7 +103,7 @@ export function setupSocket(io) {
         console.log(`[WS] registered ${type} client for user ${userId}`);
         socket.emit('registered', { status: true });
         // Join company room so targeted lifecycle events reach this client
-        query('SELECT guid FROM companies WHERE user_id=$1 LIMIT 1', [userId])
+        query('SELECT guid FROM companies WHERE user_id=$1 AND is_active=TRUE ORDER BY synced_at DESC NULLS LAST LIMIT 1', [userId])
           .then(({ rows }) => {
             if (rows[0]?.guid) {
               socket.join(`company:${rows[0].guid}`);

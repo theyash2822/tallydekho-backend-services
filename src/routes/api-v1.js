@@ -528,7 +528,14 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
 
     let company = null;
     if (isPaired) {
-      const { rows: companies } = await query('SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [req.user.userId]);
+      // Prefer most recently synced active company (desktop may switch which Tally co is open)
+      const { rows: companies } = await query(
+        `SELECT guid, name, gstin FROM companies
+         WHERE user_id = $1 AND is_active = TRUE
+         ORDER BY synced_at DESC NULLS LAST, name ASC
+         LIMIT 1`,
+        [req.user.userId]
+      );
       if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
     }
 
