@@ -1,6 +1,21 @@
 # CHANGELOG_AGENT.md
 
-## 2026-07-23 — Sales Order write: tdkRef, app_vouchers, against-order on Sales
+## 2026-07-27 — Hard sync = rebuild (purge selected GUID then re-ingest)
+
+### Changed
+- `src/services/companyPurge.js` (NEW): deletes Tally projection tables for a `company_guid`
+- `src/routes/ingest.js` `POST /desktop/init-sync`: when `isHardSync: true`, purges selected company GUID(s) before returning alterIds
+- Keeps `companies` row + app-layer (`write_queue`, `app_vouchers`, settings, audit logs)
+- Normal sync unchanged (no purge)
+
+### Behavior
+Hard Sync selected companies → wipe cloud Tally data for those GUIDs → full fetch → insert. Unselected companies untouched.
+
+### QA fix (2026-07-27)
+- Removed `stock_barcodes` / `barcode_import_jobs` from purge list (app-layer barcodes, not Tally projection)
+- `isHardSync === true` gate (reject truthy non-booleans)
+
+---
 
 ### Added / Changed
 - `POST /tally/voucher/sales-order`: accepts invoice-shaped payload (`items`, `taxes`, `logistics`, `dueDate`, `termsText`, `numbering_policy`, `isOptional`); generates `TDK-SOR-*` ref; inserts `app_vouchers` (`voucher_type=sales_order`); `ORDERDUEDATE` from due date

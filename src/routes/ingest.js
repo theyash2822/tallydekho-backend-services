@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
 import { processIngestedData } from '../controllers/ingestProcessor.js';
+import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
 
 let _socketService = null;
 export function setSocketService(s) { _socketService = s; }
@@ -26,10 +27,13 @@ function normalizeGstType(raw) {
 }
 
 // POST /desktop/init-sync
+// Body: { companies, isHardSync? }
+// Hard sync: purge Tally projection for selected GUIDs, then proceed (rebuild).
+// Normal sync: unchanged (no purge).
 router.post('/desktop/init-sync', async (req, res) => {
   const deviceId = req.headers['device-id'];
-  const { companies } = req.body || {};
-  console.log(`[SYNC] init-sync from device ${deviceId}, companies: ${companies?.length}`);
+  const { companies, isHardSync = false } = req.body || {};
+  console.log(`[SYNC] init-sync from device ${deviceId}, companies: ${companies?.length}, hard=${!!isHardSync}`);
 
   try {
     const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
@@ -37,6 +41,19 @@ router.post('/desktop/init-sync', async (req, res) => {
     const userId = device?.user_id;
 
     if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
+
+    // Hard sync only: wipe cloud Tally data for selected companies before re-ingest
+    // Strict === true so string "false" / "0" cannot accidentally purge
+    if (isHardSync === true && companies?.length > 0) {
+      const guids = companies.map(c => c.guid).filter(Boolean);
+      console.log(`[SYNC] Hard sync rebuild — purging ${guids.length} company GUID(s)`);
+      try {
+        await purgeCompaniesForHardSync(guids);
+      } catch (purgeErr) {
+        console.error('[SYNC] Hard sync purge failed:', purgeErr.message);
+        return res.status(500).json({ status: false, message: `Hard sync rebuild failed: ${purgeErr.message}` });
+      }
+    }
 
     const alterIds = {};
     if (companies && companies.length > 0) {
