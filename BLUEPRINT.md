@@ -32,6 +32,8 @@
 - `src/services/whatsapp.js` — OTP via Cronberry WABA (template: otp_international)
 - `src/services/notifications.js` — push + WhatsApp payment reminders
 - `src/utils/gstClassifier.js` — GST tab classification per voucher type
+- `src/utils/creditNoteContext.js` — Sales Return context (linked invoice, sold/returned/remaining qty),
+  shared by the credit-note-context read endpoint and the Credit Note writer
 
 ## Auth Flow
 1. POST /api/auth/send-otp → sends OTP via WhatsApp (Cronberry)

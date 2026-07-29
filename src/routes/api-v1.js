@@ -15,6 +15,7 @@ import { sendOTPEmail } from '../services/email.js';
 import { getGstTabsForVoucher, getClassificationReason } from '../utils/gstClassifier.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
+import { resolveCreditNoteContext } from '../utils/creditNoteContext.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -845,6 +846,71 @@ const voucherListHandler = (voucherType) => async (req, res) => {
 
 router.get('/sales/invoices',    authMiddleware, voucherListHandler('Sales'));
 router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
+
+// GET /api/sales/invoices/:id/credit-note-context
+// Everything the Credit Note (Sales Return) screen needs for one Sales invoice:
+// header + party, the invoice's inventory rows with cumulative returned/remaining
+// quantity, the Sales ledger(s) the invoice actually posted to, and the tax rows.
+// `:id` is the invoice GUID (preferred) or its voucher number.
+// Remaining qty already accounts for Credit Notes synced from Tally AND app-created
+// Credit Notes still queued — the same resolver the writer validates against, so the
+// number shown here is the number POST /tally/voucher/credit-note will accept.
+router.get('/sales/invoices/:id/credit-note-context', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const resolved = await resolveCreditNoteContext(companyGuid, req.params.id);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ success: false, error: { code: resolved.code, message: resolved.message } });
+    }
+    const { invoice, context } = resolved;
+    const returnable = context.items.filter(i => i.remainingQty > 0);
+    res.json({
+      success: true,
+      data: {
+        invoice: {
+          guid: invoice.guid,
+          voucherNumber: invoice.voucher_number || null,
+          voucherType: invoice.voucher_type || null,
+          voucherTypeParent: invoice.voucher_type_parent || null,
+          date: invoice.date || null,
+          partyName: invoice.party_name || null,
+          partyGuid: invoice.party_guid || null,
+          amount: context.totals.invoiceAmount,
+          reference: invoice.reference || null,
+          narration: invoice.narration || null,
+          billRefName: context.linkedInvoice.billRefName,
+          tdkRef: context.linkedInvoice.tdkRef,
+          financialYear: invoice.financial_year || null,
+          isOptional: invoice.is_optional ?? false,
+        },
+        party: context.party,
+        // Echo straight back into POST /tally/voucher/credit-note as `linked_invoice`.
+        linkedInvoice: context.linkedInvoice,
+        items: context.items,
+        salesLedgerCandidates: context.invoiceSalesLedgers,
+        companySalesLedgers: context.companySalesLedgers,
+        defaultSalesLedger: context.defaultSalesLedger,
+        taxes: context.taxes,
+        otherLedgers: context.otherLedgers,
+        gst: context.gst,
+        totals: context.totals,
+        priorReturns: context.priorReturns,
+        meta: {
+          itemCount: context.items.length,
+          returnableItemCount: returnable.length,
+          fullyReturned: context.items.length > 0 && returnable.length === 0,
+          natureOfReturn: '01-Sales Return',
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[credit-note-context]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 router.get('/sales/credit-notes',authMiddleware, voucherListHandler('Credit Note'));
 router.get('/sales/delivery-notes', authMiddleware, voucherListHandler('Delivery Note'));
 router.get('/sales/ewaybills',   authMiddleware, voucherListHandler('Sales'));
@@ -1108,8 +1174,11 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
           OR (av.voucher_type = 'journal'       AND v.voucher_type ILIKE 'Journal')
           OR (av.voucher_type = 'contra'        AND v.voucher_type ILIKE 'Contra')
           OR (av.voucher_type = 'purchase'      AND v.voucher_type ILIKE 'Purchase%' AND v.voucher_type NOT ILIKE '%Order%')
+          -- Credit Note numbers are sequential ('1','2','3'…) like Receipts, so the
+          -- explicit pair keeps the type predicate tight alongside the date match.
+          OR (av.voucher_type = 'credit_note'   AND v.voucher_type ILIKE '%Credit Note%')
           OR (
-            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase')
+            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase','credit_note')
             AND LOWER(COALESCE(v.voucher_type,'')) LIKE '%' || REPLACE(av.voucher_type, '_', ' ') || '%'
           )
         )

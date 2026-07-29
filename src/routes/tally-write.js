@@ -7,6 +7,14 @@ import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
+import {
+  resolveCreditNoteContext,
+  normalizeName,
+  num as toNum,
+  round2 as r2,
+  round3 as r3,
+  QTY_EPSILON,
+} from '../utils/creditNoteContext.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -2368,21 +2376,450 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
 });
 
 
-router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, date, voucherNumber, reference, narration, partyLedger, totalAmount, items = [], taxes = [], isOptional = false } = req.body;
-  if (!companyGuid || !partyLedger) return res.status(400).json({ status: false, message: 'partyLedger required' });
-  const isOpt = isOptional ? 'Yes' : 'No';
-  const amt = parseFloat(totalAmount) || 0;
+// ── Credit Note (Sales Return) XML builder ───────────────────────────────────
+// Mirrors a real TallyPrime Credit Note export (Invoice Voucher View, Item Invoice
+// entry mode, GST nature of return 01-Sales Return) with the export-only fields
+// (GUID / REMOTEID / VCHKEY / ALTERID / empty *.LIST scaffolding) left out.
+//
+// Signs, as in the reference export:
+//   inventory + batch + accounting allocation + tax legs → negative, ISDEEMEDPOSITIVE Yes
+//   quantities                                            → positive
+//   party leg                                             → positive, ISDEEMEDPOSITIVE No
+// The party leg carries BILLALLOCATIONS.LIST / BILLTYPE 'Agst Ref' against the
+// original invoice's bill reference so Tally knocks the return off that bill.
+//
+// Exported for the XML shape tests in src/__tests__/credit-note.test.js.
+export function buildCreditNoteXml({
+  companyName,
+  date,
+  voucherNumber = '',
+  reference = '',
+  narration = '',
+  partyLedger,
+  isOptional = false,
+  items = [],
+  taxes = [],
+  billRefName,
+  partyAmount = 0,
+}) {
   const dt = tallyDate(date);
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Credit Note" ACTION="Create"><VOUCHERTYPENAME>Credit Note</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><REFERENCE>${reference||''}</REFERENCE><ISINVOICE>Yes</ISINVOICE><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration||''}</NARRATION><PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME><LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><ISPARTYLEDGER>Yes</ISPARTYLEDGER><LEDGERNAME>${partyLedger}</LEDGERNAME><AMOUNT>${amt}</AMOUNT></LEDGERENTRIES.LIST>`;
+  const isOpt = isOptional ? 'Yes' : 'No';
+
+  let xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="Credit Note" ACTION="Create" OBJVIEW="Invoice Voucher View">
+  <VOUCHERTYPENAME>Credit Note</VOUCHERTYPENAME>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
+  <VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>
+  <REFERENCE>${escapeXml(reference)}</REFERENCE>
+  <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+  <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
+  <GSTNATUREOFRETURN>01-Sales Return</GSTNATUREOFRETURN>
+  <ISINVOICE>Yes</ISINVOICE>
+  <ISCANCELLED>No</ISCANCELLED>
+  <ISPOSTDATED>No</ISPOSTDATED>
+  <DIFFACTUALQTY>Yes</DIFFACTUALQTY>
+  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <NARRATION>${escapeXml(narration)}</NARRATION>
+  <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>`;
+
   for (const item of items) {
-    const ia = parseFloat(item.amount)||0;
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${item.returnLedger||'Sales Return'}</LEDGERNAME><AMOUNT>${-ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+    const qty = item.qty;
+    const amount = item.amount;
+    const negAmt = -amount;
+    // TallyPrime exports RATE qualified with the stock item's unit ("155.00/nos").
+    const rawRate = item.rate ?? 0;
+    const rateXml = String(rawRate).includes('/')
+      ? String(rawRate)
+      : `${rawRate}${item.unit ? `/${item.unit}` : ''}`;
+    xml += `
+  <ALLINVENTORYENTRIES.LIST>
+    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <RATE>${escapeXml(rateXml)}</RATE>
+    <AMOUNT>${negAmt}</AMOUNT>
+    <ACTUALQTY>${qty}</ACTUALQTY>
+    <BILLEDQTY>${qty}</BILLEDQTY>
+    <BATCHALLOCATIONS.LIST>
+      <GODOWNNAME>${escapeXml(item.godown || 'Main Location')}</GODOWNNAME>
+      <BATCHNAME>${escapeXml(item.batch || 'Primary Batch')}</BATCHNAME>
+      <AMOUNT>${negAmt}</AMOUNT>
+      <ACTUALQTY>${qty}</ACTUALQTY>
+      <BILLEDQTY>${qty}</BILLEDQTY>
+    </BATCHALLOCATIONS.LIST>
+    <ACCOUNTINGALLOCATIONS.LIST>
+      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+      <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+      <LEDGERFROMITEM>No</LEDGERFROMITEM>
+      <ISPARTYLEDGER>No</ISPARTYLEDGER>
+      <LEDGERNAME>${escapeXml(item.salesLedger)}</LEDGERNAME>
+      <AMOUNT>${negAmt}</AMOUNT>
+    </ACCOUNTINGALLOCATIONS.LIST>
+  </ALLINVENTORYENTRIES.LIST>`;
   }
-  for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
-  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Credit note created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
+
+  // Tax legs are the Sales pattern reversed: debit (ISDEEMEDPOSITIVE Yes) with a
+  // negative amount and a negative assessable value.
+  for (const tax of taxes) {
+    if (!tax.ledgerName || !(tax.taxAmount > 0)) continue;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <ISPARTYLEDGER>No</ISPARTYLEDGER>
+    <LEDGERNAME>${escapeXml(tax.ledgerName)}</LEDGERNAME>
+    <AMOUNT>${-tax.taxAmount}</AMOUNT>
+    <VATASSESSABLEVALUE>${-tax.taxableValue}</VATASSESSABLEVALUE>
+  </LEDGERENTRIES.LIST>`;
+  }
+
+  xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${escapeXml(partyLedger)}</LEDGERNAME>
+    <AMOUNT>${partyAmount}</AMOUNT>
+    <BILLALLOCATIONS.LIST>
+      <NAME>${escapeXml(billRefName)}</NAME>
+      <BILLTYPE>Agst Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${partyAmount}</AMOUNT>
+    </BILLALLOCATIONS.LIST>
+  </LEDGERENTRIES.LIST>
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  return xml;
+}
+
+/**
+ * Validate + normalise a Credit Note request against the linked invoice context.
+ * Pure (no IO) so it can be unit-tested; returns either { error } or the
+ * server-recomputed items/taxes/totals that the XML and the ledger rows use.
+ * Exported for src/__tests__/credit-note.test.js.
+ */
+export function prepareCreditNoteLines({ items = [], taxes = [], context, invoice }) {
+  const invoiceLabel = invoice?.voucher_number || context?.linkedInvoice?.voucherNumber || 'the linked invoice';
+  const itemIndex = new Map(context.items.map(i => [normalizeName(i.itemName), i]));
+  const invoiceSalesKeys = new Set(context.invoiceSalesLedgers.map(l => normalizeName(l.ledgerName)));
+  const companySalesKeys = new Set(context.companySalesLedgers.map(l => normalizeName(l.ledgerName)));
+  const fallbackSalesLedger = context.defaultSalesLedger;
+
+  // Same item may arrive on several request lines — the remaining-qty check has to
+  // see the request total, not each line in isolation.
+  const requestedQty = new Map();
+  const normItems = [];
+
+  for (const raw of items) {
+    const rawName = String(raw?.itemName || raw?.name || '').trim();
+    if (!rawName) return { error: 'Each item needs an itemName' };
+
+    const key = normalizeName(rawName);
+    const ctxItem = itemIndex.get(key);
+    if (!ctxItem) {
+      return { error: `"${rawName}" is not on invoice ${invoiceLabel} — only items billed on the invoice can be returned` };
+    }
+
+    const qty = r3(Math.abs(toNum(raw.billedQty ?? raw.actualQty ?? raw.qty)));
+    if (!(qty > 0)) return { error: `Return quantity for "${ctxItem.itemName}" must be greater than 0` };
+
+    const rate = r2(Math.abs(toNum(raw.rate ?? ctxItem.rate)));
+    if (!(rate > 0)) return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
+
+    const totalForItem = r3((requestedQty.get(key) || 0) + qty);
+    if (totalForItem > ctxItem.remainingQty + QTY_EPSILON) {
+      return {
+        error: `Cannot return ${totalForItem} of "${ctxItem.itemName}" — invoice ${invoiceLabel} billed ${ctxItem.soldQty}, ${ctxItem.previouslyReturnedQty} already returned, ${ctxItem.remainingQty} remaining`,
+      };
+    }
+    requestedQty.set(key, totalForItem);
+
+    // Client may edit the Sales ledger, but it must still be a Sales ledger the
+    // original invoice actually posted to (falls back to the company's Sales
+    // Accounts ledgers when the invoice has no synced ledger legs).
+    const salesLedger = String(raw.salesLedger || raw.returnLedger || fallbackSalesLedger || '').trim();
+    if (!salesLedger) {
+      return { error: `salesLedger required for "${ctxItem.itemName}" — could not resolve the Sales ledger from invoice ${invoiceLabel}` };
+    }
+    const allowed = invoiceSalesKeys.size ? invoiceSalesKeys : companySalesKeys;
+    if (!allowed.has(normalizeName(salesLedger))) {
+      return {
+        error: invoiceSalesKeys.size
+          ? `"${salesLedger}" is not a Sales ledger used on invoice ${invoiceLabel}`
+          : `"${salesLedger}" is not a Sales Accounts ledger for this company`,
+      };
+    }
+
+    normItems.push({
+      itemName: ctxItem.itemName,
+      qty,
+      rate,
+      amount: r2(qty * rate),
+      unit: String(raw.unit || ctxItem.unit || '').trim(),
+      godown: String(raw.godown || ctxItem.godown || 'Main Location').trim(),
+      batch: String(raw.batchName || raw.batch || 'Primary Batch').trim(),
+      salesLedger,
+      hsn: ctxItem.hsn || '',
+      soldQty: ctxItem.soldQty,
+      remainingQtyBefore: ctxItem.remainingQty,
+    });
+  }
+
+  if (normItems.length === 0) return { error: 'At least one item with a positive return quantity is required' };
+
+  const itemsTotal = r2(normItems.reduce((s, i) => s + i.amount, 0));
+
+  // One row per tax ledger, matching Tally's own export.
+  const taxTotals = new Map();
+  for (const raw of taxes) {
+    const name = String(raw?.ledgerName || raw?.ledger || raw?.name || '').trim();
+    if (!name) continue;
+    const taxAmount = r2(Math.abs(toNum(raw.taxAmount ?? raw.amount)));
+    if (!(taxAmount > 0)) continue;
+    const taxRate = raw.taxRate ?? raw.rate ?? null;
+    const current = taxTotals.get(name) || { ledgerName: name, taxAmount: 0, taxableValue: 0, taxRate };
+    current.taxAmount = r2(current.taxAmount + taxAmount);
+    current.taxableValue = r2(current.taxableValue + Math.abs(toNum(raw.taxableValue ?? raw.taxableAmount)));
+    if (current.taxRate == null && taxRate != null) current.taxRate = taxRate;
+    taxTotals.set(name, current);
+  }
+  const normTaxes = [...taxTotals.values()].map(t => ({
+    ...t,
+    // A tax leg with no stated base is assessed on the whole return value.
+    taxableValue: t.taxableValue > 0 ? t.taxableValue : itemsTotal,
+  }));
+
+  const taxTotal = r2(normTaxes.reduce((s, t) => s + t.taxAmount, 0));
+  return { items: normItems, taxes: normTaxes, itemsTotal, taxTotal, totalAmount: r2(itemsTotal + taxTotal) };
+}
+
+// ── POST /tally/voucher/credit-note ──────────────────────────────────────────
+// 2026-07-29 rewrite: Sales Return only, always linked to a Sales invoice.
+// Follows the Sales / Delivery Note / Receipt production pattern — TDK reference,
+// TallyDekho series numbering, app_vouchers lifecycle row, offline queue, desktop
+// sync-back — and validates everything against the linked invoice server-side:
+// company ownership, invoice is Sales, exact party match, item membership, positive
+// qty/rate, cumulative returned qty across prior synced + queued Credit Notes, and
+// that the Sales ledger belongs to the original invoice.
+router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, companyName, date, narration,
+    partyLedger, totalAmount,
+    items = [],     // [{ itemName, billedQty|actualQty|qty, rate, unit, godown, salesLedger }]
+    taxes = [],     // [{ ledgerName, taxRate, taxAmount, taxableValue }]
+    isOptional = false,
+    original_entry_type,
+    numbering_policy = 'tally_prime_series', // 'tally_prime_series' | 'tallydekho_series'
+    linked_invoice = null,                   // { invoiceGuid, voucherNumber, billRefName, tdkRef }
+    reference,                               // fallback only; REFERENCE is the TDK-CN ref
+  } = req.body;
+
+  const bad = (message, code = 400) => res.status(code).json({ status: false, message });
+
+  if (!companyGuid) return bad('companyGuid required');
+  if (!partyLedger) return bad('partyLedger required');
+  if (!Array.isArray(items) || items.length === 0) return bad('items required');
+  if (!linked_invoice || typeof linked_invoice !== 'object') {
+    return bad('linked_invoice required — a Sales Return must be raised against a Sales invoice');
+  }
+  const invoiceRef = String(
+    linked_invoice.invoiceGuid
+    || linked_invoice.guid
+    || linked_invoice.id
+    || linked_invoice.voucherNumber
+    || linked_invoice.invoice_no
+    || linked_invoice.voucher_number
+    || ''
+  ).trim();
+  if (!invoiceRef) return bad('linked_invoice.invoiceGuid or linked_invoice.voucherNumber required');
+
+  const entryType = original_entry_type || (isOptional ? 'optional' : 'regular');
+
+  let qId = null;
+  let creditNoteUuid = null;
+  try {
+    // ── Ownership ────────────────────────────────────────────────────────────
+    const { rows: coRows } = await query(
+      'SELECT guid, name FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
+      [companyGuid, req.user.userId]
+    );
+    if (!coRows[0]) return bad('Company not found or access denied', 403);
+    const resolvedCompanyName = companyName || coRows[0].name;
+
+    // ── Linked Sales invoice + cumulative return context ─────────────────────
+    const resolved = await resolveCreditNoteContext(companyGuid, invoiceRef);
+    if (!resolved.ok) return bad(resolved.message, resolved.status);
+    const { invoice, context } = resolved;
+
+    // ── Party must be the invoice party, exactly ─────────────────────────────
+    if (normalizeName(partyLedger) !== normalizeName(invoice.party_name)) {
+      return bad(`partyLedger "${partyLedger}" does not match invoice ${invoice.voucher_number} party "${invoice.party_name}"`);
+    }
+
+    // ── Items / taxes / totals, recomputed server-side ───────────────────────
+    const prepared = prepareCreditNoteLines({ items, taxes, context, invoice });
+    if (prepared.error) return bad(prepared.error);
+    const { items: normItems, taxes: normTaxes, itemsTotal, taxTotal } = prepared;
+    const amt = prepared.totalAmount;
+    const clientTotal = (totalAmount === undefined || totalAmount === null || totalAmount === '')
+      ? null : r2(totalAmount);
+    const totalAdjusted = clientTotal !== null && Math.abs(clientTotal - amt) > 0.05;
+
+    // ── Original bill reference for the Agst Ref allocation ──────────────────
+    const clientBillRef = String(
+      linked_invoice.billRefName
+      || linked_invoice.bill_ref_name
+      || linked_invoice.invoice_no
+      || ''
+    ).trim();
+    const candidateKeys = new Set(context.linkedInvoice.billRefCandidates.map(normalizeName));
+    const billRefName = clientBillRef && candidateKeys.has(normalizeName(clientBillRef))
+      ? clientBillRef
+      : context.linkedInvoice.billRefName;
+    if (!billRefName) {
+      return bad(`Could not resolve the original bill reference for invoice ${invoice.voucher_number}`);
+    }
+
+    // ── TDK reference + numbering ────────────────────────────────────────────
+    const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CN').catch(() => null);
+    // Tally series → blank VOUCHERNUMBER, Tally assigns it and syncs it back.
+    let tdkCreditNoteNo = null;
+    let effectiveVoucherNumber = '';
+    if (numbering_policy === 'tallydekho_series' && !isOptional) {
+      tdkCreditNoteNo = await generateTDSeriesNumber(companyGuid, 'CN').catch(() => null);
+      if (tdkCreditNoteNo) effectiveVoucherNumber = tdkCreditNoteNo;
+    }
+
+    const xml = buildCreditNoteXml({
+      companyName: resolvedCompanyName,
+      date,
+      voucherNumber: effectiveVoucherNumber,
+      reference: tdkRef || reference || '',
+      narration: narration || '',
+      partyLedger,
+      isOptional,
+      items: normItems,
+      taxes: normTaxes,
+      billRefName,
+      partyAmount: amt,
+    });
+
+    const linkedInvoicePayload = {
+      invoiceGuid: context.linkedInvoice.invoiceGuid,
+      voucherNumber: context.linkedInvoice.voucherNumber,
+      voucherType: context.linkedInvoice.voucherType,
+      date: context.linkedInvoice.date,
+      partyLedger: context.linkedInvoice.partyLedger,
+      billRefName,
+      tdkRef: context.linkedInvoice.tdkRef,
+      reference: context.linkedInvoice.reference,
+      amount: context.linkedInvoice.amount,
+    };
+
+    const persistPayload = {
+      ...req.body,
+      companyName: resolvedCompanyName,
+      partyLedger,
+      items: normItems,
+      taxes: normTaxes,
+      itemsTotal,
+      taxTotal,
+      totalAmount: amt,
+      clientTotalAmount: clientTotal,
+      isOptional,
+      original_entry_type: entryType,
+      numbering_policy,
+      narration: narration || '',
+      natureOfReturn: '01-Sales Return',
+      linked_invoice: linkedInvoicePayload,
+      tdkRef,
+    };
+
+    const label = `${partyLedger} ← return vs ${invoice.voucher_number || billRefName}`;
+    qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', label, amt, persistPayload, xml).catch(() => null);
+
+    if (qId && tdkRef) {
+      const avResult = await query(
+        `INSERT INTO app_vouchers
+         (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+          tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+          party_name, total_amount, voucher_date, payload)
+         VALUES ($1,$2,$3,'credit_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+         RETURNING invoice_uuid`,
+        [companyGuid, req.user.userId, qId, tdkRef, entryType,
+         numbering_policy,
+         tdkCreditNoteNo || null,
+         partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
+      ).catch(e => { console.error('[app_vouchers] credit_note insert failed:', e.message); return { rows: [] }; });
+      creditNoteUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+    }
+
+    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+
+    // Ask desktop to pull the new voucher so tally_voucher_no lands without a full sync.
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName: resolvedCompanyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+        });
+      });
+    }
+
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      tdkReferenceNo: tdkRef,
+      invoiceUuid: creditNoteUuid,
+      creditNoteNumber: tdkCreditNoteNo || result?.voucherNumber || null,
+      voucherNumber: tdkCreditNoteNo || result?.voucherNumber || null,
+      numbering_policy,
+      linkedInvoice: linkedInvoicePayload,
+      totals: {
+        itemsTotal,
+        taxTotal,
+        totalAmount: amt,
+        clientTotalAmount: clientTotal,
+        recomputed: totalAdjusted,
+      },
+      message: offline
+        ? 'Entry saved. Will push to Tally when desktop connects.'
+        : (isOptional ? 'Optional credit note saved' : 'Credit note created'),
+      data: result,
+      tallyId: result?.tallyId || null,
+    });
+  } catch (e) {
+    await updateWriteQueue(qId, null, e.message).catch(() => {});
+    if (creditNoteUuid) {
+      await query(
+        `UPDATE app_vouchers SET tally_sync_status='failed', books_impact_status='not_posted',
+             sync_error=$2, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+           WHERE invoice_uuid=$1`,
+        [creditNoteUuid, String(e.message).slice(0, 500)]
+      ).catch(() => {});
+    }
+    console.error('[voucher/credit-note]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
 });
 
 router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
@@ -4239,9 +4676,15 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const invoiceNumberLabel = av.tally_voucher_no || 'Pending from TallyPrime';
   const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
   const isSalesOrder = vType === 'sales_order';
+  const isCreditNote = vType === 'credit_note';
+
+  // A Credit Note shares the item/tax/total shape of a Sales invoice; it only differs
+  // in document type and in always carrying the invoice it returns against.
+  const linkedInvoice = p.linked_invoice || p.linkedInvoice || null;
 
   return {
-    documentType: isSalesOrder ? 'sales_order' : 'sales_invoice',
+    documentType: isCreditNote ? 'credit_note' : (isSalesOrder ? 'sales_order' : 'sales_invoice'),
+    tallyVoucherType: isCreditNote ? 'Credit Note' : undefined,
     documentNumber: invoiceNumberLabel,
     documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
     tdkRef: av.tdk_reference_no,
@@ -4278,6 +4721,19 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
     termsText: p.termsText || '',
     dueDate: p.dueDate || '',
     rawPayload: p,
+    creditNote: isCreditNote ? {
+      natureOfReturn: p.natureOfReturn || '01-Sales Return',
+      returnType: 'Sales Return',
+      againstInvoice: linkedInvoice ? {
+        invoiceGuid:   linkedInvoice.invoiceGuid   || null,
+        voucherNumber: linkedInvoice.voucherNumber || null,
+        date:          linkedInvoice.date          || null,
+        billRefName:   linkedInvoice.billRefName   || null,
+        tdkRef:        linkedInvoice.tdkRef        || null,
+        amount:        linkedInvoice.amount != null ? parseFloat(linkedInvoice.amount) : null,
+      } : null,
+    } : undefined,
+    againstInvoiceNo: isCreditNote ? (linkedInvoice?.voucherNumber || linkedInvoice?.billRefName || '') : undefined,
     againstOrderNo: isSalesOrder ? (av.tally_voucher_no || p.againstOrderNo || '') : (p.againstOrderNo || ''),
     additionalCharges: (p.logistics || []).map(l => ({
       description: l.ledgerName || 'Charge',

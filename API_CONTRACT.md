@@ -71,6 +71,27 @@ All: ?companyGuid&fy
 All: ?companyGuid&fy&from&to&page&limit&search&partyName
 `partyName` (optional): exact party match, case- and whitespace-insensitive. Omit for the full list.
 
+### GET /api/sales/invoices/:id/credit-note-context
+Return-context for the Credit Note (Sales Return) flow. `:id` = invoice GUID (preferred) or voucher number. Requires `?companyGuid=`.
+Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_SALES_INVOICE` (400).
+
+`data`:
+| Field | Notes |
+|-------|-------|
+| `invoice` | guid, voucherNumber, voucherType(+Parent), date, partyName, amount, reference, billRefName, tdkRef, financialYear |
+| `party` | party ledger master (gstin, address, …) |
+| `linkedInvoice` | echo straight back as `linked_invoice` in the POST — invoiceGuid, voucherNumber, billRefName, billRefCandidates, tdkRef |
+| `items[]` | itemName, unit, hsn, godown, batch, rate, `soldQty`, `returnedSyncedQty`, `returnedPendingQty`, `previouslyReturnedQty`, `remainingQty`, `isFullyReturned`, `selected:false`, `lines[]` |
+| `salesLedgerCandidates[]` | Sales ledgers the invoice actually posted to (the POST validates against this set) |
+| `companySalesLedgers[]` | all Sales Accounts ledgers — fallback when the invoice has no synced ledger legs |
+| `defaultSalesLedger` | largest invoice Sales leg |
+| `taxes[]` | ledgerName, taxAmount, taxableValue, inferred `taxRate` |
+| `gst`, `totals`, `otherLedgers` | invoice GST summary / totals / non-sales non-tax legs |
+| `priorReturns` | `{ synced[], pending[], hasAny }` |
+| `meta` | itemCount, returnableItemCount, fullyReturned, natureOfReturn |
+
+`remainingQty` is cumulative over Credit Notes already synced from Tally (`bill_type='Agst Ref'` against this invoice) **and** app-created Credit Notes still queued.
+
 ## Purchase
 | Method | Path |
 |--------|------|

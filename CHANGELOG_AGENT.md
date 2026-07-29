@@ -1,5 +1,124 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-29 — Credit Note (Sales Return) backend: linked-invoice context + write rewrite
+
+### Added
+- `src/utils/creditNoteContext.js` (new) — shared Sales Return resolver used by both the read
+  endpoint and the writer, so the remaining quantity shown to the user is exactly the quantity
+  the writer will accept. Exports `resolveInvoiceForReturn`, `isSalesInvoiceRow`,
+  `loadCreditNoteContext`, `resolveCreditNoteContext` + the `normalizeName` / `num` / `round2` /
+  `round3` / `QTY_EPSILON` helpers.
+  - Per-item `soldQty`, `returnedSyncedQty`, `returnedPendingQty`, `previouslyReturnedQty`,
+    `remainingQty`, `isFullyReturned`.
+  - Prior returns come from two sources, never double-counted:
+    1. **synced** — `vouchers` where type is Credit Note, `bill_type='Agst Ref'` and
+       `bill_ref_name` matches the invoice's `bill_ref_name` / `reference` / `voucher_number` /
+       TDK ref, joined to `voucher_inventory_items`;
+    2. **pending** — `app_vouchers` with `voucher_type='credit_note'`, `tally_sync_status<>'failed'`,
+       whose `payload->linked_invoice` targets this invoice and which is not yet represented by a
+       synced Tally row (matched on `tally_voucher_no`, or the TDK ref appearing in the synced
+       voucher's `reference`/`narration`).
+  - Sales ledger candidates: the invoice's own `voucher_ledger_entries` legs intersected with the
+    company's Sales Accounts ledgers (group tree walked recursively), plus the full company list as
+    a fallback. Tax rows are the invoice's GST/duty legs with a rate inferred from the taxable base.
+- `src/routes/api-v1.js` — `GET /api/sales/invoices/:id/credit-note-context` (authed,
+  `verifyCompanyOwnership`). `:id` is the invoice GUID (preferred) or voucher number. Returns
+  invoice header/party, `linkedInvoice` (echo back into the POST), `items[]` with cumulative
+  return quantities and `selected:false`, `salesLedgerCandidates[]`, `companySalesLedgers[]`,
+  `defaultSalesLedger`, `taxes[]`, `gst`, `totals`, `otherLedgers`, `priorReturns`, `meta`.
+  Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_SALES_INVOICE` (400).
+- `src/__tests__/credit-note.test.js` (new) — 18 unit tests over the two pure pieces of the
+  writer (`prepareCreditNoteLines`, `buildCreditNoteXml`) plus the context helpers. No DB or
+  running server needed: `node --test src/__tests__/credit-note.test.js`.
+
+### Changed
+- `src/routes/tally-write.js` — `POST /tally/voucher/credit-note` fully rewritten as
+  **Sales Return only, always linked to a Sales invoice**, following the
+  Sales / Delivery Note / Receipt production pattern.
+  - Payload: `companyGuid`, `companyName`, `date`, `partyLedger`, `totalAmount`, `items[]`,
+    `taxes[]`, `isOptional`, `original_entry_type`, `numbering_policy`, `linked_invoice`,
+    `narration`. `linked_invoice` is **required** and carries
+    `{ invoiceGuid, voucherNumber, billRefName, tdkRef }`.
+  - Server-side validation (all 400 unless noted): company ownership (403), linked invoice exists
+    (404), linked voucher is a Sales invoice, `partyLedger` matches the invoice party exactly,
+    every item is billed on that invoice, positive qty and rate, requested qty (summed across
+    duplicate request lines) ≤ current remaining qty cumulatively, and the item's Sales ledger is
+    one the invoice actually posted to.
+  - Totals are recomputed server-side from `qty × rate` + tax legs; the client `totalAmount` is
+    only echoed back as `totals.clientTotalAmount` with `totals.recomputed`.
+  - `TDK-CN-*` / `TDK-OPT-CN-*` reference via `generateTDKReference(…, 'CN')`;
+    `numbering_policy='tallydekho_series'` (non-optional only) pre-assigns `TD/CN/<FY>/#####` via
+    `generateTDSeriesNumber(…, 'CN')`; Tally series → blank `<VOUCHERNUMBER>`.
+  - New `buildCreditNoteXml()` (exported) follows the real TallyPrime Credit Note export:
+    `VCHTYPE="Credit Note" ACTION="Create" OBJVIEW="Invoice Voucher View"`, `PERSISTEDVIEW`,
+    `VCHENTRYMODE Item Invoice`, `ISINVOICE Yes`, `DIFFACTUALQTY Yes`,
+    `GSTNATUREOFRETURN 01-Sales Return`, `ISOPTIONAL`, `REFERENCE` = TDK-CN ref.
+    Inventory / batch / accounting-allocation / tax amounts are **negative** with
+    `ISDEEMEDPOSITIVE Yes` and **positive** quantities, `RATE` unit-qualified (`155/nos`),
+    `Primary Batch` + godown, accounting allocation on the supplied original Sales ledger.
+    Party leg is **positive** with `ISDEEMEDPOSITIVE No` and
+    `BILLALLOCATIONS.LIST` → `NAME` = original bill ref, `BILLTYPE Agst Ref`, positive amount.
+    Export-only noise (GUID / REMOTEID / VCHKEY / ALTERID / empty `*.LIST` scaffolding /
+    `ORIGINVOICEDETAILS`) is not emitted. All values pass through `escapeXml()`.
+  - Lifecycle: `write_queue` (`entry_type='credit_note'`) + `app_vouchers`
+    (`voucher_type='credit_note'`, TDK ref, `original_entry_type`, numbering policy, party,
+    server total, payload); requests desktop sync-back on success; marks `app_vouchers`
+    `failed` / `not_posted` on throw. Offline queue + retry reuse the existing generic paths.
+  - Response: `queued`, `queueId`, `tdkReferenceNo`, `invoiceUuid`, `creditNoteNumber`,
+    `voucherNumber`, `numbering_policy`, `linkedInvoice`, `totals`, `tallyId`, `data`.
+- `src/routes/tally-write.js` — `buildVoucherDocument()` now handles `credit_note`:
+  `documentType:'credit_note'`, `tallyVoucherType:'Credit Note'`, `creditNote.againstInvoice`
+  (invoice guid/number/date/bill ref/TDK ref/amount), `againstInvoiceNo`, and the existing
+  `rawPayload`. `GET /tally/invoice/:tdkRef/preview` and `POST …/share-pdf` therefore render
+  Credit Notes with no further change.
+- `src/routes/api-v1.js` — `GET /api/vouchers/my-entries` now has an explicit
+  `credit_note ↔ '%Credit Note%'` JOIN pair (Credit Note numbers are sequential like Receipts, so
+  the tight type predicate matters) and `credit_note` was added to the generic-fallback exclusion list.
+
+### Behavior
+- A Credit Note can no longer be created without a linked Sales invoice, and can never return more
+  than the invoice billed minus what has already been returned — including returns still sitting in
+  the offline queue.
+- Debit Note and every other voucher route are untouched.
+
+### How to test
+- `node --test src/__tests__/credit-note.test.js` → 18/18 pass (validation + XML shape, no DB).
+- `GET /api/sales/invoices/<guid>/credit-note-context?companyGuid=…` → confirm `items[].remainingQty`
+  equals `soldQty` on a never-returned invoice; create a Credit Note, then re-fetch and confirm
+  `remainingQty` dropped and `priorReturns.pending` (desktop offline) or `.synced` lists it.
+- `POST /tally/voucher/credit-note` happy path with `numbering_policy:'tally_prime_series'` →
+  `tdkReferenceNo: TDK-CN-<year>-####`, blank `<VOUCHERNUMBER>` in `write_queue.xml`,
+  `queued:true` when the desktop is offline.
+- Repeat with `numbering_policy:'tallydekho_series'` → `creditNoteNumber` returned immediately as
+  `TD/CN/<FY>/#####` and present as `<VOUCHERNUMBER>`. `isOptional:true` → `ISOPTIONAL Yes`,
+  ref `TDK-OPT-CN-*`, no TD series number.
+- Rejection paths: omit `linked_invoice`; point it at a Purchase or Sales Order voucher; send a
+  mismatched `partyLedger`; send an item not on the invoice; send qty above `remainingQty`; send a
+  `salesLedger` the invoice never used — each returns 400 with a specific message.
+- With desktop + Tally running: import and confirm TallyPrime shows a Credit Note in Invoice
+  Voucher View with nature of return `01-Sales Return`, stock coming back in, and the party bill
+  knocked off against the original invoice reference.
+
+### Risks
+- The taxable GST child structure could not be verified against the reference export (it is an
+  exempt/B2C voucher with no tax legs). Tax legs use the established Sales/Delivery ledger pattern
+  reversed; `ORIGINVOICEDETAILS` children were deliberately not invented. Verify a taxable
+  Sales Return against live TallyPrime before enabling GST returns in the app.
+- `RATE` is emitted as `<rate>/<unit>` whenever a unit is known (from the request or the invoice
+  line); a unit that does not match the stock item's Tally unit will be rejected by Tally.
+- `BILLALLOCATIONS` requires the customer ledger to have "Maintain bill-by-bill = Yes", same
+  constraint as the paired Receipt flow. Without it Tally rejects the voucher.
+- Prior-return matching depends on `vouchers.bill_ref_name` / `bill_type` being populated by the
+  sync. A Credit Note entered directly in Tally without a bill allocation is invisible to the
+  remaining-qty calculation, so such a return would not reduce `remainingQty`.
+- Optional (non-book) Credit Notes are counted toward returned quantity — conservative, but it
+  means an optional return blocks that quantity from being returned again.
+- New SQL (recursive Sales-group walk, `payload->'linked_invoice'` JSONB filter) was validated by
+  review and by syntax check only — no local Postgres was available, so run the two endpoints
+  against a real company before shipping.
+
+---
+
 ## 2026-07-29 — Delivery Note Order/Dispatch XML (screenshot tags)
 
 ### Changed
