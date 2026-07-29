@@ -1,5 +1,29 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-29 — Delivery Note Order/Dispatch XML (screenshot tags)
+
+### Changed
+- `src/routes/tally-write.js` — `POST /tally/voucher/delivery-note` `dispatch_details` now emits the full Order & Dispatch screenshot set:
+  - `mode_of_payment` → `BASICDUEDATEOFPYMT`
+  - `other_references` → `BASICORDERREF` (`REFERENCE` remains `TDK-DN-*`)
+  - `terms_of_delivery` → `BASICORDERTERMS.LIST` (newline-split)
+  - `transport_doc_no` / `dispatch_doc_no` → `BASICSHIPDOCUMENTNO`
+  - `dispatched_through` / `transport_mode` → `BASICSHIPPEDBY`
+  - `ship_to` / `destination` → `BASICFINALDESTINATION`
+  - `carrier_name` / `transporter_name` → `EICHECKPOST`
+  - `bill_of_lading_no` / `lr_rr_no` → `BILLOFLADINGNO`
+  - `lr_date` / `transport_doc_date` → `BILLOFLADINGDATE`
+  - `vehicle_number` → `BASICSHIPVESSELNO`
+- Existing Sales-like payload, TDK numbering, `linked_order` → `INVOICEORDERLIST`, and `original_entry_type` unchanged.
+
+### How to test
+- Post DN with full `dispatch_details` + `linked_order`; inspect `write_queue.xml` for the tags above; confirm Tally accepts and shows Order/Dispatch fields.
+
+### Risks
+- Carrier → `EICHECKPOST` is the agreed screenshot mapping; live Tally may ignore unknown UDFs quietly — verify in TallyPrime after import.
+
+---
+
 ## 2026-07-29 — Delivery Note write parity + optional party filter on voucher lists
 
 ### Changed

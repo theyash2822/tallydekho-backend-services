@@ -2417,7 +2417,7 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
     isOptional = false,
     original_entry_type,
     numbering_policy = 'tally_prime_series', // 'tally_prime_series' | 'tallydekho_series'
-    dispatch_details = null,
+    dispatch_details = null, // Order & Dispatch screenshot fields (see dispatchXml below)
     linked_order = null, // { order_date, order_no } — emits INVOICEORDERLIST.LIST
     trackingNumber = '', // voucher-level fallback for per-item trackingNumber
   } = req.body;
@@ -2447,18 +2447,56 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
   // the actual item/tax/logistics legs, use the derived total for the party leg.
   const amt = Math.abs(requestedTotal - derivedTotal) <= 0.05 ? requestedTotal : derivedTotal;
 
-  // ── Dispatch details → top-level TallyPrime tags (same mapping as Sales) ────
+  // ── Order & Dispatch → top-level TallyPrime tags (Delivery Note screenshot) ─
+  // Mode/Terms of Payment → BASICDUEDATEOFPYMT
+  // Other References      → BASICORDERREF  (REFERENCE stays TDK-DN-* for reconciliation)
+  // Terms of Delivery     → BASICORDERTERMS.LIST
+  // Dispatch Doc No.      → BASICSHIPDOCUMENTNO
+  // Dispatched through    → BASICSHIPPEDBY
+  // Destination           → BASICFINALDESTINATION
+  // Carrier Name/Agent    → EICHECKPOST
+  // Bill of Lading/LR-RR  → BILLOFLADINGNO
+  // LR Date               → BILLOFLADINGDATE
+  // Motor Vehicle No.     → BASICSHIPVESSELNO
   let dispatchXml = '';
   if (dispatch_details) {
     const dd = dispatch_details;
     const modeSimpleMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', 'not_applicable': '', 'not applicable': '' };
-    const modeKey = (dd.transport_mode || '').toLowerCase().replace(' ', '_');
-    const tallySimpleMode = modeSimpleMap[modeKey] ?? dd.transport_mode ?? '';
+    const modeKey = (dd.dispatched_through || dd.transport_mode || '').toLowerCase().replace(/\s+/g, '_');
+    const shippedBy = modeSimpleMap[modeKey]
+      ?? (dd.dispatched_through || dd.transport_mode || '');
+    const termsRaw = dd.terms_of_delivery || dd.termsOfDelivery || '';
+    const termsLines = String(termsRaw)
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean);
+    const termsXml = termsLines.length
+      ? [
+          '  <BASICORDERTERMS.LIST TYPE="String">',
+          ...termsLines.map(l => `    <BASICORDERTERMS>${escapeXml(l)}</BASICORDERTERMS>`),
+          '  </BASICORDERTERMS.LIST>',
+        ].join('\n')
+      : '';
+    const lrDate = dd.lr_date || dd.transport_doc_date || '';
+    const lrDateXml = lrDate ? `  <BILLOFLADINGDATE>${tallyDate(lrDate)}</BILLOFLADINGDATE>` : '';
+    const carrier = dd.carrier_name || dd.transporter_name || '';
+    const blNo = dd.bill_of_lading_no || dd.lr_rr_no || '';
     dispatchXml = [
-      tallySimpleMode     ? `  <BASICSHIPPEDBY>${escapeXml(tallySimpleMode)}</BASICSHIPPEDBY>` : '',
-      dd.transport_doc_no ? `  <BASICSHIPDOCUMENTNO>${escapeXml(dd.transport_doc_no)}</BASICSHIPDOCUMENTNO>` : '',
-      dd.ship_to          ? `  <BASICFINALDESTINATION>${escapeXml(dd.ship_to)}</BASICFINALDESTINATION>` : '',
-      dd.vehicle_number   ? `  <BASICSHIPVESSELNO>${escapeXml(dd.vehicle_number)}</BASICSHIPVESSELNO>` : '',
+      dd.mode_of_payment || dd.payment_terms
+        ? `  <BASICDUEDATEOFPYMT>${escapeXml(dd.mode_of_payment || dd.payment_terms)}</BASICDUEDATEOFPYMT>` : '',
+      dd.other_references
+        ? `  <BASICORDERREF>${escapeXml(dd.other_references)}</BASICORDERREF>` : '',
+      termsXml,
+      dd.transport_doc_no || dd.dispatch_doc_no
+        ? `  <BASICSHIPDOCUMENTNO>${escapeXml(dd.transport_doc_no || dd.dispatch_doc_no)}</BASICSHIPDOCUMENTNO>` : '',
+      shippedBy ? `  <BASICSHIPPEDBY>${escapeXml(shippedBy)}</BASICSHIPPEDBY>` : '',
+      dd.ship_to || dd.destination
+        ? `  <BASICFINALDESTINATION>${escapeXml(dd.ship_to || dd.destination)}</BASICFINALDESTINATION>` : '',
+      carrier ? `  <EICHECKPOST>${escapeXml(carrier)}</EICHECKPOST>` : '',
+      blNo ? `  <BILLOFLADINGNO>${escapeXml(blNo)}</BILLOFLADINGNO>` : '',
+      lrDateXml,
+      dd.vehicle_number
+        ? `  <BASICSHIPVESSELNO>${escapeXml(dd.vehicle_number)}</BASICSHIPVESSELNO>` : '',
     ].filter(Boolean).join('\n');
   }
 
