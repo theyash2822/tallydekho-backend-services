@@ -68,7 +68,8 @@ All: ?companyGuid&fy
 | GET | /api/sales/credit-notes |
 | GET | /api/sales/delivery-notes |
 | GET | /api/sales/ewaybills |
-All: ?companyGuid&fy&from&to&page&limit
+All: ?companyGuid&fy&from&to&page&limit&search&partyName
+`partyName` (optional): exact party match, case- and whitespace-insensitive. Omit for the full list.
 
 ## Purchase
 | Method | Path |
@@ -76,7 +77,7 @@ All: ?companyGuid&fy&from&to&page&limit
 | GET | /api/purchase/invoices |
 | GET | /api/purchase/orders |
 | GET | /api/purchase/debit-notes |
-All: ?companyGuid&fy&from&to
+All: ?companyGuid&fy&from&to&page&limit&search&partyName
 
 ## Vouchers
 | Method | Path | Notes |

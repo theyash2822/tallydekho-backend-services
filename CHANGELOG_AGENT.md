@@ -1,5 +1,43 @@
 # CHANGELOG_AGENT.md
 
+## 2026-07-29 — Delivery Note write parity + optional party filter on voucher lists
+
+### Changed
+- `src/routes/tally-write.js` — `POST /tally/voucher/delivery-note` rewritten:
+  - Payload aligned with Sales / Sales Order: `companyGuid`, `companyName`, `date`, `voucherNumber`, `reference`, `narration`, `partyLedger`, `totalAmount`, `items[]`, `taxes[]`, `logistics[]`, `isOptional`, `original_entry_type`, `numbering_policy`, `dispatch_details`, `linked_order`, `trackingNumber`
+  - Validates `companyGuid` + `partyLedger` + non-empty `items[]` (and `itemName` per item) → 400
+  - All caller-supplied strings run through the existing `escapeXml()` helper
+  - `TDK-DN-*` / `TDK-OPT-DN-*` reference via `generateTDKReference(…, 'DN')`; `numbering_policy=tallydekho_series` (non-optional) pre-assigns `TD/DN/<FY>/#####` via `generateTDSeriesNumber(…, 'DN')`
+  - XML matches a real TallyPrime Delivery Note export: `VCHTYPE="Delivery Note" ACTION="Create" OBJVIEW="Invoice Voucher View"`, `PERSISTEDVIEW`, `ISINVOICE No`, `DIFFACTUALQTY Yes`, `ISOPTIONAL`, `DATE`/`EFFECTIVEDATE`, dispatch tags `BASICSHIPPEDBY` / `BASICSHIPDOCUMENTNO` / `BASICFINALDESTINATION` / `BASICSHIPVESSELNO`, party `LEDGERENTRIES` debited `-total`, per-item `ALLINVENTORYENTRIES` (`RATE` qualified with unit, positive amount/qty, `BATCHALLOCATIONS` godown + Primary Batch + `TRACKINGNUMBER`, `ACCOUNTINGALLOCATIONS` sales ledger), tax + logistics ledger entries as in Sales, and `INVOICEORDERLIST.LIST` (`BASICORDERDATE` + `BASICPURCHASEORDERNO`) when `linked_order` is supplied
+  - Persists `write_queue` (`entry_type=delivery_note`, amount) + `app_vouchers` (`voucher_type=delivery_note`, TDK ref, numbering policy, party, amount, payload); requests desktop sync-back on success; marks `app_vouchers` failed on throw
+  - `original_entry_type` falls back to `optional` when `isOptional` is set and the caller didn't supply it (explicit value still wins)
+  - Response: `queued`, `queueId`, `tdkReferenceNo`, `invoiceUuid`, `deliveryNoteNumber`, `voucherNumber`, `numbering_policy`, `tallyId`, `data`
+- `src/routes/api-v1.js` — `voucherListHandler` accepts an optional `partyName` query param (exact match, case- and whitespace-insensitive), applied to both the page query and the `meta.total` count. Available on every list route it backs (`/api/sales/orders`, `/sales/invoices`, `/sales/delivery-notes`, `/sales/credit-notes`, `/purchase/*`).
+
+### Behavior
+- Delivery Note now behaves like Sales/Sales Order for numbering, TDK referencing, My Entries lifecycle and reconciliation (REFERENCE-first path picks up `TDK-DN-*`; My Entries JOIN resolves `delivery_note` ↔ `Delivery Note` through the generic `voucher_type` fallback).
+- Offline semantics unchanged: no paired/connected desktop → entry queued, `queued: true`, pushed when desktop reconnects.
+- Party debit is derived from items + taxes + logistics whenever the caller total
+  differs, keeping the voucher balanced.
+- Item and logistics taxes are aggregated into one row per tax ledger (matching
+  Tally's reference export with one combined `GST` ledger row).
+- Voucher lists without `partyName` return exactly what they returned before.
+
+### How to test
+- `POST /tally/voucher/delivery-note` with `numbering_policy: 'tally_prime_series'` → expect `tdkReferenceNo: TDK-DN-<year>-####`, `queued: true` with desktop offline; inspect `write_queue.xml` for the tags listed above.
+- Repeat with `numbering_policy: 'tallydekho_series'` → `deliveryNoteNumber` returned immediately as `TD/DN/<FY>/#####` and present as `<VOUCHERNUMBER>`.
+- `isOptional: true` → `ISOPTIONAL Yes`, ref `TDK-OPT-DN-*`, no TD series number.
+- With desktop + Tally running: post with `dispatch_details` + `linked_order`, confirm Tally accepts and the Delivery Note shows dispatch details and order link.
+- `GET /api/sales/orders?companyGuid=…&partyName=<exact party>` → only that party's orders, `meta.total` matching; drop `partyName` → unchanged full list.
+
+### Risks
+- `RATE` is emitted as `<rate>/<unit>` when `items[].unit` is supplied; a unit symbol that does not match the stock item's Tally unit will be rejected by Tally. Omit `unit` to send a bare rate.
+- Party is debited for the full value even though a Delivery Note has no billing impact — matches the reference export, but ledger totals differ from the old (party-entry-less) XML.
+- `ISINVOICE` flipped `Yes` → `No` and `DIFFACTUALQTY` `No` → `Yes` per the reference export; Tally imports the voucher in Invoice Voucher View.
+- No DB/schema change; `app_vouchers.voucher_type='delivery_note'` relies on the existing generic reconcile fallback rather than a dedicated branch.
+
+---
+
 ## 2026-07-27 — Hard sync = rebuild (purge selected GUID then re-ingest)
 
 ### Changed

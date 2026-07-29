@@ -803,6 +803,9 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   const { search = '', page = 1, limit = 30 } = req.query;
   const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
+  // Optional exact (case/whitespace-insensitive) party filter — used by "deliveries for
+  // this customer" style screens. Omitted → handler behaves exactly as before.
+  const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
   try {
     let q = `
       SELECT v.*,
@@ -820,13 +823,20 @@ const voucherListHandler = (voucherType) => async (req, res) => {
         AND (v.party_name ILIKE $3 OR v.voucher_number ILIKE $3)
         AND v.date BETWEEN $4 AND $5`;
     const params = [companyGuid, `%${voucherType}%`, `%${search}%`, from, to];
-    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $6 OFFSET $7`;
+    if (partyName) {
+      params.push(partyName);
+      q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
+    }
+    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const { rows: cnt } = await query(
-      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND date BETWEEN $3 AND $4`,
-      [companyGuid, `%${voucherType}%`, from, to]
-    );
+    const cntParams = [companyGuid, `%${voucherType}%`, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND date BETWEEN $3 AND $4`;
+    if (partyName) {
+      cntParams.push(partyName);
+      cntQ += ` AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
+    }
+    const { rows: cnt } = await query(cntQ, cntParams);
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
