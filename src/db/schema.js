@@ -1,5 +1,6 @@
 // Database — PostgreSQL via pg pool
 import pg from 'pg';
+import { REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -947,6 +948,14 @@ export async function initSchema() {
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
     `);
+
+    // Data repair: thin SimplifiedVoucher syncs used to overwrite every
+    // voucher_type_parent with the 'Voucher' placeholder, emptying the GST
+    // classification and breaking the Credit Note Sales-invoice guard.
+    // Idempotent — a no-op once the table is clean.
+    const repaired = await client.query(REPAIR_VOUCHER_TYPE_PARENT_SQL, [null]);
+    if (repaired.rowCount) console.log(`🔧 voucher_type_parent repaired for ${repaired.rowCount} rows`);
+
     console.log('✅ PostgreSQL schema initialized');
   } finally {
     client.release();

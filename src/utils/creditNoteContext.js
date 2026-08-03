@@ -46,13 +46,14 @@ const uniqueStrings = (values) => {
 
 /**
  * A voucher qualifies as a Sales invoice when Tally's parent voucher type is
- * 'Sales', or (for installs where voucher_type_parent was never synced) when the
- * type reads like Sales without being an order.
+ * 'Sales', or — when the parent is missing or carries the 'Voucher' placeholder
+ * that SimplifiedVoucher.xml leaves behind — when the type reads like Sales
+ * without being an order.
  */
 export function isSalesInvoiceRow(voucher) {
   if (!voucher) return false;
-  const parent = String(voucher.voucher_type_parent || '').trim();
-  if (parent) return parent.toLowerCase() === 'sales';
+  const parent = String(voucher.voucher_type_parent || '').trim().toLowerCase();
+  if (parent && parent !== 'voucher') return parent === 'sales';
   const vt = String(voucher.voucher_type || '');
   return /sales/i.test(vt) && !/order/i.test(vt);
 }

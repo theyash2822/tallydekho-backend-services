@@ -2,6 +2,7 @@
 // Handles: masters (ledgers, stocks), vouchers, stock transactions
 import { getClient, query as dbQuery } from '../db/schema.js';
 import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
+import { deriveVoucherTypeParent, REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
 import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
 
@@ -387,20 +388,6 @@ function _tallyAliasMayBeBarcode(val) {
   return numRatio >= 0.7 || v.startsWith('TDK');
 }
 
-// Derive parent voucher type from custom Tally voucher type name
-function deriveVoucherTypeParent(voucherType) {
-  if (!voucherType) return voucherType;
-  const vt = voucherType.toLowerCase();
-  if (vt.includes('credit note') || vt.includes('sales return')) return 'Credit Note';
-  if (vt.includes('debit note') || vt.includes('purchase return')) return 'Debit Note';
-  if (vt.includes('sales') || vt.includes('invoice') || vt.includes('retail')) return 'Sales';
-  if (vt.includes('purchase')) return 'Purchase';
-  if (vt.includes('journal') || vt.includes('adjustment')) return 'Journal';
-  if (vt.includes('payment')) return 'Payment';
-  if (vt.includes('receipt')) return 'Receipt';
-  if (vt.includes('contra')) return 'Contra';
-  return voucherType;
-}
 async function maybeStoreRaw(records, companyGuid, streamName) {
   if (!STORE_RAW || !records?.length) return;
   const client = await getClient();
@@ -732,7 +719,8 @@ async function processVouchers(data, companyGuid) {
             -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             voucher_number        = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type          = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
-            voucher_type_parent   = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
+            -- NULLIF: a stub's 'Voucher' placeholder must never flatten a resolved parent
+            voucher_type_parent   = COALESCE(NULLIF(EXCLUDED.voucher_type_parent, 'Voucher'), vouchers.voucher_type_parent),
             date                  = COALESCE(EXCLUDED.date, vouchers.date),
             party_name            = COALESCE(EXCLUDED.party_name, vouchers.party_name),
             party_guid            = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),
@@ -2172,6 +2160,9 @@ async function processGSTDetails(data, companyGuid) {
     console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);
     // Post-process: update vouchers classification from gst_voucher_details
     try {
+      // Every classification below filters on voucher_type_parent, so heal any row
+      // a thin stream left on the 'Voucher' placeholder before they run.
+      await dbQuery(REPAIR_VOUCHER_TYPE_PARENT_SQL, [companyGuid]);
       // Mark is_interstate on gst_voucher_details (IGST only = interstate)
       await dbQuery(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_guid = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [companyGuid]);
       // Mark is_rcm on gst_voucher_details from Tally data
@@ -2931,7 +2922,8 @@ async function processAllVoucher(data, companyGuid) {
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
-            voucher_type_parent = COALESCE(EXCLUDED.voucher_type_parent, vouchers.voucher_type_parent),
+            -- NULLIF: a stub's 'Voucher' placeholder must never flatten a resolved parent
+            voucher_type_parent = COALESCE(NULLIF(EXCLUDED.voucher_type_parent, 'Voucher'), vouchers.voucher_type_parent),
             date                = COALESCE(EXCLUDED.date, vouchers.date),
             party_name          = COALESCE(EXCLUDED.party_name, vouchers.party_name),
             party_guid          = COALESCE(EXCLUDED.party_guid, vouchers.party_guid),

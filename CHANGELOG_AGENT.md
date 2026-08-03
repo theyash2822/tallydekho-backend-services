@@ -1,5 +1,76 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-03 — Prevent duplicate Sales / Audit Trail retries
+
+### Changed
+- `src/routes/tally-write.js`
+  - Sales Invoice: 2-minute duplicate-submit guard (same party/date/amount/items)
+    returns the existing `app_vouchers` row instead of minting another TDK + Tally voucher.
+  - `retrySingleEntry`: atomic claim only from `desktop_offline` / `failed` / `pending`;
+    rejects concurrent retries with `alreadyProcessing`; skips re-import when a
+    `tally_voucher_number` already exists.
+  - `/tally/audit-trail/:id/retry` now uses the same atomic helper.
+  - Auto-retry loop also claims rows atomically.
+- `src/routes/api-v1.js` — `/vouchers/my-entries/:id/retry` returns 409 when already processing.
+
+---
+
+## 2026-07-30 — Credit Note editable return amount
+
+### Changed
+- `src/routes/tally-write.js`: Credit Note item normalization now accepts a positive
+  client-entered `amount`. The effective Tally rate is derived as amount ÷ return quantity,
+  preserving the exact credit value. Payloads without an amount retain the original
+  quantity × rate behavior.
+- `src/__tests__/credit-note.test.js`: covers editable amount, derived rate, omitted-amount
+  fallback, and zero-amount rejection (19 tests passing).
+
+---
+
+## 2026-07-30 — Fix: `voucher_type_parent` flattened to 'Voucher' for every row
+
+A valid Sales invoice (`TD131-3-2026`, type `Sales`) was rejected by Credit Note with
+`NOT_A_SALES_INVOICE`. Root cause was data, not the voucher: all 8,411 rows in `vouchers`
+carried `voucher_type_parent = 'Voucher'`.
+
+`SimplifiedVoucher.xml` omits `VOUCHERTYPENAME`, so the ingest falls back to the literal
+`'Voucher'`; `deriveVoucherTypeParent()` returned that string unchanged, and the upsert's
+`COALESCE(EXCLUDED.voucher_type_parent, …)` — which prefers the incoming value — wrote it over
+the resolved parent on every thin sync. `voucher_type` was already protected against exactly
+this sentinel by an explicit `CASE`; the parent column was not. The 2026-05-18 backfill was
+erased by later syncs.
+
+### Added
+- `src/utils/voucherTypeParent.js` (new) — single home for the parent mapping: JS
+  `deriveVoucherTypeParent()` (returns `null` for the `'Voucher'` placeholder), the equivalent
+  `voucherTypeParentSql()` expression, and idempotent `REPAIR_VOUCHER_TYPE_PARENT_SQL`
+  (one param: company_guid, or `null` for all companies).
+  Orders, Delivery Notes and Receipt Notes now map to their own parents instead of falling
+  through to `Sales` / `Receipt` — a Sales Order could previously derive parent `Sales`.
+
+### Changed
+- `src/utils/creditNoteContext.js` — `isSalesInvoiceRow()` treats a `'Voucher'` parent as
+  unknown and falls back to the `voucher_type` name check, same as a missing parent.
+- `src/controllers/ingestProcessor.js` — both voucher upserts use
+  `COALESCE(NULLIF(EXCLUDED.voucher_type_parent, 'Voucher'), vouchers.voucher_type_parent)`;
+  the local derive helper moved to the shared util; the GSTDetails post-process runs the
+  repair before the parent-dependent classification updates.
+- `src/db/schema.js` — runs the repair at boot, logging the row count when it heals anything.
+- `src/__tests__/credit-note.test.js` — 4 assertions covering the `'Voucher'` placeholder.
+
+### Data repair (run 2026-07-30)
+- 8,411 rows re-derived; `Sales GST`→`Sales`, `Sales Order`→`Sales Order`, etc.
+- Recomputed `gst_section`, `gstr3b_section`, `gst_tabs_json`, `gst_sections_json` for
+  Yash Ki Company: Output GST went from ₹0 to ₹52,34,773 and empty `gst_tabs_json` dropped
+  from 8,397 to 3,042 rows (the remainder are Payment/Receipt/Contra/Journal, correctly `[]`).
+
+### Known issue (not fixed here)
+- `resolveInvoiceForReturn()` matches `guid OR voucher_number`, and this company has 14
+  duplicated Sales voucher numbers (`TD131-3-2026` exists twice). Resolution by number picks
+  the most recent date. The mobile app sends the GUID, so nothing is broken today.
+
+---
+
 ## 2026-07-29 — Credit Note (Sales Return) backend: linked-invoice context + write rewrite
 
 ### Added

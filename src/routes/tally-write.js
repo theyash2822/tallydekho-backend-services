@@ -613,6 +613,57 @@ router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const amt = parseFloat(totalAmount) || 0;
   const vchType = voucherType || 'Sales GST';
 
+  // Double-submit guard: identical Sales Invoice creates within 2 minutes return the
+  // existing app_voucher instead of minting another TDK ref and Tally voucher.
+  // Fingerprint = party + date + amount + item names/qty/rate (order-insensitive).
+  const itemFingerprint = (list) => JSON.stringify(
+    [...(list || [])]
+      .map(i => ({
+        n: String(i.itemName || i.name || '').trim().toLowerCase(),
+        q: Number(i.billedQty ?? i.actualQty ?? i.qty ?? 0),
+        r: Number(i.rate ?? 0),
+        a: Number(i.amount ?? 0),
+      }))
+      .sort((a, b) => a.n.localeCompare(b.n) || a.q - b.q)
+  );
+  const thisFp = itemFingerprint(items);
+  try {
+    const { rows: recent } = await query(
+      `SELECT id, tdk_reference_no, invoice_uuid, tally_voucher_no, tally_sync_status,
+              books_impact_status, payload, write_queue_id, created_at
+         FROM app_vouchers
+        WHERE company_guid = $1
+          AND voucher_type = 'sales_invoice'
+          AND user_id = $2
+          AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($3))
+          AND ABS(COALESCE(total_amount,0) - $4::numeric) < 0.02
+          AND voucher_date = $5::date
+          AND created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 120
+        ORDER BY id DESC
+        LIMIT 5`,
+      [companyGuid, req.user.userId, partyLedger, amt, date || null]
+    );
+    const dup = recent.find(r => itemFingerprint(r.payload?.items) === thisFp);
+    if (dup) {
+      console.warn(`[sales] duplicate submit suppressed → ${dup.tdk_reference_no} (wq ${dup.write_queue_id})`);
+      return res.json({
+        status: true,
+        queued: dup.tally_sync_status === 'queued' || dup.books_impact_status === 'not_posted',
+        queueId: dup.write_queue_id,
+        tdkReferenceNo: dup.tdk_reference_no,
+        invoiceUuid: dup.invoice_uuid,
+        invoiceNumber: dup.tally_voucher_no || null,
+        numberingPolicy: numbering_policy,
+        duplicate: true,
+        message: 'Same invoice was already submitted — returning the existing entry',
+        voucherNumber: dup.tally_voucher_no || null,
+        data: { status: true, voucherNumber: dup.tally_voucher_no || null },
+      });
+    }
+  } catch (dupErr) {
+    console.warn('[sales] duplicate check skipped:', dupErr.message);
+  }
+
   // Collect Payment Now: the payment is recorded as a SEPARATE Receipt voucher (created
   // after this invoice posts). The Sales Invoice itself is always a clean party debit for
   // the full invoice amount — no Cash/Bank leg here. This gives proper party ledger trail
@@ -2536,7 +2587,19 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
     const qty = r3(Math.abs(toNum(raw.billedQty ?? raw.actualQty ?? raw.qty)));
     if (!(qty > 0)) return { error: `Return quantity for "${ctxItem.itemName}" must be greater than 0` };
 
-    const rate = r2(Math.abs(toNum(raw.rate ?? ctxItem.rate)));
+    const requestedRate = r2(Math.abs(toNum(raw.rate ?? ctxItem.rate)));
+    const hasExplicitAmount = raw.amount !== undefined && raw.amount !== null && raw.amount !== '';
+    if (!hasExplicitAmount && !(requestedRate > 0)) {
+      return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
+    }
+    const amount = hasExplicitAmount
+      ? r2(Math.abs(toNum(raw.amount)))
+      : r2(qty * requestedRate);
+    if (!(amount > 0)) return { error: `Return amount for "${ctxItem.itemName}" must be greater than 0` };
+    // When the user edits the credit amount, send Tally the corresponding rate
+    // while retaining the exact entered amount. Without an explicit amount the
+    // original qty × rate behaviour remains unchanged.
+    const rate = hasExplicitAmount ? r2(amount / qty) : requestedRate;
     if (!(rate > 0)) return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
 
     const totalForItem = r3((requestedQty.get(key) || 0) + qty);
@@ -2567,7 +2630,7 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
       itemName: ctxItem.itemName,
       qty,
       rate,
-      amount: r2(qty * rate),
+      amount,
       unit: String(raw.unit || ctxItem.unit || '').trim(),
       godown: String(raw.godown || ctxItem.godown || 'Main Location').trim(),
       batch: String(raw.batchName || raw.batch || 'Primary Batch').trim(),
@@ -3873,45 +3936,74 @@ router.get('/audit-trail', authMiddleware, async (req, res) => {
 router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
-    const { rows } = await query(
-      'SELECT * FROM write_queue WHERE id = $1 AND user_id = $2',
-      [id, req.user.userId]
-    );
-    const entry = rows[0];
-    if (!entry) return res.status(404).json({ status: false, message: 'Entry not found' });
-    if (entry.status === 'success') return res.json({ status: true, message: 'Already pushed to Tally', alreadySuccess: true });
-    if (!entry.xml) return res.status(400).json({ status: false, message: 'No XML stored for retry' });
-
-    // Mark as processing first to prevent retryOfflineEntries from racing
-    await query(`UPDATE write_queue SET status='processing', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [id]);
-    const result = await forwardToTally(entry.company_guid, req.user.userId, entry.xml);
-    await updateWriteQueue(id, result, null);
-    const offline = result?.status === 'desktop_offline';
-    if (result?.status === false) {
-      return res.status(422).json({ status: false, message: result?.message || 'Tally rejected the entry' });
+    const result = await retrySingleEntry(id, req.user.userId);
+    if (result.alreadySuccess) {
+      return res.json({ status: true, message: result.message, alreadySuccess: true, voucherNumber: result.voucherNumber || null });
+    }
+    if (result.alreadyProcessing) {
+      return res.status(409).json({ status: false, message: result.message, alreadyProcessing: true });
+    }
+    if (!result.success) {
+      const code = /not found/i.test(result.message || '') ? 404 : 400;
+      return res.status(code).json({ status: false, message: result.message });
+    }
+    if (result.message?.startsWith('Tally rejected')) {
+      return res.status(422).json({ status: false, message: result.message });
     }
     res.json({
       status: true,
-      queued: offline,
-      message: offline ? 'Desktop still offline. Entry is queued.' : 'Successfully pushed to Tally',
-      voucherNumber: result?.voucherNumber || null,
+      queued: !!result.queued,
+      message: result.message,
+      voucherNumber: result.voucherNumber || null,
     });
   } catch (e) {
-    await updateWriteQueue(id, null, e.message);
+    await updateWriteQueue(id, null, e.message).catch(() => {});
     res.status(500).json({ status: false, message: e.message });
   }
 });
 
 // ── Auto-retry: called when desktop comes online ───────────────────────────────
-// Retry a single write_queue entry by id (used by /my-entries/:id/retry)
+// Retry a single write_queue entry by id (used by /my-entries/:id/retry).
+// Atomic claim: only desktop_offline / failed rows can be claimed. Concurrent
+// Audit Trail taps on a queued row used to re-forward the same XML and create
+// duplicate vouchers in Tally — the WHERE clause prevents that race.
 export async function retrySingleEntry(entryId, userId) {
   try {
-    const { rows } = await query(`SELECT * FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
-    const entry = rows[0];
-    if (!entry || !entry.xml) return { success: false, message: 'Entry not found or no XML' };
-    if (entry.status === 'success') return { success: true, alreadySuccess: true, message: 'Already pushed to Tally' };
-    // Mark as processing so retryOfflineEntries won't race
-    await query(`UPDATE write_queue SET status='processing', error_message=NULL, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entryId]);
+    const { rows: claimed } = await query(
+      `UPDATE write_queue
+          SET status='processing',
+              error_message=NULL,
+              updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE id=$1 AND user_id=$2
+          AND status IN ('desktop_offline', 'failed', 'pending')
+          AND xml IS NOT NULL
+        RETURNING *`,
+      [entryId, userId]
+    );
+    const entry = claimed[0];
+    if (!entry) {
+      const { rows } = await query(`SELECT id, status, xml, tally_voucher_number FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
+      const existing = rows[0];
+      if (!existing) return { success: false, message: 'Entry not found' };
+      if (existing.status === 'success') {
+        return { success: true, alreadySuccess: true, message: 'Already pushed to Tally', voucherNumber: existing.tally_voucher_number || null };
+      }
+      if (existing.status === 'processing') {
+        return { success: false, alreadyProcessing: true, message: 'Push already in progress — wait for it to finish' };
+      }
+      if (!existing.xml) return { success: false, message: 'No XML stored for retry' };
+      return { success: false, message: `Cannot retry entry in status "${existing.status}"` };
+    }
+
+    // If Tally already assigned a number on a prior attempt, do not re-import.
+    if (entry.tally_voucher_number) {
+      await query(
+        `UPDATE write_queue SET status='success', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`,
+        [entryId]
+      );
+      return { success: true, alreadySuccess: true, message: 'Already pushed to Tally', voucherNumber: entry.tally_voucher_number };
+    }
+
     const result = await forwardToTally(entry.company_guid, userId, entry.xml);
     await updateWriteQueue(entryId, result, null);
     const offline = result?.status === 'desktop_offline';
@@ -3923,6 +4015,7 @@ export async function retrySingleEntry(entryId, userId) {
         : result?.status === false
           ? `Tally rejected: ${result.message}`
           : 'Successfully pushed to Tally',
+      voucherNumber: result?.voucherNumber || null,
     };
   } catch (err) {
     await updateWriteQueue(entryId, null, err.message).catch(() => {});
@@ -3964,7 +4057,18 @@ export async function retryOfflineEntries(userId, companyGuid) {
     for (const entry of rows) {
       if (!entry.xml) continue;
       try {
-        await query(`UPDATE write_queue SET status='processing', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
+        // Atomic claim — skip if another retry already grabbed this row
+        const { rows: claimed } = await query(
+          `UPDATE write_queue SET status='processing', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+            WHERE id=$1 AND status IN ('desktop_offline','failed')
+            RETURNING id`,
+          [entry.id]
+        );
+        if (!claimed[0]) continue;
+        if (entry.tally_voucher_number) {
+          await query(`UPDATE write_queue SET status='success', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
+          continue;
+        }
         const result = await forwardToTally(entry.company_guid, userId, entry.xml);
         await updateWriteQueue(entry.id, result, null);
         // Update stock_adjustment status if linked

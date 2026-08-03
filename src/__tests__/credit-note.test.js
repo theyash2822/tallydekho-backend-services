@@ -49,20 +49,31 @@ const makeContext = (overrides = {}) => ({
 
 // ── prepareCreditNoteLines ───────────────────────────────────────────────────
 
-test('prepareCreditNoteLines — recomputes amounts and totals from qty × rate', () => {
+test('prepareCreditNoteLines — accepts an explicit editable return amount', () => {
   const out = prepareCreditNoteLines({
-    items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 50, rate: 155, amount: 999999 }],
-    taxes: [{ ledgerName: 'GST', taxAmount: 387.5, taxableValue: 7750, taxRate: 5 }],
+    items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 50, rate: 150, amount: 7500 }],
+    taxes: [{ ledgerName: 'GST', taxAmount: 375, taxableValue: 7500, taxRate: 5 }],
     context: makeContext(),
     invoice,
   });
 
   assert.equal(out.error, undefined);
-  assert.equal(out.items[0].amount, 7750, 'client-supplied amount must be ignored');
-  assert.equal(out.itemsTotal, 7750);
-  assert.equal(out.taxTotal, 387.5);
-  assert.equal(out.totalAmount, 8137.5);
+  assert.equal(out.items[0].amount, 7500);
+  assert.equal(out.items[0].rate, 150, 'rate is derived from editable amount ÷ quantity');
+  assert.equal(out.itemsTotal, 7500);
+  assert.equal(out.taxTotal, 375);
+  assert.equal(out.totalAmount, 7875);
   assert.equal(out.items[0].salesLedger, 'Seed Sale A\\C', 'falls back to the invoice Sales ledger');
+});
+
+test('prepareCreditNoteLines — falls back to qty × rate when amount is omitted', () => {
+  const out = prepareCreditNoteLines({
+    items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 50, rate: 155 }],
+    taxes: [], context: makeContext(), invoice,
+  });
+  assert.equal(out.error, undefined);
+  assert.equal(out.items[0].amount, 7750);
+  assert.equal(out.items[0].rate, 155);
 });
 
 test('prepareCreditNoteLines — rejects an item that is not on the invoice', () => {
@@ -86,6 +97,12 @@ test('prepareCreditNoteLines — rejects non-positive qty and rate', () => {
     invoice,
   });
   assert.match(zeroRate.error, /Rate .* must be greater than 0/);
+
+  const zeroAmount = prepareCreditNoteLines({
+    items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 5, rate: 155, amount: 0 }],
+    taxes: [], context: makeContext(), invoice,
+  });
+  assert.match(zeroAmount.error, /Return amount .* must be greater than 0/);
 });
 
 test('prepareCreditNoteLines — enforces cumulative remaining qty across prior returns', () => {
@@ -272,6 +289,11 @@ test('isSalesInvoiceRow — accepts Sales, rejects orders and other parents', ()
   assert.equal(isSalesInvoiceRow({ voucher_type_parent: 'Sales Order', voucher_type: 'Sales Order' }), false);
   // No parent synced → fall back to the type name.
   assert.equal(isSalesInvoiceRow({ voucher_type: 'Sales GST' }), true);
+  // SimplifiedVoucher.xml leaves the 'Voucher' placeholder → also fall back.
+  assert.equal(isSalesInvoiceRow({ voucher_type_parent: 'Voucher', voucher_type: 'Sales' }), true);
+  assert.equal(isSalesInvoiceRow({ voucher_type_parent: 'Voucher', voucher_type: 'Sales GST' }), true);
+  assert.equal(isSalesInvoiceRow({ voucher_type_parent: 'Voucher', voucher_type: 'Sales Order' }), false);
+  assert.equal(isSalesInvoiceRow({ voucher_type_parent: 'Voucher', voucher_type: 'Credit Note' }), false);
   assert.equal(isSalesInvoiceRow({ voucher_type: 'Sales Order' }), false);
   assert.equal(isSalesInvoiceRow({ voucher_type: 'Purchase' }), false);
   assert.equal(isSalesInvoiceRow(null), false);

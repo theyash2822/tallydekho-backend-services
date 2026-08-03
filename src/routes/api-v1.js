@@ -1292,10 +1292,12 @@ router.post('/vouchers/my-entries/:id/retry', authMiddleware, async (req, res) =
       [id, userId]
     );
     if (!rows[0]) return res.status(404).json({ success: false, message: 'Entry not found' });
-    const entry = rows[0];
     // Use retrySingleEntry to safely push one entry without race conditions
     const { retrySingleEntry } = await import('./tally-write.js');
     const result = await retrySingleEntry(id, userId);
+    if (result.alreadyProcessing) {
+      return res.status(409).json({ success: false, alreadyProcessing: true, message: result.message });
+    }
     return res.json(result);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
