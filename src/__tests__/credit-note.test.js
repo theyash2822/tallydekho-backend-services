@@ -32,18 +32,21 @@ const makeContext = (overrides = {}) => ({
   items: [
     {
       itemName: 'Maize 4794 TL 1KG', unit: 'nos', hsn: '1209', godown: 'Main Location', batch: 'Primary Batch',
-      rate: 155, soldQty: 50, soldAmount: 7750,
+      rate: 155, soldQty: 50, soldAmount: 7750, netTaxablePerUnit: 155, discount: 0, gstRate: 5,
       returnedSyncedQty: 0, returnedPendingQty: 0, previouslyReturnedQty: 0, remainingQty: 50,
     },
     {
       itemName: 'Wheat Seed 5KG', unit: 'bag', hsn: '1001', godown: 'Main Location', batch: 'Primary Batch',
-      rate: 400, soldQty: 10, soldAmount: 4000,
+      rate: 400, soldQty: 10, soldAmount: 4000, netTaxablePerUnit: 400, discount: 0, gstRate: 5,
       returnedSyncedQty: 4, returnedPendingQty: 3, previouslyReturnedQty: 7, remainingQty: 3,
     },
   ],
   invoiceSalesLedgers: [{ ledgerName: 'Seed Sale A\\C', amount: 7750 }],
   companySalesLedgers: [{ ledgerName: 'Seed Sale A\\C' }, { ledgerName: 'Sales Account GST' }],
   defaultSalesLedger: 'Seed Sale A\\C',
+  taxes: [{ ledgerName: 'GST', taxAmount: 387.5, taxRate: 5 }],
+  gst: { taxableAmount: 7750, cgstAmount: 0, sgstAmount: 0, igstAmount: 0 },
+  totals: { itemsTotal: 11750, salesLedgerTotal: 7750 },
   ...overrides,
 });
 
@@ -52,7 +55,7 @@ const makeContext = (overrides = {}) => ({
 test('prepareCreditNoteLines — accepts an explicit editable return amount', () => {
   const out = prepareCreditNoteLines({
     items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 50, rate: 150, amount: 7500 }],
-    taxes: [{ ledgerName: 'GST', taxAmount: 375, taxableValue: 7500, taxRate: 5 }],
+    taxes: [{ ledgerName: 'GST', taxAmount: 9999, taxableValue: 7500, taxRate: 5 }],
     context: makeContext(),
     invoice,
   });
@@ -61,12 +64,13 @@ test('prepareCreditNoteLines — accepts an explicit editable return amount', ()
   assert.equal(out.items[0].amount, 7500);
   assert.equal(out.items[0].rate, 150, 'rate is derived from editable amount ÷ quantity');
   assert.equal(out.itemsTotal, 7500);
+  // Server owns GST — client taxAmount 9999 is ignored; 5% of 7500 = 375
   assert.equal(out.taxTotal, 375);
   assert.equal(out.totalAmount, 7875);
   assert.equal(out.items[0].salesLedger, 'Seed Sale A\\C', 'falls back to the invoice Sales ledger');
 });
 
-test('prepareCreditNoteLines — falls back to qty × rate when amount is omitted', () => {
+test('prepareCreditNoteLines — falls back to qty × net taxable/unit when amount is omitted', () => {
   const out = prepareCreditNoteLines({
     items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 50, rate: 155 }],
     taxes: [], context: makeContext(), invoice,
@@ -74,6 +78,7 @@ test('prepareCreditNoteLines — falls back to qty × rate when amount is omitte
   assert.equal(out.error, undefined);
   assert.equal(out.items[0].amount, 7750);
   assert.equal(out.items[0].rate, 155);
+  assert.equal(out.taxTotal, 387.5);
 });
 
 test('prepareCreditNoteLines — rejects an item that is not on the invoice', () => {
@@ -93,7 +98,15 @@ test('prepareCreditNoteLines — rejects non-positive qty and rate', () => {
 
   const zeroRate = prepareCreditNoteLines({
     items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 5, rate: 0 }],
-    taxes: [], context: makeContext({ items: [{ ...makeContext().items[0], rate: 0 }] }),
+    taxes: [],
+    context: makeContext({
+      items: [{
+        ...makeContext().items[0],
+        rate: 0, soldAmount: 0, netTaxablePerUnit: 0, gstRate: null,
+      }],
+      taxes: [],
+      gst: null,
+    }),
     invoice,
   });
   assert.match(zeroRate.error, /Rate .* must be greater than 0/);
@@ -119,7 +132,9 @@ test('prepareCreditNoteLines — enforces cumulative remaining qty across prior 
     taxes: [], context: makeContext(), invoice,
   });
   assert.equal(exact.error, undefined, 'returning exactly the remaining qty is allowed');
-  assert.equal(exact.totalAmount, 1200);
+  assert.equal(exact.itemsTotal, 1200);
+  assert.equal(exact.taxTotal, 60);
+  assert.equal(exact.totalAmount, 1260);
 });
 
 test('prepareCreditNoteLines — sums duplicate request lines for the same item', () => {
@@ -152,7 +167,7 @@ test('prepareCreditNoteLines — falls back to company Sales ledgers when the in
   assert.equal(out.items[0].salesLedger, 'Sales Account GST');
 });
 
-test('prepareCreditNoteLines — collapses taxes to one row per ledger', () => {
+test('prepareCreditNoteLines — server recalculates GST and ignores client tax amounts', () => {
   const out = prepareCreditNoteLines({
     items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 10, rate: 155 }],
     taxes: [
@@ -162,12 +177,32 @@ test('prepareCreditNoteLines — collapses taxes to one row per ledger', () => {
     ],
     context: makeContext(), invoice,
   });
-  assert.equal(out.taxes.length, 2);
-  const gst = out.taxes.find(t => t.ledgerName === 'GST');
-  assert.equal(gst.taxAmount, 77.5);
-  assert.equal(gst.taxableValue, 1550);
-  const cess = out.taxes.find(t => t.ledgerName === 'Cess');
-  assert.equal(cess.taxableValue, 1550, 'a tax leg with no base is assessed on the return value');
+  assert.equal(out.error, undefined);
+  assert.equal(out.itemsTotal, 1550);
+  assert.equal(out.taxTotal, 77.5);
+  assert.equal(out.taxes.length, 1);
+  assert.equal(out.taxes[0].ledgerName, 'GST');
+  assert.equal(out.taxes[0].taxAmount, 77.5);
+});
+
+test('prepareCreditNoteLines — no GST invented on exempt invoice', () => {
+  const out = prepareCreditNoteLines({
+    items: [{ itemName: 'Maize 4794 TL 1KG', billedQty: 10 }],
+    taxes: [{ ledgerName: 'GST', taxAmount: 999 }],
+    context: makeContext({
+      items: [{
+        ...makeContext().items[0],
+        gstRate: null,
+      }],
+      taxes: [],
+      gst: null,
+    }),
+    invoice,
+  });
+  assert.equal(out.error, undefined);
+  assert.equal(out.taxTotal, 0);
+  assert.equal(out.taxes.length, 0);
+  assert.equal(out.totalAmount, 1550);
 });
 
 // ── buildCreditNoteXml ───────────────────────────────────────────────────────

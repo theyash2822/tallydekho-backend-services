@@ -15,6 +15,7 @@ import {
   round3 as r3,
   QTY_EPSILON,
 } from '../utils/creditNoteContext.js';
+import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -2560,6 +2561,9 @@ export function buildCreditNoteXml({
  * Validate + normalise a Credit Note request against the linked invoice context.
  * Pure (no IO) so it can be unit-tested; returns either { error } or the
  * server-recomputed items/taxes/totals that the XML and the ledger rows use.
+ *
+ * Tax is always recalculated from the original invoice geometry (discount-safe
+ * net taxable/unit + GST reverse). Client tax amounts are ignored.
  * Exported for src/__tests__/credit-note.test.js.
  */
 export function prepareCreditNoteLines({ items = [], taxes = [], context, invoice }) {
@@ -2572,7 +2576,7 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
   // Same item may arrive on several request lines — the remaining-qty check has to
   // see the request total, not each line in isolation.
   const requestedQty = new Map();
-  const normItems = [];
+  const validated = [];
 
   for (const raw of items) {
     const rawName = String(raw?.itemName || raw?.name || '').trim();
@@ -2587,21 +2591,6 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
     const qty = r3(Math.abs(toNum(raw.billedQty ?? raw.actualQty ?? raw.qty)));
     if (!(qty > 0)) return { error: `Return quantity for "${ctxItem.itemName}" must be greater than 0` };
 
-    const requestedRate = r2(Math.abs(toNum(raw.rate ?? ctxItem.rate)));
-    const hasExplicitAmount = raw.amount !== undefined && raw.amount !== null && raw.amount !== '';
-    if (!hasExplicitAmount && !(requestedRate > 0)) {
-      return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
-    }
-    const amount = hasExplicitAmount
-      ? r2(Math.abs(toNum(raw.amount)))
-      : r2(qty * requestedRate);
-    if (!(amount > 0)) return { error: `Return amount for "${ctxItem.itemName}" must be greater than 0` };
-    // When the user edits the credit amount, send Tally the corresponding rate
-    // while retaining the exact entered amount. Without an explicit amount the
-    // original qty × rate behaviour remains unchanged.
-    const rate = hasExplicitAmount ? r2(amount / qty) : requestedRate;
-    if (!(rate > 0)) return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
-
     const totalForItem = r3((requestedQty.get(key) || 0) + qty);
     if (totalForItem > ctxItem.remainingQty + QTY_EPSILON) {
       return {
@@ -2610,9 +2599,6 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
     }
     requestedQty.set(key, totalForItem);
 
-    // Client may edit the Sales ledger, but it must still be a Sales ledger the
-    // original invoice actually posted to (falls back to the company's Sales
-    // Accounts ledgers when the invoice has no synced ledger legs).
     const salesLedger = String(raw.salesLedger || raw.returnLedger || fallbackSalesLedger || '').trim();
     if (!salesLedger) {
       return { error: `salesLedger required for "${ctxItem.itemName}" — could not resolve the Sales ledger from invoice ${invoiceLabel}` };
@@ -2626,47 +2612,78 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
       };
     }
 
-    normItems.push({
+    const unitNet = toNum(ctxItem.netTaxablePerUnit) > 0
+      ? r2(toNum(ctxItem.netTaxablePerUnit))
+      : (ctxItem.soldQty > 0 ? r2(toNum(ctxItem.soldAmount) / ctxItem.soldQty) : r2(toNum(ctxItem.rate)));
+    if (!(unitNet > 0) && !(toNum(raw.amount) > 0)) {
+      return { error: `Rate for "${ctxItem.itemName}" must be greater than 0` };
+    }
+
+    const hasExplicitAmount = raw.amount !== undefined && raw.amount !== null && raw.amount !== '';
+    if (hasExplicitAmount && !(r2(Math.abs(toNum(raw.amount))) > 0)) {
+      return { error: `Return amount for "${ctxItem.itemName}" must be greater than 0` };
+    }
+
+    validated.push({
       itemName: ctxItem.itemName,
       qty,
-      rate,
-      amount,
+      amount: hasExplicitAmount ? r2(Math.abs(toNum(raw.amount))) : undefined,
+      salesLedger,
       unit: String(raw.unit || ctxItem.unit || '').trim(),
       godown: String(raw.godown || ctxItem.godown || 'Main Location').trim(),
       batch: String(raw.batchName || raw.batch || 'Primary Batch').trim(),
-      salesLedger,
-      hsn: ctxItem.hsn || '',
-      soldQty: ctxItem.soldQty,
-      remainingQtyBefore: ctxItem.remainingQty,
     });
   }
 
-  if (normItems.length === 0) return { error: 'At least one item with a positive return quantity is required' };
+  if (validated.length === 0) return { error: 'At least one item with a positive return quantity is required' };
 
-  const itemsTotal = r2(normItems.reduce((s, i) => s + i.amount, 0));
+  const calc = calcCreditNoteReturn({
+    context,
+    returnLines: validated.map(v => ({
+      itemName: v.itemName,
+      qty: v.qty,
+      amount: v.amount,
+    })),
+  });
 
-  // One row per tax ledger, matching Tally's own export.
-  const taxTotals = new Map();
-  for (const raw of taxes) {
-    const name = String(raw?.ledgerName || raw?.ledger || raw?.name || '').trim();
-    if (!name) continue;
-    const taxAmount = r2(Math.abs(toNum(raw.taxAmount ?? raw.amount)));
-    if (!(taxAmount > 0)) continue;
-    const taxRate = raw.taxRate ?? raw.rate ?? null;
-    const current = taxTotals.get(name) || { ledgerName: name, taxAmount: 0, taxableValue: 0, taxRate };
-    current.taxAmount = r2(current.taxAmount + taxAmount);
-    current.taxableValue = r2(current.taxableValue + Math.abs(toNum(raw.taxableValue ?? raw.taxableAmount)));
-    if (current.taxRate == null && taxRate != null) current.taxRate = taxRate;
-    taxTotals.set(name, current);
-  }
-  const normTaxes = [...taxTotals.values()].map(t => ({
-    ...t,
-    // A tax leg with no stated base is assessed on the whole return value.
-    taxableValue: t.taxableValue > 0 ? t.taxableValue : itemsTotal,
-  }));
+  if (!calc.items.length) return { error: 'At least one item with a positive return quantity is required' };
 
-  const taxTotal = r2(normTaxes.reduce((s, t) => s + t.taxAmount, 0));
-  return { items: normItems, taxes: normTaxes, itemsTotal, taxTotal, totalAmount: r2(itemsTotal + taxTotal) };
+  const metaByName = new Map(validated.map(v => [normalizeName(v.itemName), v]));
+  const normItems = calc.items.map(item => {
+    const meta = metaByName.get(normalizeName(item.itemName)) || {};
+    return {
+      itemName: item.itemName,
+      qty: item.qty,
+      rate: item.rate,
+      amount: item.amount,
+      taxableValue: item.taxableValue,
+      netTaxablePerUnit: item.netTaxablePerUnit,
+      gstRate: item.gstRate,
+      lineTaxes: item.lineTaxes || [],
+      unit: meta.unit || item.unit || '',
+      godown: meta.godown || item.godown || 'Main Location',
+      batch: meta.batch || item.batch || 'Primary Batch',
+      salesLedger: meta.salesLedger,
+      hsn: item.hsn || '',
+      soldQty: itemIndex.get(normalizeName(item.itemName))?.soldQty,
+      remainingQtyBefore: itemIndex.get(normalizeName(item.itemName))?.remainingQty,
+    };
+  });
+
+  // taxes arg is intentionally unused — GST reverse is server-owned.
+  void taxes;
+
+  return {
+    items: normItems,
+    taxes: calc.taxes,
+    itemsTotal: calc.itemsTotal,
+    taxTotal: calc.taxTotal,
+    totalAmount: calc.totalAmount,
+    returnTaxMode: calc.returnTaxMode,
+    allocationMode: calc.allocationMode,
+    fallbackUsed: calc.fallbackUsed,
+    summary: calc.summary,
+  };
 }
 
 // ── POST /tally/voucher/credit-note ──────────────────────────────────────────

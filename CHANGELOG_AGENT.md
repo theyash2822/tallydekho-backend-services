@@ -1,5 +1,27 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-03 — Credit Note GST reversal (server-owned)
+
+### Added
+- `src/utils/creditNoteTax.js` — calculates return taxable + CGST/SGST/IGST/cess
+  reverse from original invoice geometry (`item_rate` or proportional fallback).
+- `src/__tests__/credit-note-tax.test.js` — local 18%, discount, interstate, exempt,
+  proportional mixed-rate cases.
+
+### Changed
+- `src/utils/creditNoteContext.js` — exposes discount, netTaxablePerUnit, gstRate
+  (from voucher_items, never stock master), `returnTaxMode`, `taxGeometry`.
+- `src/routes/tally-write.js` `prepareCreditNoteLines` — ignores client tax amounts;
+  recomputes GST reverse server-side before XML.
+- `src/__tests__/credit-note.test.js` — updated for server-owned tax.
+- QA fix: `item_rate` requires tax ledger legs; otherwise fall back to proportional
+  via `gst_voucher_details` so GST is not silently dropped.
+
+### Test
+`node --test src/__tests__/credit-note-tax.test.js src/__tests__/credit-note.test.js` → 28/28.
+
+---
+
 ## 2026-08-03 — Credit Note context: collapse duplicate tax ledgers
 
 ### Changed

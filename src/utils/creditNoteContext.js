@@ -14,8 +14,10 @@
 // A synced app-created Credit Note is counted once, via source 1 only.
 
 import { query } from '../db/schema.js';
+import { buildTaxGeometry, RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST } from './creditNoteTax.js';
 
 export const QTY_EPSILON = 0.0005;
+export { RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST };
 
 export const normalizeName = (value) => String(value ?? '').trim().toLowerCase();
 
@@ -129,6 +131,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     { rows: companySalesRows },
     { rows: gstRows },
     { rows: partyRows },
+    { rows: voucherItemTaxRows },
   ] = await Promise.all([
     query(
       `SELECT vi.id,
@@ -141,7 +144,8 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
               ABS(COALESCE(vi.billed_qty, 0))                   AS billed_qty,
               ABS(COALESCE(vi.actual_qty, 0))                   AS actual_qty,
               ABS(COALESCE(vi.amount, 0))                       AS amount,
-              ABS(COALESCE(vi.rate, 0))                         AS rate
+              ABS(COALESCE(vi.rate, 0))                         AS rate,
+              ABS(COALESCE(vi.discount, 0))                     AS discount
          FROM voucher_inventory_items vi
          LEFT JOIN stocks s
            ON s.name = vi.stock_item_name AND s.company_guid = vi.company_guid
@@ -187,7 +191,24 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
          FROM ledgers WHERE company_guid = $1 AND name = $2 LIMIT 1`,
       [companyGuid, invoice.party_name || '']
     ).catch(() => ({ rows: [] })),
+    // Original invoice GSTRATE when AllVoucher ingest stored it on voucher_items.
+    // Never fall back to stocks.tax_rate (today's master).
+    query(
+      `SELECT item_name, MAX(ABS(COALESCE(tax_rate, 0))) AS tax_rate
+         FROM voucher_items
+        WHERE voucher_guid = $1 AND company_guid = $2
+          AND ABS(COALESCE(tax_rate, 0)) > 0
+        GROUP BY item_name`,
+      [invoiceGuid, companyGuid]
+    ).catch(() => ({ rows: [] })),
   ]);
+
+  const gstRateByItem = new Map();
+  for (const row of voucherItemTaxRows) {
+    const key = normalizeName(row.item_name);
+    if (!key) continue;
+    gstRateByItem.set(key, round2(row.tax_rate));
+  }
 
   const companySalesLedgers = companySalesRows.map(r => ({
     ledgerName: r.name, guid: r.guid || null, parentGroup: r.parent || null,
@@ -237,6 +258,8 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
         rate: 0,
         soldQty: 0,
         soldAmount: 0,
+        discount: 0,
+        gstRate: gstRateByItem.get(key) || 0,
         lines: [],
       };
       itemMap.set(key, entry);
@@ -244,7 +267,9 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     const qty = num(row.billed_qty) || num(row.actual_qty);
     entry.soldQty += qty;
     entry.soldAmount += num(row.amount);
+    entry.discount += num(row.discount);
     if (!entry.rate) entry.rate = num(row.rate);
+    if (!entry.gstRate && gstRateByItem.has(key)) entry.gstRate = gstRateByItem.get(key);
     if (!entry.unit) entry.unit = row.unit || '';
     if (!entry.godown) entry.godown = row.godown_name || '';
     if (!entry.batch) entry.batch = row.batch_name || '';
@@ -255,6 +280,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       actualQty: round3(row.actual_qty),
       rate: round2(row.rate),
       amount: round2(row.amount),
+      discount: round2(row.discount),
     });
   }
 
@@ -365,7 +391,9 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     const returnedPendingQty = round3(pendingQtyByItem.get(key) || 0);
     const previouslyReturnedQty = round3(returnedSyncedQty + returnedPendingQty);
     const remainingQty = Math.max(0, round3(soldQty - previouslyReturnedQty));
-    const rate = entry.rate || (soldQty > 0 ? round2(entry.soldAmount / soldQty) : 0);
+    const soldAmount = round2(entry.soldAmount);
+    const rate = entry.rate || (soldQty > 0 ? round2(soldAmount / soldQty) : 0);
+    const netTaxablePerUnit = soldQty > 0 ? round2(soldAmount / soldQty) : round2(rate);
     return {
       itemName: entry.itemName,
       itemGuid: entry.itemGuid,
@@ -374,8 +402,11 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       godown: entry.godown || 'Main Location',
       batch: entry.batch || 'Primary Batch',
       rate: round2(rate),
+      discount: round2(entry.discount),
       soldQty,
-      soldAmount: round2(entry.soldAmount),
+      soldAmount,
+      netTaxablePerUnit,
+      gstRate: round2(entry.gstRate) || null,
       returnedSyncedQty,
       returnedPendingQty,
       previouslyReturnedQty,
@@ -411,6 +442,37 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     taxRate: taxableBase > 0 ? round2((t.amount / taxableBase) * 100) : null,
   }));
 
+  const gstPayload = gst
+    ? {
+        taxableAmount: round2(gst.taxable_amount),
+        cgstAmount: round2(gst.cgst_amount),
+        sgstAmount: round2(gst.sgst_amount),
+        igstAmount: round2(gst.igst_amount),
+        gstRegType: gst.gst_reg_type || null,
+        placeOfSupply: gst.place_of_supply || null,
+      }
+    : null;
+
+  // Infer single-slab gstRate onto lines that lack voucher_items.tax_rate so
+  // the client can show item-wise GST when the invoice is uniform.
+  const prelimGeometry = buildTaxGeometry({
+    items,
+    taxes: taxRows,
+    gst: gstPayload,
+    totals: { itemsTotal, salesLedgerTotal: salesTotal },
+  });
+  if (prelimGeometry.singleSlabRate != null) {
+    for (const item of items) {
+      if (!item.gstRate) item.gstRate = prelimGeometry.singleSlabRate;
+    }
+  }
+  const taxGeometry = buildTaxGeometry({
+    items,
+    taxes: taxRows,
+    gst: gstPayload,
+    totals: { itemsTotal, salesLedgerTotal: salesTotal },
+  });
+
   return {
     linkedInvoice: {
       invoiceGuid,
@@ -444,16 +506,18 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     defaultSalesLedger: invoiceSalesLedgers[0]?.ledgerName || null,
     taxes: taxRows,
     otherLedgers,
-    gst: gst
-      ? {
-          taxableAmount: round2(gst.taxable_amount),
-          cgstAmount: round2(gst.cgst_amount),
-          sgstAmount: round2(gst.sgst_amount),
-          igstAmount: round2(gst.igst_amount),
-          gstRegType: gst.gst_reg_type || null,
-          placeOfSupply: gst.place_of_supply || null,
-        }
-      : null,
+    gst: gstPayload,
+    returnTaxMode: taxGeometry.returnTaxMode,
+    taxGeometry: {
+      allocationMode: taxGeometry.allocationMode,
+      fallbackUsed: taxGeometry.fallbackUsed,
+      isInterstate: taxGeometry.isInterstate,
+      placeOfSupply: taxGeometry.placeOfSupply,
+      originalTaxable: taxGeometry.originalTaxable,
+      originalTaxTotal: taxGeometry.originalTaxTotal,
+      singleSlabRate: taxGeometry.singleSlabRate,
+      legs: taxGeometry.legs,
+    },
     totals: {
       itemsTotal,
       salesLedgerTotal: salesTotal,
