@@ -895,6 +895,8 @@ router.get('/sales/invoices/:id/credit-note-context', authMiddleware, async (req
         taxes: context.taxes,
         otherLedgers: context.otherLedgers,
         gst: context.gst,
+        returnTaxMode: context.returnTaxMode,
+        taxGeometry: context.taxGeometry,
         totals: context.totals,
         priorReturns: context.priorReturns,
         meta: {
