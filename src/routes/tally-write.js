@@ -2481,6 +2481,7 @@ export function buildCreditNoteXml({
   <DIFFACTUALQTY>Yes</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${escapeXml(narration)}</NARRATION>
+  <PARTYNAME>${escapeXml(partyLedger)}</PARTYNAME>
   <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>`;
 
   for (const item of items) {
@@ -2518,6 +2519,24 @@ export function buildCreditNoteXml({
   </ALLINVENTORYENTRIES.LIST>`;
   }
 
+  // Party leg first among ledger entries so Day Book Particulars = customer
+  // (not the first tax ledger like CGST).
+  xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${escapeXml(partyLedger)}</LEDGERNAME>
+    <AMOUNT>${partyAmount}</AMOUNT>
+    <BILLALLOCATIONS.LIST>
+      <NAME>${escapeXml(billRefName)}</NAME>
+      <BILLTYPE>Agst Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${partyAmount}</AMOUNT>
+    </BILLALLOCATIONS.LIST>
+  </LEDGERENTRIES.LIST>`;
+
   // Tax legs are the Sales pattern reversed: debit (ISDEEMEDPOSITIVE Yes) with a
   // negative amount and a negative assessable value.
   for (const tax of taxes) {
@@ -2535,20 +2554,6 @@ export function buildCreditNoteXml({
   }
 
   xml += `
-  <LEDGERENTRIES.LIST>
-    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${escapeXml(partyLedger)}</LEDGERNAME>
-    <AMOUNT>${partyAmount}</AMOUNT>
-    <BILLALLOCATIONS.LIST>
-      <NAME>${escapeXml(billRefName)}</NAME>
-      <BILLTYPE>Agst Ref</BILLTYPE>
-      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
-      <AMOUNT>${partyAmount}</AMOUNT>
-    </BILLALLOCATIONS.LIST>
-  </LEDGERENTRIES.LIST>
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   calcCreditNoteReturn,
   buildTaxGeometry,
+  filterStockReturnTaxRows,
   RETURN_TAX_WITH_GST,
   RETURN_TAX_WITHOUT_GST,
 } from '../utils/creditNoteTax.js';
@@ -184,4 +185,45 @@ test('calcCreditNoteReturn — proportional fallback when mixed rates missing', 
   assert.equal(out.itemsTotal, 5000);
   // Half of original tax total (575+575=1150) → 575
   assert.equal(out.taxTotal, 575);
+});
+
+test('calcCreditNoteReturn — excludes bare GST when CGST/SGST already exist (logistics GST)', () => {
+  const out = calcCreditNoteReturn({
+    context: {
+      items: [{
+        itemName: 'Fighter 20ML',
+        soldQty: 100,
+        soldAmount: 1000000,
+        rate: 10000,
+        netTaxablePerUnit: 10000,
+        gstRate: null,
+        remainingQty: 100,
+      }],
+      taxes: [
+        { ledgerName: 'CGST', taxAmount: 97650, taxRate: 9 },
+        { ledgerName: 'SGST', taxAmount: 97650, taxRate: 9 },
+        { ledgerName: 'GST', taxAmount: 1800, taxRate: 0.17 }, // transport GST on original invoice
+      ],
+      gst: { taxableAmount: 0, cgstAmount: 0, sgstAmount: 0, igstAmount: 0 },
+      totals: { itemsTotal: 1085000, salesLedgerTotal: 1085000 },
+    },
+    returnLines: [
+      { itemName: 'Fighter 20ML', qty: 10 },
+    ],
+  });
+  assert.equal(out.itemsTotal, 100000);
+  assert.ok(!out.taxes.some(t => /^gst$/i.test(t.ledgerName)), 'bare GST must not reverse on stock return');
+  assert.equal(out.taxes.length, 2);
+  assert.equal(out.taxTotal, 18000); // 9%+9% of 100000 via proportional on CGST+SGST only over sales base
+});
+
+test('filterStockReturnTaxRows — keeps bare GST only when it is the sole GST style', () => {
+  const onlyGst = filterStockReturnTaxRows([{ ledgerName: 'GST', taxAmount: 100 }]);
+  assert.equal(onlyGst.length, 1);
+  const withSplit = filterStockReturnTaxRows([
+    { ledgerName: 'CGST', taxAmount: 90 },
+    { ledgerName: 'SGST', taxAmount: 90 },
+    { ledgerName: 'GST', taxAmount: 18 },
+  ]);
+  assert.deepEqual(withSplit.map(t => t.ledgerName), ['CGST', 'SGST']);
 });

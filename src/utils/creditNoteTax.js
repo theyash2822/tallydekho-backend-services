@@ -27,8 +27,29 @@ export function classifyTaxLedger(name) {
   if (/cgst/i.test(n)) return 'cgst';
   if (/sgst|utgst/i.test(n)) return 'sgst';
   if (/cess/i.test(n)) return 'cess';
-  if (/\bgst\b/i.test(n) || /tax/i.test(n)) return 'gst';
+  // Bare "GST" (common for logistics/expense GST in Tally) — not CGST/SGST/IGST.
+  if (/^\s*gst\s*$/i.test(n) || /^gst\s*\d/i.test(n)) return 'gst';
   return 'other';
+}
+
+/**
+ * Stock-return GST reverse should only touch inventory GST ledgers.
+ * When the invoice already has CGST/SGST (or IGST), a bare "GST" ledger is almost
+ * always tax on Transportation / packing / other charges — do not reverse it on a
+ * goods-only Credit Note.
+ */
+export function isStockReturnTaxLedger(name, siblingKinds = []) {
+  const kind = classifyTaxLedger(name);
+  if (kind === 'cgst' || kind === 'sgst' || kind === 'igst' || kind === 'cess') return true;
+  if (kind !== 'gst') return false;
+  const hasSplit = siblingKinds.some(k => k === 'cgst' || k === 'sgst' || k === 'igst');
+  // Keep bare GST only when it is the sole GST style on the invoice (old single-ledger books).
+  return !hasSplit;
+}
+
+export function filterStockReturnTaxRows(taxRows = []) {
+  const kinds = taxRows.map(t => classifyTaxLedger(t.ledgerName || t.ledger || t.name));
+  return taxRows.filter((t, i) => isStockReturnTaxLedger(t.ledgerName || t.ledger || t.name, kinds));
 }
 
 /**
@@ -47,7 +68,7 @@ export function buildTaxGeometry(context = {}) {
   );
 
   const legs = [];
-  for (const t of taxRows) {
+  for (const t of filterStockReturnTaxRows(taxRows)) {
     const ledgerName = String(t.ledgerName || t.ledger || '').trim();
     if (!ledgerName) continue;
     const originalAmount = round2(Math.abs(num(t.taxAmount ?? t.amount)));

@@ -273,12 +273,18 @@ test('buildCreditNoteXml — tax leg is the Sales pattern reversed', () => {
 
 test('buildCreditNoteXml — party leg is positive with an Agst Ref bill allocation', () => {
   const xml = xmlFixture();
-  const partyLeg = xml.slice(xml.lastIndexOf('<LEDGERENTRIES.LIST>'));
+  assert.match(xml, /<PARTYNAME>Amarsinghji Patel Kanjrota<\/PARTYNAME>/);
+  assert.match(xml, /<PARTYLEDGERNAME>Amarsinghji Patel Kanjrota<\/PARTYLEDGERNAME>/);
+  const partyLeg = xml.match(/<LEDGERENTRIES\.LIST>(?:(?!<\/LEDGERENTRIES\.LIST>)[\s\S])*?ISPARTYLEDGER>Yes[\s\S]*?<\/LEDGERENTRIES\.LIST>/)[0];
   assert.match(partyLeg, /<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
   assert.match(partyLeg, /<ISPARTYLEDGER>Yes<\/ISPARTYLEDGER>/);
   assert.match(partyLeg, /<AMOUNT>8137\.5<\/AMOUNT>/);
   assert.match(partyLeg, /<NAME>0469\/17-18<\/NAME>/);
   assert.match(partyLeg, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+  // Party ledger entry appears before tax ledgers so Day Book Particulars = party.
+  const partyAt = xml.indexOf('<ISPARTYLEDGER>Yes</ISPARTYLEDGER>');
+  const taxAt = xml.indexOf('>GST</LEDGERNAME>');
+  assert.ok(partyAt > 0 && taxAt > partyAt, 'party ledger entry must come before tax ledgers');
 });
 
 test('buildCreditNoteXml — voucher balances to zero', () => {

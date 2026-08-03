@@ -14,7 +14,7 @@
 // A synced app-created Credit Note is counted once, via source 1 only.
 
 import { query } from '../db/schema.js';
-import { buildTaxGeometry, RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST } from './creditNoteTax.js';
+import { buildTaxGeometry, filterStockReturnTaxRows, RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST } from './creditNoteTax.js';
 
 export const QTY_EPSILON = 0.0005;
 export { RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST };
@@ -435,12 +435,18 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     }
     taxByLedger.set(key, { ...t });
   }
-  const taxRows = [...taxByLedger.values()].map(t => ({
+  const taxRowsAll = [...taxByLedger.values()].map(t => ({
     ...t,
     taxAmount: t.amount,
     taxableValue: taxableBase,
     taxRate: taxableBase > 0 ? round2((t.amount / taxableBase) * 100) : null,
   }));
+  // Stock returns reverse only inventory CGST/SGST/IGST (and cess). Bare "GST"
+  // next to Transportation on the invoice must not ride along.
+  const taxRows = filterStockReturnTaxRows(taxRowsAll);
+  const excludedTaxes = taxRowsAll.filter(
+    t => !taxRows.some(k => normalizeName(k.ledgerName) === normalizeName(t.ledgerName))
+  );
 
   const gstPayload = gst
     ? {
@@ -505,6 +511,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     companySalesLedgers,
     defaultSalesLedger: invoiceSalesLedgers[0]?.ledgerName || null,
     taxes: taxRows,
+    excludedTaxes,
     otherLedgers,
     gst: gstPayload,
     returnTaxMode: taxGeometry.returnTaxMode,
