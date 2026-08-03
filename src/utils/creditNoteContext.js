@@ -387,12 +387,24 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     };
   });
 
-  // ── Tax rows with an inferred rate where the taxable base is known ─────────
+  // ── Tax rows collapsed to one per ledger (Tally often emits CGST/SGST once
+  // per inventory or logistics line). Duplicate ledger names must not reach the
+  // client as separate list keys.
   const salesTotal = round2(invoiceSalesLedgers.reduce((s, l) => s + l.amount, 0));
   const itemsTotal = round2(items.reduce((s, i) => s + i.soldAmount, 0));
   const gst = gstRows[0] || null;
   const taxableBase = round2(num(gst?.taxable_amount) || salesTotal || itemsTotal);
-  const taxRows = taxes.map(t => ({
+  const taxByLedger = new Map();
+  for (const t of taxes) {
+    const key = normalizeName(t.ledgerName);
+    const current = taxByLedger.get(key);
+    if (current) {
+      current.amount = round2(current.amount + t.amount);
+      continue;
+    }
+    taxByLedger.set(key, { ...t });
+  }
+  const taxRows = [...taxByLedger.values()].map(t => ({
     ...t,
     taxAmount: t.amount,
     taxableValue: taxableBase,

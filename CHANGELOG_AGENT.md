@@ -1,5 +1,17 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-03 — Credit Note context: collapse duplicate tax ledgers
+
+### Changed
+- `src/utils/creditNoteContext.js`: tax legs with the same ledger name (common when
+  Tally emits CGST/SGST per inventory line) are merged by summing amounts so the
+  mobile CN screen gets one editable row per ledger.
+
+### Test
+`node --test src/__tests__/credit-note.test.js` → 19/19. QA: YELLOW (ship with mobile).
+
+---
+
 ## 2026-08-03 — Prevent duplicate Sales / Audit Trail retries
 
 ### Changed
