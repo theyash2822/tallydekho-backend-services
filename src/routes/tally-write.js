@@ -16,6 +16,7 @@ import {
   QTY_EPSILON,
 } from '../utils/creditNoteContext.js';
 import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
+import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -817,9 +818,17 @@ ${topLevelDispatchXml}
     </BILLALLOCATIONS.LIST>` : ''}
   </LEDGERENTRIES.LIST>`;
 
-  // Inventory line items
+  // Inventory line items — stamp GSTRATE when the client sent per-line tax (Phase 3).
   for (const item of items) {
     const itemAmt = parseFloat(item.amount) || 0;
+    const lineGstRate = Array.isArray(item.taxEntries) && item.taxEntries.length
+      ? item.taxEntries.reduce((s, t) => s + (parseFloat(t.taxRate) || 0), 0)
+      : (parseFloat(item.gstRate) || parseFloat(item.taxRate) || 0);
+    const gstRateXml = lineGstRate > 0
+      ? `
+    <GSTOVERRIDDEN>Yes</GSTOVERRIDDEN>
+    <IGSTAPPLICABLERATE>${lineGstRate}</IGSTAPPLICABLERATE>`
+      : '';
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -827,7 +836,7 @@ ${topLevelDispatchXml}
     <AMOUNT>${itemAmt}</AMOUNT>
     <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
     <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
-    <RATE>${item.rate || 0}</RATE>
+    <RATE>${item.rate || 0}</RATE>${gstRateXml}
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -919,6 +928,16 @@ ${topLevelDispatchXml}
     ).catch(e => { console.error('[app_vouchers] insert failed:', e.message); return { rows: [] }; });
     invoiceUuid      = avResult?.rows?.[0]?.invoice_uuid || null;
     invoiceCreatedAt = avResult?.rows?.[0]?.created_at   || null;
+
+    // Phase 3: persist per-line tax geometry for Credit Note reversal
+    // (common GST ledger / VAT / packing GST attribution).
+    await persistVoucherLineTaxes(query, {
+      companyGuid,
+      tdkReferenceNo: tdkRef,
+      items,
+      taxes,
+      logistics,
+    }).catch(e => console.warn('[voucher_line_taxes] persist failed:', e.message));
   }
 
   try {

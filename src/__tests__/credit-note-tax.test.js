@@ -227,3 +227,60 @@ test('filterStockReturnTaxRows — keeps bare GST only when it is the sole GST s
   ]);
   assert.deepEqual(withSplit.map(t => t.ledgerName), ['CGST', 'SGST']);
 });
+
+test('filterStockReturnTaxRows — keeps VAT as goods tax', () => {
+  const rows = filterStockReturnTaxRows([
+    { ledgerName: 'GST', taxAmount: 500 },
+    { ledgerName: 'Vat Tax 5%', taxAmount: 900 },
+  ]);
+  assert.equal(rows.length, 2);
+  assert.ok(rows.some(t => /vat/i.test(t.ledgerName)));
+});
+
+test('calcCreditNoteReturn — TD1031 item_attributed: mixed GST+VAT, no packing GST', () => {
+  // Original: item1 GST 5%, item2 GST 18%, item3 Vat 9%. Packing GST excluded.
+  const context = {
+    items: [
+      {
+        itemName: 'Item A', soldQty: 10, soldAmount: 10000, rate: 1000,
+        netTaxablePerUnit: 1000, remainingQty: 10, gstRate: 5,
+        taxEntries: [{ ledgerName: 'GST', taxRate: 5, taxAmount: 500, taxableValue: 10000, kind: 'gst' }],
+      },
+      {
+        itemName: 'Item B', soldQty: 10, soldAmount: 10000, rate: 1000,
+        netTaxablePerUnit: 1000, remainingQty: 10, gstRate: 18,
+        taxEntries: [{ ledgerName: 'GST', taxRate: 18, taxAmount: 1800, taxableValue: 10000, kind: 'gst' }],
+      },
+      {
+        itemName: 'Item C', soldQty: 10, soldAmount: 10000, rate: 1000,
+        netTaxablePerUnit: 1000, remainingQty: 10, gstRate: 9,
+        taxEntries: [{ ledgerName: 'Vat Tax 5%', taxRate: 9, taxAmount: 900, taxableValue: 10000, kind: 'vat' }],
+      },
+    ],
+    taxes: [
+      { ledgerName: 'GST', taxAmount: 2300, taxRate: null },
+      { ledgerName: 'Vat Tax 5%', taxAmount: 900, taxRate: 9 },
+    ],
+    gst: null,
+    totals: { itemsTotal: 30000, salesLedgerTotal: 30000 },
+  };
+  const out = calcCreditNoteReturn({
+    context,
+    returnLines: [
+      { itemName: 'Item A', qty: 1 },
+      { itemName: 'Item B', qty: 1 },
+      { itemName: 'Item C', qty: 1 },
+    ],
+  });
+  assert.equal(out.allocationMode, 'item_attributed');
+  assert.equal(out.itemsTotal, 3000);
+  assert.equal(out.taxTotal, 320); // 50 + 180 + 90
+  assert.equal(out.totalAmount, 3320);
+  const gst = out.taxes.find(t => /^gst$/i.test(t.ledgerName));
+  const vat = out.taxes.find(t => /vat/i.test(t.ledgerName));
+  assert.equal(gst.taxAmount, 230);
+  assert.equal(vat.taxAmount, 90);
+  assert.equal(out.items[0].gstRate, 5);
+  assert.equal(out.items[1].gstRate, 18);
+  assert.equal(out.items[2].gstRate, 9);
+});

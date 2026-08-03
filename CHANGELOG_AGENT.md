@@ -1,5 +1,25 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-03 — Credit Note phases 1–3: common GST ledger + VAT + packing
+
+### Added
+- `src/utils/creditNoteItemTax.js` — per-item tax geometry from (1) `voucher_line_taxes`,
+  (2) Sales `app_vouchers` payload, (3) ledger order-walk (tax before packing = goods).
+- `voucher_line_taxes` table + `voucher_inventory_items.tax_rate` (schema).
+- Persist line taxes on Sales create (`persistVoucherLineTaxes` in tally-write).
+- Tests: TD1031 item_attributed (₹320 on 1+1+1), payload zip, ledger-order packing split.
+
+### Changed
+- `creditNoteTax.js` — `item_attributed` allocation; VAT as goods tax; synthesize legs
+  from taxEntries when ledger collapse would blend rates.
+- `creditNoteContext.js` — stamp `taxEntries`/`gstRate` per item; exclude logistics GST.
+- Sales inventory XML stamps `IGSTAPPLICABLERATE` when client sends line rates.
+
+### Test
+`node --test src/__tests__/credit-note*.test.js` → 35/35. QA **YELLOW** (device verify TD1031).
+
+---
+
 ## 2026-08-03 — Credit Note GST reversal (server-owned)
 
 ### Added

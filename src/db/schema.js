@@ -947,6 +947,28 @@ export async function initSchema() {
         -- 'manual' | 'auto' | 'ask_after_irn'
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
+
+      -- Per-line tax geometry for Credit Note reversal (common GST ledger / VAT / packing).
+      -- Written at Sales create from app payload; read by creditNoteContext.
+      CREATE TABLE IF NOT EXISTS voucher_line_taxes (
+        id                BIGSERIAL PRIMARY KEY,
+        company_guid      TEXT NOT NULL,
+        tdk_reference_no  TEXT,
+        voucher_guid      TEXT,
+        stock_item_name   TEXT,
+        line_index        INT NOT NULL DEFAULT 0,
+        ledger_name       TEXT NOT NULL,
+        tax_rate          DECIMAL(15,4) DEFAULT 0,
+        tax_amount        DECIMAL(15,4) DEFAULT 0,
+        taxable_value     DECIMAL(15,4) DEFAULT 0,
+        source            TEXT NOT NULL DEFAULT 'item',
+        created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_vlt_company_tdk
+        ON voucher_line_taxes(company_guid, tdk_reference_no);
+      CREATE INDEX IF NOT EXISTS idx_vlt_company_voucher
+        ON voucher_line_taxes(company_guid, voucher_guid);
+      ALTER TABLE voucher_inventory_items ADD COLUMN IF NOT EXISTS tax_rate DECIMAL(15,4);
     `);
 
     // Data repair: thin SimplifiedVoucher syncs used to overwrite every

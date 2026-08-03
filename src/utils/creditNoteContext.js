@@ -15,6 +15,13 @@
 
 import { query } from '../db/schema.js';
 import { buildTaxGeometry, filterStockReturnTaxRows, RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST } from './creditNoteTax.js';
+import {
+  buildItemTaxesFromSalesPayload,
+  buildItemTaxesFromLedgerOrder,
+  buildItemTaxesFromLineTaxRows,
+  geometryHasAttributedTax,
+  mergeItemTaxGeometry,
+} from './creditNoteItemTax.js';
 
 export const QTY_EPSILON = 0.0005;
 export { RETURN_TAX_WITH_GST, RETURN_TAX_WITHOUT_GST };
@@ -103,16 +110,29 @@ function appVoucherTargetsInvoice(payload, invoice, refKeys) {
 export async function loadCreditNoteContext(companyGuid, invoice) {
   const invoiceGuid = invoice.guid;
 
-  // ── TDK reference of the invoice itself (present for app-created invoices) ──
+  // ── TDK reference + Sales payload (app-created invoices — best tax geometry) ──
   const { rows: invAvRows } = await query(
-    `SELECT tdk_reference_no FROM app_vouchers
+    `SELECT tdk_reference_no, payload, tally_guid
+       FROM app_vouchers
       WHERE company_guid = $1
-        AND tally_voucher_no = $2
         AND voucher_type IN ('sales_invoice', 'sales')
-      ORDER BY id DESC LIMIT 1`,
-    [companyGuid, invoice.voucher_number || '']
+        AND (
+          tally_voucher_no = $2
+          OR ($3::text <> '' AND tdk_reference_no = $3)
+          OR ($3::text <> '' AND COALESCE(payload->>'reference', '') = $3)
+        )
+      ORDER BY
+        (tally_voucher_no = $2)::int DESC,
+        id DESC
+      LIMIT 1`,
+    [
+      companyGuid,
+      invoice.voucher_number || '',
+      invoice.reference || '',
+    ]
   ).catch(() => ({ rows: [] }));
   const invoiceTdkRef = invAvRows[0]?.tdk_reference_no || null;
+  const salesPayload = invAvRows[0]?.payload || null;
 
   // Bill references Tally could have stamped on the original invoice's bill.
   const billRefCandidates = uniqueStrings([
@@ -385,7 +405,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
   }
 
   // ── Finalise per-item sold / returned / remaining ──────────────────────────
-  const items = [...itemMap.entries()].map(([key, entry]) => {
+  let items = [...itemMap.entries()].map(([key, entry]) => {
     const soldQty = round3(entry.soldQty);
     const returnedSyncedQty = round3(syncedQtyByItem.get(key) || 0);
     const returnedPendingQty = round3(pendingQtyByItem.get(key) || 0);
@@ -407,6 +427,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       soldAmount,
       netTaxablePerUnit,
       gstRate: round2(entry.gstRate) || null,
+      taxEntries: [],
       returnedSyncedQty,
       returnedPendingQty,
       previouslyReturnedQty,
@@ -417,6 +438,44 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       lines: entry.lines,
     };
   });
+
+  // ── Per-item tax geometry (common GST ledger / VAT / packing GST) ───────────
+  // Priority: voucher_line_taxes → Sales app payload → ledger order walk.
+  const { rows: lineTaxRows } = await query(
+    `SELECT stock_item_name, line_index, ledger_name, tax_rate, tax_amount,
+            taxable_value, source
+       FROM voucher_line_taxes
+      WHERE company_guid = $1
+        AND (
+          ($2::text IS NOT NULL AND voucher_guid = $2)
+          OR ($3::text IS NOT NULL AND tdk_reference_no = $3)
+        )
+      ORDER BY line_index ASC, id ASC`,
+    [companyGuid, invoiceGuid || null, invoiceTdkRef || null]
+  ).catch(() => ({ rows: [] }));
+
+  let itemTaxGeometry = null;
+  if (lineTaxRows.length) {
+    itemTaxGeometry = buildItemTaxesFromLineTaxRows(lineTaxRows, items);
+  }
+  if (!geometryHasAttributedTax(itemTaxGeometry) && salesPayload) {
+    itemTaxGeometry = buildItemTaxesFromSalesPayload(salesPayload, items);
+  }
+  if (!geometryHasAttributedTax(itemTaxGeometry)) {
+    itemTaxGeometry = buildItemTaxesFromLedgerOrder({
+      ledgerRows,
+      inventoryItems: items,
+      partyName: invoice.party_name || '',
+      salesLedgerNames: [
+        ...invoiceSalesLedgers.map(l => l.ledgerName),
+        ...companySalesLedgers.map(l => l.ledgerName),
+      ],
+    });
+  }
+
+  if (geometryHasAttributedTax(itemTaxGeometry)) {
+    items = mergeItemTaxGeometry(items, itemTaxGeometry);
+  }
 
   // ── Tax rows collapsed to one per ledger (Tally often emits CGST/SGST once
   // per inventory or logistics line). Duplicate ledger names must not reach the
@@ -441,12 +500,58 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     taxableValue: taxableBase,
     taxRate: taxableBase > 0 ? round2((t.amount / taxableBase) * 100) : null,
   }));
-  // Stock returns reverse only inventory CGST/SGST/IGST (and cess). Bare "GST"
-  // next to Transportation on the invoice must not ride along.
-  const taxRows = filterStockReturnTaxRows(taxRowsAll);
-  const excludedTaxes = taxRowsAll.filter(
+
+  let taxRows = filterStockReturnTaxRows(taxRowsAll);
+  let excludedTaxes = taxRowsAll.filter(
     t => !taxRows.some(k => normalizeName(k.ledgerName) === normalizeName(t.ledgerName))
   );
+
+  // Attributed geometry: rebuild goods tax rows from per-item entries (correct rates),
+  // and move packing/transport GST into excludedTaxes.
+  if (geometryHasAttributedTax(itemTaxGeometry)) {
+    const goodsByLedger = new Map();
+    for (const item of items) {
+      for (const te of item.taxEntries || []) {
+        const ledgerName = String(te.ledgerName || '').trim();
+        if (!ledgerName) continue;
+        const key = normalizeName(ledgerName);
+        const cur = goodsByLedger.get(key);
+        const taxAmount = round2(Math.abs(num(te.taxAmount)));
+        const taxRate = round2(num(te.taxRate));
+        if (cur) {
+          cur.taxAmount = round2(cur.taxAmount + taxAmount);
+          cur.amount = cur.taxAmount;
+          // Mixed rates on same ledger (common GST) — leave blended rate null.
+          if (cur.taxRate != null && taxRate > 0 && Math.abs(cur.taxRate - taxRate) > 0.05) {
+            cur.taxRate = null;
+          }
+          continue;
+        }
+        goodsByLedger.set(key, {
+          ledgerName,
+          guid: null,
+          parentGroup: null,
+          amount: taxAmount,
+          taxAmount,
+          taxableValue: taxableBase,
+          taxRate: taxRate || null,
+          kind: te.kind || null,
+          drCr: null,
+        });
+      }
+    }
+    taxRows = [...goodsByLedger.values()];
+    excludedTaxes = (itemTaxGeometry.chargeTaxes || []).map(te => ({
+      ledgerName: te.ledgerName,
+      amount: round2(te.taxAmount),
+      taxAmount: round2(te.taxAmount),
+      taxableValue: round2(te.taxableValue || 0),
+      taxRate: round2(te.taxRate) || null,
+      kind: te.kind || null,
+      source: 'logistics',
+      chargeLedger: te.chargeLedger || null,
+    }));
+  }
 
   const gstPayload = gst
     ? {
@@ -459,8 +564,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       }
     : null;
 
-  // Infer single-slab gstRate onto lines that lack voucher_items.tax_rate so
-  // the client can show item-wise GST when the invoice is uniform.
+  // Infer single-slab gstRate onto lines that lack rates when invoice is uniform.
   const prelimGeometry = buildTaxGeometry({
     items,
     taxes: taxRows,
@@ -523,6 +627,8 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       originalTaxable: taxGeometry.originalTaxable,
       originalTaxTotal: taxGeometry.originalTaxTotal,
       singleSlabRate: taxGeometry.singleSlabRate,
+      attributed: taxGeometry.attributed,
+      itemTaxSource: itemTaxGeometry?.source || null,
       legs: taxGeometry.legs,
     },
     totals: {

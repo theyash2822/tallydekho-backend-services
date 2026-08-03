@@ -27,20 +27,24 @@ export function classifyTaxLedger(name) {
   if (/cgst/i.test(n)) return 'cgst';
   if (/sgst|utgst/i.test(n)) return 'sgst';
   if (/cess/i.test(n)) return 'cess';
-  // Bare "GST" (common for logistics/expense GST in Tally) — not CGST/SGST/IGST.
-  if (/^\s*gst\s*$/i.test(n) || /^gst\s*\d/i.test(n)) return 'gst';
+  // VAT (and ledgers named like "Vat Tax 5%") are goods tax, not packing.
+  if (/vat/i.test(n)) return 'vat';
+  // Bare "GST" (common for multi-rate + logistics GST in Tally) — not CGST/SGST/IGST.
+  if (/^\s*gst\s*$/i.test(n) || /^gst\s*\d/i.test(n) || /\bgst\b/i.test(n)) return 'gst';
   return 'other';
 }
 
 /**
- * Stock-return GST reverse should only touch inventory GST ledgers.
- * When the invoice already has CGST/SGST (or IGST), a bare "GST" ledger is almost
- * always tax on Transportation / packing / other charges — do not reverse it on a
- * goods-only Credit Note.
+ * Stock-return tax reverse: CGST/SGST/IGST/cess/VAT always.
+ * Bare "GST" is kept when it is the sole GST style (common ledger books), or when
+ * siblingKinds already marked attributed goods GST. When CGST/SGST exist alongside
+ * bare GST, bare GST is usually packing/transport — drop it unless context excluded it.
  */
 export function isStockReturnTaxLedger(name, siblingKinds = []) {
   const kind = classifyTaxLedger(name);
-  if (kind === 'cgst' || kind === 'sgst' || kind === 'igst' || kind === 'cess') return true;
+  if (kind === 'cgst' || kind === 'sgst' || kind === 'igst' || kind === 'cess' || kind === 'vat') {
+    return true;
+  }
   if (kind !== 'gst') return false;
   const hasSplit = siblingKinds.some(k => k === 'cgst' || k === 'sgst' || k === 'igst');
   // Keep bare GST only when it is the sole GST style on the invoice (old single-ledger books).
@@ -85,11 +89,48 @@ export function buildTaxGeometry(context = {}) {
     });
   }
 
+  const allItemsAttributed = items.length > 0
+    && items.every(i => Array.isArray(i.taxEntries) && i.taxEntries.length > 0);
+  const attributedTaxTotal = round2(items.reduce(
+    (s, i) => s + (i.taxEntries || []).reduce((a, t) => a + Math.abs(num(t.taxAmount ?? t.amount)), 0),
+    0
+  ));
+
+  // When items carry attributed taxEntries but ledger collapse dropped VAT / blended GST,
+  // synthesize legs from those entries so WITH_GST + totals stay correct.
+  if (allItemsAttributed && (!legs.length || attributedTaxTotal > 0)) {
+    const byLedger = new Map();
+    for (const item of items) {
+      for (const te of item.taxEntries || []) {
+        const ledgerName = String(te.ledgerName || te.ledger || '').trim();
+        if (!ledgerName) continue;
+        const key = normalizeName(ledgerName);
+        const amount = round2(Math.abs(num(te.taxAmount ?? te.amount)));
+        const rate = round2(num(te.taxRate ?? te.rate));
+        const cur = byLedger.get(key);
+        if (cur) {
+          cur.originalAmount = round2(cur.originalAmount + amount);
+          continue;
+        }
+        byLedger.set(key, {
+          ledgerName,
+          kind: te.kind || classifyTaxLedger(ledgerName),
+          originalAmount: amount,
+          taxRate: rate,
+        });
+      }
+    }
+    if (byLedger.size) {
+      legs.length = 0;
+      legs.push(...byLedger.values());
+    }
+  }
+
   const taxTotal = round2(legs.reduce((s, l) => s + l.originalAmount, 0));
   const hasGstDetails = gst && (
     num(gst.cgstAmount) > 0 || num(gst.sgstAmount) > 0 || num(gst.igstAmount) > 0
   );
-  const returnTaxMode = (legs.length > 0 || hasGstDetails)
+  const returnTaxMode = (legs.length > 0 || hasGstDetails || allItemsAttributed || attributedTaxTotal > 0)
     ? RETURN_TAX_WITH_GST
     : RETURN_TAX_WITHOUT_GST;
 
@@ -103,12 +144,12 @@ export function buildTaxGeometry(context = {}) {
   const uniqueItemRates = [...new Set(itemRates.map(r => round2(r)))];
   const singleSlabRate = uniqueItemRates.length === 1 ? uniqueItemRates[0] : null;
 
-  // Prefer item rates when every invoice line has one, or invoice is single-slab.
-  // item_rate needs original tax ledger legs to allocate CGST/SGST/IGST; without
-  // legs fall through to proportional (gst_voucher_details) so GST is not dropped.
+  // Prefer per-item attributed taxEntries (common GST ledger / mixed rates / VAT).
+  // Then item_rate when every line has gstRate, else proportional scale of legs.
   let allocationMode = 'none';
   if (returnTaxMode === RETURN_TAX_WITH_GST) {
-    if ((allItemsHaveRate || singleSlabRate != null) && legs.length > 0) allocationMode = 'item_rate';
+    if (allItemsAttributed) allocationMode = 'item_attributed';
+    else if ((allItemsHaveRate || singleSlabRate != null) && legs.length > 0) allocationMode = 'item_rate';
     else if (legs.length > 0 && originalTaxable > 0) allocationMode = 'proportional';
     else if (hasGstDetails && originalTaxable > 0) allocationMode = 'proportional';
   }
@@ -117,12 +158,13 @@ export function buildTaxGeometry(context = {}) {
     returnTaxMode,
     allocationMode,
     originalTaxable,
-    originalTaxTotal: taxTotal,
+    originalTaxTotal: taxTotal || attributedTaxTotal,
     isInterstate,
     placeOfSupply: gst?.placeOfSupply || null,
     legs,
     singleSlabRate,
     fallbackUsed: allocationMode === 'proportional',
+    attributed: allItemsAttributed,
   };
 }
 
@@ -158,6 +200,7 @@ function allocateLineTax(lineTaxable, gstRate, geometry) {
   const sgst = legs.filter(l => l.kind === 'sgst');
   const igst = legs.filter(l => l.kind === 'igst');
   const gst = legs.filter(l => l.kind === 'gst');
+  const vat = legs.filter(l => l.kind === 'vat');
   const cess = legs.filter(l => l.kind === 'cess');
 
   const out = [];
@@ -199,6 +242,16 @@ function allocateLineTax(lineTaxable, gstRate, geometry) {
         kind: 'gst',
       });
     }
+  } else if (vat.length) {
+    for (const leg of vat) {
+      const rate = num(leg.taxRate) > 0 ? num(leg.taxRate) : gstRate;
+      out.push({
+        ledgerName: leg.ledgerName,
+        taxRate: round2(rate / vat.length),
+        taxAmount: round2(lineTaxable * rate / vat.length / 100),
+        kind: 'vat',
+      });
+    }
   }
 
   // Cess: keep original rate relative to taxable (from geometry), not folded into gstRate.
@@ -214,6 +267,38 @@ function allocateLineTax(lineTaxable, gstRate, geometry) {
   }
 
   return out.filter(t => t.taxAmount > 0);
+}
+
+/** Scale original per-item taxEntries by return taxable / original line taxable. */
+function allocateAttributedLineTax(ctxItem, lineTaxable) {
+  const entries = Array.isArray(ctxItem.taxEntries) ? ctxItem.taxEntries : [];
+  const soldAmount = num(ctxItem.soldAmount);
+  const out = [];
+  for (const te of entries) {
+    const ledgerName = String(te.ledgerName || te.ledger || '').trim();
+    if (!ledgerName) continue;
+    let rate = num(te.taxRate ?? te.rate);
+    const origTax = round2(Math.abs(num(te.taxAmount ?? te.amount)));
+    const origBase = round2(Math.abs(num(te.taxableValue))) || soldAmount;
+    if (!(rate > 0) && origBase > 0 && origTax > 0) {
+      rate = round2((origTax / origBase) * 100);
+    }
+    let taxAmount = 0;
+    if (rate > 0) {
+      taxAmount = round2(lineTaxable * rate / 100);
+    } else if (origBase > 0 && origTax > 0) {
+      taxAmount = round2(origTax * (lineTaxable / origBase));
+    }
+    if (!(taxAmount > 0)) continue;
+    out.push({
+      ledgerName,
+      taxRate: rate > 0 ? round2(rate) : null,
+      taxAmount,
+      taxableValue: lineTaxable,
+      kind: te.kind || classifyTaxLedger(ledgerName),
+    });
+  }
+  return out;
 }
 
 function collapseTaxes(rows) {
@@ -272,14 +357,20 @@ export function calcCreditNoteReturn({ context, returnLines = [] }) {
       ? round2(Math.abs(num(raw.amount)))
       : round2(qty * unitNet);
     const rate = qty > 0 ? round2(taxable / qty) : unitNet;
-    const gstRate = lineGstRate(ctxItem, geometry);
+    const gstRate = geometry.allocationMode === 'item_attributed'
+      ? round2((ctxItem.taxEntries || []).reduce((s, t) => s + num(t.taxRate), 0)) || lineGstRate(ctxItem, geometry)
+      : lineGstRate(ctxItem, geometry);
 
     let lineTaxes = [];
-    if (geometry.returnTaxMode === RETURN_TAX_WITH_GST && geometry.allocationMode === 'item_rate') {
-      lineTaxes = allocateLineTax(taxable, gstRate, geometry).map(t => ({
-        ...t,
-        taxableValue: taxable,
-      }));
+    if (geometry.returnTaxMode === RETURN_TAX_WITH_GST) {
+      if (geometry.allocationMode === 'item_attributed') {
+        lineTaxes = allocateAttributedLineTax(ctxItem, taxable);
+      } else if (geometry.allocationMode === 'item_rate') {
+        lineTaxes = allocateLineTax(taxable, gstRate, geometry).map(t => ({
+          ...t,
+          taxableValue: taxable,
+        }));
+      }
     }
 
     items.push({
@@ -292,6 +383,7 @@ export function calcCreditNoteReturn({ context, returnLines = [] }) {
       originalRate: round2(num(ctxItem.rate)),
       discount: round2(num(ctxItem.discount)),
       gstRate,
+      taxEntries: ctxItem.taxEntries || [],
       lineTaxes,
       unit: ctxItem.unit || '',
       hsn: ctxItem.hsn || '',
@@ -305,7 +397,7 @@ export function calcCreditNoteReturn({ context, returnLines = [] }) {
 
   if (geometry.returnTaxMode === RETURN_TAX_WITHOUT_GST || geometry.allocationMode === 'none') {
     taxes = [];
-  } else if (geometry.allocationMode === 'item_rate') {
+  } else if (geometry.allocationMode === 'item_attributed' || geometry.allocationMode === 'item_rate') {
     taxes = collapseTaxes(
       items.flatMap(i => i.lineTaxes.map(t => ({
         ...t,
