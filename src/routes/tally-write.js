@@ -2366,32 +2366,153 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
 });
 
 // POST /tally/voucher/purchase
+// Mirrors Sales create signs flipped for purchase (party Cr +, inventory/tax Dr −).
+// Reference: TallyPrime Purchase export — VCHTYPE Purchase, Item Invoice, BILLALLOCATIONS New Ref.
 router.post('/voucher/purchase', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
-    partyLedger, totalAmount, items = [], taxes = [], isOptional = false,
-    voucherType = 'Purchase GST', make_payment = null,
+    partyLedger, totalAmount, items = [], taxes = [], logistics = [],
+    isOptional = false,
+    voucherType = 'Purchase',
+    make_payment = null,
+    numbering_policy = 'tally_prime_series',
+    original_entry_type = 'regular',
   } = req.body;
-  if (!companyGuid || !partyLedger) return res.status(400).json({ status: false, message: 'partyLedger required' });
+  if (!companyGuid || !partyLedger) {
+    return res.status(400).json({ status: false, message: 'companyGuid and partyLedger required' });
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ status: false, message: 'At least one item is required' });
+  }
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(totalAmount) || 0;
   const dt = tallyDate(date);
-  const vchType = voucherType || 'Purchase GST';
+  const vchType = voucherType || 'Purchase';
   const payAmt = make_payment?.ledgerName && parseFloat(make_payment.amount) > 0
     ? parseFloat(make_payment.amount) : 0;
 
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PUR').catch(() => null);
   const fullNarration = [tdkRef ? `TDK Purchase: ${tdkRef}` : '', narration].filter(Boolean).join(' | ');
 
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${vchType}" ACTION="Create"><VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><REFERENCE>${tdkRef || reference||''}</REFERENCE><ISINVOICE>Yes</ISINVOICE><ISCANCELLED>No</ISCANCELLED><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${fullNarration||''}</NARRATION><PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME><LEDGERENTRIES.LIST><REMOVEZEROENTRIES>No</REMOVEZEROENTRIES><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><ISPARTYLEDGER>Yes</ISPARTYLEDGER><LEDGERNAME>${partyLedger}</LEDGERNAME><AMOUNT>${amt}</AMOUNT></LEDGERENTRIES.LIST>`;
-  for (const item of items) {
-    const ia = parseFloat(item.amount)||0;
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${item.purchaseLedger||'Purchase Account GST'}</LEDGERNAME><AMOUNT>${-ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  let tdkInvoiceNo = null;
+  let effectiveVoucherNumber = voucherNumber || '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'PUR').catch(() => null);
+    if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
-  for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
-  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
 
-  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration };
+  let xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="${vchType}" ACTION="Create" OBJVIEW="Invoice Voucher View">
+  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
+  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
+  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
+  <ISINVOICE>Yes</ISINVOICE>
+  <ISCANCELLED>No</ISCANCELLED>
+  <ISPOSTDATED>No</ISPOSTDATED>
+  <DIFFACTUALQTY>No</DIFFACTUALQTY>
+  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <NARRATION>${fullNarration || ''}</NARRATION>
+  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
+  <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <AMOUNT>${amt}</AMOUNT>${tdkRef ? `
+    <BILLALLOCATIONS.LIST>
+      <NAME>${tdkRef}</NAME>
+      <BILLTYPE>New Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${amt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>` : ''}
+  </LEDGERENTRIES.LIST>`;
+
+  for (const item of items) {
+    const ia = parseFloat(item.amount) || 0;
+    const qty = item.actualQty || item.billedQty || 1;
+    const billed = item.billedQty || qty;
+    xml += `
+  <ALLINVENTORYENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
+    <AMOUNT>${-ia}</AMOUNT>
+    <ACTUALQTY>${qty}</ACTUALQTY>
+    <BILLEDQTY>${billed}</BILLEDQTY>
+    <RATE>${item.rate || 0}</RATE>
+    <ACCOUNTINGALLOCATIONS.LIST>
+      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+      <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+      <LEDGERFROMITEM>No</LEDGERFROMITEM>
+      <LEDGERNAME>${item.purchaseLedger || 'Purchase Account GST'}</LEDGERNAME>
+      <AMOUNT>${-ia}</AMOUNT>
+    </ACCOUNTINGALLOCATIONS.LIST>
+    <BATCHALLOCATIONS.LIST>
+      <BATCHNAME>Primary Batch</BATCHNAME>
+      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
+      <AMOUNT>${-ia}</AMOUNT>
+      <ACTUALQTY>${qty}</ACTUALQTY>
+      <BILLEDQTY>${billed}</BILLEDQTY>
+    </BATCHALLOCATIONS.LIST>
+  </ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  for (const tax of taxes) {
+    if (!tax.ledgerName || !(parseFloat(tax.taxAmount) > 0)) continue;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT>
+    <VATASSESSABLEVALUE>${-Math.abs(parseFloat(tax.taxableValue) || 0)}</VATASSESSABLEVALUE>
+  </LEDGERENTRIES.LIST>`;
+  }
+
+  for (const lg of logistics) {
+    if (!lg.ledgerName) continue;
+    const lgAmt = parseFloat(lg.amount) || 0;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-lgAmt}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    for (const lt of (lg.taxes || [])) {
+      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
+      xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-parseFloat(lt.taxAmount)}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    }
+  }
+
+  xml += `
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType };
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml).catch(() => null);
 
   let invoiceUuid = null;
@@ -2400,10 +2521,13 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     const avResult = await query(
       `INSERT INTO app_vouchers
        (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
-        tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'purchase_invoice',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9)
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'purchase_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid, created_at`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : (original_entry_type || 'regular'),
+       numbering_policy || 'tally_prime_series',
+       tdkInvoiceNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[purchase-app_voucher] insert failed:', e.message); return { rows: [] }; });
     invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
@@ -2434,11 +2558,25 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
       }
     }
 
+    if (!off && tdkRef) {
+      requestDesktopSyncAfterWrite({
+        userId: req.user.userId,
+        companyGuid,
+        companyName,
+        tdkRef,
+        tallyIds: r?.tallyId ? [r.tallyId] : [],
+        extra: { voucherType: vchType },
+      }).catch(() => {});
+    }
+
     res.json({
       status: true, queued: off, queueId: qId, tdkRef, invoiceUuid,
+      tdkReferenceNo: tdkRef,
+      numberingPolicy: numbering_policy || 'tally_prime_series',
+      invoiceNumber: r?.voucherNumber || tdkInvoiceNo || null,
       payment: paymentResult,
       message: off ? 'Saved. Will push when desktop connects.' : (isOptional ? 'Optional purchase saved' : 'Purchase invoice created'),
-      data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null,
+      data: r, voucherNumber: r?.voucherNumber || tdkInvoiceNo || null, tallyId: r?.tallyId || null,
     });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
@@ -4822,14 +4960,21 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
   const isSalesOrder = vType === 'sales_order';
   const isCreditNote = vType === 'credit_note';
+  const isPurchaseInvoice = vType === 'purchase_invoice' || vType === 'purchase';
 
   // A Credit Note shares the item/tax/total shape of a Sales invoice; it only differs
   // in document type and in always carrying the invoice it returns against.
   const linkedInvoice = p.linked_invoice || p.linkedInvoice || null;
 
+  const payBlock = p.make_payment || p.collect_payment || null;
+
   return {
-    documentType: isCreditNote ? 'credit_note' : (isSalesOrder ? 'sales_order' : 'sales_invoice'),
-    tallyVoucherType: isCreditNote ? 'Credit Note' : undefined,
+    documentType: isCreditNote
+      ? 'credit_note'
+      : (isSalesOrder
+        ? 'sales_order'
+        : (isPurchaseInvoice ? 'purchase_invoice' : 'sales_invoice')),
+    tallyVoucherType: isCreditNote ? 'Credit Note' : (isPurchaseInvoice ? 'Purchase' : undefined),
     documentNumber: invoiceNumberLabel,
     documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
     tdkRef: av.tdk_reference_no,
@@ -4878,17 +5023,18 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
         amount:        linkedInvoice.amount != null ? parseFloat(linkedInvoice.amount) : null,
       } : null,
     } : undefined,
+    paymentInfo: !isSalesOrder && payBlock ? {
+      collected: parseFloat(payBlock.amount || 0),
+      mode: payBlock.ledgerName || '',
+      reference: payBlock.reference || '',
+      kind: p.make_payment ? 'payment' : 'receipt',
+    } : undefined,
     againstInvoiceNo: isCreditNote ? (linkedInvoice?.voucherNumber || linkedInvoice?.billRefName || '') : undefined,
     againstOrderNo: isSalesOrder ? (av.tally_voucher_no || p.againstOrderNo || '') : (p.againstOrderNo || ''),
     additionalCharges: (p.logistics || []).map(l => ({
       description: l.ledgerName || 'Charge',
       amount: parseFloat(l.amount || 0),
     })),
-    paymentInfo: !isSalesOrder && p.collect_payment ? {
-      collected: parseFloat(p.collect_payment.amount || 0),
-      mode: p.collect_payment.ledgerName || '',
-      reference: p.collect_payment.reference || '',
-    } : null,
     dispatchDetails: !isSalesOrder ? (p.dispatch_details || null) : null,
   };
 }

@@ -1,5 +1,22 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-05 — Purchase invoice create: VCHTYPE Purchase + bill alloc + ledger API
+
+### Added
+- `GET /api/purchase/ledger-accounts` — Purchase Accounts group ledgers (recursive).
+- Purchase create: logistics legs, numbering_policy / TD series PUR, desktop sync after write.
+
+### Changed
+- `POST /tally/voucher/purchase` default `voucherType` → **`Purchase`** (TallyPrime export parity).
+- Require `items.length > 0`; party leg `BILLALLOCATIONS New Ref` with TDK-PUR for payment pairing.
+- Preview `documentType: purchase_invoice`; read `make_payment` as well as `collect_payment`.
+- `my-entries` join accepts `purchase_invoice` (was broken expecting `purchase` only).
+
+### Test
+Create purchase with items → Tally Purchase voucher + TDK New Ref; Make Payment Now → Payment against PUR ref.
+
+---
+
 ## 2026-08-03 — Credit Note phases 1–3: common GST ledger + VAT + packing
 
 ### Added

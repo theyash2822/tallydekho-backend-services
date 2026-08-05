@@ -993,6 +993,34 @@ router.get('/sales/ledger-accounts', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/purchase/ledger-accounts — Purchase Accounts group ledgers only
+router.get('/purchase/ledger-accounts', authMiddleware, async (req, res) => {
+  try {
+    const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const { rows } = await query(
+      `WITH RECURSIVE purchase_groups AS (
+         SELECT name FROM groups
+          WHERE company_guid = $1 AND name ILIKE 'Purchase Account%'
+         UNION ALL
+         SELECT g.name FROM groups g
+           JOIN purchase_groups pg ON g.parent = pg.name
+          WHERE g.company_guid = $1
+       )
+       SELECT DISTINCT l.name, l.guid, l.parent
+         FROM ledgers l
+        WHERE l.company_guid = $1
+          AND (l.parent IN (SELECT name FROM purchase_groups) OR l.parent ILIKE '%Purchase Account%')
+        ORDER BY l.name ASC`,
+      [companyGuid]
+    );
+    res.json({ status: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
 // GET /api/tax/ledgers — GST/Tax ledgers for item-level tax assignment
 router.get('/tax/ledgers', authMiddleware, async (req, res) => {
   try {
@@ -1176,12 +1204,12 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
           OR (av.voucher_type = 'payment'       AND v.voucher_type ILIKE 'Payment')
           OR (av.voucher_type = 'journal'       AND v.voucher_type ILIKE 'Journal')
           OR (av.voucher_type = 'contra'        AND v.voucher_type ILIKE 'Contra')
-          OR (av.voucher_type = 'purchase'      AND v.voucher_type ILIKE 'Purchase%' AND v.voucher_type NOT ILIKE '%Order%')
+          OR (av.voucher_type IN ('purchase', 'purchase_invoice') AND v.voucher_type ILIKE 'Purchase%' AND v.voucher_type NOT ILIKE '%Order%')
           -- Credit Note numbers are sequential ('1','2','3'…) like Receipts, so the
           -- explicit pair keeps the type predicate tight alongside the date match.
           OR (av.voucher_type = 'credit_note'   AND v.voucher_type ILIKE '%Credit Note%')
           OR (
-            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase','credit_note')
+            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase','purchase_invoice','credit_note')
             AND LOWER(COALESCE(v.voucher_type,'')) LIKE '%' || REPLACE(av.voucher_type, '_', ' ') || '%'
           )
         )
@@ -1352,9 +1380,10 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
         company: co[0] || null,
         party: partyLedger[0] || null,
         ledger_entries: ledgerEntries,
-        // App-origin data (dispatch, collect_payment) — present only for TallyDekho-created vouchers
+        // App-origin data — present only for TallyDekho-created vouchers
         dispatch_details: avPayload?.dispatch_details || null,
         collect_payment: avPayload?.collect_payment || null,
+        make_payment: avPayload?.make_payment || null,
         app_narration: avPayload?.narration || null,
         logistics: avPayload?.logistics || null,
       }
