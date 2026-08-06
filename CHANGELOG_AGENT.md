@@ -1,5 +1,15 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Remove Purchase e-Way Bill write
+
+### Removed
+- `POST /tally/voucher/purchase`: no longer accepts/emits `dispatch_details` / EWAYBILLDETAILS (Purchase does not use EWB in app)
+
+### Note
+Sales invoice EWB write path unchanged. Stock hard-sync qty protect from earlier today remains.
+
+---
+
 ## 2026-08-06 — Hard-sync stock qty wipe + Purchase e-Way Bill write
 
 ### Fixed
@@ -7,10 +17,10 @@
 - `applyCurrentFyClosingQty`: do not replace a nonzero qty with FY valuation `0`
 
 ### Added
-- `POST /tally/voucher/purchase`: accept `dispatch_details` and emit Tally `EWAYBILLDETAILS.LIST` (+ top-level dispatch tags) like Sales; optional `ewb_number` / `ewb_date` → BILLNUMBER / BILLDATE
+- ~~`POST /tally/voucher/purchase`: accept `dispatch_details`~~ — **removed same day** (Purchase does not need EWB)
 
 ### Test
-Hard sync → stocks with qty stay nonzero. Purchase with EWB toggle → Tally Additional Details populated.
+Hard sync → stocks with qty stay nonzero.
 
 ---
 

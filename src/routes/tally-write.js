@@ -2377,7 +2377,6 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     make_payment = null,
     numbering_policy = 'tally_prime_series',
     original_entry_type = 'regular',
-    dispatch_details = null,
   } = req.body;
   if (!companyGuid || !partyLedger) {
     return res.status(400).json({ status: false, message: 'companyGuid and partyLedger required' });
@@ -2396,88 +2395,6 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
   // Keep narration user/business-friendly (no TDK ids). Identity = REFERENCE + bill New Ref.
   // LOCKED DECISIONS 2026-07-16: FORBIDDEN stuffing TDK into narration as primary identity.
   const fullNarration = narration || '';
-
-  // ── Dispatch / EWB XML (same shape as Sales; DOCUMENTTYPE=Invoice for purchase inward) ──
-  const toTallyDatePur = (d) => d ? String(d).replace(/-/g, '') : '';
-  let topLevelDispatchXml = '';
-  let ewbDetailsXml = '';
-  if (dispatch_details) {
-    const dd = dispatch_details;
-    const modeSimpleMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', 'not_applicable': '', 'not applicable': '' };
-    const modeCodeMap   = { road: '1 - Road', rail: '2 - Rail', air: '3 - Air', ship: '4 - Ship' };
-    const modeKey        = (dd.transport_mode || '').toLowerCase().replace(' ', '_');
-    const tallySimpleMode = modeSimpleMap[modeKey] ?? dd.transport_mode ?? '';
-    const tallyCodedMode  = modeCodeMap[modeKey] ?? '';
-    const vtKey = (dd.vehicle_type || '').toLowerCase();
-    const tallyVehicleType = vtKey.includes('over') ? 'O - Over Dimensional Cargo (ODC)'
-                           : vtKey === 'regular'     ? 'R - Regular'
-                           : dd.vehicle_type         || '';
-    const dispatchDate = toTallyDatePur(dd.transport_doc_date || date);
-    topLevelDispatchXml = [
-      dispatchDate          ? `  <BILLOFLADINGDATE>${dispatchDate}</BILLOFLADINGDATE>` : '',
-      tallySimpleMode       ? `  <BASICSHIPPEDBY>${tallySimpleMode}</BASICSHIPPEDBY>` : '',
-      dd.transport_doc_no   ? `  <BASICSHIPDOCUMENTNO>${dd.transport_doc_no}</BASICSHIPDOCUMENTNO>` : '',
-      dd.ship_to            ? `  <BASICFINALDESTINATION>${dd.ship_to}</BASICFINALDESTINATION>` : '',
-      dd.vehicle_number     ? `  <BASICSHIPVESSELNO>${dd.vehicle_number}</BASICSHIPVESSELNO>` : '',
-    ].filter(Boolean).join('\n');
-
-    const hasTransport = dd.vehicle_number || tallyCodedMode || dd.transporter_name || dd.transporter_id;
-    const consignorLines = [dd.dispatch_from_address1, dd.dispatch_from_address2].map(l => (l || '').trim()).filter(Boolean);
-    const consigneeLines = [dd.ship_to_address1, dd.ship_to_address2].map(l => (l || '').trim()).filter(Boolean);
-    const consignorAddrXml = consignorLines.length
-      ? consignorLines.map(l => `      <CONSIGNORADDRESS>${l}</CONSIGNORADDRESS>`).join('\n')
-      : `      <CONSIGNORADDRESS>${dd.dispatch_from || ''}</CONSIGNORADDRESS>`;
-    const consigneeAddrXml = consigneeLines.length
-      ? consigneeLines.map(l => `      <CONSIGNEEADDRESS>${l}</CONSIGNEEADDRESS>`).join('\n')
-      : `      <CONSIGNEEADDRESS>${dd.ship_to || ''}</CONSIGNEEADDRESS>`;
-    const ewbNoXml = dd.ewb_number ? `\n    <BILLNUMBER>${dd.ewb_number}</BILLNUMBER>` : '';
-    const ewbDtXml = dd.ewb_date ? `\n    <BILLDATE>${toTallyDatePur(dd.ewb_date)}</BILLDATE>` : '';
-
-    ewbDetailsXml = `
-  <EWAYBILLDETAILS.LIST>
-    <CONSIGNORADDRESS.LIST TYPE="String">
-${consignorAddrXml}
-    </CONSIGNORADDRESS.LIST>
-    <CONSIGNEEADDRESS.LIST TYPE="String">
-${consigneeAddrXml}
-    </CONSIGNEEADDRESS.LIST>
-    <DOCUMENTTYPE>Invoice</DOCUMENTTYPE>
-    <SUBTYPE>Supply</SUBTYPE>${ewbNoXml}${ewbDtXml}
-    <CONSIGNORPLACE>${dd.dispatch_from || ''}</CONSIGNORPLACE>
-    <CONSIGNEEPLACE>${dd.ship_to || ''}</CONSIGNEEPLACE>
-    <CONSIGNORPINCODE>${dd.dispatch_from_pincode || ''}</CONSIGNORPINCODE>
-    <CONSIGNEEPINCODE>${dd.ship_to_pincode || ''}</CONSIGNEEPINCODE>
-    <SHIPPEDFROMSTATE>${dd.dispatch_from_state || ''}</SHIPPEDFROMSTATE>
-    <SHIPPEDTOSTATE>${dd.ship_to_state || ''}</SHIPPEDTOSTATE>
-    <ISCANCELLED>No</ISCANCELLED>
-    <IGNOREGSTINVALIDATION>No</IGNOREGSTINVALIDATION>
-    <ISCANCELPENDING>No</ISCANCELPENDING>
-    <IGNOREGENERATIONVALIDATION>No</IGNOREGENERATIONVALIDATION>
-    <ISEXPORTEDFORGENERATION>No</ISEXPORTEDFORGENERATION>
-    <INTRASTATEAPPLICABILITY>No</INTRASTATEAPPLICABILITY>${hasTransport ? `
-    <TRANSPORTDETAILS.LIST>
-      <DOCUMENTDATE>${dispatchDate}</DOCUMENTDATE>
-      <TRANSPORTERID>${dd.transporter_id || ''}</TRANSPORTERID>
-      <TRANSPORTERNAME>${dd.transporter_name || ''}</TRANSPORTERNAME>
-      <TRANSPORTMODE>${tallyCodedMode}</TRANSPORTMODE>
-      <VEHICLENUMBER>${dd.vehicle_number || ''}</VEHICLENUMBER>
-      <OLDVEHICLETYPE>${tallyVehicleType}</OLDVEHICLETYPE>
-      <VEHICLETYPE>${tallyVehicleType}</VEHICLETYPE>
-      <IGNOREVEHICLENOVALIDATION>No</IGNOREVEHICLENOVALIDATION>
-      <ISTRANSIDPENDING>No</ISTRANSIDPENDING>
-      <ISTRANSIDUPDATED>No</ISTRANSIDUPDATED>
-      <IGNORETRANSIDVALIDATION>No</IGNORETRANSIDVALIDATION>
-      <ISEXPORTEDFORTRANSPORTERID>No</ISEXPORTEDFORTRANSPORTERID>
-      <ISPARTBPENDING>No</ISPARTBPENDING>
-      <ISPARTBUPDATED>No</ISPARTBUPDATED>
-      <IGNOREPARTBVALIDATION>No</IGNOREPARTBVALIDATION>
-      <ISEXPORTEDFORPARTB>No</ISEXPORTEDFORPARTB>
-    </TRANSPORTDETAILS.LIST>` : ''}
-    <EXTENSIONDETAILS.LIST></EXTENSIONDETAILS.LIST>
-    <MULTIVEHICLEDETAILS.LIST></MULTIVEHICLEDETAILS.LIST>
-    <STATEWISETHRESHOLD.LIST></STATEWISETHRESHOLD.LIST>
-  </EWAYBILLDETAILS.LIST>`;
-  }
 
   let tdkInvoiceNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
@@ -2507,7 +2424,6 @@ ${consigneeAddrXml}
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${fullNarration || ''}</NARRATION>
-${topLevelDispatchXml}
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
@@ -2592,15 +2508,13 @@ ${topLevelDispatchXml}
     }
   }
 
-  if (ewbDetailsXml) xml += ewbDetailsXml;
-
   xml += `
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType, dispatch_details: dispatch_details || null };
+  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType };
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml).catch(() => null);
 
   let invoiceUuid = null;
