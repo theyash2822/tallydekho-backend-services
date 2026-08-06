@@ -1,5 +1,17 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Tax ledger rate autofill (TAXRATE → ledgers.tax_rate)
+
+### Added
+- `ledgers.tax_rate` column; ingest from LedgerFull `TAXRATE` / RateOfTaxCalculation
+- `GET /tax/ledgers` returns `taxRate`
+- Duties & Taxes party create immediate insert stores `percentage` as `tax_rate`
+
+### Test
+After ledger sync: tax API shows taxRate for CGST/SGST; mobile Select Tax autofills %.
+
+---
+
 ## 2026-08-06 — Purchase narration clean (no TDK in NARRATION)
 
 ### Changed

@@ -1037,7 +1037,7 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
          JOIN tax_groups tg ON g.parent = tg.name
          WHERE g.company_guid = $1
        )
-       SELECT DISTINCT l.name, l.guid FROM ledgers l
+       SELECT DISTINCT l.name, l.guid, COALESCE(l.tax_rate, 0)::float AS "taxRate" FROM ledgers l
        WHERE l.company_guid = $1
          AND (
            l.parent IN (SELECT name FROM tax_groups)

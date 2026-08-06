@@ -2262,12 +2262,12 @@ ${mailingDetailsXml}
     // Immediate insert — skip if a ledger with same name already exists (prevents duplicate before sync)
     const balanceType = isCr ? 'Cr' : 'Dr';
     query(
-      `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, state_name, pincode, gst_registration_type, opening_balance, closing_balance, balance_type)
-       SELECT gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11
+      `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, state_name, pincode, gst_registration_type, opening_balance, closing_balance, balance_type, tax_rate)
+       SELECT gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12
        WHERE NOT EXISTS (
          SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
        )`,
-      [companyGuid, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType]
+      [companyGuid, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType, isDutiesLedger ? ratePct : 0]
     ).catch((e) => { console.warn('[party-immediate-insert]', e.message); }); // fire-and-forget, don't block response
 
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });

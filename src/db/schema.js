@@ -481,6 +481,7 @@ export async function initSchema() {
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS opening_balance NUMERIC(18,4) DEFAULT 0;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS alter_id BIGINT DEFAULT 0;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS pincode TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS tax_rate NUMERIC(8,4) DEFAULT 0;
 
       -- vouchers migrations (E-Invoice / E-Way Bill columns)
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;

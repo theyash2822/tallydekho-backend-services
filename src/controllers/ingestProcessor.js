@@ -6,6 +6,13 @@ import { deriveVoucherTypeParent, REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../util
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
 import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
 
+/** Tally Duties & Taxes: RateOfTaxCalculation exported as TAXRATE in LedgerFull.xml */
+function extractLedgerTaxRate(r) {
+  const raw = r?.TAXRATE ?? r?.TaxRate ?? r?.RateOfTaxCalculation ?? r?.RATEOFTAXCALCULATION ?? 0;
+  const n = parseFloat(String(raw).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
 // ── Dispatch / EWB Extraction ────────────────────────────────────────────────
 // Extracts dispatch + transport details from a TallyPrime voucher record.
 // Field names validated against real TallyPrime XML export (2026-06-24).
@@ -527,8 +534,8 @@ async function processMasters(data, companyGuid) {
           [companyGuid, name, guid]
         );
         await client.query(`
-          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -537,7 +544,8 @@ async function processMasters(data, companyGuid) {
             balance_type=EXCLUDED.balance_type, alter_id=EXCLUDED.alter_id,
             synced_at=EXCLUDED.synced_at,
             gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
-            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode)
+            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode),
+            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END
         `, [
           guid, companyGuid, name, parent,
           r.ALIAS || r.LANGUAGENAME2 || null,
@@ -553,6 +561,7 @@ async function processMasters(data, companyGuid) {
           extractNativeGstRegType(r),
           r.LEDSTATENAME || r.LedStateName || r.STATENAME || r.MAILINGSTATE || null,
           extractNativePincode(r),
+          extractLedgerTaxRate(r),
         ]);
         saved++;
       } catch (e) {
@@ -1814,8 +1823,8 @@ async function processFullLedger(data, companyGuid) {
         );
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
-            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -1824,7 +1833,8 @@ async function processFullLedger(data, companyGuid) {
             balance_type=EXCLUDED.balance_type, is_revenue=EXCLUDED.is_revenue,
             alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
             gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
-            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode)
+            pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode),
+            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
@@ -1842,6 +1852,7 @@ async function processFullLedger(data, companyGuid) {
           extractNativeGstRegType(r),
           extractNativeStateName(r),
           extractNativePincode(r),
+          extractLedgerTaxRate(r),
         ]);
         saved++;
         // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction
