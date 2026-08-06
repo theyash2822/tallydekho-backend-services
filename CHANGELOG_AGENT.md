@@ -1,5 +1,16 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Purchase Order write parity + against-order on Purchase Invoice
+
+### Added / Changed
+- `POST /tally/voucher/purchase-order`: full SO-parity write — TDK `POR`, numbering policy, logistics, taxes, ORDERNO/ORDERDUEDATE on batches, `app_vouchers` (`purchase_order`)
+- `POST /tally/voucher/purchase`: accept `againstOrderNo` → stamp `<ORDERNO>` on inventory batches (PO→PI convert)
+
+### Test
+Create PO from app → Tally Purchase Order with REFERENCE TDK-POR-…; convert to PI → Purchase voucher batches carry ORDERNO.
+
+---
+
 ## 2026-08-06 — Remove Purchase e-Way Bill write
 
 ### Removed

@@ -2348,21 +2348,200 @@ router.post('/master/warehouse', authMiddleware, async (req, res) => {
 
 
 // POST /tally/voucher/purchase-order
+// Mirrors Sales Order with purchase signs (party Cr +, inventory/tax Dr −).
+// TDK ref prefix POR; ORDERNO/ORDERDUEDATE on batches (desktop CreatePurchaseOrder.xml).
 router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, date, voucherNumber, reference, narration, partyLedger, totalAmount, items = [], taxes = [], isOptional = true } = req.body;
-  if (!companyGuid || !partyLedger) return res.status(400).json({ status: false, message: 'partyLedger required' });
+  const {
+    companyGuid, companyName, date, dueDate, voucherNumber, reference, narration,
+    partyLedger, totalAmount,
+    items = [],
+    taxes = [],
+    logistics = [],
+    isOptional = false,
+    original_entry_type = 'regular',
+    numbering_policy = 'tally_prime_series',
+    termsText,
+  } = req.body;
+
+  if (!companyGuid || !partyLedger || !items.length) {
+    return res.status(400).json({ status: false, message: 'companyGuid, partyLedger and items required' });
+  }
+
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(totalAmount) || 0;
   const dt = tallyDate(date);
-  let xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Purchase Order" ACTION="Create"><VOUCHERTYPENAME>Purchase Order</VOUCHERTYPENAME><DATE>${dt}</DATE><EFFECTIVEDATE>${dt}</EFFECTIVEDATE><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><REFERENCE>${reference||''}</REFERENCE><ISINVOICE>Yes</ISINVOICE><ISCANCELLED>No</ISCANCELLED><ISOPTIONAL>${isOpt}</ISOPTIONAL><NARRATION>${narration||''}</NARRATION><PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME><LEDGERENTRIES.LIST><REMOVEZEROENTRIES>No</REMOVEZEROENTRIES><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><ISPARTYLEDGER>Yes</ISPARTYLEDGER><LEDGERNAME>${partyLedger}</LEDGERNAME><AMOUNT>${amt}</AMOUNT></LEDGERENTRIES.LIST>`;
-  for (const item of items) {
-    const ia = parseFloat(item.amount)||0;
-    xml += `<ALLINVENTORYENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><STOCKITEMNAME>${item.itemName}</STOCKITEMNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY><RATE>${item.rate||0}</RATE><ACCOUNTINGALLOCATIONS.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${item.purchaseLedger||'Purchase Account GST'}</LEDGERNAME><AMOUNT>${-ia}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST><BATCHALLOCATIONS.LIST><BATCHNAME>Primary Batch</BATCHNAME><GODOWNNAME>${item.godown||'Main Location'}</GODOWNNAME><AMOUNT>${-ia}</AMOUNT><ACTUALQTY>${item.actualQty||1}</ACTUALQTY><BILLEDQTY>${item.billedQty||1}</BILLEDQTY></BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`;
+  const dueDt = dueDate ? tallyDate(dueDate) : dt;
+
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'POR').catch(() => null);
+
+  let tdkOrderNo = null;
+  let effectiveVoucherNumber = voucherNumber || '';
+  if (numbering_policy === 'tallydekho_series' && !isOptional) {
+    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'POR').catch(() => null);
+    if (tdkOrderNo) effectiveVoucherNumber = tdkOrderNo;
   }
-  for (const tax of taxes) { xml += `<LEDGERENTRIES.LIST><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><LEDGERNAME>${tax.ledgerName}</LEDGERNAME><AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT><VATASSESSABLEVALUE>${-parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE></LEDGERENTRIES.LIST>`; }
-  xml += '</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>';
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase_order', partyLedger, parseFloat(totalAmount)||0, req.body, xml).catch(() => null);
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); await updateWriteQueue(qId, r, null); const off = r?.status === 'desktop_offline'; res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Purchase order created', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { updateWriteQueue(qId, null, e.message); res.status(500).json({ status: false, message: e.message }); }
+
+  const persistPayload = { ...req.body, tdkRef, termsText: termsText || req.body.termsText || '', voucherType: 'Purchase Order' };
+
+  let xml = `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER VCHTYPE="Purchase Order" ACTION="Create">
+  <VOUCHERTYPENAME>Purchase Order</VOUCHERTYPENAME>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
+  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
+  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
+  <ISINVOICE>Yes</ISINVOICE>
+  <ISCANCELLED>No</ISCANCELLED>
+  <ISPOSTDATED>No</ISPOSTDATED>
+  <DIFFACTUALQTY>No</DIFFACTUALQTY>
+  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
+  <NARRATION>${narration || ''}</NARRATION>
+  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <AMOUNT>${amt}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+
+  for (const item of items) {
+    const itemAmt = parseFloat(item.amount) || 0;
+    const qty = item.actualQty || item.billedQty || 1;
+    const billed = item.billedQty || qty;
+    const orderNoTag = effectiveVoucherNumber || '';
+    xml += `
+  <ALLINVENTORYENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
+    <AMOUNT>${-itemAmt}</AMOUNT>
+    <ACTUALQTY>${qty}</ACTUALQTY>
+    <BILLEDQTY>${billed}</BILLEDQTY>
+    <RATE>${item.rate || 0}</RATE>
+    <ACCOUNTINGALLOCATIONS.LIST>
+      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+      <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+      <LEDGERFROMITEM>No</LEDGERFROMITEM>
+      <LEDGERNAME>${item.purchaseLedger || 'Purchase Account GST'}</LEDGERNAME>
+      <AMOUNT>${-itemAmt}</AMOUNT>
+    </ACCOUNTINGALLOCATIONS.LIST>
+    <BATCHALLOCATIONS.LIST>
+      <BATCHNAME>Primary Batch</BATCHNAME>
+      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
+      ${orderNoTag ? `<ORDERNO>${orderNoTag}</ORDERNO>` : '<ORDERNO/>'}
+      <ORDERDUEDATE>${dueDt}</ORDERDUEDATE>
+      <AMOUNT>${-itemAmt}</AMOUNT>
+      <ACTUALQTY>${qty}</ACTUALQTY>
+      <BILLEDQTY>${billed}</BILLEDQTY>
+    </BATCHALLOCATIONS.LIST>
+  </ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  for (const tax of taxes) {
+    if (!tax.ledgerName || !(parseFloat(tax.taxAmount) > 0)) continue;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT>
+    <VATASSESSABLEVALUE>${-Math.abs(parseFloat(tax.taxableValue) || 0)}</VATASSESSABLEVALUE>
+  </LEDGERENTRIES.LIST>`;
+  }
+
+  for (const lg of logistics) {
+    if (!lg.ledgerName) continue;
+    const lgAmt = parseFloat(lg.amount) || 0;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-lgAmt}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    for (const lt of (lg.taxes || [])) {
+      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
+      xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <AMOUNT>${-parseFloat(lt.taxAmount)}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    }
+  }
+
+  xml += `
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+
+  const label = `${partyLedger}${effectiveVoucherNumber ? ' #' + effectiveVoucherNumber : ''}`;
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase_order', label, amt, persistPayload, xml).catch(() => null);
+
+  let orderUuid = null;
+  if (qId && tdkRef) {
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'purchase_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, qId, tdkRef, original_entry_type || (isOptional ? 'optional' : 'regular'),
+       numbering_policy,
+       tdkOrderNo || null,
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[app_vouchers] purchase_order insert failed:', e.message); return { rows: [] }; });
+    orderUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+  }
+
+  try {
+    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(qId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    if (!offline && orderUuid) {
+      await query(
+        `UPDATE app_vouchers SET tally_sync_status='synced', books_impact_status='posted'
+         WHERE invoice_uuid=$1`,
+        [orderUuid]
+      ).catch(() => {});
+    }
+    res.json({
+      status: true,
+      queued: offline,
+      queueId: qId,
+      message: offline ? 'Saved. Will push when desktop connects.' : 'Purchase order created',
+      data: result,
+      tdkReferenceNo: tdkRef,
+      voucherNumber: tdkOrderNo || result?.voucherNumber || null,
+      tallyId: result?.tallyId || null,
+      invoiceUuid: orderUuid,
+      numberingPolicy: numbering_policy,
+      numbering_policy,
+    });
+  } catch (e) {
+    await updateWriteQueue(qId, null, e.message);
+    if (orderUuid) {
+      await query(
+        `UPDATE app_vouchers SET tally_sync_status='failed' WHERE invoice_uuid=$1`,
+        [orderUuid]
+      ).catch(() => {});
+    }
+    res.status(500).json({ status: false, message: e.message });
+  }
 });
 
 // POST /tally/voucher/purchase
@@ -2377,6 +2556,7 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     make_payment = null,
     numbering_policy = 'tally_prime_series',
     original_entry_type = 'regular',
+    againstOrderNo = null,
   } = req.body;
   if (!companyGuid || !partyLedger) {
     return res.status(400).json({ status: false, message: 'companyGuid and partyLedger required' });
@@ -2465,6 +2645,7 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
       <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
+      ${againstOrderNo ? `<ORDERNO>${againstOrderNo}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${-ia}</AMOUNT>
       <ACTUALQTY>${qty}</ACTUALQTY>
       <BILLEDQTY>${billed}</BILLEDQTY>
@@ -2514,7 +2695,7 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType };
+  const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType, againstOrderNo: againstOrderNo || null };
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml).catch(() => null);
 
   let invoiceUuid = null;
