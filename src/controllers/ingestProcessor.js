@@ -613,8 +613,11 @@ async function processStocks(data, companyGuid) {
             name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
             category=EXCLUDED.category,
             group_name=EXCLUDED.group_name, unit=EXCLUDED.unit, hsn=EXCLUDED.hsn,
-            tax_rate=EXCLUDED.tax_rate, closing_qty=EXCLUDED.closing_qty,
-            closing_rate=EXCLUDED.closing_rate, closing_value=EXCLUDED.closing_value,
+            tax_rate=EXCLUDED.tax_rate,
+            -- Never wipe qty/rate/value with StockItemFull zeros — txn/FY recompute owns these.
+            closing_qty=stocks.closing_qty,
+            closing_rate=CASE WHEN EXCLUDED.closing_rate > 0 THEN EXCLUDED.closing_rate ELSE stocks.closing_rate END,
+            closing_value=stocks.closing_value,
             reorder_level=EXCLUDED.reorder_level, minimum_order_qty=EXCLUDED.minimum_order_qty,
             alter_id=EXCLUDED.alter_id,
             batch_enabled=EXCLUDED.batch_enabled, expiry_enabled=EXCLUDED.expiry_enabled,
@@ -2526,6 +2529,8 @@ async function applyCurrentFyClosingQty(companyGuid) {
       ) fv
       WHERE s.name = fv.stock_name
         AND s.company_guid = $1
+        -- Do not replace a nonzero txn-computed qty with a FY default of 0
+        AND NOT (COALESCE(fv.closing_qty, 0) = 0 AND COALESCE(s.closing_qty, 0) <> 0)
     `, [companyGuid]);
     console.log(`[DB] applyCurrentFyClosingQty: updated ${result.rowCount} stocks for ${companyGuid}`);
   } catch (e) {

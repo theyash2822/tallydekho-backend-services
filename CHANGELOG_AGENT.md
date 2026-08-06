@@ -1,5 +1,19 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Hard-sync stock qty wipe + Purchase e-Way Bill write
+
+### Fixed
+- `processStocks` ON CONFLICT: keep existing `closing_qty` / `closing_value` (StockItemFull always sends 0 — no longer wipes qty on hard sync)
+- `applyCurrentFyClosingQty`: do not replace a nonzero qty with FY valuation `0`
+
+### Added
+- `POST /tally/voucher/purchase`: accept `dispatch_details` and emit Tally `EWAYBILLDETAILS.LIST` (+ top-level dispatch tags) like Sales; optional `ewb_number` / `ewb_date` → BILLNUMBER / BILLDATE
+
+### Test
+Hard sync → stocks with qty stay nonzero. Purchase with EWB toggle → Tally Additional Details populated.
+
+---
+
 ## 2026-08-06 — Tax ledger rate autofill (TAXRATE → ledgers.tax_rate)
 
 ### Added
