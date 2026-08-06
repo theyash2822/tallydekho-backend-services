@@ -96,9 +96,25 @@ Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_SALES_INVOICE` (400).
 | Method | Path |
 |--------|------|
 | GET | /api/purchase/invoices |
+| GET | /api/purchase/invoices/:id/debit-note-context |
 | GET | /api/purchase/orders |
 | GET | /api/purchase/debit-notes |
-All: ?companyGuid&fy&from&to&page&limit&search&partyName
+All list routes: ?companyGuid&fy&from&to&page&limit&search&partyName
+
+### GET /api/purchase/invoices/:id/debit-note-context
+Purchase Return mirror of credit-note-context. Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_PURCHASE_INVOICE` (400).
+
+Same shape as credit-note-context with Purchase naming:
+`purchaseLedgerCandidates`, `companyPurchaseLedgers`, `defaultPurchaseLedger`,
+`meta.natureOfReturn = '02-Purchase Return'`.
+
+`remainingQty` counts synced Debit Notes (Agst Ref) + queued `app_vouchers.voucher_type='debit_note'`.
+
+### POST /tally/voucher/debit-note
+Purchase Return only — requires `linked_invoice` (Purchase invoice GUID or number).
+Numbering prefix **DBN** (`TDK-DBN-*`; series `DBN` when `tallydekho_series`) — does not use Delivery Note `DN`.
+XML: VCHTYPE Debit Note, GSTNATUREOFRETURN `02-Purchase Return`, party Dr / inventory+tax Cr, BILLALLOCATIONS Agst Ref.
+Response mirrors credit-note (`tdkReferenceNo`, `voucherNumber`, `invoiceUuid`, `queued`, `totals`).
 
 ## Vouchers
 | Method | Path | Notes |

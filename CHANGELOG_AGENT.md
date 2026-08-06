@@ -1,6 +1,21 @@
 # CHANGELOG_AGENT.md
 
-## 2026-08-06 — Purchase Order write parity + against-order on Purchase Invoice
+## 2026-08-06 — Debit Note = Credit Note mirror (Purchase Return)
+
+### Added
+- `src/utils/debitNoteContext.js` — Purchase Invoice return context (remaining qty from synced Debit Notes + queued `debit_note` app_vouchers); Purchase Accounts ledgers; reuses `creditNoteTax` / `creditNoteItemTax` calc
+- `GET /api/purchase/invoices/:id/debit-note-context` — mirror of credit-note-context; `meta.natureOfReturn: '02-Purchase Return'`; `purchaseLedgerCandidates` / `defaultPurchaseLedger`
+- `POST /tally/voucher/debit-note` — full CN-style writer: `buildDebitNoteXml` / `prepareDebitNoteLines`, linked Purchase Invoice required, Agst Ref, GST nature `02-Purchase Return`, signs from CreateDebitNote.xml (party Dr / inventory+tax Cr), numbering `DBN` → `TDK-DBN-*` (not Delivery Note `DN`)
+- My Entries JOIN: `debit_note` ↔ Debit Note
+- `src/__tests__/debit-note.test.js`
+
+### Unchanged
+- Credit Note behavior, Delivery Note `DN` prefix
+
+### Test
+`node --test src/__tests__/debit-note.test.js`; `node --check` on changed JS
+
+---
 
 ### Added / Changed
 - `POST /tally/voucher/purchase-order`: full SO-parity write — TDK `POR`, numbering policy, logistics, taxes, ORDERNO/ORDERDUEDATE on batches, `app_vouchers` (`purchase_order`)
