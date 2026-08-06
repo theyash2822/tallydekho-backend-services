@@ -1,5 +1,15 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Stock godowns: resolve by GUID or name
+
+### Changed
+- `GET /stocks/items/:id/godowns` — lookup stock by Tally GUID **or** exact name (GUID preferred). Fixes mobile callers that only pass stock name.
+
+### Test
+Call godowns with stock name or guid for Yash Ki Company → 200 with warehouses list.
+
+---
+
 ## 2026-08-05 — Purchase invoice create: VCHTYPE Purchase + bill alloc + ledger API
 
 ### Added

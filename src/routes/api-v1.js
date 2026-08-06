@@ -5903,8 +5903,12 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
+    // Resolve by Tally GUID or stock name (mobile sometimes only has name).
     const { rows: sRows } = await query(
-      'SELECT name, closing_qty, unit FROM stocks WHERE guid=$1 AND company_guid=$2',
+      `SELECT name, closing_qty, unit, guid FROM stocks
+        WHERE company_guid = $2 AND (guid = $1 OR name = $1)
+        ORDER BY (guid = $1)::int DESC
+        LIMIT 1`,
       [req.params.id, companyGuid]
     );
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
@@ -5912,9 +5916,7 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
     const totalQty  = parseFloat(sRows[0].closing_qty || 0);
     const unit      = sRows[0].unit || 'pcs';
 
-    // Per-godown = opening-balance rows + net movements (excl OB + Physical Stock).
-    // If no opening-balance rows exist (e.g. item created with godown-wise opening),
-    // fall back to Physical Stock as the base.
+    // stock_transactions.stock_guid stores stock NAME (ingest convention).
     const { rows } = await query(`
       WITH ob AS (
         SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
