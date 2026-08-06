@@ -2392,7 +2392,9 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     ? parseFloat(make_payment.amount) : 0;
 
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PUR').catch(() => null);
-  const fullNarration = [tdkRef ? `TDK Purchase: ${tdkRef}` : '', narration].filter(Boolean).join(' | ');
+  // Keep narration user/business-friendly (no TDK ids). Identity = REFERENCE + bill New Ref.
+  // LOCKED DECISIONS 2026-07-16: FORBIDDEN stuffing TDK into narration as primary identity.
+  const fullNarration = narration || '';
 
   let tdkInvoiceNo = null;
   let effectiveVoucherNumber = voucherNumber || '';

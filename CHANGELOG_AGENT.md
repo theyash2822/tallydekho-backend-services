@@ -1,5 +1,15 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-06 — Purchase narration clean (no TDK in NARRATION)
+
+### Changed
+- `POST /tally/voucher/purchase`: narration = user text only. TDK-PUR stays in `<REFERENCE>` + party bill `New Ref` (DECISIONS 2026-07-16). Numbering unchanged (`tally_prime_series` / `tallydekho_series` + PUR).
+
+### Test
+Create Purchase with narration "Goods received" → Tally NARRATION has no TDK-PUR; REFERENCE + New Ref still have TDK-PUR-….
+
+---
+
 ## 2026-08-06 — Stock godowns: resolve by GUID or name
 
 ### Changed
