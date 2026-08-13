@@ -18,6 +18,11 @@ import {
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
+import {
+  insertAppMaster,
+  markAppMasterFailed,
+  markAppMasterPushed,
+} from '../utils/appMasters.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
@@ -45,7 +50,8 @@ async function requestDesktopSyncAfterWrite({ userId, companyGuid, companyName, 
       tallyIds: ids,
       ...extra,
     });
-    console.log(`[sync:request] Triggered desktop sync after tally:write for ${tdkRef} (tallyIds: ${ids.join(',') || 'none — full sync'})`);
+    const reason = extra?.reason || 'voucher_created';
+    console.log(`[sync:request] Triggered desktop sync after tally:write reason=${reason} ref=${tdkRef || 'n/a'} (tallyIds: ${ids.join(',') || 'none — full sync'})`);
   } catch (syncErr) {
     console.warn('[sync:request] Could not trigger desktop sync:', syncErr.message);
   }
@@ -130,12 +136,14 @@ const updateWriteQueue = async (id, result, error) => {
        error_message = $2, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
       [id, String(error)]
     );
+    await markAppMasterFailed(id, error);
   } else if (result?.status === 'desktop_offline' || (result?.message || '').includes('not connected')) {
     await query(
       `UPDATE write_queue SET status = 'desktop_offline', error_message = $2,
        attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
       [id, result?.message || 'Desktop offline']
     );
+    // Keep app_masters queued — will push when desktop reconnects
   } else if (result?.status === false) {
     // Tally rejected the entry (LINEERROR or other Tally-side failure) — mark as failed, NOT success.
     // This was the silent failure bug: Tally rejections were being marked 'success'.
@@ -156,6 +164,7 @@ const updateWriteQueue = async (id, result, error) => {
         WHERE write_queue_id = $1`,
       [id, String(errMsg).slice(0, 500)]
     ).catch(() => {});
+    await markAppMasterFailed(id, errMsg);
   } else if (
     // Defense: empty Tally create (CREATED=0 / LASTVCHID=0) must never become Posted.
     // Desktop now rejects these, but older desktops may still return status:true.
@@ -178,6 +187,7 @@ const updateWriteQueue = async (id, result, error) => {
         WHERE write_queue_id = $1`,
       [id, String(errMsg).slice(0, 500)]
     ).catch(() => {});
+    await markAppMasterFailed(id, errMsg);
   } else {
     let resolvedVoucherNumber = result?.voucherNumber || null;
     const tallyId = result?.tallyId || null;
@@ -217,6 +227,9 @@ const updateWriteQueue = async (id, result, error) => {
        error_message = NULL, attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
       [id, resolvedVoucherNumber || null, tallyId]
     );
+
+    // Masters: pushed only — Posted waits for ingest confirmation (app_masters).
+    await markAppMasterPushed(id);
 
     // Always mark app_vouchers posted on successful Tally write (number may arrive later via sync).
     const avResult = await query(`
@@ -2253,6 +2266,16 @@ ${mailingDetailsXml}
 </IMPORTDATA></BODY></ENVELOPE>`;
 
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'party', name, null, req.body, xml).catch(() => null);
+  if (qId) {
+    await insertAppMaster({
+      companyGuid,
+      userId: req.user.userId,
+      writeQueueId: qId,
+      masterType: 'party',
+      masterName: name,
+      payload: req.body,
+    });
+  }
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
@@ -2270,6 +2293,20 @@ ${mailingDetailsXml}
        )`,
       [companyGuid, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType, isDutiesLedger ? ratePct : 0]
     ).catch((e) => { console.warn('[party-immediate-insert]', e.message); }); // fire-and-forget, don't block response
+
+    // Masters need LedgerFull pull (not SingleVoucher) — empty tallyIds forces full post-write sync.
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef: null,
+          tallyIds: [],
+          extra: { reason: 'master_created', masterType: 'party', masterName: name },
+        });
+      });
+    }
 
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Party/Ledger created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
@@ -2336,10 +2373,32 @@ router.post('/master/warehouse', authMiddleware, async (req, res) => {
   const parentXml = effectiveParent ? `<PARENT>${effectiveParent}</PARENT>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><GODOWN NAME="${name}" ACTION="Create"><NAME>${name}</NAME>${parentXml}${addressXml}</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'warehouse', name, null, req.body, xml).catch(() => null);
+  if (qId) {
+    await insertAppMaster({
+      companyGuid,
+      userId: req.user.userId,
+      writeQueueId: qId,
+      masterType: 'warehouse',
+      masterName: name,
+      payload: req.body,
+    });
+  }
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef: null,
+          tallyIds: [],
+          extra: { reason: 'master_created', masterType: 'warehouse', masterName: name },
+        });
+      });
+    }
     res.json({ status: true, queued: offline, queueId: qId, message: offline ? 'Saved. Will push when desktop connects.' : 'Warehouse created in Tally', data: result, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null });
   } catch (e) {
     await updateWriteQueue(qId, null, e.message);
@@ -4047,6 +4106,16 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
   const gstXml = hsnCode ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM><HSNCODE>${hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml).catch(() => null);
+  if (qId) {
+    await insertAppMaster({
+      companyGuid,
+      userId: req.user.userId,
+      writeQueueId: qId,
+      masterType: 'item',
+      masterName: name,
+      payload: req.body,
+    });
+  }
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
@@ -4295,6 +4364,19 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
       });
     }
 
+    if (!queued) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef: null,
+          tallyIds: [],
+          extra: { reason: 'master_created', masterType: 'item', masterName: name },
+        });
+      });
+    }
+
     res.json({
       status: true,
       queued,
@@ -4354,6 +4436,16 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'alter_stock_item', existingName, null, req.body, xml).catch(() => null);
+  if (qId) {
+    await insertAppMaster({
+      companyGuid,
+      userId: req.user.userId,
+      writeQueueId: qId,
+      masterType: 'alter_stock_item',
+      masterName: changes?.name || existingName,
+      payload: req.body,
+    });
+  }
   try {
     const r = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(qId, r, null);
@@ -4969,10 +5061,33 @@ router.post('/master/bank', authMiddleware, async (req, res) => {
 
   const payload = { companyGuid, bankName, accountNumber, ifsc, accountType, openingBalance };
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'bank', ledgerName, openBal, payload, xml);
+  if (queueId) {
+    await insertAppMaster({
+      companyGuid,
+      userId: req.user.userId,
+      writeQueueId: queueId,
+      masterType: 'bank',
+      masterName: ledgerName,
+      payload,
+    });
+  }
   let result;
   try {
     result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(queueId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName: req.body.companyName || null,
+          tdkRef: null,
+          tallyIds: [],
+          extra: { reason: 'master_created', masterType: 'bank', masterName: ledgerName },
+        });
+      });
+    }
     return res.json({ status: true, data: { message: 'Bank ledger created in Tally', bankName: ledgerName, queueId, tallyResult: result } });
   } catch (err) {
     await updateWriteQueue(queueId, null, err.message);
@@ -5670,6 +5785,136 @@ async function waitForTallyNumber(tdkRef, companyGuid, userId, maxWaitMs = 10000
   }
   return null;
 }
+
+// ── GET /tally/master/:queueId/preview ───────────────────────────────────────
+// Master/ledger preview keyed by write_queue.id (not TDK ref).
+router.get('/master/:queueId/preview', authMiddleware, async (req, res) => {
+  try {
+    const queueId = parseInt(req.params.queueId, 10);
+    const { companyGuid } = req.query;
+    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!queueId) return res.status(400).json({ status: false, message: 'queueId required' });
+
+    const { rows } = await query(
+      `SELECT wq.id, wq.entry_type, wq.entry_label, wq.status AS queue_status,
+              wq.amount, wq.payload, wq.error_message, wq.created_at,
+              am.master_type, am.master_name, am.tally_guid,
+              am.tally_sync_status, am.books_impact_status, am.payload AS am_payload
+         FROM write_queue wq
+         LEFT JOIN app_masters am ON am.write_queue_id = wq.id
+        WHERE wq.id = $1
+          AND wq.company_guid = $2
+          AND wq.user_id = $3
+          AND wq.entry_type IN ('party','bank','warehouse','item','alter_stock_item')`,
+      [queueId, companyGuid, req.user.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ status: false, message: 'Master entry not found' });
+
+    const row = rows[0];
+    const payload = row.am_payload || row.payload || {};
+    const masterType = row.master_type || row.entry_type;
+    const masterName = row.master_name || row.entry_label || payload.name || payload.partyName || payload.bankName || '';
+    const posted = row.books_impact_status === 'posted';
+
+    let live = null;
+    if (masterType === 'party' || masterType === 'bank') {
+      const { rows: ledgers } = await query(
+        `SELECT guid, name, parent, gstin, pan, address, state_name, pincode,
+                gst_registration_type, opening_balance, closing_balance, balance_type, tax_rate, phone, email
+           FROM ledgers
+          WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+          ORDER BY CASE WHEN guid LIKE $1 || '%' THEN 0 ELSE 1 END
+          LIMIT 1`,
+        [companyGuid, masterName]
+      ).catch(() => ({ rows: [] }));
+      live = ledgers[0] || null;
+    } else if (masterType === 'warehouse') {
+      const { rows: wh } = await query(
+        `SELECT guid, name, parent, address FROM warehouses
+          WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+        [companyGuid, masterName]
+      ).catch(() => ({ rows: [] }));
+      live = wh[0] || null;
+    } else if (masterType === 'item' || masterType === 'alter_stock_item') {
+      const { rows: stocks } = await query(
+        `SELECT guid, name, group_name, unit, hsn, tax_rate, opening_qty, opening_rate,
+                closing_qty, closing_rate, closing_value
+           FROM stocks
+          WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+          ORDER BY CASE WHEN guid LIKE $1 || '%' THEN 0 ELSE 1 END
+          LIMIT 1`,
+        [companyGuid, masterName]
+      ).catch(() => ({ rows: [] }));
+      live = stocks[0] || null;
+    }
+
+    const ledgerType = payload.ledger_type || null;
+    const typeLabel = ({
+      party: ledgerType === 'duties_taxes' ? 'Duties & Taxes'
+        : ledgerType === 'sundry_creditor' ? 'Sundry Creditors'
+        : ledgerType === 'sundry_debtor' ? 'Sundry Debtors'
+        : ledgerType === 'custom' ? 'Custom Ledger'
+        : 'Ledger',
+      bank: 'Bank Ledger',
+      warehouse: 'Warehouse',
+      item: 'Stock Item',
+      alter_stock_item: 'Stock Item Edit',
+    })[masterType] || 'Master';
+
+    res.json({
+      status: true,
+      data: {
+        kind: 'master',
+        queueId: row.id,
+        masterType,
+        ledgerType,
+        typeLabel,
+        name: masterName,
+        parent: live?.parent || live?.group_name || payload.parent || payload.parentGodown || payload.groupName || null,
+        queueStatus: row.queue_status,
+        tallySyncStatus: row.tally_sync_status || null,
+        booksImpactStatus: row.books_impact_status || 'not_posted',
+        postingTag: posted ? 'Posted' : (row.queue_status === 'success' || row.tally_sync_status === 'pushed' ? 'Awaiting Sync' : 'Not Posted'),
+        syncConfirmed: posted,
+        tallyGuid: row.tally_guid || live?.guid || null,
+        createdAt: row.created_at,
+        errorMessage: row.error_message || null,
+        // Snapshot from create payload (always available)
+        payload: {
+          gstin: payload.gstin || live?.gstin || null,
+          pan: payload.pan || live?.pan || null,
+          phone: payload.phone || live?.phone || null,
+          email: payload.email || live?.email || null,
+          address: payload.address || live?.address || null,
+          state: payload.state || live?.state_name || null,
+          pincode: payload.pincode || live?.pincode || null,
+          gstRegType: payload.gstRegType || payload.gstType || live?.gst_registration_type || null,
+          openingBalance: payload.openingBalance ?? live?.opening_balance ?? row.amount ?? 0,
+          isCr: payload.isCr ?? (live?.balance_type === 'Cr'),
+          dutyCategory: payload.dutyCategory || null,
+          taxType: payload.taxType || null,
+          percentage: payload.percentage ?? payload.dutyPercentage ?? live?.tax_rate ?? null,
+          gstApplicable: payload.gstApplicable || null,
+          hsnCode: payload.hsnCode || live?.hsn || null,
+          igstRate: payload.igstRate ?? live?.tax_rate ?? null,
+          unit: payload.unit || live?.unit || null,
+          openingQty: payload.openingQty ?? live?.opening_qty ?? null,
+          openingRate: payload.openingRate ?? live?.opening_rate ?? null,
+          warehouse: payload.warehouse || null,
+          bankDetails: payload.bankDetails || null,
+          accountNumber: payload.accountNumber || null,
+          ifsc: payload.ifsc || null,
+          accountType: payload.accountType || null,
+          changes: payload.changes || null,
+        },
+        live: live || null,
+      },
+    });
+  } catch (e) {
+    console.error('[master/preview]', e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
 
 // ── GET /tally/invoice/:tdkRef/preview ───────────────────────────────────────
 router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {

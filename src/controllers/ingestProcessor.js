@@ -5,6 +5,7 @@ import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifie
 import { deriveVoucherTypeParent, REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
 import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
+import { confirmAppMasterFromIngest } from '../utils/appMasters.js';
 
 /** Tally Duties & Taxes: RateOfTaxCalculation exported as TAXRATE in LedgerFull.xml */
 function extractLedgerTaxRate(r) {
@@ -571,6 +572,14 @@ async function processMasters(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Masters: saved ${saved}/${data.length} ledgers for ${companyGuid}`);
+
+    // Confirm app_masters (party/bank) after commit — Posted only when real Tally GUID exists
+    for (const r of data) {
+      const name = r.NAME || r.name || r.LEDGERNAME || '';
+      const guid = r.GUID || r.guid || '';
+      if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
+      await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
+    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Masters transaction failed:', e.message);
@@ -581,6 +590,7 @@ async function processMasters(data, companyGuid) {
 
 async function processStocks(data, companyGuid) {
   const client = await getClient();
+  const confirmedStocks = [];
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -656,6 +666,10 @@ async function processStocks(data, companyGuid) {
               [companyGuid, guid, name, String(aliasVal).trim()]);
           } catch (_) { /* non-critical — skip silently */ }
         }
+
+        if (String(guid).startsWith(companyGuid) || String(guid).includes(companyGuid)) {
+          confirmedStocks.push({ name, guid });
+        }
       } catch (e) {
         console.warn('[DB] Stock insert failed:', e.message);
       }
@@ -663,6 +677,9 @@ async function processStocks(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Stocks: saved ${saved}/${data.length} for ${companyGuid}`);
+    for (const s of confirmedStocks) {
+      await confirmAppMasterFromIngest(companyGuid, s.name, ['item', 'alter_stock_item'], s.guid);
+    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Stocks transaction failed:', e.message);
@@ -3017,6 +3034,7 @@ async function processAllVoucher(data, companyGuid) {
 
 async function processWarehouses(data, companyGuid) {
   const client = await getClient();
+  const confirmedWarehouses = [];
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3038,10 +3056,15 @@ async function processWarehouses(data, companyGuid) {
           parseInt(r.AlterId || r.ALTERID || 0), now(),
         ]);
         saved++;
+        const whGuid = r.Guid || r.GUID || null;
+        if (whGuid) confirmedWarehouses.push({ name, guid: whGuid });
       } catch (e) { console.warn('[DB] Warehouse insert failed:', e.message); }
     }
     await client.query('COMMIT');
     console.log(`[DB] Warehouses: saved ${saved}/${data.length} for ${companyGuid}`);
+    for (const w of confirmedWarehouses) {
+      await confirmAppMasterFromIngest(companyGuid, w.name, ['warehouse'], w.guid);
+    }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Warehouses failed:', e.message); }
   finally { client.release(); }
 }

@@ -970,7 +970,41 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vlt_company_voucher
         ON voucher_line_taxes(company_guid, voucher_guid);
       ALTER TABLE voucher_inventory_items ADD COLUMN IF NOT EXISTS tax_rate DECIMAL(15,4);
+
+      -- ── App Masters (ledger / bank / warehouse / stock lifecycle) ───────────
+      -- Posted only after ingest confirms the master in the synced table
+      -- (unlike vouchers, which mark posted on successful Tally write).
+      CREATE TABLE IF NOT EXISTS app_masters (
+        id                      SERIAL PRIMARY KEY,
+        company_guid            TEXT NOT NULL,
+        user_id                 INTEGER REFERENCES users(id),
+        write_queue_id          INTEGER REFERENCES write_queue(id) UNIQUE,
+        master_type             TEXT NOT NULL,  -- party | bank | warehouse | item | alter_stock_item
+        master_name             TEXT NOT NULL,
+        tally_guid              TEXT,
+        tally_sync_status       TEXT NOT NULL DEFAULT 'queued',    -- queued | pushed | synced | failed
+        books_impact_status     TEXT NOT NULL DEFAULT 'not_posted', -- not_posted | posted
+        payload                 JSONB,
+        sync_error              TEXT,
+        created_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_masters_company ON app_masters(company_guid);
+      CREATE INDEX IF NOT EXISTS idx_app_masters_wqid    ON app_masters(write_queue_id);
+      CREATE INDEX IF NOT EXISTS idx_app_masters_name
+        ON app_masters(company_guid, LOWER(master_name));
+      CREATE INDEX IF NOT EXISTS idx_app_masters_posted
+        ON app_masters(company_guid, books_impact_status);
     `);
+
+    // Backfill historical master writes into app_masters + mark posted when synced.
+    try {
+      const { backfillAppMasters } = await import('../utils/appMasters.js');
+      await backfillAppMasters(client);
+      console.log('✅ app_masters backfill complete');
+    } catch (e) {
+      console.warn('[app_masters] backfill skipped:', e.message);
+    }
 
     // Data repair: thin SimplifiedVoucher syncs used to overwrite every
     // voucher_type_parent with the 'Voucher' placeholder, emptying the GST

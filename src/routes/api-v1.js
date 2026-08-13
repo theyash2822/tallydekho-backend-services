@@ -1297,9 +1297,48 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     params.push(parseInt(limit), offset);
     const { rows: postedRows } = await query(q, params);
 
+    // 1b. Posted masters (party/bank/warehouse/item) — confirmed by ingest via app_masters
+    const { rows: postedMasterRows } = await query(`
+      SELECT
+        wq.id as _queue_id,
+        wq.entry_type as voucher_type,
+        wq.entry_label as party_name,
+        'posted' as _queue_status,
+        NULL as _queue_error,
+        wq.attempt_count,
+        TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') as date,
+        wq.created_at,
+        NULL as voucher_number,
+        wq.amount as amount,
+        COALESCE(am.payload, wq.payload) as _payload,
+        am.tally_guid as guid,
+        NULL as tdk_reference_no,
+        'regular' as original_entry_type,
+        'regular' as current_entry_type,
+        am.books_impact_status,
+        NULL as conversion_status,
+        'not_applicable' as e_invoice_status,
+        'not_required' as e_way_bill_status,
+        NULL as av_tally_voucher_no,
+        NULL as parent_invoice_uuid,
+        NULL as parent_tdk_reference_no,
+        NULL as parent_tally_voucher_no,
+        TRUE as _is_master
+      FROM app_masters am
+      JOIN write_queue wq ON wq.id = am.write_queue_id
+      WHERE am.company_guid = $1
+        AND am.user_id = $2
+        AND am.books_impact_status = 'posted'
+        AND ($3::text IS NULL OR TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') >= $3)
+        AND ($4::text IS NULL OR TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') <= $4)
+      ORDER BY wq.created_at DESC
+      LIMIT 100
+    `, [companyGuid, userId, from || null, to || null]);
+
     // 2. Pending/failed write_queue entries not yet in vouchers
     // Also include 'success' entries for non-standard voucher types (stock_transfer, stock_adjustment)
     // that may not produce a joinable tally_voucher_number match
+    // Masters: exclude rows already posted via app_masters
     const { rows: pendingRows } = await query(`
       SELECT
         wq.id as _queue_id,
@@ -1312,22 +1351,24 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         wq.created_at,
         wq.tally_voucher_number as voucher_number,
         wq.amount as amount,
-        wq.payload as _payload,
-        NULL as guid,
+        COALESCE(am.payload, wq.payload) as _payload,
+        am.tally_guid as guid,
         av.tdk_reference_no,
-        av.original_entry_type,
-        av.current_entry_type,
-        av.books_impact_status,
+        COALESCE(av.original_entry_type, CASE WHEN am.id IS NOT NULL THEN 'regular' ELSE NULL END) as original_entry_type,
+        COALESCE(av.current_entry_type,  CASE WHEN am.id IS NOT NULL THEN 'regular' ELSE NULL END) as current_entry_type,
+        COALESCE(am.books_impact_status, av.books_impact_status) as books_impact_status,
         av.conversion_status,
         av.e_invoice_status,
         av.e_way_bill_status,
         av.tally_voucher_no as av_tally_voucher_no,
         av.parent_invoice_uuid,
         parent_av.tdk_reference_no as parent_tdk_reference_no,
-        parent_av.tally_voucher_no as parent_tally_voucher_no
+        parent_av.tally_voucher_no as parent_tally_voucher_no,
+        (am.id IS NOT NULL) as _is_master
       FROM write_queue wq
       LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
       LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
+      LEFT JOIN app_masters am ON am.write_queue_id = wq.id
       WHERE wq.company_guid = $1
         AND wq.user_id = $2
         AND (
@@ -1337,6 +1378,9 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
             AND wq.created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 2592000
           )
         )
+        -- IMPORTANT: am is LEFT JOIN — when no app_masters row, books_impact_status is NULL.
+        -- NOT (NULL = posted) evaluates to NULL and drops the row. Use COALESCE.
+        AND COALESCE(am.books_impact_status, 'not_posted') <> 'posted'
       ORDER BY wq.created_at DESC
       LIMIT 50
     `, [companyGuid, userId]);
@@ -1344,7 +1388,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     const { lifecycleFilter } = req.query;
 
     // Apply lifecycle filter to combined results (filter on JS side — simpler than complex SQL)
-    let allRows = [...pendingRows, ...postedRows];
+    let allRows = [...pendingRows, ...postedMasterRows, ...postedRows];
     if (lifecycleFilter && lifecycleFilter !== 'all') {
       allRows = allRows.filter(r => {
         const entryType  = r.current_entry_type || r.original_entry_type;
@@ -1352,15 +1396,19 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         const syncStatus = r._queue_status;
         const eInvoice   = r.e_invoice_status;
         const eWayBill   = r.e_way_bill_status;
+        const isMaster   = r._is_master || ['party','bank','warehouse','item','alter_stock_item'].includes(r.voucher_type);
 
         if (lifecycleFilter === 'pending_sync')
-          return ['pending', 'processing', 'desktop_offline'].includes(syncStatus);
+          return ['pending', 'processing', 'desktop_offline'].includes(syncStatus)
+            || (isMaster && r.books_impact_status === 'not_posted' && syncStatus === 'success');
         if (lifecycleFilter === 'regular')
-          return entryType === 'regular' || (!entryType && syncStatus === 'posted');
+          return isMaster
+            || entryType === 'regular'
+            || (!entryType && syncStatus === 'posted');
         if (lifecycleFilter === 'optional')
-          return entryType === 'optional';
+          return !isMaster && entryType === 'optional';
         if (lifecycleFilter === 'originally_optional')
-          return origType === 'optional' && entryType === 'regular';
+          return !isMaster && origType === 'optional' && entryType === 'regular';
         if (lifecycleFilter === 'failed')
           return syncStatus === 'failed';
         if (lifecycleFilter === 'irn_pending')
@@ -1371,7 +1419,11 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       });
     }
 
-    res.json({ success: true, data: allRows.filter(r => r._queue_status === 'posted'), pending: allRows.filter(r => r._queue_status !== 'posted') });
+    res.json({
+      success: true,
+      data: allRows.filter(r => r._queue_status === 'posted'),
+      pending: allRows.filter(r => r._queue_status !== 'posted'),
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
