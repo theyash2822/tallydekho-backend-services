@@ -1,5 +1,19 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-14 — Proforma Invoice (optional Sales, TDK-PRF)
+
+### Added
+- `POST /tally/voucher/proforma` — always `ISOPTIONAL=Yes`, `app_vouchers.voucher_type=proforma_invoice`, ref `TDK-PRF-*`
+- `POST /tally/voucher/proforma/convert` — Alter same voucher `ISOPTIONAL=No`
+- Ingest optional sync also matches `TDK-PRF-` (does not change `TDK-OPT-SAL-`)
+- Regular TDK reconcile excludes `TDK-PRF-` (same as `TDK-OPT-`) so sync cannot mark a still-optional proforma as posted
+- My Entries join for `proforma_invoice`; convert queue type `proforma_convert` hidden from list
+
+### Unchanged
+- Sales Invoice Regular/Optional path
+
+---
+
 ## 2026-08-06 — Debit Note = Credit Note mirror (Purchase Return)
 
 ### Added

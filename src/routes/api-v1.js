@@ -1244,6 +1244,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.parent_invoice_uuid,
         av.created_at as av_created_at,
         av.id as av_id,
+        av.voucher_type as app_voucher_type,
         parent_av.tdk_reference_no as parent_tdk_reference_no,
         parent_av.tally_voucher_no as parent_tally_voucher_no
       FROM vouchers v
@@ -1264,6 +1265,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
           (av.voucher_type = 'receipt'       AND v.voucher_type ILIKE 'Receipt')
           OR (av.voucher_type = 'sales_order' AND v.voucher_type ILIKE '%Sales Order%')
           OR (av.voucher_type = 'sales_invoice' AND v.voucher_type ILIKE 'Sales%' AND v.voucher_type NOT ILIKE '%Order%')
+          OR (av.voucher_type = 'proforma_invoice' AND v.voucher_type ILIKE 'Sales%' AND v.voucher_type NOT ILIKE '%Order%')
           OR (av.voucher_type = 'payment'       AND v.voucher_type ILIKE 'Payment')
           OR (av.voucher_type = 'journal'       AND v.voucher_type ILIKE 'Journal')
           OR (av.voucher_type = 'contra'        AND v.voucher_type ILIKE 'Contra')
@@ -1273,7 +1275,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
           OR (av.voucher_type = 'credit_note'   AND v.voucher_type ILIKE '%Credit Note%')
           OR (av.voucher_type = 'debit_note'    AND v.voucher_type ILIKE '%Debit Note%')
           OR (
-            av.voucher_type NOT IN ('receipt','sales_invoice','sales_order','payment','journal','contra','purchase','purchase_invoice','credit_note','debit_note')
+            av.voucher_type NOT IN ('receipt','sales_invoice','proforma_invoice','sales_order','payment','journal','contra','purchase','purchase_invoice','credit_note','debit_note')
             AND LOWER(COALESCE(v.voucher_type,'')) LIKE '%' || REPLACE(av.voucher_type, '_', ' ') || '%'
           )
         )
@@ -1361,6 +1363,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         av.e_invoice_status,
         av.e_way_bill_status,
         av.tally_voucher_no as av_tally_voucher_no,
+        av.voucher_type as app_voucher_type,
         av.parent_invoice_uuid,
         parent_av.tdk_reference_no as parent_tdk_reference_no,
         parent_av.tally_voucher_no as parent_tally_voucher_no,
@@ -1371,6 +1374,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       LEFT JOIN app_masters am ON am.write_queue_id = wq.id
       WHERE wq.company_guid = $1
         AND wq.user_id = $2
+        AND wq.entry_type IS DISTINCT FROM 'proforma_convert'
         AND (
           wq.status IN ('pending', 'processing', 'desktop_offline', 'failed')
           OR (

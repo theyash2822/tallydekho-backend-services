@@ -15,6 +15,7 @@ const PARENT_RULES = [
   [/credit note|sales return/, 'Credit Note'],
   [/debit note|purchase return/, 'Debit Note'],
   [/sales order/, 'Sales Order'],
+  [/proforma/, 'Sales'],
   [/purchase order/, 'Purchase Order'],
   [/delivery note/, 'Delivery Note'],
   [/receipt note/, 'Receipt Note'],
@@ -45,6 +46,7 @@ export const voucherTypeParentSql = (col = 'voucher_type') => `
     WHEN ${col} ~* 'credit note|sales return'     THEN 'Credit Note'
     WHEN ${col} ~* 'debit note|purchase return'   THEN 'Debit Note'
     WHEN ${col} ~* 'sales order'                  THEN 'Sales Order'
+    WHEN ${col} ~* 'proforma'                     THEN 'Sales'
     WHEN ${col} ~* 'purchase order'               THEN 'Purchase Order'
     WHEN ${col} ~* 'delivery note'                THEN 'Delivery Note'
     WHEN ${col} ~* 'receipt note'                 THEN 'Receipt Note'

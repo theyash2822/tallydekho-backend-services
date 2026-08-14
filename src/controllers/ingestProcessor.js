@@ -870,7 +870,7 @@ async function processVouchers(data, companyGuid) {
       // <ISOPTIONAL>Yes</ISOPTIONAL>. Never convert from Simplified-only / missing flag.
       try {
         const ref = String(r.Reference || r.REFERENCE || r.reference || '');
-        if (ref.startsWith('TDK-OPT-')) {
+        if (ref.startsWith('TDK-OPT-') || ref.startsWith('TDK-PRF-')) {
           // Always attach Tally voucher number / synced status without changing entry type.
           if (voucherNumber) {
             const { rows: optSyncRows } = await dbQuery(
@@ -939,7 +939,7 @@ async function processVouchers(data, companyGuid) {
       try {
         // String-safe: Tally/XML parsers can emit Reference as number (same class as OPT path bug).
         const ref2 = String(r.Reference || r.REFERENCE || r.reference || '');
-        if (voucherNumber && ref2 && ref2.startsWith('TDK-') && !ref2.startsWith('TDK-OPT-')) {
+        if (voucherNumber && ref2 && ref2.startsWith('TDK-') && !ref2.startsWith('TDK-OPT-') && !ref2.startsWith('TDK-PRF-')) {
           const { rows: avRegRows } = await dbQuery(
             `UPDATE app_vouchers
              SET tally_voucher_no    = $1,
@@ -1889,6 +1889,20 @@ async function processFullLedger(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] FullLedger: saved ${saved}/${data.length} for ${companyGuid}`);
+
+    // Confirm app_masters (party/bank) — LedgerFull is the primary ledger sync path;
+    // processMasters alone is not enough for Posted badges after master create.
+    for (const raw of expandedData) {
+      let r = raw;
+      const ledgerVal = raw.LEDGER ?? raw.Ledger;
+      if (ledgerVal) {
+        try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
+      }
+      const name = tallyName(r);
+      const guid = r.GUID || r.Guid || r.guid || '';
+      if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
+      await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
+    }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message); }
   finally { client.release(); }
 }

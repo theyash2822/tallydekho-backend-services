@@ -18,6 +18,7 @@ import {
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
+import { buildSalesLikeVoucherXml } from '../utils/salesLikeVoucherXml.js';
 import {
   insertAppMaster,
   markAppMasterFailed,
@@ -1005,6 +1006,228 @@ ${topLevelDispatchXml}
       voucherNumber: result?.voucherNumber || null,
       tallyId: result?.tallyId || null,
       receipt: receiptResult ? { ok: receiptResult.ok, tdkRef: receiptResult.tdkRef, error: receiptResult.error || null } : null,
+    });
+  } catch (e) {
+    await updateWriteQueue(queueId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── POST /tally/voucher/proforma ─────────────────────────────────────────────
+// Always optional Sales in Tally. Separate app identity (proforma_invoice / TDK-PRF).
+router.post('/voucher/proforma', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, companyName, date, voucherNumber, reference, narration,
+    partyLedger, totalAmount,
+    items = [],
+    taxes = [],
+    logistics = [],
+    voucherType = 'Sales',
+    dispatch_details = null,
+  } = req.body;
+
+  if (!companyGuid || !partyLedger || !items.length) {
+    return res.status(400).json({ status: false, message: 'companyGuid, partyLedger and items required' });
+  }
+
+  const dt = tallyDate(date);
+  const amt = parseFloat(totalAmount) || 0;
+  const vchType = voucherType || 'Sales';
+  const fullNarration = narration || '';
+
+  const tdkRef = await generateTDKReference(companyGuid, false, 'PRF').catch(() => null);
+
+  const xml = buildSalesLikeVoucherXml({
+    companyName,
+    vchType,
+    action: 'Create',
+    dt,
+    voucherNumber: voucherNumber || '',
+    tdkRef: tdkRef || reference || '',
+    isOptional: true,
+    narration: fullNarration,
+    partyLedger,
+    partyAmt: amt,
+    items,
+    taxes,
+    logistics,
+    againstOrderNo: req.body.againstOrderNo || '',
+  });
+
+  const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
+  const persistPayload = { ...req.body, isOptional: true, original_entry_type: 'optional', tdkRef };
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'proforma', label, amt, persistPayload, xml).catch(() => null);
+
+  let invoiceUuid = null;
+  if (queueId && tdkRef) {
+    const avResult = await query(
+      `INSERT INTO app_vouchers
+       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+        tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
+        party_name, total_amount, voucher_date, payload)
+       VALUES ($1,$2,$3,'proforma_invoice',$4,'optional','optional','queued','not_posted','tally_prime_series',$5,$6,$7,$8,$9)
+       RETURNING invoice_uuid`,
+      [companyGuid, req.user.userId, queueId, tdkRef,
+       voucherNumber || null,
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
+    ).catch(e => { console.error('[app_vouchers] proforma insert failed:', e.message); return { rows: [] }; });
+    invoiceUuid = avResult?.rows?.[0]?.invoice_uuid || null;
+
+    await persistVoucherLineTaxes(query, {
+      companyGuid,
+      tdkReferenceNo: tdkRef,
+      items,
+      taxes,
+      logistics,
+    }).catch(e => console.warn('[voucher_line_taxes] proforma persist failed:', e.message));
+  }
+
+  try {
+    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(queueId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    if (!offline) {
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId],
+          extra: { reason: 'proforma_created' },
+        });
+      });
+    }
+    res.json({
+      status: true, queued: offline, queueId,
+      tdkReferenceNo: tdkRef, invoiceUuid,
+      invoiceNumber: result?.voucherNumber || null,
+      numberingPolicy: 'tally_prime_series',
+      message: offline ? 'Entry saved. Will push to Tally when desktop connects.' : 'Proforma invoice saved (optional)',
+      data: result,
+      voucherNumber: result?.voucherNumber || null,
+      tallyId: result?.tallyId || null,
+    });
+  } catch (e) {
+    await updateWriteQueue(queueId, null, e.message);
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── POST /tally/voucher/proforma/convert ─────────────────────────────────────
+// Flip the same Tally Sales voucher Optional → Regular.
+router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
+  const { companyGuid, companyName, tdkRef } = req.body;
+  if (!companyGuid || !tdkRef) {
+    return res.status(400).json({ status: false, message: 'companyGuid and tdkRef required' });
+  }
+
+  const { rows: avRows } = await query(
+    `SELECT * FROM app_vouchers
+      WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3 AND voucher_type='proforma_invoice'`,
+    [tdkRef, companyGuid, req.user.userId]
+  );
+  const av = avRows[0];
+  if (!av) return res.status(404).json({ status: false, message: 'Proforma not found' });
+  if (av.current_entry_type === 'regular' || av.conversion_status === 'converted') {
+    return res.json({
+      status: true, alreadyConverted: true,
+      tdkReferenceNo: tdkRef,
+      invoiceNumber: av.tally_voucher_no || null,
+      message: 'Already converted to invoice',
+    });
+  }
+  const { rows: wqRowsEarly } = await query(
+    `SELECT tally_id, status FROM write_queue WHERE id=$1`,
+    [av.write_queue_id]
+  ).catch(() => ({ rows: [] }));
+  const tallyIdOk = wqRowsEarly[0]?.tally_id && String(wqRowsEarly[0].tally_id) !== '0';
+  if (!av.tally_voucher_no && av.tally_sync_status !== 'synced' && !tallyIdOk) {
+    return res.status(409).json({
+      status: false,
+      message: 'Wait until this Proforma is synced from Tally, then convert.',
+    });
+  }
+
+  const p = typeof av.payload === 'string' ? JSON.parse(av.payload) : (av.payload || {});
+  const items = p.items || [];
+  const taxes = p.taxes || [];
+  const logistics = p.logistics || [];
+  const partyLedger = av.party_name || p.partyLedger;
+  const amt = parseFloat(av.total_amount || p.totalAmount || 0);
+  const vchType = p.voucherType || 'Sales';
+  const dt = tallyDate(av.voucher_date || p.date);
+
+  const { rows: vRows } = await query(
+    `SELECT guid FROM vouchers WHERE company_guid=$1 AND (reference=$2 OR voucher_number=$3) LIMIT 1`,
+    [companyGuid, tdkRef, av.tally_voucher_no || '']
+  ).catch(() => ({ rows: [] }));
+  const { rows: wqRows } = await query(
+    `SELECT tally_id FROM write_queue WHERE id=$1`,
+    [av.write_queue_id]
+  ).catch(() => ({ rows: [] }));
+
+  const xml = buildSalesLikeVoucherXml({
+    companyName: companyName || p.companyName,
+    vchType,
+    action: 'Alter',
+    dt,
+    voucherNumber: av.tally_voucher_no || p.voucherNumber || '',
+    tdkRef,
+    isOptional: false,
+    narration: p.narration || '',
+    partyLedger,
+    partyAmt: amt,
+    items,
+    taxes,
+    logistics,
+    againstOrderNo: p.againstOrderNo || '',
+    guid: vRows[0]?.guid || '',
+    masterId: wqRowsEarly[0]?.tally_id || wqRows[0]?.tally_id || '',
+  });
+
+  const queueId = await logWriteQueue(
+    req.user.userId, companyGuid, 'proforma_convert',
+    `${partyLedger} (convert to invoice)`, amt, { ...p, convert: true, tdkRef }, xml
+  ).catch(() => null);
+
+  try {
+    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(queueId, result, null);
+    const offline = result?.status === 'desktop_offline';
+    if (!offline && result?.status !== false) {
+      await query(
+        `UPDATE app_vouchers
+            SET current_entry_type  = 'regular',
+                books_impact_status = 'posted',
+                conversion_status   = 'converted',
+                tally_sync_status   = 'synced',
+                tally_voucher_no    = COALESCE($2, tally_voucher_no),
+                updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
+          WHERE id = $1`,
+        [av.id, result?.voucherNumber || av.tally_voucher_no || null]
+      );
+      setImmediate(() => {
+        requestDesktopSyncAfterWrite({
+          userId: req.user.userId,
+          companyGuid,
+          companyName: companyName || p.companyName,
+          tdkRef,
+          tallyIds: [result?.tallyId, wqRows[0]?.tally_id],
+          extra: { reason: 'proforma_converted' },
+        });
+      });
+    }
+    res.json({
+      status: true,
+      queued: offline,
+      queueId,
+      tdkReferenceNo: tdkRef,
+      invoiceNumber: result?.voucherNumber || av.tally_voucher_no || null,
+      message: offline
+        ? 'Convert queued. Will push when desktop connects.'
+        : 'Proforma converted to Sales Invoice',
+      data: result,
     });
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
@@ -5693,6 +5916,7 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const isSalesOrder = vType === 'sales_order';
   const isCreditNote = vType === 'credit_note';
   const isPurchaseInvoice = vType === 'purchase_invoice' || vType === 'purchase';
+  const isProforma = vType === 'proforma_invoice';
 
   // A Credit Note shares the item/tax/total shape of a Sales invoice; it only differs
   // in document type and in always carrying the invoice it returns against.
@@ -5705,7 +5929,13 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       ? 'credit_note'
       : (isSalesOrder
         ? 'sales_order'
-        : (isPurchaseInvoice ? 'purchase_invoice' : 'sales_invoice')),
+        : (isPurchaseInvoice ? 'purchase_invoice' : (isProforma ? 'proforma_invoice' : 'sales_invoice'))),
+    currentEntryType: av.current_entry_type || null,
+    conversionStatus: av.conversion_status || null,
+    canConvertProforma: isProforma
+      && av.current_entry_type === 'optional'
+      && av.conversion_status !== 'converted'
+      && (!!av.tally_voucher_no || av.tally_sync_status === 'synced'),
     tallyVoucherType: isCreditNote ? 'Credit Note' : (isPurchaseInvoice ? 'Purchase' : undefined),
     documentNumber: invoiceNumberLabel,
     documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
