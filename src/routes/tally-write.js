@@ -1115,9 +1115,17 @@ router.post('/voucher/proforma', authMiddleware, async (req, res) => {
 });
 
 // ── POST /tally/voucher/proforma/convert ─────────────────────────────────────
-// Flip the same Tally Sales voucher Optional → Regular.
+// Alter the same Tally Sales voucher Optional → Regular (no second voucher).
+// Optional body fields (items, taxes, …) overlay the stored payload so the user
+// can review/edit in Create Invoice before the Alter is pushed.
 router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, tdkRef } = req.body;
+  const {
+    companyGuid, companyName, tdkRef,
+    partyLedger: bodyParty, date: bodyDate, items: bodyItems, taxes: bodyTaxes,
+    logistics: bodyLogistics, narration: bodyNarration, totalAmount: bodyTotal,
+    salesLedger: bodySalesLedger, dispatch_details: bodyDispatch,
+    collect_payment: bodyCollect, reference: bodyReference,
+  } = req.body;
   if (!companyGuid || !tdkRef) {
     return res.status(400).json({ status: false, message: 'companyGuid and tdkRef required' });
   }
@@ -1150,13 +1158,32 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   }
 
   const p = typeof av.payload === 'string' ? JSON.parse(av.payload) : (av.payload || {});
+  if (Array.isArray(bodyItems) && bodyItems.length) p.items = bodyItems;
+  if (Array.isArray(bodyTaxes)) p.taxes = bodyTaxes;
+  if (Array.isArray(bodyLogistics)) p.logistics = bodyLogistics;
+  if (bodyParty) p.partyLedger = bodyParty;
+  if (bodyDate) p.date = bodyDate;
+  if (bodyNarration !== undefined) p.narration = bodyNarration;
+  if (bodyTotal != null && bodyTotal !== '') p.totalAmount = bodyTotal;
+  if (bodySalesLedger) p.salesLedger = bodySalesLedger;
+  if (bodyDispatch) p.dispatch_details = bodyDispatch;
+  if (bodyCollect) p.collect_payment = bodyCollect;
+  if (bodyReference) p.reference = bodyReference;
+  p.convert = true;
+  p.tdkRef = tdkRef;
+  p.isOptional = false;
+
   const items = p.items || [];
   const taxes = p.taxes || [];
   const logistics = p.logistics || [];
-  const partyLedger = av.party_name || p.partyLedger;
-  const amt = parseFloat(av.total_amount || p.totalAmount || 0);
+  const partyLedger = p.partyLedger || av.party_name;
+  const amt = parseFloat(p.totalAmount || av.total_amount || 0);
   const vchType = p.voucherType || 'Sales';
-  const dt = tallyDate(av.voucher_date || p.date);
+  const dt = tallyDate(p.date || av.voucher_date);
+  const collect_payment = p.collect_payment || null;
+  const payAmt = collect_payment?.ledgerName && parseFloat(collect_payment.amount) > 0
+    ? parseFloat(collect_payment.amount)
+    : 0;
 
   const { rows: vRows } = await query(
     `SELECT guid FROM vouchers WHERE company_guid=$1 AND (reference=$2 OR voucher_number=$3) LIMIT 1`,
@@ -1203,18 +1230,52 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
                 conversion_status   = 'converted',
                 tally_sync_status   = 'synced',
                 tally_voucher_no    = COALESCE($2, tally_voucher_no),
+                party_name          = COALESCE($3, party_name),
+                total_amount        = COALESCE($4, total_amount),
+                voucher_date        = COALESCE($5, voucher_date),
+                payload             = $6,
                 updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
           WHERE id = $1`,
-        [av.id, result?.voucherNumber || av.tally_voucher_no || null]
+        [
+          av.id,
+          result?.voucherNumber || av.tally_voucher_no || null,
+          partyLedger || null,
+          amt,
+          p.date ? new Date(p.date) : null,
+          JSON.stringify(p),
+        ]
       );
+      await persistVoucherLineTaxes(query, {
+        companyGuid,
+        tdkReferenceNo: tdkRef,
+        items,
+        taxes,
+        logistics,
+      }).catch(e => console.warn('[voucher_line_taxes] proforma convert persist failed:', e.message));
+
+      let receiptResult = null;
+      if (collect_payment?.ledgerName && payAmt > 0 && av.invoice_uuid) {
+        try {
+          receiptResult = await createReceiptForInvoice({
+            companyGuid, companyName: companyName || p.companyName, userId: req.user.userId,
+            date: p.date, partyLedger, bankLedger: collect_payment.ledgerName, amount: payAmt,
+            parentInvoiceUuid: av.invoice_uuid, parentTdkRef: tdkRef,
+            isOptional: false, reference: p.reference,
+          });
+        } catch (rcpErr) {
+          console.error(`[receipt-pair] Proforma convert receipt failed for ${tdkRef}:`, rcpErr.message);
+          receiptResult = { ok: false, error: rcpErr.message };
+        }
+      }
+
       setImmediate(() => {
         requestDesktopSyncAfterWrite({
           userId: req.user.userId,
           companyGuid,
           companyName: companyName || p.companyName,
           tdkRef,
-          tallyIds: [result?.tallyId, wqRows[0]?.tally_id],
-          extra: { reason: 'proforma_converted' },
+          tallyIds: [result?.tallyId, wqRows[0]?.tally_id, receiptResult?.tallyId],
+          extra: { reason: 'proforma_converted', rcpTdkRef: receiptResult?.tdkRef || null },
         });
       });
     }
@@ -1223,7 +1284,9 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
       queued: offline,
       queueId,
       tdkReferenceNo: tdkRef,
+      invoiceUuid: av.invoice_uuid || null,
       invoiceNumber: result?.voucherNumber || av.tally_voucher_no || null,
+      numberingPolicy: av.numbering_policy || 'tally_prime_series',
       message: offline
         ? 'Convert queued. Will push when desktop connects.'
         : 'Proforma converted to Sales Invoice',

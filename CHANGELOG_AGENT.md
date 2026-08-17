@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-17 — Proforma convert accepts edited payload
+
+### Changed
+- `POST /tally/voucher/proforma/convert` overlays form fields onto the stored Proforma and **Alters** the same Tally voucher (`ISOPTIONAL=No`)
+- Persists updated payload + optional Collect Payment receipt after convert
+- Still one voucher — no duplicate Sales Invoice
+
+---
+
 ## 2026-08-17 — Proforma preview documentType
 
 ### Fixed
