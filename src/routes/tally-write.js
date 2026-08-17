@@ -5929,7 +5929,12 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
       ? 'credit_note'
       : (isSalesOrder
         ? 'sales_order'
-        : (isPurchaseInvoice ? 'purchase_invoice' : (isProforma ? 'proforma_invoice' : 'sales_invoice'))),
+        : (isPurchaseInvoice
+          ? 'purchase_invoice'
+          // Converted Proforma displays as Tax Invoice; unconverted stays Proforma
+          : (isProforma && av.current_entry_type === 'optional' && av.conversion_status !== 'converted'
+            ? 'proforma_invoice'
+            : 'sales_invoice'))),
     currentEntryType: av.current_entry_type || null,
     conversionStatus: av.conversion_status || null,
     canConvertProforma: isProforma

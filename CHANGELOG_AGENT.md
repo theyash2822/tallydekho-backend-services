@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-17 — Proforma preview documentType
+
+### Fixed
+- Preview: unconverted optional Proforma → `documentType=proforma_invoice`; after convert → `sales_invoice` (Tax Invoice labels)
+
+---
+
 ## 2026-08-14 — Proforma Invoice (optional Sales, TDK-PRF)
 
 ### Added
