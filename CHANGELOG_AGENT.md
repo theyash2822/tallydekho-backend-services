@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-17 — Proforma XML parity with Tally optional Sales export
+
+### Fixed
+- Create/convert XML now matches TallyPrime optional Sales (`Sales_TD1531-3-2026.xml`): `OBJVIEW` / `PERSISTEDVIEW` Invoice Voucher View, `VCHENTRYMODE` Item Invoice, `VCHSTATUSISOPTIONAL`, `DIFFACTUALQTY=Yes`, qty/rate with unit
+- Convert Alter requires GUID or MASTERID; **fail if Tally returns CREATED without ALTERED** (stops duplicate Sales)
+- Alter XML sends REMOTEID + GUID + MASTERID + ALTERID
+
+---
+
 ## 2026-08-17 — Proforma convert accepts edited payload
 
 ### Changed

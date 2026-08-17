@@ -1186,13 +1186,25 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     : 0;
 
   const { rows: vRows } = await query(
-    `SELECT guid FROM vouchers WHERE company_guid=$1 AND (reference=$2 OR voucher_number=$3) LIMIT 1`,
+    `SELECT guid, alter_id FROM vouchers WHERE company_guid=$1 AND (reference=$2 OR voucher_number=$3) LIMIT 1`,
     [companyGuid, tdkRef, av.tally_voucher_no || '']
   ).catch(() => ({ rows: [] }));
   const { rows: wqRows } = await query(
     `SELECT tally_id FROM write_queue WHERE id=$1`,
     [av.write_queue_id]
   ).catch(() => ({ rows: [] }));
+
+  const guid = vRows[0]?.guid || '';
+  const rawMaster = wqRowsEarly[0]?.tally_id || wqRows[0]?.tally_id || '';
+  const masterId = (rawMaster && String(rawMaster) !== '0') ? String(rawMaster) : '';
+  const alterId = vRows[0]?.alter_id || '';
+  // Alter without identity is treated as Create by Tally → duplicate Sales (Yash 2026-08-17).
+  if (!guid && !masterId) {
+    return res.status(409).json({
+      status: false,
+      message: 'Wait until this Proforma is fully synced from Tally, then convert.',
+    });
+  }
 
   const xml = buildSalesLikeVoucherXml({
     companyName: companyName || p.companyName,
@@ -1209,8 +1221,9 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     taxes,
     logistics,
     againstOrderNo: p.againstOrderNo || '',
-    guid: vRows[0]?.guid || '',
-    masterId: wqRowsEarly[0]?.tally_id || wqRows[0]?.tally_id || '',
+    guid,
+    masterId,
+    alterId,
   });
 
   const queueId = await logWriteQueue(
@@ -1220,6 +1233,15 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
 
   try {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const createdCount = Number(result?.created || 0);
+    const alteredCount = Number(result?.altered || 0);
+    // Tally Alter without identity returns CREATED=1 — that is a duplicate, not a convert.
+    if (result && result.status !== 'desktop_offline' && result.status !== false
+        && createdCount > 0 && alteredCount === 0) {
+      const dupMsg = 'Tally created a new Sales voucher instead of converting this Proforma. Cancel the extra invoice in Tally and retry after a full sync.';
+      await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount }, null);
+      return res.status(409).json({ status: false, message: dupMsg, created: createdCount, altered: alteredCount });
+    }
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
     if (!offline && result?.status !== false) {
