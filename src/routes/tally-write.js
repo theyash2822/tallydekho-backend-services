@@ -22,6 +22,7 @@ import {
   buildSalesLikeVoucherXml,
   buildMinimalVoucherAlterXml,
   buildDispatchXml,
+  buildSalesVoucherLinesXml,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
 import {
@@ -1129,8 +1130,9 @@ router.post('/voucher/proforma', authMiddleware, async (req, res) => {
 });
 
 // ── POST /tally/voucher/proforma/convert ─────────────────────────────────────
-// Same Tally voucher: DATE + TAGNAME=MASTER ID Alter, only ISOPTIONAL → No.
-// Proven 2026-08-18 (narration-only probe on MASTERID 8560). Do not rebuild the voucher.
+// Same Tally voucher: DATE + TAGNAME=MASTER ID Alter. Flip ISOPTIONAL → No.
+// Also send narration + convert-form item lines (no GUID/REMOTEID rebuild).
+// Proven 2026-08-18 (narration-only probe on MASTERID 8560).
 router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, tdkRef,
@@ -1169,8 +1171,10 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
 
   const hasDispatch = p.dispatch_details
     && Object.values(p.dispatch_details).some((v) => v != null && String(v).trim() !== '');
+  const hasNarration = !!(p.narration && String(p.narration).trim());
+  const sendItems = Array.isArray(bodyItems) && bodyItems.length > 0;
   const alreadyConverted = av.current_entry_type === 'regular' || av.conversion_status === 'converted';
-  if (alreadyConverted && !hasDispatch) {
+  if (alreadyConverted && !hasDispatch && !hasNarration && !sendItems) {
     return res.json({
       status: true, alreadyConverted: true,
       tdkReferenceNo: tdkRef,
@@ -1235,14 +1239,30 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     });
   }
 
+  const includeItems = sendItems || (!alreadyConverted && items.length > 0);
+  let extraInnerXml = '';
+  if (includeItems) {
+    extraInnerXml += buildSalesVoucherLinesXml({
+      partyLedger,
+      partyAmt: amt,
+      tdkRef,
+      items,
+      taxes,
+      logistics,
+      againstOrderNo: p.againstOrderNo || '',
+    });
+  }
+  if (hasDispatch) extraInnerXml += (extraInnerXml ? '\n' : '') + buildDispatchXml(p.dispatch_details, dt);
+
   const xml = buildMinimalVoucherAlterXml({
     companyName: companyName || p.companyName,
     vchType,
     dt,
     masterId,
     tagName: 'MASTER ID',
+    narration: hasNarration ? String(p.narration).trim() : undefined,
     isOptional: false,
-    extraInnerXml: hasDispatch ? buildDispatchXml(p.dispatch_details, dt) : '',
+    extraInnerXml,
   });
 
   const queueId = await logWriteQueue(

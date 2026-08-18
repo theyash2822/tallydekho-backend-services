@@ -11,6 +11,7 @@ import {
   buildVoucherCancelXml,
   buildMinimalVoucherAlterXml,
   buildDispatchXml,
+  buildSalesVoucherLinesXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -121,6 +122,69 @@ test('proforma convert XML flips optional flags only', () => {
   assert.match(xml, /<VCHSTATUSISOPTIONAL>No<\/VCHSTATUSISOPTIONAL>/);
   assert.doesNotMatch(xml, /<NARRATION>/);
   assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
+  assert.doesNotMatch(xml, /REMOTEID=/);
+  assert.doesNotMatch(xml, /<GUID>/);
+});
+
+test('convert Alter includes narration without GUID rebuild', () => {
+  const xml = buildMinimalVoucherAlterXml({
+    companyName: 'Yash Ki Company',
+    dt: '20260818',
+    masterId: '8568',
+    tagName: 'MASTER ID',
+    narration: 'This is the performa invoice',
+    isOptional: false,
+  });
+  assert.match(xml, /<NARRATION>This is the performa invoice<\/NARRATION>/);
+  assert.match(xml, /<ISOPTIONAL>No<\/ISOPTIONAL>/);
+  assert.match(xml, /TAGVALUE="8568"/);
+  assert.doesNotMatch(xml, /REMOTEID=/);
+  assert.doesNotMatch(xml, /<GUID>/);
+});
+
+test('convert Alter can attach added item lines + party ledger', () => {
+  const lines = buildSalesVoucherLinesXml({
+    partyLedger: 'Manish ai services',
+    partyAmt: 27250,
+    tdkRef: 'TDK-PRF-2026-0007',
+    items: [
+      {
+        itemName: 'Soybean RVSM-1135',
+        billedQty: 5,
+        actualQty: 5,
+        rate: 5000,
+        amount: 25000,
+        unit: 'nos',
+        salesLedger: 'Sales Account GST',
+        godown: 'Main Location',
+      },
+      {
+        itemName: 'Extra Bag',
+        billedQty: 1,
+        actualQty: 1,
+        rate: 100,
+        amount: 100,
+        unit: 'nos',
+        salesLedger: 'Sales Account GST',
+        godown: 'Main Location',
+      },
+    ],
+    taxes: [{ ledgerName: 'CGST', taxAmount: 2250, taxableValue: 25000 }],
+  });
+  const xml = buildMinimalVoucherAlterXml({
+    companyName: 'Yash Ki Company',
+    dt: '20260818',
+    masterId: '8568',
+    tagName: 'MASTER ID',
+    narration: 'This is the performa invoice',
+    isOptional: false,
+    extraInnerXml: lines,
+  });
+  assert.match(xml, /<NARRATION>This is the performa invoice<\/NARRATION>/);
+  assert.match(xml, /<STOCKITEMNAME>Soybean RVSM-1135<\/STOCKITEMNAME>/);
+  assert.match(xml, /<STOCKITEMNAME>Extra Bag<\/STOCKITEMNAME>/);
+  assert.match(xml, /<LEDGERNAME>Manish ai services<\/LEDGERNAME>/);
+  assert.match(xml, /ACTION="Alter"/);
   assert.doesNotMatch(xml, /REMOTEID=/);
   assert.doesNotMatch(xml, /<GUID>/);
 });

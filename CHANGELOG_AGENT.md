@@ -1,10 +1,18 @@
-## 2026-08-18 — Proforma convert = flag-only MASTER ID Alter
+## 2026-08-18 — Convert Alter sends narration + item lines
+
+Live convert (TDK-PRF-2026-0007) flipped optional→regular and pushed dispatch, but Tally never got narration or convert-form items.
+
+Convert XML is still DATE + `TAGNAME="MASTER ID"` (no GUID rebuild). It now also sends:
+- `<NARRATION>` from the form/payload
+- Full current item/party/tax/logistics lines when the convert request includes items (so added lines go)
+
+Still 409 if Tally Creates; no auto-cancel.
 
 ### Changed
-- Convert XML matches the proven probe: `DATE` + `TAGNAME="MASTER ID"` + `TAGVALUE` + `ACTION="Alter"`
-- Body is only `ISOPTIONAL` + `VCHSTATUSISOPTIONAL` = No (no items/GUID/rebuild)
+- Convert XML still matches the proven probe identity: `DATE` + `TAGNAME="MASTER ID"` + `TAGVALUE` + `ACTION="Alter"` (no GUID/REMOTEID rebuild)
+- Body now includes `ISOPTIONAL`/`VCHSTATUSISOPTIONAL` = No, `<NARRATION>`, convert-form item/party/tax/logistics lines when items are present, and dispatch when filled
 - Still 409 if Tally Creates or LASTVCHID ≠ original MASTERID; **no auto-cancel**
-- `tallyDate()` now formats JS Date objects as YYYYMMDD (convert identity)
+- `tallyDate()` formats JS Date objects as YYYYMMDD (convert identity)
 
 ---
 

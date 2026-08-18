@@ -122,6 +122,109 @@ function rateWithUnit(rate, unit) {
   return u ? `${raw}/${u}` : raw;
 }
 
+/** Party + inventory + tax + logistics lines (no VOUCHER wrapper). Used by convert Alter. */
+export function buildSalesVoucherLinesXml({
+  partyLedger,
+  partyAmt = 0,
+  tdkRef = '',
+  items = [],
+  taxes = [],
+  logistics = [],
+  againstOrderNo = '',
+}) {
+  const amt = parseFloat(partyAmt) || 0;
+  let xml = `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${xmlEsc(partyLedger)}</LEDGERNAME>
+    <AMOUNT>${-amt}</AMOUNT>${tdkRef ? `
+    <BILLALLOCATIONS.LIST>
+      <NAME>${xmlEsc(tdkRef)}</NAME>
+      <BILLTYPE>New Ref</BILLTYPE>
+      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
+      <AMOUNT>${-amt}</AMOUNT>
+    </BILLALLOCATIONS.LIST>` : ''}
+  </LEDGERENTRIES.LIST>`;
+
+  for (const item of items) {
+    const itemAmt = parseFloat(item.amount) || 0;
+    const unit = item.unit || '';
+    const qtyXml = qtyWithUnit(item.actualQty || item.billedQty || 1, unit);
+    const billedXml = qtyWithUnit(item.billedQty || item.actualQty || 1, unit);
+    const lineGstRate = Array.isArray(item.taxEntries) && item.taxEntries.length
+      ? item.taxEntries.reduce((s, t) => s + (parseFloat(t.taxRate) || 0), 0)
+      : (parseFloat(item.gstRate) || parseFloat(item.taxRate) || 0);
+    const gstRateXml = lineGstRate > 0
+      ? `
+    <GSTOVERRIDDEN>Yes</GSTOVERRIDDEN>
+    <IGSTAPPLICABLERATE>${lineGstRate}</IGSTAPPLICABLERATE>`
+      : '';
+    xml += `
+  <ALLINVENTORYENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <STOCKITEMNAME>${xmlEsc(item.itemName)}</STOCKITEMNAME>
+    <GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>
+    <AMOUNT>${itemAmt}</AMOUNT>
+    <ACTUALQTY>${qtyXml}</ACTUALQTY>
+    <BILLEDQTY>${billedXml}</BILLEDQTY>
+    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${gstRateXml}
+    <ACCOUNTINGALLOCATIONS.LIST>
+      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+      <LEDGERFROMITEM>No</LEDGERFROMITEM>
+      <LEDGERNAME>${xmlEsc(item.salesLedger || 'Sales Account GST')}</LEDGERNAME>
+      <AMOUNT>${itemAmt}</AMOUNT>
+    </ACCOUNTINGALLOCATIONS.LIST>
+    <BATCHALLOCATIONS.LIST>
+      <BATCHNAME>Primary Batch</BATCHNAME>
+      <GODOWNNAME>${xmlEsc(item.godown || 'Main Location')}</GODOWNNAME>
+      ${againstOrderNo ? `<ORDERNO>${xmlEsc(againstOrderNo)}</ORDERNO>` : '<ORDERNO/>'}
+      <AMOUNT>${itemAmt}</AMOUNT>
+      <ACTUALQTY>${qtyXml}</ACTUALQTY>
+      <BILLEDQTY>${billedXml}</BILLEDQTY>
+    </BATCHALLOCATIONS.LIST>
+  </ALLINVENTORYENTRIES.LIST>`;
+  }
+
+  for (const tax of taxes) {
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${xmlEsc(tax.ledgerName)}</LEDGERNAME>
+    <AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT>
+    <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE>
+  </LEDGERENTRIES.LIST>`;
+  }
+
+  for (const lg of logistics) {
+    if (!lg.ledgerName) continue;
+    xml += `
+  <LEDGERENTRIES.LIST>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${xmlEsc(lg.ledgerName)}</LEDGERNAME>
+    <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    for (const lt of (lg.taxes || [])) {
+      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
+      xml += `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${xmlEsc(lt.ledgerName)}</LEDGERNAME>
+    <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
+    }
+  }
+  return xml;
+}
+
 export function buildSalesLikeVoucherXml({
   companyName,
   vchType = 'Sales',
@@ -293,7 +396,7 @@ export function buildMinimalVoucherAlterXml({
 }) {
   let inner = '';
   if (narration != null && narration !== '') {
-    inner += `\n  <NARRATION>${narration}</NARRATION>`;
+    inner += `\n  <NARRATION>${xmlEsc(narration)}</NARRATION>`;
   }
   if (typeof isOptional === 'boolean') {
     const isOpt = isOptional ? 'Yes' : 'No';
