@@ -1120,9 +1120,8 @@ router.post('/voucher/proforma', authMiddleware, async (req, res) => {
 });
 
 // ── POST /tally/voucher/proforma/convert ─────────────────────────────────────
-// Alter the same Tally Sales voucher Optional → Regular (no second voucher).
-// Optional body fields (items, taxes, …) overlay the stored payload so the user
-// can review/edit in Create Invoice before the Alter is pushed.
+// Same Tally voucher: DATE + TAGNAME=MASTER ID Alter, only ISOPTIONAL → No.
+// Proven 2026-08-18 (narration-only probe on MASTERID 8560). Do not rebuild the voucher.
 router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   const {
     companyGuid, companyName, tdkRef,
@@ -1184,14 +1183,13 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   const partyLedger = p.partyLedger || av.party_name;
   const amt = parseFloat(p.totalAmount || av.total_amount || 0);
   const vchType = p.voucherType || 'Sales';
-  const dt = tallyDate(p.date || av.voucher_date);
   const collect_payment = p.collect_payment || null;
   const payAmt = collect_payment?.ledgerName && parseFloat(collect_payment.amount) > 0
     ? parseFloat(collect_payment.amount)
     : 0;
 
   const { rows: vRows } = await query(
-    `SELECT guid, voucher_number, is_optional
+    `SELECT guid, voucher_number, is_optional, date
        FROM vouchers
       WHERE company_guid = $1
         AND COALESCE(is_cancelled, FALSE) = FALSE
@@ -1212,36 +1210,25 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
 
   const rawMaster = wqRowsEarly[0]?.tally_id || wqRows[0]?.tally_id || '';
   let masterId = (rawMaster && String(rawMaster) !== '0') ? String(rawMaster) : '';
-  let guid = vRows[0]?.guid || av.tally_guid || '';
-  // Native Tally GUID = companyGuid + 8-char hex MASTERID (…-0000216f for 8559).
-  if (!guid && masterId) guid = tallyVoucherGuidFromMasterId(companyGuid, masterId);
+  const guid = vRows[0]?.guid || av.tally_guid || '';
   if (!masterId && guid) masterId = tallyMasterIdFromVoucherGuid(companyGuid, guid);
   const voucherNumber = av.tally_voucher_no || vRows[0]?.voucher_number || p.voucherNumber || '';
-  // Native convert keeps GUID + MASTERID + VOUCHERNUMBER; Alter without them Creates a duplicate.
-  if (!guid || !masterId || !voucherNumber) {
+  // Identity date must be the Tally voucher date (probe failed conceptually on 20260817 vs 18).
+  const dt = tallyDate(vRows[0]?.date || av.voucher_date || p.date);
+  if (!masterId || !dt) {
     return res.status(409).json({
       status: false,
       message: 'Wait until this Proforma is fully synced from Tally, then convert.',
     });
   }
 
-  const xml = buildSalesLikeVoucherXml({
+  const xml = buildMinimalVoucherAlterXml({
     companyName: companyName || p.companyName,
     vchType,
-    action: 'Alter',
     dt,
-    voucherNumber,
-    tdkRef,
-    isOptional: false,
-    narration: p.narration || '',
-    partyLedger,
-    partyAmt: amt,
-    items,
-    taxes,
-    logistics,
-    againstOrderNo: p.againstOrderNo || '',
-    guid,
     masterId,
+    tagName: 'MASTER ID',
+    isOptional: false,
   });
 
   const queueId = await logWriteQueue(
@@ -1253,10 +1240,13 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     const createdCount = Number(result?.created || 0);
     const alteredCount = Number(result?.altered || 0);
-    // Detect Create-instead-of-Alter. Do NOT auto-cancel (cancelled TD2131 on 0005).
+    const resultId = String(result?.tallyId || '').trim();
+    const createdInstead = createdCount > 0 && alteredCount === 0;
+    const wrongVoucher = resultId && resultId !== '0' && resultId !== String(masterId);
+    // Detect Create-instead-of-Alter. Do NOT auto-cancel.
     if (result && result.status !== 'desktop_offline' && result.status !== false
-        && createdCount > 0 && alteredCount === 0) {
-      const dupMsg = 'Tally created a new Sales voucher instead of converting this Proforma. Do not retry convert until Alter is proven. Cancel any extra invoice in Tally manually.';
+        && (createdInstead || wrongVoucher)) {
+      const dupMsg = 'Tally created a new Sales voucher instead of converting this Proforma. Cancel any extra invoice in Tally manually. Do not retry convert on this Proforma.';
       await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount }, null);
       return res.status(409).json({ status: false, message: dupMsg, created: createdCount, altered: alteredCount });
     }

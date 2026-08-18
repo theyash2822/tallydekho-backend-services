@@ -201,15 +201,24 @@ ${topLevelDispatchXml || ''}
   return xml;
 }
 
-/** Narration-only Alter — probe whether Tally finds an existing voucher. */
+/** Minimal Alter by DATE + TAGNAME=MASTER ID (proven 2026-08-18 on voucher 8560). */
 export function buildMinimalVoucherAlterXml({
   companyName,
   vchType = 'Sales',
   dt,
   masterId,
   tagName = 'MASTER ID',
-  narration = '',
+  narration,
+  isOptional,
 }) {
+  let inner = '';
+  if (narration != null && narration !== '') {
+    inner += `\n  <NARRATION>${narration}</NARRATION>`;
+  }
+  if (typeof isOptional === 'boolean') {
+    const isOpt = isOptional ? 'Yes' : 'No';
+    inner += `\n  <ISOPTIONAL>${isOpt}</ISOPTIONAL>\n  <VCHSTATUSISOPTIONAL>${isOpt}</VCHSTATUSISOPTIONAL>`;
+  }
   return `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -219,8 +228,7 @@ export function buildMinimalVoucherAlterXml({
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER DATE="${dt}" TAGNAME="${tagName}" TAGVALUE="${masterId}" ACTION="Alter" VCHTYPE="${vchType}">
-  <NARRATION>${narration || ''}</NARRATION>
+<VOUCHER DATE="${dt}" TAGNAME="${tagName}" TAGVALUE="${masterId}" ACTION="Alter" VCHTYPE="${vchType}">${inner}
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>

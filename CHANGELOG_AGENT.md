@@ -1,3 +1,12 @@
+## 2026-08-18 — Proforma convert = flag-only MASTER ID Alter
+
+### Changed
+- Convert XML matches the proven probe: `DATE` + `TAGNAME="MASTER ID"` + `TAGVALUE` + `ACTION="Alter"`
+- Body is only `ISOPTIONAL` + `VCHSTATUSISOPTIONAL` = No (no items/GUID/rebuild)
+- Still 409 if Tally Creates or LASTVCHID ≠ original MASTERID; **no auto-cancel**
+
+---
+
 ## 2026-08-18 — Narration-only Alter probe (MASTER ID 8560)
 
 Tally **does** Alter in place: DATE=20260818 + TAGNAME=`MASTER ID` + TAGVALUE=8560 + ACTION=Alter + NARRATION only.

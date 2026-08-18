@@ -104,6 +104,26 @@ test('minimal Alter probe XML is narration-only with MASTER ID tag', () => {
   assert.doesNotMatch(xml, /REMOTEID=/);
 });
 
+test('proforma convert XML flips optional flags only', () => {
+  const xml = buildMinimalVoucherAlterXml({
+    companyName: 'Yash Ki Company',
+    dt: '20260818',
+    masterId: '8560',
+    tagName: 'MASTER ID',
+    isOptional: false,
+  });
+  assert.match(xml, /DATE="20260818"/);
+  assert.match(xml, /TAGNAME="MASTER ID"/);
+  assert.match(xml, /TAGVALUE="8560"/);
+  assert.match(xml, /ACTION="Alter"/);
+  assert.match(xml, /<ISOPTIONAL>No<\/ISOPTIONAL>/);
+  assert.match(xml, /<VCHSTATUSISOPTIONAL>No<\/VCHSTATUSISOPTIONAL>/);
+  assert.doesNotMatch(xml, /<NARRATION>/);
+  assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
+  assert.doesNotMatch(xml, /REMOTEID=/);
+  assert.doesNotMatch(xml, /<GUID>/);
+});
+
 test('convert cancel XML identifies stray Create by MasterID', () => {
   const xml = buildVoucherCancelXml({
     companyName: 'Yash Ki Company',
