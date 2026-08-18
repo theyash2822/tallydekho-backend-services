@@ -29,6 +29,85 @@ export function tallyMasterIdFromVoucherGuid(companyGuid, guid) {
   return Number.isFinite(n) && n > 0 ? String(n) : '';
 }
 
+function xmlEsc(s) {
+  return String(s ?? '').replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+}
+
+function dispatchToTallyDate(d) {
+  if (!d) return '';
+  const s = String(d);
+  if (/^\d{8}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10).replace(/-/g, '');
+  return s.replace(/-/g, '').slice(0, 8);
+}
+
+/** Dispatch / e-way fields for Sales Alter (same tags as create-invoice). Empty string if nothing filled. */
+export function buildDispatchXml(dispatch_details, invoiceDate) {
+  if (!dispatch_details || typeof dispatch_details !== 'object') return '';
+  const dd = dispatch_details;
+  const filled = Object.values(dd).some((v) => v != null && String(v).trim() !== '');
+  if (!filled) return '';
+
+  const modeSimpleMap = { road: 'Road', rail: 'Rail', air: 'Air', ship: 'Ship', not_applicable: '', 'not applicable': '' };
+  const modeCodeMap = { road: '1 - Road', rail: '2 - Rail', air: '3 - Air', ship: '4 - Ship' };
+  const modeKey = String(dd.transport_mode || '').toLowerCase().replace(/\s+/g, '_');
+  const tallySimpleMode = modeSimpleMap[modeKey] ?? dd.transport_mode ?? '';
+  const tallyCodedMode = modeCodeMap[modeKey] ?? '';
+  const vtKey = String(dd.vehicle_type || '').toLowerCase();
+  const tallyVehicleType = vtKey.includes('over') ? 'O - Over Dimensional Cargo (ODC)'
+    : vtKey === 'regular' ? 'R - Regular'
+    : (dd.vehicle_type || '');
+  const dispatchDate = dispatchToTallyDate(dd.transport_doc_date || invoiceDate);
+
+  const topLevel = [
+    dispatchDate ? `  <BILLOFLADINGDATE>${dispatchDate}</BILLOFLADINGDATE>` : '',
+    tallySimpleMode ? `  <BASICSHIPPEDBY>${xmlEsc(tallySimpleMode)}</BASICSHIPPEDBY>` : '',
+    dd.transport_doc_no ? `  <BASICSHIPDOCUMENTNO>${xmlEsc(dd.transport_doc_no)}</BASICSHIPDOCUMENTNO>` : '',
+    dd.ship_to ? `  <BASICFINALDESTINATION>${xmlEsc(dd.ship_to)}</BASICFINALDESTINATION>` : '',
+    dd.vehicle_number ? `  <BASICSHIPVESSELNO>${xmlEsc(dd.vehicle_number)}</BASICSHIPVESSELNO>` : '',
+  ].filter(Boolean).join('\n');
+
+  const hasTransport = dd.vehicle_number || tallyCodedMode || dd.transporter_name || dd.transporter_id;
+  const consignorLines = [dd.dispatch_from_address1, dd.dispatch_from_address2].map((l) => String(l || '').trim()).filter(Boolean);
+  const consigneeLines = [dd.ship_to_address1, dd.ship_to_address2].map((l) => String(l || '').trim()).filter(Boolean);
+  const consignorAddrXml = consignorLines.length
+    ? consignorLines.map((l) => `      <CONSIGNORADDRESS>${xmlEsc(l)}</CONSIGNORADDRESS>`).join('\n')
+    : `      <CONSIGNORADDRESS>${xmlEsc(dd.dispatch_from || '')}</CONSIGNORADDRESS>`;
+  const consigneeAddrXml = consigneeLines.length
+    ? consigneeLines.map((l) => `      <CONSIGNEEADDRESS>${xmlEsc(l)}</CONSIGNEEADDRESS>`).join('\n')
+    : `      <CONSIGNEEADDRESS>${xmlEsc(dd.ship_to || '')}</CONSIGNEEADDRESS>`;
+
+  const ewb = `
+  <EWAYBILLDETAILS.LIST>
+    <CONSIGNORADDRESS.LIST TYPE="String">
+${consignorAddrXml}
+    </CONSIGNORADDRESS.LIST>
+    <CONSIGNEEADDRESS.LIST TYPE="String">
+${consigneeAddrXml}
+    </CONSIGNEEADDRESS.LIST>
+    <DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
+    <SUBTYPE>Supply</SUBTYPE>
+    <CONSIGNORPLACE>${xmlEsc(dd.dispatch_from || '')}</CONSIGNORPLACE>
+    <CONSIGNEEPLACE>${xmlEsc(dd.ship_to || '')}</CONSIGNEEPLACE>
+    <CONSIGNORPINCODE>${xmlEsc(dd.dispatch_from_pincode || '')}</CONSIGNORPINCODE>
+    <CONSIGNEEPINCODE>${xmlEsc(dd.ship_to_pincode || '')}</CONSIGNEEPINCODE>
+    <SHIPPEDFROMSTATE>${xmlEsc(dd.dispatch_from_state || '')}</SHIPPEDFROMSTATE>
+    <SHIPPEDTOSTATE>${xmlEsc(dd.ship_to_state || '')}</SHIPPEDTOSTATE>
+    <ISCANCELLED>No</ISCANCELLED>${hasTransport ? `
+    <TRANSPORTDETAILS.LIST>
+      <DOCUMENTDATE>${dispatchDate}</DOCUMENTDATE>
+      <TRANSPORTERID>${xmlEsc(dd.transporter_id || '')}</TRANSPORTERID>
+      <TRANSPORTERNAME>${xmlEsc(dd.transporter_name || '')}</TRANSPORTERNAME>
+      <TRANSPORTMODE>${xmlEsc(tallyCodedMode)}</TRANSPORTMODE>
+      <VEHICLENUMBER>${xmlEsc(dd.vehicle_number || '')}</VEHICLENUMBER>
+      <OLDVEHICLETYPE>${xmlEsc(tallyVehicleType)}</OLDVEHICLETYPE>
+      <VEHICLETYPE>${xmlEsc(tallyVehicleType)}</VEHICLETYPE>
+    </TRANSPORTDETAILS.LIST>` : ''}
+  </EWAYBILLDETAILS.LIST>`;
+
+  return [topLevel, ewb].filter(Boolean).join('\n');
+}
+
 function qtyWithUnit(qty, unit) {
   const n = parseFloat(qty);
   const q = Number.isFinite(n) ? n : 1;
@@ -210,6 +289,7 @@ export function buildMinimalVoucherAlterXml({
   tagName = 'MASTER ID',
   narration,
   isOptional,
+  extraInnerXml = '',
 }) {
   let inner = '';
   if (narration != null && narration !== '') {
@@ -219,6 +299,7 @@ export function buildMinimalVoucherAlterXml({
     const isOpt = isOptional ? 'Yes' : 'No';
     inner += `\n  <ISOPTIONAL>${isOpt}</ISOPTIONAL>\n  <VCHSTATUSISOPTIONAL>${isOpt}</VCHSTATUSISOPTIONAL>`;
   }
+  if (extraInnerXml) inner += `\n${extraInnerXml}`;
   return `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>

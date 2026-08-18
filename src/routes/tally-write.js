@@ -21,6 +21,7 @@ import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
 import {
   buildSalesLikeVoucherXml,
   buildMinimalVoucherAlterXml,
+  buildDispatchXml,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
 import {
@@ -1149,7 +1150,27 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   );
   const av = avRows[0];
   if (!av) return res.status(404).json({ status: false, message: 'Proforma not found' });
-  if (av.current_entry_type === 'regular' || av.conversion_status === 'converted') {
+
+  const p = typeof av.payload === 'string' ? JSON.parse(av.payload) : (av.payload || {});
+  if (Array.isArray(bodyItems) && bodyItems.length) p.items = bodyItems;
+  if (Array.isArray(bodyTaxes)) p.taxes = bodyTaxes;
+  if (Array.isArray(bodyLogistics)) p.logistics = bodyLogistics;
+  if (bodyParty) p.partyLedger = bodyParty;
+  if (bodyDate) p.date = bodyDate;
+  if (bodyNarration !== undefined) p.narration = bodyNarration;
+  if (bodyTotal != null && bodyTotal !== '') p.totalAmount = bodyTotal;
+  if (bodySalesLedger) p.salesLedger = bodySalesLedger;
+  if (bodyDispatch) p.dispatch_details = bodyDispatch;
+  if (bodyCollect) p.collect_payment = bodyCollect;
+  if (bodyReference) p.reference = bodyReference;
+  p.convert = true;
+  p.tdkRef = tdkRef;
+  p.isOptional = false;
+
+  const hasDispatch = p.dispatch_details
+    && Object.values(p.dispatch_details).some((v) => v != null && String(v).trim() !== '');
+  const alreadyConverted = av.current_entry_type === 'regular' || av.conversion_status === 'converted';
+  if (alreadyConverted && !hasDispatch) {
     return res.json({
       status: true, alreadyConverted: true,
       tdkReferenceNo: tdkRef,
@@ -1168,22 +1189,6 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
       message: 'Wait until this Proforma is synced from Tally, then convert.',
     });
   }
-
-  const p = typeof av.payload === 'string' ? JSON.parse(av.payload) : (av.payload || {});
-  if (Array.isArray(bodyItems) && bodyItems.length) p.items = bodyItems;
-  if (Array.isArray(bodyTaxes)) p.taxes = bodyTaxes;
-  if (Array.isArray(bodyLogistics)) p.logistics = bodyLogistics;
-  if (bodyParty) p.partyLedger = bodyParty;
-  if (bodyDate) p.date = bodyDate;
-  if (bodyNarration !== undefined) p.narration = bodyNarration;
-  if (bodyTotal != null && bodyTotal !== '') p.totalAmount = bodyTotal;
-  if (bodySalesLedger) p.salesLedger = bodySalesLedger;
-  if (bodyDispatch) p.dispatch_details = bodyDispatch;
-  if (bodyCollect) p.collect_payment = bodyCollect;
-  if (bodyReference) p.reference = bodyReference;
-  p.convert = true;
-  p.tdkRef = tdkRef;
-  p.isOptional = false;
 
   const items = p.items || [];
   const taxes = p.taxes || [];
@@ -1237,6 +1242,7 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     masterId,
     tagName: 'MASTER ID',
     isOptional: false,
+    extraInnerXml: hasDispatch ? buildDispatchXml(p.dispatch_details, dt) : '',
   });
 
   const queueId = await logWriteQueue(
@@ -1292,7 +1298,7 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
       }).catch(e => console.warn('[voucher_line_taxes] proforma convert persist failed:', e.message));
 
       let receiptResult = null;
-      if (collect_payment?.ledgerName && payAmt > 0 && av.invoice_uuid) {
+      if (!alreadyConverted && collect_payment?.ledgerName && payAmt > 0 && av.invoice_uuid) {
         try {
           receiptResult = await createReceiptForInvoice({
             companyGuid, companyName: companyName || p.companyName, userId: req.user.userId,

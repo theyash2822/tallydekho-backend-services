@@ -10,6 +10,7 @@ import {
   buildSalesLikeVoucherXml,
   buildVoucherCancelXml,
   buildMinimalVoucherAlterXml,
+  buildDispatchXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -122,6 +123,41 @@ test('proforma convert XML flips optional flags only', () => {
   assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
   assert.doesNotMatch(xml, /REMOTEID=/);
   assert.doesNotMatch(xml, /<GUID>/);
+});
+
+test('convert Alter includes dispatch / vehicle fields without inventory', () => {
+  const dispatchXml = buildDispatchXml({
+    dispatch_from: 'Ajmer',
+    dispatch_from_state: 'Rajasthan',
+    dispatch_from_pincode: '305002',
+    dispatch_from_address1: 'New Bus Stand',
+    ship_to: 'Alwar',
+    ship_to_state: 'Rajasthan',
+    ship_to_pincode: '301001',
+    ship_to_address1: 'Iskon road',
+    transport_mode: 'Road',
+    transporter_name: 'Shiva',
+    vehicle_number: 'RJ02SX1657',
+    vehicle_type: 'Regular',
+    transport_doc_no: '56',
+    transport_doc_date: '2026-08-18',
+  }, '20260818');
+  const xml = buildMinimalVoucherAlterXml({
+    companyName: 'Yash Ki Company',
+    dt: '20260818',
+    masterId: '8568',
+    tagName: 'MASTER ID',
+    isOptional: false,
+    extraInnerXml: dispatchXml,
+  });
+  assert.match(xml, /<ISOPTIONAL>No<\/ISOPTIONAL>/);
+  assert.match(xml, /<BASICSHIPDOCUMENTNO>56<\/BASICSHIPDOCUMENTNO>/);
+  assert.match(xml, /<BASICSHIPVESSELNO>RJ02SX1657<\/BASICSHIPVESSELNO>/);
+  assert.match(xml, /<BASICFINALDESTINATION>Alwar<\/BASICFINALDESTINATION>/);
+  assert.match(xml, /<TRANSPORTERNAME>Shiva<\/TRANSPORTERNAME>/);
+  assert.match(xml, /<VEHICLENUMBER>RJ02SX1657<\/VEHICLENUMBER>/);
+  assert.match(xml, /<CONSIGNORPLACE>Ajmer<\/CONSIGNORPLACE>/);
+  assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
 });
 
 test('convert cancel XML identifies stray Create by MasterID', () => {

@@ -8,6 +8,13 @@
 
 ---
 
+## 2026-08-18 — Convert Alter also sends dispatch details
+
+Flag-only convert skipped dispatch. Convert XML now adds the same dispatch/e-way tags as Sales create (`BASICSHIP*`, `EWAYBILLDETAILS`) while keeping DATE + MASTER ID identity.
+Already-converted Proforma with dispatch in payload can Alter again to push those fields (no second receipt).
+
+---
+
 ## 2026-08-18 — Narration-only Alter probe (MASTER ID 8560)
 
 Tally **does** Alter in place: DATE=20260818 + TAGNAME=`MASTER ID` + TAGVALUE=8560 + ACTION=Alter + NARRATION only.
