@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   buildSalesLikeVoucherXml,
   buildVoucherCancelXml,
+  buildMinimalVoucherAlterXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -83,6 +84,24 @@ test('proforma convert Alter — identity + not optional, no ALTERID', () => {
   assert.match(xml, /<ISOPTIONAL>No<\/ISOPTIONAL>/);
   assert.match(xml, /<VCHSTATUSISOPTIONAL>No<\/VCHSTATUSISOPTIONAL>/);
   assert.doesNotMatch(xml, /<ALTERID>/);
+});
+
+test('minimal Alter probe XML is narration-only with MASTER ID tag', () => {
+  const xml = buildMinimalVoucherAlterXml({
+    companyName: 'Yash Ki Company',
+    dt: '20260818',
+    masterId: '8560',
+    tagName: 'MASTER ID',
+    narration: 'Edited from TallyDekho using Master ID 8560',
+  });
+  assert.match(xml, /DATE="20260818"/);
+  assert.match(xml, /TAGNAME="MASTER ID"/);
+  assert.match(xml, /TAGVALUE="8560"/);
+  assert.match(xml, /ACTION="Alter"/);
+  assert.match(xml, /<NARRATION>Edited from TallyDekho using Master ID 8560<\/NARRATION>/);
+  assert.doesNotMatch(xml, /ISOPTIONAL/);
+  assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
+  assert.doesNotMatch(xml, /REMOTEID=/);
 });
 
 test('convert cancel XML identifies stray Create by MasterID', () => {

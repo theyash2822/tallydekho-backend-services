@@ -1,5 +1,12 @@
-# CHANGELOG_AGENT.md
+## 2026-08-18 — Narration-only Alter probe (MASTER ID 8560)
 
+Tally **does** Alter in place: DATE=20260818 + TAGNAME=`MASTER ID` + TAGVALUE=8560 + ACTION=Alter + NARRATION only.
+LASTVCHID stayed **8560**. Optional TD1931 narration updated; ALTERID 9655→9676. Duplicate 8561 untouched.
+Convert failed because we sent a **full Sales rebuild**, not because Tally cannot Alter.
+
+Auto-cancel of stray Creates rolled back (no more TD2131 from convert).
+
+---
 ## 2026-08-18 — Proforma convert Alter by MasterID + cancel stray Create
 
 ### Forensic (TDK-PRF-2026-0004 / TD1931-3-2026)

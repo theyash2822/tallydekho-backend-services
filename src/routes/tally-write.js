@@ -20,7 +20,7 @@ import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
 import {
   buildSalesLikeVoucherXml,
-  buildVoucherCancelXml,
+  buildMinimalVoucherAlterXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -1253,31 +1253,11 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     const createdCount = Number(result?.created || 0);
     const alteredCount = Number(result?.altered || 0);
-    const resultId = String(result?.tallyId || '').trim();
-    const touchedWrongVoucher = resultId && resultId !== '0' && resultId !== String(masterId);
-    // GUID re-import in the same company Creates a second Sales (Tally overwrite=No).
-    // LASTVCHID must stay the original MASTERID; otherwise cancel the extra and fail.
+    // Detect Create-instead-of-Alter. Do NOT auto-cancel (cancelled TD2131 on 0005).
     if (result && result.status !== 'desktop_offline' && result.status !== false
-        && ((createdCount > 0 && alteredCount === 0) || touchedWrongVoucher)) {
-      const extraId = (resultId && resultId !== String(masterId)) ? resultId : '';
-      if (extraId) {
-        const extraGuid = tallyVoucherGuidFromMasterId(companyGuid, extraId);
-        const cancelXml = buildVoucherCancelXml({
-          companyName: companyName || p.companyName,
-          vchType,
-          dt,
-          masterId: extraId,
-          guid: extraGuid,
-          voucherNumber,
-        });
-        await forwardToTally(companyGuid, req.user.userId, cancelXml).catch((e) => {
-          console.warn('[proforma/convert] cancel stray Create failed:', e.message);
-        });
-      }
-      const dupMsg = extraId
-        ? `Tally created extra Sales #${extraId} instead of converting this Proforma. Extra voucher was cancelled — retry convert after a sync.`
-        : 'Tally created a new Sales voucher instead of converting this Proforma. Cancel the extra invoice in Tally and retry after a full sync.';
-      await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount, tallyId: resultId || null }, null);
+        && createdCount > 0 && alteredCount === 0) {
+      const dupMsg = 'Tally created a new Sales voucher instead of converting this Proforma. Do not retry convert until Alter is proven. Cancel any extra invoice in Tally manually.';
+      await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount }, null);
       return res.status(409).json({ status: false, message: dupMsg, created: createdCount, altered: alteredCount });
     }
     await updateWriteQueue(queueId, result, null);
@@ -1355,6 +1335,56 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
+  }
+});
+
+// ── POST /tally/debug/alter-probe ─────────────────────────────────────────────
+// One-shot: narration-only Alter by DATE + TAGNAME + MASTERID. Does not convert,
+// does not cancel, does not update app_vouchers.
+router.post('/debug/alter-probe', authMiddleware, async (req, res) => {
+  const {
+    companyGuid,
+    companyName,
+    masterId,
+    date,
+    tagName = 'MASTER ID',
+    vchType = 'Sales',
+    narration = 'Edited from TallyDekho using Master ID probe',
+  } = req.body || {};
+  if (!companyGuid || !companyName || !masterId || !date) {
+    return res.status(400).json({ status: false, message: 'companyGuid, companyName, masterId, date required' });
+  }
+  const dt = tallyDate(date);
+  const xml = buildMinimalVoucherAlterXml({
+    companyName, vchType, dt, masterId: String(masterId), tagName, narration,
+  });
+  const queueId = await logWriteQueue(
+    req.user.userId, companyGuid, 'alter_probe',
+    `Alter probe MASTERID ${masterId}`, 0,
+    { probe: true, masterId, date: dt, tagName, narration }, xml
+  ).catch(() => null);
+  try {
+    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    await updateWriteQueue(queueId, result, null);
+    console.log('[alter-probe]', {
+      masterId, dt, tagName,
+      created: result?.created, altered: result?.altered,
+      tallyId: result?.tallyId, voucherNumber: result?.voucherNumber,
+      status: result?.status, message: result?.message,
+    });
+    return res.json({
+      status: true,
+      probe: true,
+      xml,
+      created: Number(result?.created || 0),
+      altered: Number(result?.altered || 0),
+      tallyId: result?.tallyId || null,
+      voucherNumber: result?.voucherNumber || null,
+      data: result,
+    });
+  } catch (e) {
+    await updateWriteQueue(queueId, null, e.message);
+    return res.status(500).json({ status: false, message: e.message, xml });
   }
 });
 

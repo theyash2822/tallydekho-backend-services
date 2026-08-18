@@ -201,6 +201,32 @@ ${topLevelDispatchXml || ''}
   return xml;
 }
 
+/** Narration-only Alter — probe whether Tally finds an existing voucher. */
+export function buildMinimalVoucherAlterXml({
+  companyName,
+  vchType = 'Sales',
+  dt,
+  masterId,
+  tagName = 'MASTER ID',
+  narration = '',
+}) {
+  return `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER DATE="${dt}" TAGNAME="${tagName}" TAGVALUE="${masterId}" ACTION="Alter" VCHTYPE="${vchType}">
+  <NARRATION>${narration || ''}</NARRATION>
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
+}
+
 /** Cancel a voucher Tally just created by mistake (Alter that became Create). */
 export function buildVoucherCancelXml({ companyName, vchType = 'Sales', dt, masterId, guid = '', voucherNumber = '' }) {
   const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
