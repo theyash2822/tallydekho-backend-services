@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildSalesLikeVoucherXml,
+  buildVoucherCancelXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -72,6 +73,9 @@ test('proforma convert Alter — identity + not optional, no ALTERID', () => {
     alterId: '9653',
   });
   assert.match(xml, /ACTION="Alter"/);
+  assert.match(xml, /DATE="20260817"/);
+  assert.match(xml, /TAGNAME="MasterID"/);
+  assert.match(xml, /TAGVALUE="8559"/);
   assert.match(xml, /REMOTEID="2272cb4f-b5d6-4555-bdb7-1bd747049dc5-0000216f"/);
   assert.match(xml, /<GUID>2272cb4f-b5d6-4555-bdb7-1bd747049dc5-0000216f<\/GUID>/);
   assert.match(xml, /<MASTERID>8559<\/MASTERID>/);
@@ -79,4 +83,19 @@ test('proforma convert Alter — identity + not optional, no ALTERID', () => {
   assert.match(xml, /<ISOPTIONAL>No<\/ISOPTIONAL>/);
   assert.match(xml, /<VCHSTATUSISOPTIONAL>No<\/VCHSTATUSISOPTIONAL>/);
   assert.doesNotMatch(xml, /<ALTERID>/);
+});
+
+test('convert cancel XML identifies stray Create by MasterID', () => {
+  const xml = buildVoucherCancelXml({
+    companyName: 'Yash Ki Company',
+    vchType: 'Sales',
+    dt: '20260818',
+    masterId: '8561',
+    guid: '2272cb4f-b5d6-4555-bdb7-1bd747049dc5-00002171',
+    voucherNumber: 'TD1931-3-2026',
+  });
+  assert.match(xml, /ACTION="Cancel"/);
+  assert.match(xml, /TAGNAME="MasterID"/);
+  assert.match(xml, /TAGVALUE="8561"/);
+  assert.match(xml, /DATE="20260818"/);
 });

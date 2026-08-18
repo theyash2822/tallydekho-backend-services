@@ -10,7 +10,8 @@
  * Native convert (2026-08-18) only flips optional flags; GUID/MASTERID/VOUCHERNUMBER stay.
  * Do NOT send ALTERID — Tally owns that counter (9653 → 9654 on convert).
  * Proforma create: ACTION=Create, ISOPTIONAL=Yes.
- * Convert: ACTION=Alter, ISOPTIONAL=No.
+ * Convert Alter MUST identify by DATE + TAGNAME=MasterID (TallyHelp).
+ * GUID-only Alter in the same company Creates a duplicate (Tally import overwrite=No).
  */
 
 /** Tally voucher GUID = `{companyGuid}-{MASTERID as 8-char hex}`. MASTERID 8559 → …-0000216f */
@@ -65,7 +66,11 @@ export function buildSalesLikeVoucherXml({
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(partyAmt) || 0;
   const vn = voucherNumber || '';
+  const isAlter = String(action).toLowerCase() === 'alter';
   const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
+  const dateAttr = dt ? ` DATE="${dt}"` : '';
+  // TallyHelp: Alter identity = Master ID + voucher type + date (not GUID re-import).
+  const tagAttr = (isAlter && masterId) ? ` TAGNAME="MasterID" TAGVALUE="${masterId}"` : '';
   const guidXml = guid ? `\n  <GUID>${guid}</GUID>` : '';
   const masterXml = masterId ? `\n  <MASTERID>${masterId}</MASTERID>` : '';
 
@@ -78,7 +83,7 @@ export function buildSalesLikeVoucherXml({
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER${remoteAttr} VCHTYPE="${vchType}" ACTION="${action}" OBJVIEW="Invoice Voucher View">
+<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${vchType}" ACTION="${action}" OBJVIEW="Invoice Voucher View">
   <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
@@ -194,4 +199,29 @@ ${topLevelDispatchXml || ''}
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
   return xml;
+}
+
+/** Cancel a voucher Tally just created by mistake (Alter that became Create). */
+export function buildVoucherCancelXml({ companyName, vchType = 'Sales', dt, masterId, guid = '', voucherNumber = '' }) {
+  const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
+  const dateAttr = dt ? ` DATE="${dt}"` : '';
+  const tagAttr = masterId ? ` TAGNAME="MasterID" TAGVALUE="${masterId}"` : '';
+  return `<ENVELOPE>
+<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
+<BODY><IMPORTDATA>
+<REQUESTDESC>
+  <REPORTNAME>Vouchers</REPORTNAME>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${vchType}" ACTION="Cancel">
+  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+  <DATE>${dt}</DATE>
+  ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+  <ISCANCELLED>Yes</ISCANCELLED>
+</VOUCHER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA></BODY></ENVELOPE>`;
 }

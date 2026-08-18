@@ -1,5 +1,17 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-18 — Proforma convert Alter by MasterID + cancel stray Create
+
+### Forensic (TDK-PRF-2026-0004 / TD1931-3-2026)
+- Create MASTERID 8560 optional; convert Alter with GUID still **CREATED** 8561 (same voucher number)
+- Tally import overwrite-GUID=No: first GUID re-import duplicates; retry overwrote the duplicate and looked like success
+- Original 8560 stayed optional → two Sales in Tally
+
+### Fixed
+- Alter identity: `DATE` + `TAGNAME=MasterID` + `TAGVALUE` (TallyHelp), not GUID-only
+- If LASTVCHID ≠ original MASTERID, **Cancel** the extra voucher then 409 (retry cannot succeed against the duplicate)
+
+---
 ## 2026-08-18 — Proforma convert = native Tally optional→regular Alter
 
 ### Fixed

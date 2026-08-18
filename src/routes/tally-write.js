@@ -20,6 +20,7 @@ import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
 import {
   buildSalesLikeVoucherXml,
+  buildVoucherCancelXml,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -1217,7 +1218,7 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
   if (!masterId && guid) masterId = tallyMasterIdFromVoucherGuid(companyGuid, guid);
   const voucherNumber = av.tally_voucher_no || vRows[0]?.voucher_number || p.voucherNumber || '';
   // Native convert keeps GUID + MASTERID + VOUCHERNUMBER; Alter without them Creates a duplicate.
-  if (!guid || !voucherNumber) {
+  if (!guid || !masterId || !voucherNumber) {
     return res.status(409).json({
       status: false,
       message: 'Wait until this Proforma is fully synced from Tally, then convert.',
@@ -1252,11 +1253,31 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     const result = await forwardToTally(companyGuid, req.user.userId, xml);
     const createdCount = Number(result?.created || 0);
     const alteredCount = Number(result?.altered || 0);
-    // Tally Alter without identity returns CREATED=1 — that is a duplicate, not a convert.
+    const resultId = String(result?.tallyId || '').trim();
+    const touchedWrongVoucher = resultId && resultId !== '0' && resultId !== String(masterId);
+    // GUID re-import in the same company Creates a second Sales (Tally overwrite=No).
+    // LASTVCHID must stay the original MASTERID; otherwise cancel the extra and fail.
     if (result && result.status !== 'desktop_offline' && result.status !== false
-        && createdCount > 0 && alteredCount === 0) {
-      const dupMsg = 'Tally created a new Sales voucher instead of converting this Proforma. Cancel the extra invoice in Tally and retry after a full sync.';
-      await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount }, null);
+        && ((createdCount > 0 && alteredCount === 0) || touchedWrongVoucher)) {
+      const extraId = (resultId && resultId !== String(masterId)) ? resultId : '';
+      if (extraId) {
+        const extraGuid = tallyVoucherGuidFromMasterId(companyGuid, extraId);
+        const cancelXml = buildVoucherCancelXml({
+          companyName: companyName || p.companyName,
+          vchType,
+          dt,
+          masterId: extraId,
+          guid: extraGuid,
+          voucherNumber,
+        });
+        await forwardToTally(companyGuid, req.user.userId, cancelXml).catch((e) => {
+          console.warn('[proforma/convert] cancel stray Create failed:', e.message);
+        });
+      }
+      const dupMsg = extraId
+        ? `Tally created extra Sales #${extraId} instead of converting this Proforma. Extra voucher was cancelled — retry convert after a sync.`
+        : 'Tally created a new Sales voucher instead of converting this Proforma. Cancel the extra invoice in Tally and retry after a full sync.';
+      await updateWriteQueue(queueId, { status: false, message: dupMsg, created: createdCount, altered: alteredCount, tallyId: resultId || null }, null);
       return res.status(409).json({ status: false, message: dupMsg, created: createdCount, altered: alteredCount });
     }
     await updateWriteQueue(queueId, result, null);
