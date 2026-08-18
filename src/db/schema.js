@@ -688,6 +688,7 @@ export async function initSchema() {
 
       -- Bill-wise allocation (Phase B+C, 2026-06-30): cached from Tally's BILLALLOCATIONS.LIST so
       -- the reconciler can match Receipts (where Tally drops top-level <REFERENCE>) by Agst Ref linkage.
+      ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS is_optional           BOOLEAN DEFAULT FALSE;
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_ref_name         TEXT;
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_type             TEXT;  -- 'New Ref' | 'Agst Ref' | 'On Account' | 'Advance'
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS bill_allocated_amount DECIMAL(15,4);

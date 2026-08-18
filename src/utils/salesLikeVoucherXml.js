@@ -1,15 +1,32 @@
 /**
  * Shared Sales-shaped voucher XML (Sales Invoice + Proforma).
- * Shape aligned to a real TallyPrime optional Sales export
- * (Sales_TD1531-3-2026.xml, Yash Ki Company, 2026-08-17):
+ * Shape aligned to TallyPrime optional Sales exports
+ * (Sales_TD1531-3-2026.xml + native optional→regular pair, Yash Ki Company):
  *   OBJVIEW + PERSISTEDVIEW = Invoice Voucher View
  *   VCHENTRYMODE = Item Invoice
  *   ISOPTIONAL + VCHSTATUSISOPTIONAL
  *   DIFFACTUALQTY = Yes
- *   GUID / MASTERID / ALTERID / REMOTEID for Alter (same voucher, no duplicate)
+ *   GUID / MASTERID / REMOTEID for Alter (same voucher, no duplicate)
+ * Native convert (2026-08-18) only flips optional flags; GUID/MASTERID/VOUCHERNUMBER stay.
+ * Do NOT send ALTERID — Tally owns that counter (9653 → 9654 on convert).
  * Proforma create: ACTION=Create, ISOPTIONAL=Yes.
  * Convert: ACTION=Alter, ISOPTIONAL=No.
  */
+
+/** Tally voucher GUID = `{companyGuid}-{MASTERID as 8-char hex}`. MASTERID 8559 → …-0000216f */
+export function tallyVoucherGuidFromMasterId(companyGuid, masterId) {
+  const n = parseInt(String(masterId ?? '').trim(), 10);
+  if (!companyGuid || !Number.isFinite(n) || n <= 0) return '';
+  return `${companyGuid}-${n.toString(16).padStart(8, '0')}`;
+}
+
+export function tallyMasterIdFromVoucherGuid(companyGuid, guid) {
+  if (!companyGuid || !guid) return '';
+  const prefix = `${companyGuid}-`;
+  if (!String(guid).startsWith(prefix)) return '';
+  const n = parseInt(String(guid).slice(prefix.length), 16);
+  return Number.isFinite(n) && n > 0 ? String(n) : '';
+}
 
 function qtyWithUnit(qty, unit) {
   const n = parseFloat(qty);
@@ -44,7 +61,6 @@ export function buildSalesLikeVoucherXml({
   ewbDetailsXml = '',
   guid = '',
   masterId = '',
-  alterId = '',
 }) {
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(partyAmt) || 0;
@@ -52,7 +68,6 @@ export function buildSalesLikeVoucherXml({
   const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
   const guidXml = guid ? `\n  <GUID>${guid}</GUID>` : '';
   const masterXml = masterId ? `\n  <MASTERID>${masterId}</MASTERID>` : '';
-  const alterXml = alterId ? `\n  <ALTERID>${alterId}</ALTERID>` : '';
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -68,7 +83,7 @@ export function buildSalesLikeVoucherXml({
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERNUMBER>${vn}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || ''}</REFERENCE>${guidXml}${masterXml}${alterXml}
+  <REFERENCE>${tdkRef || ''}</REFERENCE>${guidXml}${masterXml}
   <PARTYNAME>${partyLedger}</PARTYNAME>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>

@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md
 
+## 2026-08-18 — Proforma convert = native Tally optional→regular Alter
+
+### Fixed
+- Native Tally convert (TD1831-3-2026) keeps the same GUID / MASTERID / VOUCHERNUMBER and only flips `ISOPTIONAL` + `VCHSTATUSISOPTIONAL`
+- Convert Alter now sends that identity: construct GUID from companyGuid + hex MASTERID when ingest GUID is missing; require voucher number; **do not send ALTERID** (Tally owns 9653→9654)
+- Prefer the still-optional `vouchers` row if duplicates exist; still 409 if Tally CREATES instead of ALTERS
+
+---
+
 ## 2026-08-17 — Proforma XML parity with Tally optional Sales export
 
 ### Fixed

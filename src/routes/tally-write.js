@@ -18,7 +18,11 @@ import {
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
-import { buildSalesLikeVoucherXml } from '../utils/salesLikeVoucherXml.js';
+import {
+  buildSalesLikeVoucherXml,
+  tallyVoucherGuidFromMasterId,
+  tallyMasterIdFromVoucherGuid,
+} from '../utils/salesLikeVoucherXml.js';
 import {
   insertAppMaster,
   markAppMasterFailed,
@@ -1186,20 +1190,34 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     : 0;
 
   const { rows: vRows } = await query(
-    `SELECT guid, alter_id FROM vouchers WHERE company_guid=$1 AND (reference=$2 OR voucher_number=$3) LIMIT 1`,
-    [companyGuid, tdkRef, av.tally_voucher_no || '']
+    `SELECT guid, voucher_number, is_optional
+       FROM vouchers
+      WHERE company_guid = $1
+        AND COALESCE(is_cancelled, FALSE) = FALSE
+        AND (
+          ($2 <> '' AND guid = $2)
+          OR reference = $3
+          OR ($4 <> '' AND voucher_number = $4)
+        )
+      ORDER BY CASE WHEN COALESCE(is_optional, FALSE) THEN 0 ELSE 1 END,
+               synced_at DESC NULLS LAST
+      LIMIT 1`,
+    [companyGuid, av.tally_guid || '', tdkRef, av.tally_voucher_no || '']
   ).catch(() => ({ rows: [] }));
   const { rows: wqRows } = await query(
     `SELECT tally_id FROM write_queue WHERE id=$1`,
     [av.write_queue_id]
   ).catch(() => ({ rows: [] }));
 
-  const guid = vRows[0]?.guid || '';
   const rawMaster = wqRowsEarly[0]?.tally_id || wqRows[0]?.tally_id || '';
-  const masterId = (rawMaster && String(rawMaster) !== '0') ? String(rawMaster) : '';
-  const alterId = vRows[0]?.alter_id || '';
-  // Alter without identity is treated as Create by Tally → duplicate Sales (Yash 2026-08-17).
-  if (!guid && !masterId) {
+  let masterId = (rawMaster && String(rawMaster) !== '0') ? String(rawMaster) : '';
+  let guid = vRows[0]?.guid || av.tally_guid || '';
+  // Native Tally GUID = companyGuid + 8-char hex MASTERID (…-0000216f for 8559).
+  if (!guid && masterId) guid = tallyVoucherGuidFromMasterId(companyGuid, masterId);
+  if (!masterId && guid) masterId = tallyMasterIdFromVoucherGuid(companyGuid, guid);
+  const voucherNumber = av.tally_voucher_no || vRows[0]?.voucher_number || p.voucherNumber || '';
+  // Native convert keeps GUID + MASTERID + VOUCHERNUMBER; Alter without them Creates a duplicate.
+  if (!guid || !voucherNumber) {
     return res.status(409).json({
       status: false,
       message: 'Wait until this Proforma is fully synced from Tally, then convert.',
@@ -1211,7 +1229,7 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     vchType,
     action: 'Alter',
     dt,
-    voucherNumber: av.tally_voucher_no || p.voucherNumber || '',
+    voucherNumber,
     tdkRef,
     isOptional: false,
     narration: p.narration || '',
@@ -1223,7 +1241,6 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
     againstOrderNo: p.againstOrderNo || '',
     guid,
     masterId,
-    alterId,
   });
 
   const queueId = await logWriteQueue(
