@@ -4,6 +4,7 @@
 - Convert XML matches the proven probe: `DATE` + `TAGNAME="MASTER ID"` + `TAGVALUE` + `ACTION="Alter"`
 - Body is only `ISOPTIONAL` + `VCHSTATUSISOPTIONAL` = No (no items/GUID/rebuild)
 - Still 409 if Tally Creates or LASTVCHID ≠ original MASTERID; **no auto-cancel**
+- `tallyDate()` now formats JS Date objects as YYYYMMDD (convert identity)
 
 ---
 

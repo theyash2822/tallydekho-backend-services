@@ -21,7 +21,6 @@ import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
 import {
   buildSalesLikeVoucherXml,
   buildMinimalVoucherAlterXml,
-  tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
 import {
@@ -68,7 +67,16 @@ const router = Router();
 // ── Helper: format date YYYYMMDD ──────────────────────────────────────────────
 const tallyDate = (d) => {
   if (!d) return new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  return String(d).replace(/-/g, '').slice(0, 8);
+  if (d instanceof Date && !Number.isNaN(d.getTime())) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}${m}${day}`;
+  }
+  const s = String(d);
+  if (/^\d{8}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10).replace(/-/g, '');
+  return s.replace(/-/g, '').slice(0, 8);
 };
 
 // ── Helper: build XML from template ──────────────────────────────────────────
