@@ -818,7 +818,15 @@ const voucherListHandler = (voucherType) => async (req, res) => {
       LEFT JOIN LATERAL (
         SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
         FROM app_vouchers av
-        WHERE av.company_guid = v.company_guid AND av.tally_voucher_no = v.voucher_number
+        WHERE av.company_guid = v.company_guid
+          AND av.tally_voucher_no = v.voucher_number
+          AND av.voucher_date::text = v.date
+          -- When multiple Tally vouchers share the same voucher_number, guard by TDK ref (REFERENCE)
+          -- so the list mapping doesn't accidentally attach the wrong app_voucher.
+          AND (
+            (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
+            OR COALESCE(av.tdk_reference_no, '') = ''
+          )
         ORDER BY av.id DESC LIMIT 1
       ) av_info ON true
       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE $2
@@ -1261,6 +1269,13 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
         AND av.company_guid = v.company_guid
         AND av.voucher_date::text = v.date
+        -- When TDK reference exists, use it as the primary identity guard.
+        -- This prevents fan-out when Tally allows duplicate voucher numbers
+        -- (e.g. optional + regular or multiple optional Sales sharing number).
+        AND (
+          (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
+          OR (COALESCE(av.tdk_reference_no, '') = '')
+        )
         AND (
           (av.voucher_type = 'receipt'       AND v.voucher_type ILIKE 'Receipt')
           OR (av.voucher_type = 'sales_order' AND v.voucher_type ILIKE '%Sales Order%')

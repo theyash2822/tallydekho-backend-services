@@ -340,8 +340,16 @@ const updateWriteQueue = async (id, result, error) => {
             `SELECT v.*, av.payload as av_payload
              FROM vouchers v
              LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_guid = v.company_guid
-             WHERE v.company_guid = $1 AND v.voucher_number = $2`,
-            [companyGuid, resolvedVoucherNumber]
+             AND av.write_queue_id = $3
+             AND av.voucher_date::text = v.date
+             AND (
+               (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
+               OR COALESCE(av.tdk_reference_no, '') = ''
+             )
+             WHERE v.company_guid = $1 AND v.voucher_number = $2
+             ORDER BY (av.payload IS NOT NULL) DESC, v.date DESC
+             LIMIT 1`,
+            [companyGuid, resolvedVoucherNumber, id]
           ).catch(() => ({ rows: [] }));
           if (!vRowsEWB[0]) return;
 
