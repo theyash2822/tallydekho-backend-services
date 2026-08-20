@@ -12,6 +12,9 @@ import {
   buildMinimalVoucherAlterXml,
   buildDispatchXml,
   buildSalesVoucherLinesXml,
+  buildVoucherHeaderExtrasXml,
+  buildRoundOffXml,
+  typeOfSupplyFor,
   tallyVoucherGuidFromMasterId,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
@@ -222,6 +225,83 @@ test('convert Alter includes dispatch / vehicle fields without inventory', () =>
   assert.match(xml, /<VEHICLENUMBER>RJ02SX1657<\/VEHICLENUMBER>/);
   assert.match(xml, /<CONSIGNORPLACE>Ajmer<\/CONSIGNORPLACE>/);
   assert.doesNotMatch(xml, /ALLINVENTORYENTRIES/);
+});
+
+test('header extras emit GST, reference date and terms tags', () => {
+  const xml = buildVoucherHeaderExtrasXml({
+    placeOfSupply: 'Rajasthan',
+    partyGstin: '08AAACT2727Q1ZW',
+    consigneeGstin: '08AAACT2727Q1ZX',
+    referenceDate: '2026-08-18',
+    paymentTerms: '30 Days',
+    termsText: 'Goods once sold\nSubject to Ajmer jurisdiction',
+  });
+  assert.match(xml, /<PLACEOFSUPPLY>Rajasthan<\/PLACEOFSUPPLY>/);
+  assert.match(xml, /<PARTYGSTIN>08AAACT2727Q1ZW<\/PARTYGSTIN>/);
+  assert.match(xml, /<CONSIGNEEGSTIN>08AAACT2727Q1ZX<\/CONSIGNEEGSTIN>/);
+  assert.match(xml, /<REFERENCEDATE>20260818<\/REFERENCEDATE>/);
+  assert.match(xml, /<BASICDUEDATEOFPYMT>30 Days<\/BASICDUEDATEOFPYMT>/);
+  assert.match(xml, /<BASICORDERTERMS>Goods once sold<\/BASICORDERTERMS>/);
+  assert.match(xml, /<BASICORDERTERMS>Subject to Ajmer jurisdiction<\/BASICORDERTERMS>/);
+});
+
+test('header extras stay empty when nothing is known', () => {
+  assert.equal(buildVoucherHeaderExtrasXml({}), '');
+  assert.equal(buildVoucherHeaderExtrasXml({ termsText: '\n  \n' }), '');
+});
+
+test('round-off ledger is debited when negative, credited when positive', () => {
+  const up = buildRoundOffXml({ ledgerName: 'Round Off', amount: 0.4 });
+  assert.match(up, /<LEDGERNAME>Round Off<\/LEDGERNAME>/);
+  assert.match(up, /<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
+  const down = buildRoundOffXml({ ledgerName: 'Round Off', amount: -0.4 });
+  assert.match(down, /<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.equal(buildRoundOffXml({ ledgerName: 'Round Off', amount: 0 }), '');
+  assert.equal(buildRoundOffXml({ amount: 5 }), '');
+});
+
+test('type of supply follows the stock master instead of always saying Goods', () => {
+  assert.equal(typeOfSupplyFor({ typeOfSupply: 'Services' }), 'Services');
+  assert.equal(typeOfSupplyFor({ type_of_supply: 'services' }), 'Services');
+  assert.equal(typeOfSupplyFor({ typeOfSupply: 'Goods' }), 'Goods');
+  // Unknown must stay Goods: that is what Tally assumes for a stock item, and it
+  // is the behaviour every already-posted voucher was written with.
+  assert.equal(typeOfSupplyFor({}), 'Goods');
+  assert.equal(typeOfSupplyFor({ typeOfSupply: '' }), 'Goods');
+
+  const svc = buildSalesLikeVoucherXml({
+    ...base,
+    action: 'Create',
+    isOptional: false,
+    items: [{ ...base.items[0], typeOfSupply: 'Services' }],
+  });
+  assert.match(svc, /<GSTOVRDNTYPEOFSUPPLY>Services<\/GSTOVRDNTYPEOFSUPPLY>/);
+  const goods = buildSalesLikeVoucherXml({ ...base, action: 'Create', isOptional: false });
+  assert.match(goods, /<GSTOVRDNTYPEOFSUPPLY>Goods<\/GSTOVRDNTYPEOFSUPPLY>/);
+});
+
+test('sales lines carry HSN and line discount', () => {
+  const xml = buildSalesLikeVoucherXml({
+    ...base,
+    action: 'Create',
+    isOptional: false,
+    items: [{ ...base.items[0], hsn: '1201', discount: 5 }],
+  });
+  assert.match(xml, /<HSNCODE>1201<\/HSNCODE>/);
+  assert.match(xml, /<DISCOUNT>5<\/DISCOUNT>/);
+});
+
+test('dispatch builder can emit the e-Way Bill block alone', () => {
+  const args = [{
+    dispatch_from: 'Ajmer',
+    ship_to: 'Alwar',
+    transport_doc_no: '56',
+    vehicle_number: 'RJ02SX1657',
+  }, '20260818'];
+  const ewbOnly = buildDispatchXml(...args, { ewbOnly: true });
+  assert.match(ewbOnly, /<EWAYBILLDETAILS.LIST>/);
+  assert.doesNotMatch(ewbOnly, /<BASICSHIPDOCUMENTNO>/);
+  assert.match(buildDispatchXml(...args), /<BASICSHIPDOCUMENTNO>56<\/BASICSHIPDOCUMENTNO>/);
 });
 
 test('convert cancel XML identifies stray Create by MasterID', () => {

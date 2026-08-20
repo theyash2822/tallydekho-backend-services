@@ -313,6 +313,40 @@ test('buildCreditNoteXml — escapes XML-unsafe values', () => {
   assert.ok(!/[^&]&[^a]/.test(xml.replace(/&amp;|&lt;|&gt;|&quot;|&apos;/g, '')), 'no raw ampersands remain');
 });
 
+test('buildCreditNoteXml — GST, HSN and e-Way Bill tags match a native return', () => {
+  const xml = buildCreditNoteXml({
+    companyName: 'Yash Ki Company',
+    date: '2026-07-29',
+    partyLedger: 'Amarsinghji Patel Kanjrota',
+    items: [{
+      itemName: 'Maize 4794 TL 1KG', qty: 50, rate: 155, amount: 7750,
+      unit: 'nos', salesLedger: 'Seed Sale A\\C', hsn: '1209', discount: 2,
+    }],
+    taxes: [],
+    billRefName: '0469/17-18',
+    partyAmount: 7750,
+    placeOfSupply: 'Rajasthan',
+    partyGstin: '08AAACT2727Q1ZW',
+    referenceDate: '2026-07-01',
+    dispatch_details: { dispatch_from: 'Ajmer', ship_to: 'Alwar', vehicle_number: 'RJ02SX1657' },
+  });
+  assert.match(xml, /<PLACEOFSUPPLY>Rajasthan<\/PLACEOFSUPPLY>/);
+  assert.match(xml, /<PARTYGSTIN>08AAACT2727Q1ZW<\/PARTYGSTIN>/);
+  assert.match(xml, /<REFERENCEDATE>20260701<\/REFERENCEDATE>/);
+  assert.match(xml, /<HSNCODE>1209<\/HSNCODE>/);
+  assert.match(xml, /<DISCOUNT>2<\/DISCOUNT>/);
+  assert.match(xml, /<EWAYBILLDETAILS.LIST>/);
+  assert.match(xml, /<VEHICLENUMBER>RJ02SX1657<\/VEHICLENUMBER>/);
+});
+
+test('buildCreditNoteXml — no GST context means no empty tags', () => {
+  const xml = xmlFixture();
+  assert.doesNotMatch(xml, /<PLACEOFSUPPLY>/);
+  assert.doesNotMatch(xml, /<PARTYGSTIN>/);
+  assert.doesNotMatch(xml, /<HSNCODE>/);
+  assert.doesNotMatch(xml, /<EWAYBILLDETAILS.LIST>/);
+});
+
 test('buildCreditNoteXml — optional entry flips ISOPTIONAL', () => {
   const xml = buildCreditNoteXml({
     companyName: 'Co', date: '2026-07-29', partyLedger: 'P', isOptional: true,

@@ -95,19 +95,44 @@ router.post('/desktop/init-sync', async (req, res) => {
         alterIds[c.guid] = { master: masterAlterId, voucher: voucherByYear };
 
         try {
+          // Tally's Company collection also carries the print identity (PAN as
+          // INCOMETAXNUMBER, e-mail, phone, address, state, pincode). COALESCE on
+          // update so a payload that omits a field never wipes a synced value.
+          const companyAddress = Array.isArray(c.address)
+            ? c.address.map((l) => String(l || '').trim()).filter(Boolean).join(', ')
+            : (c.address || null);
           await query(`
-            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active, gst_taxpayer_type)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10)
+            INSERT INTO companies (guid, user_id, device_id, name, formal_name, gstin, fy_start, fy_end, synced_at, is_active, gst_taxpayer_type,
+                                   pan, phone, mobile, email, website, address, state, pincode, country)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             ON CONFLICT (guid) DO UPDATE SET
               user_id = EXCLUDED.user_id, device_id = EXCLUDED.device_id,
               name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
-              gstin = EXCLUDED.gstin, fy_start = EXCLUDED.fy_start,
+              gstin = COALESCE(EXCLUDED.gstin, companies.gstin), fy_start = EXCLUDED.fy_start,
               fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at,
               is_active = TRUE,
-              gst_taxpayer_type = EXCLUDED.gst_taxpayer_type
+              gst_taxpayer_type = EXCLUDED.gst_taxpayer_type,
+              pan     = COALESCE(EXCLUDED.pan,     companies.pan),
+              phone   = COALESCE(EXCLUDED.phone,   companies.phone),
+              mobile  = COALESCE(EXCLUDED.mobile,  companies.mobile),
+              email   = COALESCE(EXCLUDED.email,   companies.email),
+              website = COALESCE(EXCLUDED.website, companies.website),
+              address = COALESCE(EXCLUDED.address, companies.address),
+              state   = COALESCE(EXCLUDED.state,   companies.state),
+              pincode = COALESCE(EXCLUDED.pincode, companies.pincode),
+              country = COALESCE(EXCLUDED.country, companies.country)
           `, [c.guid, userId, deviceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
-              c.gstin || c.GSTIN || null, c.startingFrom || null, c.endingAt || null, now(),
-              normalizeGstType(c.GSTREGISTRATIONTYPE || c.GstRegistrationType || c.TAXPAYERTYPE || c.TaxpayerType || null)]);
+              c.gstin || c.GSTIN || c.gstNumber || null, c.startingFrom || null, c.endingAt || null, now(),
+              normalizeGstType(c.GSTREGISTRATIONTYPE || c.GstRegistrationType || c.TAXPAYERTYPE || c.TaxpayerType || null),
+              c.incomeTaxNumber || c.INCOMETAXNUMBER || null,
+              c.phoneNumber || c.PHONENUMBER || null,
+              c.mobileNumber || c.MOBILENO || null,
+              c.email || c.EMAIL || null,
+              c.website || c.WEBSITE || null,
+              companyAddress,
+              c.state || c.STATENAME || null,
+              c.pincode || c.PINCODE || null,
+              c.country || c.COUNTRYNAME || null]);
           console.log(`[DB] Company saved: ${c.name || c.guid}`);
 
           // Store all financial years for this company

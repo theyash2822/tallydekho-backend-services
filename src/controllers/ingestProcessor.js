@@ -617,8 +617,8 @@ async function processStocks(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, batch_enabled, expiry_enabled, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, batch_enabled, expiry_enabled, synced_at, type_of_supply)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
             category=EXCLUDED.category,
@@ -631,7 +631,8 @@ async function processStocks(data, companyGuid) {
             reorder_level=EXCLUDED.reorder_level, minimum_order_qty=EXCLUDED.minimum_order_qty,
             alter_id=EXCLUDED.alter_id,
             batch_enabled=EXCLUDED.batch_enabled, expiry_enabled=EXCLUDED.expiry_enabled,
-            synced_at=EXCLUDED.synced_at
+            synced_at=EXCLUDED.synced_at,
+            type_of_supply=COALESCE(NULLIF(EXCLUDED.type_of_supply,''), stocks.type_of_supply)
         `, [
           guid, companyGuid, name,
           r.OnlyAlias || r.ALIAS || null,                                        // alias
@@ -652,6 +653,7 @@ async function processStocks(data, companyGuid) {
           (r.MAINTAININBATCHES === 'Yes' || r.MaintainInBatches === 'Yes'),
           (r.USEEXPIRYDATES    === 'Yes' || r.UseExpirydates    === 'Yes'),
           now(),
+          r.GSTTYPEOFSUPPLY || r.Gsttypeofsupply || r.GstTypeOfSupply || null,
         ]);
         saved++;
 

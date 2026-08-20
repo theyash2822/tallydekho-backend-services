@@ -105,6 +105,30 @@ test('buildDebitNoteXml — header and GST nature', () => {
   assert.match(xml, /<NAME>PI-100<\/NAME>/);
 });
 
+test('buildDebitNoteXml — carries place of supply, party GSTIN, HSN and terms', () => {
+  const xml = buildDebitNoteXml({
+    companyName: 'Demo Co',
+    date: '2026-08-06',
+    partyLedger: 'ABC Traders',
+    items: [{
+      itemName: 'Maize 4794 TL 1KG', qty: 10, rate: 155, amount: 1550,
+      unit: 'nos', purchaseLedger: 'Purchase Account GST', hsn: '1209',
+    }],
+    taxes: [],
+    billRefName: 'PI-100',
+    partyAmount: 1550,
+    placeOfSupply: 'Rajasthan',
+    partyGstin: '08AAACT2727Q1ZW',
+    referenceDate: '2026-08-01',
+    termsText: 'Return accepted within 7 days',
+  });
+  assert.match(xml, /<PLACEOFSUPPLY>Rajasthan<\/PLACEOFSUPPLY>/);
+  assert.match(xml, /<PARTYGSTIN>08AAACT2727Q1ZW<\/PARTYGSTIN>/);
+  assert.match(xml, /<REFERENCEDATE>20260801<\/REFERENCEDATE>/);
+  assert.match(xml, /<BASICORDERTERMS>Return accepted within 7 days<\/BASICORDERTERMS>/);
+  assert.match(xml, /<HSNCODE>1209<\/HSNCODE>/);
+});
+
 test('isPurchaseInvoiceRow — accepts Purchase, rejects order / sales', () => {
   assert.equal(isPurchaseInvoiceRow({ voucher_type_parent: 'Purchase', voucher_type: 'Purchase' }), true);
   assert.equal(isPurchaseInvoiceRow({ voucher_type_parent: 'Voucher', voucher_type: 'Purchase GST' }), true);

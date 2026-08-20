@@ -41,8 +41,13 @@ function dispatchToTallyDate(d) {
   return s.replace(/-/g, '').slice(0, 8);
 }
 
-/** Dispatch / e-way fields for Sales Alter (same tags as create-invoice). Empty string if nothing filled. */
-export function buildDispatchXml(dispatch_details, invoiceDate) {
+/**
+ * Dispatch / e-way fields for Sales Alter (same tags as create-invoice). Empty string if nothing filled.
+ *
+ * `ewbOnly` returns just the EWAYBILLDETAILS block, for voucher types such as
+ * Delivery Note that already build their own BASICSHIP* tags.
+ */
+export function buildDispatchXml(dispatch_details, invoiceDate, { ewbOnly = false } = {}) {
   if (!dispatch_details || typeof dispatch_details !== 'object') return '';
   const dd = dispatch_details;
   const filled = Object.values(dd).some((v) => v != null && String(v).trim() !== '');
@@ -105,7 +110,58 @@ ${consigneeAddrXml}
     </TRANSPORTDETAILS.LIST>` : ''}
   </EWAYBILLDETAILS.LIST>`;
 
-  return [topLevel, ewb].filter(Boolean).join('\n');
+  return ewbOnly ? ewb : [topLevel, ewb].filter(Boolean).join('\n');
+}
+
+/**
+ * Voucher-level GST / reference / terms tags.
+ *
+ * None of these were sent by any voucher type before, which is why our PDFs were
+ * missing Place of Supply, party GSTIN, reference date and the terms block that
+ * native Tally entries carry.
+ */
+export function buildVoucherHeaderExtrasXml({
+  placeOfSupply = '',
+  partyGstin = '',
+  consigneeGstin = '',
+  referenceDate = '',
+  paymentTerms = '',
+  termsText = '',
+} = {}) {
+  const termsLines = String(termsText || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const termsXml = termsLines.length
+    ? [
+      '  <BASICORDERTERMS.LIST TYPE="String">',
+      ...termsLines.map((l) => `    <BASICORDERTERMS>${xmlEsc(l)}</BASICORDERTERMS>`),
+      '  </BASICORDERTERMS.LIST>',
+    ].join('\n')
+    : '';
+
+  return [
+    referenceDate ? `  <REFERENCEDATE>${dispatchToTallyDate(referenceDate)}</REFERENCEDATE>` : '',
+    placeOfSupply ? `  <PLACEOFSUPPLY>${xmlEsc(placeOfSupply)}</PLACEOFSUPPLY>` : '',
+    partyGstin ? `  <PARTYGSTIN>${xmlEsc(partyGstin)}</PARTYGSTIN>` : '',
+    consigneeGstin ? `  <CONSIGNEEGSTIN>${xmlEsc(consigneeGstin)}</CONSIGNEEGSTIN>` : '',
+    paymentTerms ? `  <BASICDUEDATEOFPYMT>${xmlEsc(paymentTerms)}</BASICDUEDATEOFPYMT>` : '',
+    termsXml,
+  ].filter(Boolean).join('\n');
+}
+
+/** Tally posts round-off as its own ledger line, so it must be sent explicitly. */
+export function buildRoundOffXml({ ledgerName = '', amount = 0 } = {}) {
+  const amt = parseFloat(amount) || 0;
+  if (!ledgerName || Math.abs(amt) < 0.005) return '';
+  return `
+  <LEDGERENTRIES.LIST>
+    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
+    <ISDEEMEDPOSITIVE>${amt < 0 ? 'Yes' : 'No'}</ISDEEMEDPOSITIVE>
+    <LEDGERFROMITEM>No</LEDGERFROMITEM>
+    <LEDGERNAME>${xmlEsc(ledgerName)}</LEDGERNAME>
+    <AMOUNT>${amt}</AMOUNT>
+  </LEDGERENTRIES.LIST>`;
 }
 
 function qtyWithUnit(qty, unit) {
@@ -120,6 +176,32 @@ function rateWithUnit(rate, unit) {
   if (raw.includes('/')) return raw;
   const u = String(unit || '').trim();
   return u ? `${raw}/${u}` : raw;
+}
+
+/**
+ * Per-line HSN and discount.
+ *
+ * Tally reads HSN from the stock item master, but only if the master has it. We
+ * send the line value so a voucher stays correct even when the master is blank,
+ * which is what our PDFs were missing against native entries.
+ */
+function itemHsnDiscountXml(item) {
+  const hsn = String(item.hsn || item.hsnCode || '').trim();
+  const disc = parseFloat(item.discount);
+  return [
+    hsn ? `\n    <HSNCODE>${xmlEsc(hsn)}</HSNCODE>` : '',
+    Number.isFinite(disc) && disc !== 0 ? `\n    <DISCOUNT>${disc}</DISCOUNT>` : '',
+  ].join('');
+}
+
+/**
+ * Goods vs Services for a line, from the stock master's GSTTYPEOFSUPPLY.
+ * Defaults to Goods because that is what Tally itself assumes for a stock item,
+ * but a service item must not be forced to Goods or its GST return is wrong.
+ */
+export function typeOfSupplyFor(item = {}) {
+  const raw = String(item.typeOfSupply || item.type_of_supply || '').trim();
+  return /serv/i.test(raw) ? 'Services' : 'Goods';
 }
 
 /** Party + inventory + tax + logistics lines (no VOUCHER wrapper). Used by convert Alter. */
@@ -166,11 +248,11 @@ export function buildSalesVoucherLinesXml({
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <STOCKITEMNAME>${xmlEsc(item.itemName)}</STOCKITEMNAME>
-    <GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>
+    <GSTOVRDNTYPEOFSUPPLY>${typeOfSupplyFor(item)}</GSTOVRDNTYPEOFSUPPLY>
     <AMOUNT>${itemAmt}</AMOUNT>
     <ACTUALQTY>${qtyXml}</ACTUALQTY>
     <BILLEDQTY>${billedXml}</BILLEDQTY>
-    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${gstRateXml}
+    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -244,8 +326,18 @@ export function buildSalesLikeVoucherXml({
   ewbDetailsXml = '',
   guid = '',
   masterId = '',
+  placeOfSupply = '',
+  partyGstin = '',
+  consigneeGstin = '',
+  referenceDate = '',
+  paymentTerms = '',
+  termsText = '',
+  roundOff = null,
 }) {
   const isOpt = isOptional ? 'Yes' : 'No';
+  const headerExtrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply, partyGstin, consigneeGstin, referenceDate, paymentTerms, termsText,
+  });
   const amt = parseFloat(partyAmt) || 0;
   const vn = voucherNumber || '';
   const isAlter = String(action).toLowerCase() === 'alter';
@@ -269,10 +361,10 @@ export function buildSalesLikeVoucherXml({
   <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${vn}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || ''}</REFERENCE>${guidXml}${masterXml}
-  <PARTYNAME>${partyLedger}</PARTYNAME>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <VOUCHERNUMBER>${xmlEsc(vn)}</VOUCHERNUMBER>
+  <REFERENCE>${xmlEsc(tdkRef || '')}</REFERENCE>${guidXml}${masterXml}
+  <PARTYNAME>${xmlEsc(partyLedger)}</PARTYNAME>
+  <PARTYLEDGERNAME>${xmlEsc(partyLedger)}</PARTYLEDGERNAME>
   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
   <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
   <ISINVOICE>Yes</ISINVOICE>
@@ -281,18 +373,18 @@ export function buildSalesLikeVoucherXml({
   <DIFFACTUALQTY>Yes</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <VCHSTATUSISOPTIONAL>${isOpt}</VCHSTATUSISOPTIONAL>
-  <NARRATION>${narration || ''}</NARRATION>
-${topLevelDispatchXml || ''}
+  <NARRATION>${xmlEsc(narration || '')}</NARRATION>
+${[headerExtrasXml, topLevelDispatchXml].filter(Boolean).join('\n')}
 
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlEsc(partyLedger)}</LEDGERNAME>
     <AMOUNT>${-amt}</AMOUNT>${tdkRef ? `
     <BILLALLOCATIONS.LIST>
-      <NAME>${tdkRef}</NAME>
+      <NAME>${xmlEsc(tdkRef)}</NAME>
       <BILLTYPE>New Ref</BILLTYPE>
       <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
       <AMOUNT>${-amt}</AMOUNT>
@@ -315,23 +407,23 @@ ${topLevelDispatchXml || ''}
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
-    <GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>
+    <STOCKITEMNAME>${xmlEsc(item.itemName)}</STOCKITEMNAME>
+    <GSTOVRDNTYPEOFSUPPLY>${typeOfSupplyFor(item)}</GSTOVRDNTYPEOFSUPPLY>
     <AMOUNT>${itemAmt}</AMOUNT>
     <ACTUALQTY>${qtyXml}</ACTUALQTY>
     <BILLEDQTY>${billedXml}</BILLEDQTY>
-    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${gstRateXml}
+    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
       <LEDGERFROMITEM>No</LEDGERFROMITEM>
-      <LEDGERNAME>${item.salesLedger || 'Sales Account GST'}</LEDGERNAME>
+      <LEDGERNAME>${xmlEsc(item.salesLedger || 'Sales Account GST')}</LEDGERNAME>
       <AMOUNT>${itemAmt}</AMOUNT>
     </ACCOUNTINGALLOCATIONS.LIST>
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
-      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      ${againstOrderNo ? `<ORDERNO>${againstOrderNo}</ORDERNO>` : '<ORDERNO/>'}
+      <GODOWNNAME>${xmlEsc(item.godown || 'Main Location')}</GODOWNNAME>
+      ${againstOrderNo ? `<ORDERNO>${xmlEsc(againstOrderNo)}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${itemAmt}</AMOUNT>
       <ACTUALQTY>${qtyXml}</ACTUALQTY>
       <BILLEDQTY>${billedXml}</BILLEDQTY>
@@ -345,7 +437,7 @@ ${topLevelDispatchXml || ''}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlEsc(tax.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT>
     <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE>
   </LEDGERENTRIES.LIST>`;
@@ -357,7 +449,7 @@ ${topLevelDispatchXml || ''}
   <LEDGERENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlEsc(lg.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     for (const lt of (lg.taxes || [])) {
@@ -367,12 +459,13 @@ ${topLevelDispatchXml || ''}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlEsc(lt.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     }
   }
 
+  if (roundOff) xml += buildRoundOffXml(roundOff);
   if (ewbDetailsXml) xml += ewbDetailsXml;
 
   xml += `

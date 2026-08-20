@@ -23,8 +23,24 @@ import {
   buildMinimalVoucherAlterXml,
   buildDispatchXml,
   buildSalesVoucherLinesXml,
+  buildVoucherHeaderExtrasXml,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
+import {
+  loadDocumentContext,
+  buildCompanyBlock,
+  buildPartyBlock,
+  buildItemLines,
+  buildTaxLines,
+  buildChargeLines,
+  buildHsnSummary,
+  buildTotals,
+  buildDocumentMetadata,
+  buildShippingBlock,
+  buildDispatchFromBlock,
+  amountInWords,
+  isRoundOffLedger,
+} from '../utils/voucherDocument.js';
 import {
   insertAppMaster,
   markAppMasterFailed,
@@ -411,10 +427,69 @@ async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL') {
 // ── createReceiptForInvoice ── helper that pairs a Receipt voucher with a Sales Invoice
 // when Collect Payment Now is enabled. Builds its own Receipt XML, logs to write_queue,
 // creates a child app_voucher row linked via parent_invoice_uuid, and forwards to Tally.
+/**
+ * Party GSTIN / state and item HSN for the GST tags Tally expects on a voucher.
+ *
+ * The mobile app never sent these, so our vouchers printed without Place of
+ * Supply, party GSTIN or HSN while native Tally entries carried all three.
+ */
+async function loadVoucherTagContext(companyGuid, partyLedger, items = []) {
+  const names = (items || []).map(i => i.itemName || i.name).filter(Boolean);
+  const ctx = await loadDocumentContext(companyGuid, partyLedger, names).catch(() => null);
+  const masters = ctx?.itemMasters || new Map();
+  return {
+    partyGstin: ctx?.partyRow?.gstin || '',
+    partyState: ctx?.partyRow?.state_name || '',
+    withHsn: (list = []) => list.map(item => {
+      const master = masters.get(String(item.itemName || '').toLowerCase());
+      return {
+        ...item,
+        hsn: item.hsn || master?.hsn || '',
+        typeOfSupply: item.typeOfSupply || master?.type_of_supply || '',
+      };
+    }),
+  };
+}
+
+/** `<HSNCODE>` / `<DISCOUNT>` for an inventory line, empty when we know neither. */
+function inventoryHsnDiscountXml(item) {
+  const hsn = String(item.hsn || item.hsnCode || '').trim();
+  const disc = parseFloat(item.discount);
+  return [
+    hsn ? `\n    <HSNCODE>${escapeXml(hsn)}</HSNCODE>` : '',
+    Number.isFinite(disc) && disc !== 0 ? `\n    <DISCOUNT>${disc}</DISCOUNT>` : '',
+  ].join('');
+}
+
+/** Bank instrument block for the cash/bank leg of a Receipt or Payment. */
+function buildBankAllocationXml({
+  paymentMethod = '', instrument = null, date, amount = 0, favouring = '', reference = '',
+}) {
+  // Same guard as the standalone Receipt/Payment routes: without instrument
+  // details Tally gets a blank allocation it cannot reconcile.
+  if (!paymentMethod || paymentMethod === 'Cash' || !instrument) return '';
+  const methodToTxnType = {
+    Cheque: 'Cheque', NEFT: 'Electronic Cheque', RTGS: 'Electronic Cheque',
+    UPI: 'Others', Bank: 'Transacted',
+  };
+  const inst = instrument || {};
+  const instDate = tallyDate(inst.instrumentDate || date);
+  return `    <BANKALLOCATIONS.LIST>
+      <DATE>${instDate}</DATE>
+      <INSTRUMENTDATE>${instDate}</INSTRUMENTDATE>
+      <INSTRUMENTNUMBER>${escapeXml(inst.instrumentNo || reference || '')}</INSTRUMENTNUMBER>
+      <BANKNAME>${escapeXml(inst.bankName || '')}</BANKNAME>
+      <TRANSACTIONTYPE>${escapeXml(inst.transactionType || methodToTxnType[paymentMethod] || 'Others')}</TRANSACTIONTYPE>
+      <PAYMENTFAVOURING>${escapeXml(favouring)}</PAYMENTFAVOURING>
+      <AMOUNT>${parseFloat(amount) || 0}</AMOUNT>
+    </BANKALLOCATIONS.LIST>`;
+}
+
 async function createReceiptForInvoice({
   companyGuid, companyName, userId, date,
   partyLedger, bankLedger, amount, parentInvoiceUuid, parentTdkRef,
   isOptional = false, reference,
+  paymentMethod = '', instrument = null, voucherNumber = '',
   parentCreatedAt = null,   // 2026-07-01 R4: share timestamp with parent Sales invoice
                             // so audit-trail sort keeps Invoice → Receipt sequence.
 }) {
@@ -423,7 +498,15 @@ async function createReceiptForInvoice({
   }
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
+  const dt = tallyDate(date);
   const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP');
+  // A non-cash receipt carries the instrument on the bank leg, exactly like the
+  // standalone Receipt route; without it Tally shows a bare bank entry.
+  // The allocation amount must match the bank leg's signed AMOUNT (-amt here).
+  const bankAllocXml = buildBankAllocationXml({
+    paymentMethod, instrument, date, amount: -amt, favouring: partyLedger,
+    reference: reference || parentTdkRef,
+  });
   // Keep narration user/business-friendly (no TDK ids). Receipt reconciliation uses
   // BILLALLOCATIONS.LIST (Agst Ref → parent SAL ref) instead.
   const narration = 'Receipt against invoice';
@@ -438,8 +521,10 @@ async function createReceiptForInvoice({
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <VOUCHER VCHTYPE="Receipt" ACTION="Create">
-  <DATE>${tallyDate(date)}</DATE>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+  ${voucherNumber ? `<VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>` : ''}
   <NARRATION>${narration}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <REFERENCE>${reference || rcpTdkRef || ''}</REFERENCE>
@@ -461,6 +546,7 @@ async function createReceiptForInvoice({
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>No</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
+${bankAllocXml}
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
 </TALLYMESSAGE>
@@ -531,6 +617,7 @@ async function createPaymentForInvoice({
   companyGuid, companyName, userId, date,
   partyLedger, bankLedger, amount, parentInvoiceUuid, parentTdkRef,
   isOptional = false, reference,
+  paymentMethod = '', instrument = null, voucherNumber = '',
   parentCreatedAt = null,
 }) {
   if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
@@ -538,7 +625,12 @@ async function createPaymentForInvoice({
   }
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
+  const dt = tallyDate(date);
   const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY');
+  const bankAllocXml = buildBankAllocationXml({
+    paymentMethod, instrument, date, amount: amt, favouring: partyLedger,
+    reference: reference || parentTdkRef,
+  });
   // Keep narration user/business-friendly (no TDK ids). Payment reconciliation uses
   // BILLALLOCATIONS (Agst Ref) and/or unique (party+date+amount) matching.
   const narration = 'Payment against invoice';
@@ -553,8 +645,10 @@ async function createPaymentForInvoice({
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <VOUCHER VCHTYPE="Payment" ACTION="Create">
-  <DATE>${tallyDate(date)}</DATE>
+  <DATE>${dt}</DATE>
+  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
+  ${voucherNumber ? `<VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>` : ''}
   <NARRATION>${narration}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <REFERENCE>${reference || payTdkRef || ''}</REFERENCE>
@@ -576,6 +670,7 @@ async function createPaymentForInvoice({
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
+${bankAllocXml}
   </ALLLEDGERENTRIES.LIST>
 </VOUCHER>
 </TALLYMESSAGE>
@@ -817,131 +912,51 @@ ${consigneeAddrXml}
     if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
 
-  let xml = `<ENVELOPE>
-<HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
-<BODY><IMPORTDATA>
-<REQUESTDESC>
-  <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
-</REQUESTDESC>
-<REQUESTDATA>
-<TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER VCHTYPE="${vchType}" ACTION="Create">
-  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
-  <DATE>${dt}</DATE>
-  <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
-  <ISINVOICE>Yes</ISINVOICE>
-  <ISCANCELLED>No</ISCANCELLED>
-  <ISPOSTDATED>No</ISPOSTDATED>
-  <DIFFACTUALQTY>No</DIFFACTUALQTY>
-  <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <NARRATION>${fullNarration}</NARRATION>
-${topLevelDispatchXml}
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  // Sales and Proforma now share one builder, so a regular Sales Invoice sends the
+  // same PARTYNAME / OBJVIEW / VCHENTRYMODE / unit-suffixed qty set that Proforma
+  // already did, plus the GST tags a native Tally entry carries.
+  const salesCtx = await loadDocumentContext(
+    companyGuid,
+    partyLedger,
+    items.map(i => i.itemName || i.name).filter(Boolean)
+  ).catch(() => null);
+  const itemsWithHsn = items.map(item => {
+    const master = salesCtx?.itemMasters?.get(String(item.itemName || '').toLowerCase());
+    return {
+      ...item,
+      hsn: item.hsn || master?.hsn || '',
+      typeOfSupply: item.typeOfSupply || master?.type_of_supply || '',
+    };
+  });
+  // Round-off is its own ledger line in Tally, not a freight-style charge.
+  const roundOffLine = logistics.find(l => l?.ledgerName && isRoundOffLedger(l.ledgerName)) || null;
+  const chargeLines = logistics.filter(l => l !== roundOffLine);
 
-  <LEDGERENTRIES.LIST>
-    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
-    <AMOUNT>${-partyNetAmt}</AMOUNT>${tdkRef ? `
-    <BILLALLOCATIONS.LIST>
-      <NAME>${tdkRef}</NAME>
-      <BILLTYPE>New Ref</BILLTYPE>
-      <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
-      <AMOUNT>${-partyNetAmt}</AMOUNT>
-    </BILLALLOCATIONS.LIST>` : ''}
-  </LEDGERENTRIES.LIST>`;
-
-  // Inventory line items — stamp GSTRATE when the client sent per-line tax (Phase 3).
-  for (const item of items) {
-    const itemAmt = parseFloat(item.amount) || 0;
-    const lineGstRate = Array.isArray(item.taxEntries) && item.taxEntries.length
-      ? item.taxEntries.reduce((s, t) => s + (parseFloat(t.taxRate) || 0), 0)
-      : (parseFloat(item.gstRate) || parseFloat(item.taxRate) || 0);
-    const gstRateXml = lineGstRate > 0
-      ? `
-    <GSTOVERRIDDEN>Yes</GSTOVERRIDDEN>
-    <IGSTAPPLICABLERATE>${lineGstRate}</IGSTAPPLICABLERATE>`
-      : '';
-    xml += `
-  <ALLINVENTORYENTRIES.LIST>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
-    <AMOUNT>${itemAmt}</AMOUNT>
-    <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
-    <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
-    <RATE>${item.rate || 0}</RATE>${gstRateXml}
-    <ACCOUNTINGALLOCATIONS.LIST>
-      <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-      <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-      <LEDGERFROMITEM>No</LEDGERFROMITEM>
-      <LEDGERNAME>${item.salesLedger || 'Sales Account GST'}</LEDGERNAME>
-      <AMOUNT>${itemAmt}</AMOUNT>
-    </ACCOUNTINGALLOCATIONS.LIST>
-    <BATCHALLOCATIONS.LIST>
-      <BATCHNAME>Primary Batch</BATCHNAME>
-      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      ${req.body.againstOrderNo ? `<ORDERNO>${req.body.againstOrderNo}</ORDERNO>` : '<ORDERNO/>'}
-      <AMOUNT>${itemAmt}</AMOUNT>
-      <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
-      <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
-    </BATCHALLOCATIONS.LIST>
-  </ALLINVENTORYENTRIES.LIST>`;
-  }
-
-  // Tax entries
-  for (const tax of taxes) {
-    xml += `
-  <LEDGERENTRIES.LIST>
-    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
-    <AMOUNT>${parseFloat(tax.taxAmount)}</AMOUNT>
-    <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue)}</VATASSESSABLEVALUE>
-  </LEDGERENTRIES.LIST>`;
-  }
-
-  // Logistics/freight entries
-  // Logistics/freight entries + per-entry taxes
-  for (const lg of logistics) {
-    if (!lg.ledgerName) continue;
-    xml += `
-  <LEDGERENTRIES.LIST>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
-    <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
-  </LEDGERENTRIES.LIST>`;
-    // Per-logistics-entry taxes (e.g. GST on freight)
-    for (const lt of (lg.taxes || [])) {
-      if (!lt.ledgerName || !(parseFloat(lt.taxAmount) > 0)) continue;
-      xml += `
-  <LEDGERENTRIES.LIST>
-    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
-    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
-    <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
-  </LEDGERENTRIES.LIST>`;
-    }
-  }
-
-  // (Collect Payment Now is handled by a SEPARATE Receipt voucher after this invoice posts —
-  // see createReceiptForInvoice() helper. Invoice XML stays clean.)
-
-  // Dispatch / EWB — pre-computed above, append now
-  if (ewbDetailsXml) xml += ewbDetailsXml;
-
-  xml += `
-</VOUCHER>
-</TALLYMESSAGE>
-</REQUESTDATA>
-</IMPORTDATA></BODY></ENVELOPE>`;
+  let xml = buildSalesLikeVoucherXml({
+    companyName,
+    vchType,
+    action: 'Create',
+    dt,
+    voucherNumber: effectiveVoucherNumber,
+    tdkRef: tdkRef || reference || '',
+    isOptional,
+    narration: fullNarration,
+    partyLedger,
+    partyAmt: partyNetAmt,
+    items: itemsWithHsn,
+    taxes,
+    logistics: chargeLines,
+    againstOrderNo: req.body.againstOrderNo || '',
+    topLevelDispatchXml,
+    ewbDetailsXml,
+    placeOfSupply: dispatch_details?.ship_to_state || salesCtx?.partyRow?.state_name || '',
+    partyGstin: salesCtx?.partyRow?.gstin || '',
+    consigneeGstin: dispatch_details?.ship_to_gstin || '',
+    referenceDate: date || '',
+    paymentTerms: dispatch_details?.mode_of_payment || req.body.paymentTerms || '',
+    termsText: req.body.termsText || dispatch_details?.terms_of_delivery || '',
+    roundOff: roundOffLine ? { ledgerName: roundOffLine.ledgerName, amount: roundOffLine.amount } : null,
+  });
 
   const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
@@ -994,6 +1009,10 @@ ${topLevelDispatchXml}
           partyLedger, bankLedger: collect_payment.ledgerName, amount: payAmt,
           parentInvoiceUuid: invoiceUuid, parentTdkRef: tdkRef,
           isOptional, reference: reference,
+          paymentMethod: collect_payment.mode || '',
+          instrument: collect_payment.instrument || (collect_payment.reference
+            ? { instrumentNo: collect_payment.reference }
+            : null),
           parentCreatedAt: invoiceCreatedAt,   // R4: share parent Sales timestamp
         });
         if (receiptResult?.ok) {
@@ -1333,6 +1352,10 @@ router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
             date: p.date, partyLedger, bankLedger: collect_payment.ledgerName, amount: payAmt,
             parentInvoiceUuid: av.invoice_uuid, parentTdkRef: tdkRef,
             isOptional: false, reference: p.reference,
+            paymentMethod: collect_payment.mode || '',
+            instrument: collect_payment.instrument || (collect_payment.reference
+              ? { instrumentNo: collect_payment.reference }
+              : null),
           });
         } catch (rcpErr) {
           console.error(`[receipt-pair] Proforma convert receipt failed for ${tdkRef}:`, rcpErr.message);
@@ -2261,6 +2284,16 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
   // Persist terms in payload for preview/share; narration stays clean for Tally
   const persistPayload = { ...req.body, termsText: termsText || req.body.termsText || '' };
 
+  const soTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const soItems = soTagCtx.withHsn(items);
+  const soExtrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply: req.body.placeOfSupply || soTagCtx.partyState,
+    partyGstin: soTagCtx.partyGstin,
+    referenceDate: req.body.referenceDate || '',
+    paymentTerms: req.body.paymentTerms || '',
+    termsText: termsText || req.body.termsText || '',
+  });
+
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -2283,6 +2316,7 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${narration || ''}</NARRATION>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+${soExtrasXml}
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
@@ -2292,13 +2326,13 @@ router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
     <AMOUNT>${-amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
-  for (const item of items) {
+  for (const item of soItems) {
     const itemAmt = parseFloat(item.amount) || 0;
     const orderNoTag = effectiveVoucherNumber || '';
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
+    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${itemAmt}</AMOUNT>
     <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
     <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
@@ -2851,6 +2885,16 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
 
   const persistPayload = { ...req.body, tdkRef, termsText: termsText || req.body.termsText || '', voucherType: 'Purchase Order' };
 
+  const poTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const poItems = poTagCtx.withHsn(items);
+  const poExtrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply: req.body.placeOfSupply || poTagCtx.partyState,
+    partyGstin: poTagCtx.partyGstin,
+    referenceDate: req.body.referenceDate || '',
+    paymentTerms: req.body.paymentTerms || '',
+    termsText: termsText || req.body.termsText || '',
+  });
+
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -2873,6 +2917,7 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${narration || ''}</NARRATION>
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+${poExtrasXml}
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -2882,7 +2927,7 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
     <AMOUNT>${amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
-  for (const item of items) {
+  for (const item of poItems) {
     const itemAmt = parseFloat(item.amount) || 0;
     const qty = item.actualQty || item.billedQty || 1;
     const billed = item.billedQty || qty;
@@ -2890,7 +2935,7 @@ router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
+    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${-itemAmt}</AMOUNT>
     <ACTUALQTY>${qty}</ACTUALQTY>
     <BILLEDQTY>${billed}</BILLEDQTY>
@@ -3025,6 +3070,11 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     numbering_policy = 'tally_prime_series',
     original_entry_type = 'regular',
     againstOrderNo = null,
+    dispatch_details = null,
+    placeOfSupply = null,
+    referenceDate = null,
+    paymentTerms = null,
+    termsText = null,
   } = req.body;
   if (!companyGuid || !partyLedger) {
     return res.status(400).json({ status: false, message: 'companyGuid and partyLedger required' });
@@ -3051,6 +3101,17 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
 
+  const tagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const itemsWithHsn = tagCtx.withHsn(items);
+  const headerExtrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply: placeOfSupply || dispatch_details?.dispatch_from_state || tagCtx.partyState,
+    partyGstin: tagCtx.partyGstin,
+    referenceDate: referenceDate || null,
+    paymentTerms: paymentTerms || '',
+    termsText: termsText || '',
+  });
+  const purchaseDispatchXml = buildDispatchXml(dispatch_details, date);
+
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
@@ -3075,6 +3136,7 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
   <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
   <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
 
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
@@ -3091,14 +3153,14 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
     </BILLALLOCATIONS.LIST>` : ''}
   </LEDGERENTRIES.LIST>`;
 
-  for (const item of items) {
+  for (const item of itemsWithHsn) {
     const ia = parseFloat(item.amount) || 0;
     const qty = item.actualQty || item.billedQty || 1;
     const billed = item.billedQty || qty;
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>
+    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${-ia}</AMOUNT>
     <ACTUALQTY>${qty}</ACTUALQTY>
     <BILLEDQTY>${billed}</BILLEDQTY>
@@ -3198,6 +3260,10 @@ router.post('/voucher/purchase', authMiddleware, async (req, res) => {
           partyLedger, bankLedger: make_payment.ledgerName, amount: payAmt,
           parentInvoiceUuid: invoiceUuid, parentTdkRef: tdkRef,
           isOptional, reference: make_payment.reference || reference,
+          paymentMethod: make_payment.mode || '',
+          instrument: make_payment.instrument || (make_payment.reference
+            ? { instrumentNo: make_payment.reference }
+            : null),
           parentCreatedAt: invoiceCreatedAt,
         });
         if (paymentResult?.ok) {
@@ -3261,9 +3327,19 @@ export function buildCreditNoteXml({
   taxes = [],
   billRefName,
   partyAmount = 0,
+  placeOfSupply = '',
+  partyGstin = '',
+  referenceDate = '',
+  paymentTerms = '',
+  termsText = '',
+  dispatch_details = null,
 }) {
   const dt = tallyDate(date);
   const isOpt = isOptional ? 'Yes' : 'No';
+  const extrasXml = [
+    buildVoucherHeaderExtrasXml({ placeOfSupply, partyGstin, referenceDate, paymentTerms, termsText }),
+    buildDispatchXml(dispatch_details, date),
+  ].filter(Boolean).join('\n');
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -3290,7 +3366,7 @@ export function buildCreditNoteXml({
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${escapeXml(narration)}</NARRATION>
   <PARTYNAME>${escapeXml(partyLedger)}</PARTYNAME>
-  <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>`;
+  <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>${extrasXml ? `\n${extrasXml}` : ''}`;
 
   for (const item of items) {
     const qty = item.qty;
@@ -3303,7 +3379,7 @@ export function buildCreditNoteXml({
       : `${rawRate}${item.unit ? `/${item.unit}` : ''}`;
     xml += `
   <ALLINVENTORYENTRIES.LIST>
-    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>
+    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <RATE>${escapeXml(rateXml)}</RATE>
     <AMOUNT>${negAmt}</AMOUNT>
@@ -3518,6 +3594,11 @@ router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
     numbering_policy = 'tally_prime_series', // 'tally_prime_series' | 'tallydekho_series'
     linked_invoice = null,                   // { invoiceGuid, voucherNumber, billRefName, tdkRef }
     reference,                               // fallback only; REFERENCE is the TDK-CN ref
+    dispatch_details = null,
+    placeOfSupply = null,
+    referenceDate = null,
+    paymentTerms = null,
+    termsText = null,
   } = req.body;
 
   const bad = (message, code = 400) => res.status(code).json({ status: false, message });
@@ -3596,6 +3677,7 @@ router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
       if (tdkCreditNoteNo) effectiveVoucherNumber = tdkCreditNoteNo;
     }
 
+    const cnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, normItems);
     const xml = buildCreditNoteXml({
       companyName: resolvedCompanyName,
       date,
@@ -3604,10 +3686,16 @@ router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
       narration: narration || '',
       partyLedger,
       isOptional,
-      items: normItems,
+      items: cnTagCtx.withHsn(normItems),
       taxes: normTaxes,
       billRefName,
       partyAmount: amt,
+      placeOfSupply: placeOfSupply || cnTagCtx.partyState,
+      partyGstin: cnTagCtx.partyGstin,
+      referenceDate: referenceDate || context.linkedInvoice.date || '',
+      paymentTerms: paymentTerms || '',
+      termsText: termsText || '',
+      dispatch_details,
     });
 
     const linkedInvoicePayload = {
@@ -3732,10 +3820,18 @@ export function buildDebitNoteXml({
   taxes = [],
   billRefName,
   partyAmount = 0,
+  placeOfSupply = '',
+  partyGstin = '',
+  referenceDate = '',
+  paymentTerms = '',
+  termsText = '',
 }) {
   const dt = tallyDate(date);
   const isOpt = isOptional ? 'Yes' : 'No';
   const partyAmt = -Math.abs(partyAmount);
+  const extrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply, partyGstin, referenceDate, paymentTerms, termsText,
+  });
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
@@ -3762,7 +3858,7 @@ export function buildDebitNoteXml({
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${escapeXml(narration)}</NARRATION>
   <PARTYNAME>${escapeXml(partyLedger)}</PARTYNAME>
-  <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>`;
+  <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>${extrasXml ? `\n${extrasXml}` : ''}`;
 
   for (const item of items) {
     const qty = item.qty;
@@ -3773,7 +3869,7 @@ export function buildDebitNoteXml({
       : `${rawRate}${item.unit ? `/${item.unit}` : ''}`;
     xml += `
   <ALLINVENTORYENTRIES.LIST>
-    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>
+    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <RATE>${escapeXml(rateXml)}</RATE>
     <AMOUNT>${amount}</AMOUNT>
@@ -4047,6 +4143,7 @@ router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
       if (tdkDebitNoteNo) effectiveVoucherNumber = tdkDebitNoteNo;
     }
 
+    const dnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, normItems);
     const xml = buildDebitNoteXml({
       companyName: resolvedCompanyName,
       date,
@@ -4055,10 +4152,15 @@ router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
       narration: narration || '',
       partyLedger,
       isOptional,
-      items: normItems,
+      items: dnTagCtx.withHsn(normItems),
       taxes: normTaxes,
       billRefName,
       partyAmount: amt,
+      placeOfSupply: req.body.placeOfSupply || dnTagCtx.partyState,
+      partyGstin: dnTagCtx.partyGstin,
+      referenceDate: req.body.referenceDate || context.linkedInvoice.date || '',
+      paymentTerms: req.body.paymentTerms || '',
+      termsText: req.body.termsText || '',
     });
 
     const linkedInvoicePayload = {
@@ -4263,6 +4365,17 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
     ].filter(Boolean).join('\n');
   }
 
+  // Delivery Note builds its own BASICSHIP* tags above, so only the e-Way Bill
+  // block is borrowed from the shared dispatch builder.
+  const dnEwbXml = buildDispatchXml(dispatch_details, date, { ewbOnly: true });
+  const dnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const dnItems = dnTagCtx.withHsn(items);
+  const dnExtrasXml = buildVoucherHeaderExtrasXml({
+    placeOfSupply: req.body.placeOfSupply || dispatch_details?.ship_to_state || dnTagCtx.partyState,
+    partyGstin: dnTagCtx.partyGstin,
+    referenceDate: req.body.referenceDate || linked_order?.order_date || '',
+  });
+
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'DN').catch(() => null);
 
   // TallyDekho Series: we own the sequence, so the number is final immediately.
@@ -4295,7 +4408,7 @@ router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
   <DIFFACTUALQTY>Yes</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
   <NARRATION>${escapeXml(narration || '')}</NARRATION>
-${dispatchXml}
+${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
   <PARTYLEDGERNAME>${escapeXml(partyLedger)}</PARTYLEDGERNAME>
 
   <LEDGERENTRIES.LIST>
@@ -4307,7 +4420,7 @@ ${dispatchXml}
     <AMOUNT>${-amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
-  for (const item of items) {
+  for (const item of dnItems) {
     const itemAmt  = parseFloat(item.amount) || 0;
     const actualQty = item.actualQty || item.billedQty || 1;
     const billedQty = item.billedQty || item.actualQty || 1;
@@ -4321,7 +4434,7 @@ ${dispatchXml}
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>
+    <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <RATE>${escapeXml(rateXml)}</RATE>
     <AMOUNT>${itemAmt}</AMOUNT>
     <ACTUALQTY>${actualQty}</ACTUALQTY>
@@ -5783,8 +5896,119 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, async (req, res) => {
   }
 });
 
+// ── VoucherDocument presentation tables (see tallydekho-brain/PDF_LAYOUT_SPEC.md) ─────────
+
+const DOCUMENT_TYPE_BY_VOUCHER = {
+  sales: 'sales_invoice',
+  sales_invoice: 'sales_invoice',
+  proforma_invoice: 'proforma_invoice',
+  purchase: 'purchase_invoice',
+  purchase_invoice: 'purchase_invoice',
+  credit_note: 'credit_note',
+  debit_note: 'debit_note',
+  delivery_note: 'delivery_note',
+  receipt_note: 'receipt_note',
+  sales_order: 'sales_order',
+  purchase_order: 'purchase_order',
+  // No write path (Proforma and Sales Order cover pre-sale), but Tally-synced
+  // quotations must not fall through and render as a tax invoice.
+  quotation: 'quotation',
+};
+
+const TALLY_VOUCHER_TYPE_BY_DOCUMENT = {
+  sales_invoice: 'Sales',
+  proforma_invoice: 'Sales',
+  purchase_invoice: 'Purchase',
+  credit_note: 'Credit Note',
+  debit_note: 'Debit Note',
+  delivery_note: 'Delivery Note',
+  receipt_note: 'Receipt Note',
+  sales_order: 'Sales Order',
+  purchase_order: 'Purchase Order',
+};
+
+const DOCUMENT_TITLE = {
+  sales_invoice: 'TAX INVOICE',
+  proforma_invoice: 'PROFORMA INVOICE',
+  purchase_invoice: 'TAX INVOICE',
+  credit_note: 'Tax Invoice',
+  debit_note: 'Debit Note',
+  delivery_note: 'DELIVERY NOTE',
+  receipt_note: 'RECEIPT NOTE',
+  sales_order: 'SALES ORDER',
+  purchase_order: 'PURCHASE ORDER',
+  receipt: 'Receipt Voucher',
+  payment: 'Payment Voucher',
+  journal: 'Journal Voucher',
+  contra: 'Contra Voucher',
+  stock_transfer: 'Stock Journal',
+  stock_adjustment: 'Physical Stock',
+};
+
+const PURCHASE_SIDE_DOCUMENTS = new Set(['purchase_invoice', 'debit_note', 'purchase_order', 'receipt_note']);
+const HSN_SUMMARY_DOCUMENTS = new Set(['sales_invoice', 'proforma_invoice', 'purchase_invoice']);
+const DECLARATION_DOCUMENTS = new Set(['sales_invoice', 'proforma_invoice']);
+
+/**
+ * Which layout family the renderer should use.
+ * `invoice` = Tally invoice grid, `voucher` = Dr/Cr accounting voucher,
+ * `stock` = stock journal / physical stock sheet.
+ */
+function documentLayout(documentType) {
+  if (['receipt', 'payment', 'journal', 'contra'].includes(documentType)) {
+    return {
+      family: 'voucher',
+      title: DOCUMENT_TITLE[documentType],
+      columns: ['receipt', 'payment'].includes(documentType) ? ['amount'] : ['debit', 'credit'],
+      showThrough: ['receipt', 'payment'].includes(documentType),
+      showGstin: documentType !== 'contra',
+      showSignatory: true,
+    };
+  }
+  if (['stock_transfer', 'stock_adjustment'].includes(documentType)) {
+    return {
+      family: 'stock',
+      title: DOCUMENT_TITLE[documentType],
+      showSignatory: true,
+    };
+  }
+  return {
+    family: 'invoice',
+    title: DOCUMENT_TITLE[documentType] || 'TAX INVOICE',
+    partyRole: PURCHASE_SIDE_DOCUMENTS.has(documentType) ? 'supplier' : 'buyer',
+    partyLabel: PURCHASE_SIDE_DOCUMENTS.has(documentType) ? 'Supplier (Bill from)' : 'Buyer (Bill to)',
+    showHsnSummary: HSN_SUMMARY_DOCUMENTS.has(documentType),
+    showDeclaration: DECLARATION_DOCUMENTS.has(documentType),
+    showReceivedInGoodCondition: documentType === 'delivery_note',
+    showJurisdiction: DECLARATION_DOCUMENTS.has(documentType),
+    computerGeneratedText: documentType === 'sales_invoice'
+      ? 'This is a Computer Generated Invoice'
+      : 'This is a Computer Generated Document',
+    showSignatory: true,
+  };
+}
+
+/** Number / posting state shared by every document type. */
+function documentNumbering(av) {
+  const hasNumber = !!av.tally_voucher_no;
+  const isPosted = av.books_impact_status === 'posted';
+  const numberPending = isPosted && !hasNumber;
+  return {
+    documentNumber: hasNumber
+      ? av.tally_voucher_no
+      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime'),
+    postingTag: isPosted ? 'Posted' : 'Not Posted',
+    isProvisional: !hasNumber,
+    numberPending,
+    watermarkText: numberPending
+      ? 'Posted — Tally series number pending sync'
+      : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
+    numberingMode: av.numbering_policy || 'tally_prime_series',
+  };
+}
+
 // ── Helper: build VoucherDocument from app_vouchers row + company/party info ──────────────
-async function buildVoucherDocument(av, companyRow, partyRow) {
+async function buildVoucherDocument(av, ctxOverride = null) {
   const p = av.payload || {};
   const vType = (av.voucher_type || '').toLowerCase();
   const isReceipt = vType === 'receipt';
@@ -5794,44 +6018,69 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
   const isStockAdjustment = vType === 'stock_adjustment';
   const isStockTransfer = vType === 'stock_transfer';
 
+  const partyName = av.party_name || p.partyLedger || '';
+  const itemNames = (Array.isArray(p.items) ? p.items : [])
+    .map((i) => i.itemName || i.name)
+    .filter(Boolean);
+  const ctx = ctxOverride
+    || await loadDocumentContext(av.company_guid, partyName, itemNames);
+  const company = buildCompanyBlock(ctx.companyRow, p, ctx.printProfile);
+  const party = buildPartyBlock(ctx.partyRow, partyName);
+  const numbering = documentNumbering(av);
+
   // ── Stock Journal / stock transfer document ────────────────────────────────
   if (isStockTransfer) {
-    const hasNumber = !!av.tally_voucher_no;
-    const isPosted = av.books_impact_status === 'posted';
-    const numberPending = isPosted && !hasNumber;
-    const documentNumber = hasNumber
-      ? av.tally_voucher_no
-      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
-    const postingTag = isPosted ? 'Posted' : 'Not Posted';
     const transferItems = Array.isArray(p.items) ? p.items : [];
+    const transferTotal = parseFloat(av.total_amount || 0);
+    // Tally's Stock Journal prints a Source (Consumption) table and a
+    // Destination (Production) table, so each moved item becomes two lines.
+    const transferLines = [];
+    transferItems.forEach((it, idx) => {
+      const qty = parseFloat(it.qty) || 0;
+      const rate = parseFloat(it.rate) || 0;
+      const base = {
+        name: it.itemName || '',
+        qty,
+        unit: it.unit || 'pcs',
+        rate,
+        amount: parseFloat(it.amount) || rate * qty,
+      };
+      transferLines.push({
+        ...base,
+        id: `${idx}-out`,
+        direction: 'out',
+        godown: it.fromGodown || p.fromGodown || '',
+      });
+      transferLines.push({
+        ...base,
+        id: `${idx}-in`,
+        direction: 'in',
+        godown: p.toGodown || '',
+      });
+    });
     return {
       documentType: 'stock_transfer',
       tallyVoucherType: 'Stock Journal',
-      documentNumber,
+      ...numbering,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0, 10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
-      postingTag,
-      isProvisional: !hasNumber,
-      numberPending,
-      watermarkText: numberPending
-        ? 'Posted — Tally series number pending sync'
-        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
-      numberingMode: av.numbering_policy || 'tally_prime_series',
-      company: {
-        name: companyRow?.name || p.companyName || '',
-        address: companyRow?.address || '',
-        gstin: companyRow?.gstin || '',
-        pan: companyRow?.pan || '',
-        phone: companyRow?.phone || '',
-        email: companyRow?.email || '',
-        state: companyRow?.state || '',
-      },
+      layout: documentLayout('stock_transfer'),
+      company,
       party: {
+        ...party,
         name: av.party_name || `${p.fromGodown || ''} → ${p.toGodown || ''}`,
       },
       totals: {
-        grandTotal: parseFloat(av.total_amount || 0),
+        grandTotal: transferTotal,
+        totalQty: transferItems.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0),
+      },
+      totalInWords: amountInWords(transferTotal),
+      items: transferLines,
+      metadata: {
+        referenceNo: av.tdk_reference_no || null,
+        sourceGodown: p.fromGodown || (transferItems[0] && transferItems[0].fromGodown) || null,
+        destinationGodown: p.toGodown || null,
       },
       stockTransfer: {
         toGodown: p.toGodown || '',
@@ -5850,44 +6099,42 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
 
   // ── Physical Stock / stock adjustment document ─────────────────────────────
   if (isStockAdjustment) {
-    const hasNumber = !!av.tally_voucher_no;
-    const isPosted = av.books_impact_status === 'posted';
-    const numberPending = isPosted && !hasNumber;
-    const documentNumber = hasNumber
-      ? av.tally_voucher_no
-      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
-    const postingTag = isPosted ? 'Posted' : 'Not Posted';
     const adjQty = parseFloat(p.adjustmentQty || 0);
     const qtyBefore = parseFloat(p.qtyBefore || 0);
     const qtyAfter = parseFloat(p.qtyAfter ?? (qtyBefore + (p.isIncrease ? adjQty : -adjQty)));
+    const adjTotal = parseFloat(av.total_amount || 0);
     return {
       documentType: 'stock_adjustment',
       tallyVoucherType: 'Physical Stock',
-      documentNumber,
+      ...numbering,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0, 10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
-      postingTag,
-      isProvisional: !hasNumber,
-      numberPending,
-      watermarkText: numberPending
-        ? 'Posted — Tally series number pending sync'
-        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
-      numberingMode: av.numbering_policy || 'tally_prime_series',
-      company: {
-        name: companyRow?.name || p.companyName || '',
-        address: companyRow?.address || '',
-        gstin: companyRow?.gstin || '',
-        pan: companyRow?.pan || '',
-        phone: companyRow?.phone || '',
-        email: companyRow?.email || '',
-        state: companyRow?.state || '',
-      },
+      layout: documentLayout('stock_adjustment'),
+      company,
       party: {
+        ...party,
         name: p.stockName || av.party_name || '',
       },
       totals: {
-        grandTotal: parseFloat(av.total_amount || 0),
+        grandTotal: adjTotal,
+        totalQty: adjQty,
+      },
+      totalInWords: amountInWords(adjTotal),
+      // Physical Stock prints a single counted-quantity table, so no direction.
+      items: [{
+        id: '0',
+        name: p.stockName || av.party_name || '',
+        qty: qtyAfter,
+        unit: p.unit || 'pcs',
+        rate: parseFloat(p.rate) || 0,
+        amount: adjTotal,
+        godown: p.warehouse || '',
+      }],
+      metadata: {
+        referenceNo: av.tdk_reference_no || null,
+        warehouse: p.warehouse || null,
+        adjustmentReason: p.adjustmentReason || null,
       },
       stockAdjustment: {
         stockName: p.stockName || av.party_name || '',
@@ -5906,45 +6153,24 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
 
   // ── Contra document (Source Cr → Destination Dr) ───────────────────────────
   if (isContra) {
-    const hasNumber = !!av.tally_voucher_no;
-    const isPosted = av.books_impact_status === 'posted';
-    const numberPending = isPosted && !hasNumber;
-    const documentNumber = hasNumber
-      ? av.tally_voucher_no
-      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
-    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    const contraTotal = parseFloat(av.total_amount || p.amount || 0);
     return {
       documentType: 'contra',
-      documentNumber,
+      tallyVoucherType: 'Contra',
+      ...numbering,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
-      postingTag,
-      isProvisional: !hasNumber,
-      numberPending,
-      watermarkText: numberPending
-        ? 'Posted — Tally series number pending sync'
-        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
-      numberingMode: av.numbering_policy || 'tally_prime_series',
-      company: {
-        name: companyRow?.name || p.companyName || '',
-        address: companyRow?.address || '',
-        gstin: companyRow?.gstin || '',
-        pan: companyRow?.pan || '',
-        phone: companyRow?.phone || '',
-        email: companyRow?.email || '',
-        state: companyRow?.state || '',
-      },
+      layout: documentLayout('contra'),
+      company,
       party: {
+        ...party,
         name: av.party_name || p.fromLedger || '',
-        address: '',
-        gstin: '',
-        pan: '',
-        phone: '',
       },
       totals: {
-        grandTotal: parseFloat(av.total_amount || p.amount || 0),
+        grandTotal: contraTotal,
       },
+      totalInWords: amountInWords(contraTotal),
       contra: {
         fromLedger: p.fromLedger || av.party_name || '',
         toLedger: p.toLedger || '',
@@ -5960,45 +6186,24 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
 
   // ── Journal document (single Dr+Cr pair) ───────────────────────────────────
   if (isJournal) {
-    const hasNumber = !!av.tally_voucher_no;
-    const isPosted = av.books_impact_status === 'posted';
-    const numberPending = isPosted && !hasNumber;
-    const documentNumber = hasNumber
-      ? av.tally_voucher_no
-      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
-    const postingTag = isPosted ? 'Posted' : 'Not Posted';
+    const journalTotal = parseFloat(av.total_amount || p.amount || 0);
     return {
       documentType: 'journal',
-      documentNumber,
+      tallyVoucherType: 'Journal',
+      ...numbering,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
-      postingTag,
-      isProvisional: !hasNumber,
-      numberPending,
-      watermarkText: numberPending
-        ? 'Posted — Tally series number pending sync'
-        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
-      numberingMode: av.numbering_policy || 'tally_prime_series',
-      company: {
-        name: companyRow?.name || p.companyName || '',
-        address: companyRow?.address || '',
-        gstin: companyRow?.gstin || '',
-        pan: companyRow?.pan || '',
-        phone: companyRow?.phone || '',
-        email: companyRow?.email || '',
-        state: companyRow?.state || '',
-      },
+      layout: documentLayout('journal'),
+      company,
       party: {
+        ...party,
         name: av.party_name || p.drLedger || '',
-        address: '',
-        gstin: '',
-        pan: '',
-        phone: '',
       },
       totals: {
-        grandTotal: parseFloat(av.total_amount || p.amount || 0),
+        grandTotal: journalTotal,
       },
+      totalInWords: amountInWords(journalTotal),
       journal: {
         drLedger: p.drLedger || av.party_name || '',
         crLedger: p.crLedger || '',
@@ -6011,14 +6216,6 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
 
   // ── Receipt / Payment document (shared shape; payment uses `payment` key) ──
   if (isReceipt || isPayment) {
-    const hasNumber = !!av.tally_voucher_no;
-    const isPosted = av.books_impact_status === 'posted';
-    // Posted in books but series not synced yet → not a "failed" provisional create
-    const numberPending = isPosted && !hasNumber;
-    const documentNumber = hasNumber
-      ? av.tally_voucher_no
-      : (numberPending ? 'Posted · number pending sync' : 'Pending from TallyPrime');
-    const postingTag = isPosted ? 'Posted' : 'Not Posted';
     const billAllocations = Array.isArray(p.billAllocations) ? p.billAllocations : [];
     const instrument = p.instrumentDetails || null;
     const moneyBlock = {
@@ -6037,157 +6234,127 @@ async function buildVoucherDocument(av, companyRow, partyRow) {
         transactionType: instrument.transactionType || '',
       } : null,
     };
+    const moneyTotal = parseFloat(av.total_amount || p.amount || 0);
+    const documentType = isPayment ? 'payment' : 'receipt';
     return {
-      documentType: isPayment ? 'payment' : 'receipt',
-      documentNumber,
+      documentType,
+      tallyVoucherType: isPayment ? 'Payment' : 'Receipt',
+      ...numbering,
       documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
       tdkRef: av.tdk_reference_no,
       invoiceUuid: av.invoice_uuid,
-      postingTag,
-      isProvisional: !hasNumber,
-      numberPending,
-      watermarkText: numberPending
-        ? 'Posted — Tally series number pending sync'
-        : (!hasNumber ? 'Provisional / Pending Tally Posting' : null),
-      numberingMode: av.numbering_policy || 'tally_prime_series',
-      company: {
-        name: companyRow?.name || p.companyName || '',
-        address: companyRow?.address || '',
-        gstin: companyRow?.gstin || '',
-        pan: companyRow?.pan || '',
-        phone: companyRow?.phone || '',
-        email: companyRow?.email || '',
-        state: companyRow?.state || '',
-      },
-      party: {
-        name: av.party_name || p.partyLedger || '',
-        address: partyRow?.address || '',
-        gstin: partyRow?.gstin || '',
-        pan: partyRow?.pan || '',
-        phone: partyRow?.phone || '',
-      },
+      layout: documentLayout(documentType),
+      company,
+      party,
       totals: {
-        grandTotal: parseFloat(av.total_amount || p.amount || 0),
+        grandTotal: moneyTotal,
       },
+      totalInWords: amountInWords(moneyTotal),
       receipt: isReceipt ? moneyBlock : undefined,
       payment: isPayment ? moneyBlock : undefined,
       narration: p.narration || '',
     };
   }
 
-  // ── Sales invoice document (original) ─────────────────────────────────────
-  const items = (p.items || []).map((item, idx) => ({
-    id: String(idx),
-    name: item.itemName || item.name || 'Item',
-    qty: parseFloat(item.billedQty || item.actualQty || 1),
-    unit: item.unit || 'Nos',
-    rate: parseFloat(item.rate || 0),
-    discount: parseFloat(item.discount || 0),
-    taxAmount: parseFloat(item.taxAmount || 0),
-    amount: parseFloat(item.amount || 0),
-  }));
-
-  // Build tax lines from taxes array
-  const taxLines = (p.taxes || []).map(t => ({
-    description: t.ledgerName || 'Tax',
-    rate: parseFloat(t.taxRate || 0),
-    taxableAmount: parseFloat(t.taxableValue || 0),
-    total: parseFloat(t.taxAmount || 0),
-  }));
-
-  const isProvisional = !av.tally_voucher_no;
-  const invoiceNumberLabel = av.tally_voucher_no || 'Pending from TallyPrime';
-  const postingTag = av.books_impact_status === 'posted' ? 'Posted' : 'Not Posted';
+  // ── Invoice-grid documents (sales / purchase / notes / orders) ─────────────
   const isSalesOrder = vType === 'sales_order';
+  const isPurchaseOrder = vType === 'purchase_order';
   const isCreditNote = vType === 'credit_note';
+  const isDebitNote = vType === 'debit_note';
+  const isDeliveryNote = vType === 'delivery_note';
   const isPurchaseInvoice = vType === 'purchase_invoice' || vType === 'purchase';
   const isProforma = vType === 'proforma_invoice';
+  const isOrder = isSalesOrder || isPurchaseOrder;
 
-  // A Credit Note shares the item/tax/total shape of a Sales invoice; it only differs
-  // in document type and in always carrying the invoice it returns against.
+  // A converted Proforma prints as a Tax Invoice; while still optional it stays Proforma.
+  const documentType = isProforma
+    && !(av.current_entry_type === 'optional' && av.conversion_status !== 'converted')
+    ? 'sales_invoice'
+    : (DOCUMENT_TYPE_BY_VOUCHER[vType] || 'sales_invoice');
+
+  const items = buildItemLines(p, ctx.itemMasters);
+  const taxLines = buildTaxLines(p);
+  const { charges, roundOff } = buildChargeLines(p);
+  const totals = buildTotals(p, av, items, taxLines, charges, roundOff);
+  const hsnSummary = HSN_SUMMARY_DOCUMENTS.has(documentType)
+    ? buildHsnSummary(items, taxLines)
+    : [];
+  const metadata = buildDocumentMetadata(p, av);
+  const shipping = buildShippingBlock(p, party);
+  const dispatchFrom = buildDispatchFromBlock(p, company);
+
+  // Notes carry the invoice they are raised against.
   const linkedInvoice = p.linked_invoice || p.linkedInvoice || null;
+  const againstInvoice = linkedInvoice ? {
+    invoiceGuid:   linkedInvoice.invoiceGuid   || null,
+    voucherNumber: linkedInvoice.voucherNumber || null,
+    date:          linkedInvoice.date          || null,
+    billRefName:   linkedInvoice.billRefName   || null,
+    tdkRef:        linkedInvoice.tdkRef        || null,
+    amount:        linkedInvoice.amount != null ? parseFloat(linkedInvoice.amount) : null,
+  } : null;
 
   const payBlock = p.make_payment || p.collect_payment || null;
 
   return {
-    documentType: isCreditNote
-      ? 'credit_note'
-      : (isSalesOrder
-        ? 'sales_order'
-        : (isPurchaseInvoice
-          ? 'purchase_invoice'
-          // Converted Proforma displays as Tax Invoice; unconverted stays Proforma
-          : (isProforma && av.current_entry_type === 'optional' && av.conversion_status !== 'converted'
-            ? 'proforma_invoice'
-            : 'sales_invoice'))),
+    documentType,
+    tallyVoucherType: TALLY_VOUCHER_TYPE_BY_DOCUMENT[documentType] || 'Sales',
+    layout: documentLayout(documentType),
     currentEntryType: av.current_entry_type || null,
     conversionStatus: av.conversion_status || null,
     canConvertProforma: isProforma
       && av.current_entry_type === 'optional'
       && av.conversion_status !== 'converted'
       && (!!av.tally_voucher_no || av.tally_sync_status === 'synced'),
-    tallyVoucherType: isCreditNote ? 'Credit Note' : (isPurchaseInvoice ? 'Purchase' : undefined),
-    documentNumber: invoiceNumberLabel,
+    ...numbering,
     documentDate: av.voucher_date ? new Date(av.voucher_date).toISOString().slice(0,10) : (p.date || ''),
     tdkRef: av.tdk_reference_no,
     invoiceUuid: av.invoice_uuid,
-    postingTag,
-    isProvisional,
-    watermarkText: isProvisional ? 'Provisional / Pending Tally Posting' : null,
-    numberingMode: av.numbering_policy || 'tally_prime_series',
-    company: {
-      name: companyRow?.name || p.companyName || '',
-      address: companyRow?.address || '',
-      gstin: companyRow?.gstin || '',
-      pan: companyRow?.pan || '',
-      phone: companyRow?.phone || '',
-      email: companyRow?.email || '',
-      state: companyRow?.state || '',
-    },
-    party: {
-      name: av.party_name || p.partyLedger || '',
-      address: partyRow?.address || '',
-      gstin: partyRow?.gstin || '',
-      pan: partyRow?.pan || '',
-      phone: partyRow?.phone || '',
-    },
+    company,
+    party,
+    billing: party,
+    shipping,
+    dispatchFrom,
+    metadata,
     items,
     taxLines,
-    totals: {
-      subtotal: items.reduce((s, i) => s + i.amount, 0),
-      taxTotal: taxLines.reduce((s, t) => s + t.total, 0),
-      grandTotal: parseFloat(av.total_amount || p.totalAmount || 0),
-      roundOff: parseFloat(p.roundOffAmount || 0),
-    },
+    hsnSummary,
+    additionalCharges: charges,
+    totals,
+    totalInWords: amountInWords(totals.grandTotal),
+    taxAmountInWords: totals.taxTotal > 0 ? amountInWords(totals.taxTotal) : 'NIL',
     narration: p.narration || '',
     termsText: p.termsText || '',
     dueDate: p.dueDate || '',
+    placeOfSupply: metadata.placeOfSupply,
     rawPayload: p,
     creditNote: isCreditNote ? {
       natureOfReturn: p.natureOfReturn || '01-Sales Return',
       returnType: 'Sales Return',
-      againstInvoice: linkedInvoice ? {
-        invoiceGuid:   linkedInvoice.invoiceGuid   || null,
-        voucherNumber: linkedInvoice.voucherNumber || null,
-        date:          linkedInvoice.date          || null,
-        billRefName:   linkedInvoice.billRefName   || null,
-        tdkRef:        linkedInvoice.tdkRef        || null,
-        amount:        linkedInvoice.amount != null ? parseFloat(linkedInvoice.amount) : null,
-      } : null,
+      againstInvoice,
     } : undefined,
-    paymentInfo: !isSalesOrder && payBlock ? {
+    debitNote: isDebitNote ? {
+      natureOfReturn: p.natureOfReturn || '02-Purchase Return',
+      returnType: 'Purchase Return',
+      againstInvoice,
+    } : undefined,
+    deliveryNote: isDeliveryNote ? {
+      trackingNumbers: (Array.isArray(p.items) ? p.items : [])
+        .map((i) => i.trackingNumber).filter(Boolean),
+    } : undefined,
+    paymentInfo: !isOrder && payBlock ? {
       collected: parseFloat(payBlock.amount || 0),
       mode: payBlock.ledgerName || '',
       reference: payBlock.reference || '',
       kind: p.make_payment ? 'payment' : 'receipt',
     } : undefined,
-    againstInvoiceNo: isCreditNote ? (linkedInvoice?.voucherNumber || linkedInvoice?.billRefName || '') : undefined,
-    againstOrderNo: isSalesOrder ? (av.tally_voucher_no || p.againstOrderNo || '') : (p.againstOrderNo || ''),
-    additionalCharges: (p.logistics || []).map(l => ({
-      description: l.ledgerName || 'Charge',
-      amount: parseFloat(l.amount || 0),
-    })),
-    dispatchDetails: !isSalesOrder ? (p.dispatch_details || null) : null,
+    againstInvoiceNo: (isCreditNote || isDebitNote)
+      ? (againstInvoice?.voucherNumber || againstInvoice?.billRefName || '')
+      : undefined,
+    againstOrderNo: isOrder ? (av.tally_voucher_no || p.againstOrderNo || '') : (p.againstOrderNo || ''),
+    supplierInvoiceNo: isPurchaseInvoice ? (p.vendorInvoiceNo || '') : undefined,
+    supplierInvoiceDate: isPurchaseInvoice ? (p.vendorInvoiceDate || '') : undefined,
+    dispatchDetails: !isOrder ? (p.dispatch_details || null) : null,
   };
 }
 
@@ -6350,12 +6517,7 @@ router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
     const av = avRows[0];
 
-    const [{ rows: coRows }, { rows: partyRows }] = await Promise.all([
-      query(`SELECT name, gstin, address, pan, phone, email, state FROM companies WHERE guid=$1`, [companyGuid]).catch(() => ({ rows: [] })),
-      query(`SELECT name, gstin, mailing_address AS address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1`, [companyGuid, av.party_name]).catch(() => ({ rows: [] })),
-    ]);
-
-    const doc = await buildVoucherDocument(av, coRows[0], partyRows[0]);
+    const doc = await buildVoucherDocument(av);
 
     res.json({ status: true, data: doc });
   } catch (e) {
@@ -6392,12 +6554,7 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, async (req, res) => {
       }
     }
 
-    const [{ rows: coRows }, { rows: partyRows }] = await Promise.all([
-      query(`SELECT name, gstin, address, pan, phone, email, state FROM companies WHERE guid=$1`, [companyGuid]).catch(() => ({ rows: [] })),
-      query(`SELECT name, gstin, mailing_address AS address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1`, [companyGuid, av.party_name]).catch(() => ({ rows: [] })),
-    ]);
-
-    const doc = await buildVoucherDocument(av, coRows[0], partyRows[0]);
+    const doc = await buildVoucherDocument(av);
     const pdfType = av.tally_voucher_no ? 'final' : 'provisional';
 
     res.json({
@@ -6416,4 +6573,5 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, async (req, res) => {
   }
 });
 
+export { buildVoucherDocument };
 export default router;

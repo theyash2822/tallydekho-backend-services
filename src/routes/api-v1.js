@@ -776,11 +776,13 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
     const { rows } = await query(
-      `SELECT id, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
+      `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
       [companyGuid, from, to]
     );
     const activity = rows.map(r => ({
       id: String(r.id),
+      // guid drives navigation to the real document preview (/document/[guid]).
+      guid: r.guid || null,
       type: (r.voucher_type||'').toLowerCase().includes('receipt') ? 'credit' : 'debit',
       label: `${r.voucher_type} ${r.voucher_number ? '#'+r.voucher_number : ''}`.trim(),
       amount_raw: +r.amount || 0,
@@ -1489,9 +1491,9 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     // GST details
     const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]);
     // Company info — full profile
-    const { rows: co } = await query('SELECT name, formal_name, gstin, address, state, country FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
-    // Party ledger details (GSTIN, address etc)
-    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, email, address FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
+    const { rows: co } = await query('SELECT name, formal_name, gstin, pan, phone, mobile, email, website, address, state, pincode, country FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    // Party ledger details (GSTIN, address etc) — state_name feeds Place of Supply on the print
+    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
     // Ledger entries — used to compute the TRUE party amount (not v.amount which may be wrong)
     const { rows: ledgerEntries } = await query(
       'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY ABS(amount) DESC',
@@ -1506,6 +1508,11 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
       [v.voucher_number, companyGuid]
     ).catch(() => ({ rows: [] }));
     const avPayload = avRows[0]?.payload || null;
+    // Compliance acknowledgements — the IRN band and e-Way Bill line on the print.
+    const [{ rows: eInv }, { rows: eWb }] = await Promise.all([
+      query('SELECT irn, ack_no, ack_date, qr_code, status FROM e_invoice_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]).catch(() => ({ rows: [] })),
+      query('SELECT ewb_no, ewb_date, valid_till, vehicle_no, transporter_id, status FROM e_way_bill_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]).catch(() => ({ rows: [] })),
+    ]);
     res.json({
       success: true,
       data: {
@@ -1515,6 +1522,8 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
         company: co[0] || null,
         party: partyLedger[0] || null,
         ledger_entries: ledgerEntries,
+        e_invoice: eInv[0] || null,
+        e_way_bill: eWb[0] || null,
         // App-origin data — present only for TallyDekho-created vouchers
         dispatch_details: avPayload?.dispatch_details || null,
         collect_payment: avPayload?.collect_payment || null,
@@ -3022,7 +3031,7 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
 
     // Recent stock activity (last 500 transactions)
     const { rows: activity } = await query(
-      `SELECT st.type, st.qty, st.warehouse, s.name as stock_name, v.voucher_number, v.date, v.voucher_type
+      `SELECT st.type, st.qty, st.warehouse, s.name as stock_name, v.guid as voucher_guid, v.voucher_number, v.date, v.voucher_type
        FROM stock_transactions st
        LEFT JOIN stocks s ON s.name = st.stock_guid AND s.company_guid = st.company_guid
        LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
@@ -3040,6 +3049,7 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
         skus: parseInt(summary[0]?.skus||0),
         activity: activity.map(a => ({
           type: a.voucher_type || a.type,
+          guid: a.voucher_guid || null,
           ref: a.voucher_number || '',
           date: a.date || '',
           stock_name: a.stock_name || '',
@@ -3915,12 +3925,24 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
     // Only return vouchers that have an EWB number (generated from Tally or portal)
     const { search = '', page = 1, limit = 30, from, to } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    // The e-Way Bill print sheet needs date, validity, vehicle and transporter,
+    // which live in e_way_bill_details, not on the voucher row.
+    // COALESCE on ewb_date: vouchers already has that column, so an unaliased
+    // d.ewb_date would shadow it and blank the date whenever no detail row exists.
+    let q = `SELECT v.*, COALESCE(d.ewb_date, v.ewb_date) AS ewb_date,
+                    d.valid_till, d.vehicle_no, d.transporter_id,
+                    d.distance_km, d.supply_type, d.sub_supply_type
+               FROM vouchers v
+               LEFT JOIN e_way_bill_details d
+                 ON d.voucher_guid = v.guid AND d.company_guid = v.company_guid
+              WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+                AND v.ewb_number IS NOT NULL AND v.ewb_number != ''
+                AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)`;
     const params = [companyGuid, `%${search}%`];
     let idx = 3;
-    if (from) { q += ` AND date >= $${idx++}`; params.push(from); }
-    if (to)   { q += ` AND date <= $${idx++}`; params.push(to); }
-    q += ` ORDER BY date DESC LIMIT $${idx++} OFFSET $${idx}`;
+    if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
+    if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
+    q += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
     const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != ''`, [companyGuid]);
@@ -4102,8 +4124,20 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { page = 1, limit = 50, search = '' } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
+    // Ack No / Ack date / QR live in e_invoice_details and are what the IRP
+    // extract sheet prints alongside the IRN.
     const { rows } = await query(
-      `SELECT * FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND (party_name ILIKE $4 OR voucher_number ILIKE $4) ORDER BY date DESC LIMIT $5 OFFSET $6`,
+      `SELECT v.*, d.ack_no, d.ack_date,
+              COALESCE(d.qr_code, v.qr_code) AS qr_code,
+              d.status AS einvoice_status
+         FROM vouchers v
+         LEFT JOIN e_invoice_details d
+           ON d.voucher_guid = v.guid AND d.company_guid = v.company_guid
+        WHERE v.company_guid=$1 AND v.irn IS NOT NULL AND v.irn != ''
+          AND v.irn_cancelled=FALSE AND v.is_cancelled=FALSE
+          AND v.date BETWEEN $2 AND $3
+          AND (v.party_name ILIKE $4 OR v.voucher_number ILIKE $4)
+        ORDER BY v.date DESC LIMIT $5 OFFSET $6`,
       [companyGuid, from, to, `%${search}%`, parseInt(limit), offset]
     );
     const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]);

@@ -1,3 +1,62 @@
+## 2026-08-20 — Phase 6/7: Tally XML gap closure + compliance data for prints
+
+Native Tally entries carried tags we never sent, which is why our PDFs printed
+without Place of Supply, party GSTIN, HSN or terms.
+
+### Added
+- `salesLikeVoucherXml.js`: `buildVoucherHeaderExtrasXml` (PLACEOFSUPPLY, PARTYGSTIN,
+  CONSIGNEEGSTIN, REFERENCEDATE, BASICDUEDATEOFPYMT, BASICORDERTERMS),
+  `buildRoundOffXml`, per-line HSNCODE/DISCOUNT, and `buildDispatchXml(.., { ewbOnly })`
+  so Delivery Note can borrow the EWAYBILLDETAILS block without duplicating BASICSHIP*.
+- `tally-write.js`: `loadVoucherTagContext` (party GSTIN/state + item HSN from masters)
+  and `inventoryHsnDiscountXml`, wired into Sales, Purchase, Sales Order, Purchase
+  Order, Credit Note, Debit Note and Delivery Note.
+- `buildBankAllocationXml`: the invoice-paired Receipt/Payment helpers now send
+  EFFECTIVEDATE, optional VOUCHERNUMBER and BANKALLOCATIONS for non-cash modes,
+  matching the standalone Receipt/Payment routes.
+- `GET /vouchers/:id` returns `e_invoice` and `e_way_bill` blocks; the e-invoice and
+  e-way-bill lists join their details tables (ack no/date, QR, validity, vehicle,
+  transporter) so the compliance print sheets have real values.
+
+### Fixed (found by QA before release)
+- Paired Receipt sent its bank allocation as `+amt` against a `-amt` ledger leg, so a
+  non-cash "Collect Payment Now" would not reconcile. Now `-amt`, matching the proven
+  standalone route. Payment side was already correct.
+- Bank allocation was emitted even with no instrument object, producing a blank
+  BANKNAME/INSTRUMENTNUMBER. Restored the `&& instrument` guard the standalone routes use.
+- `GET /ewaybills` selected `v.*, d.ewb_date` — `vouchers.ewb_date` already exists and
+  `pg` lets the later duplicate win, so the column came back NULL and the e-Way Bill PDF
+  could print the voucher date as the EWB date. Now `COALESCE(d.ewb_date, v.ewb_date)`;
+  same fix for `qr_code` on `/einvoice/generated`.
+- `GET /vouchers/:id` never selected company pan/phone/email or the party's state, all of
+  which the new mobile adapter reads — they were guaranteed blank on synced vouchers.
+- `ledgers.state_name` and `gst_registration_type` are written by the ingest and read for
+  Place of Supply / PARTYGSTIN, but `initSchema` never created them. On a fresh database
+  the party query threw, was swallowed by a `.catch`, and silently dropped both tags from
+  live writes. Added as idempotent ALTERs.
+- `GSTOVRDNTYPEOFSUPPLY` was hardcoded `Goods`. Unifying Sales onto the shared builder
+  meant regular invoices started sending it, so a service item would have posted as
+  Goods. Now derived from the stock master: added `stocks.type_of_supply`, mapped
+  `GSTTYPEOFSUPPLY` in the ingest (the desktop already fetched it and we discarded it),
+  and `typeOfSupplyFor()` defaults to Goods only when the master is silent.
+- `buildItemLines` defaulted a missing `discountType` to `'%'`, so a flat rupee discount
+  was read as a percentage. Now inferred from the line's own arithmetic.
+- `quotation` was missing from `DOCUMENT_TYPE_BY_VOUCHER`, so a synced quotation fell
+  through to `sales_invoice` and printed as TAX INVOICE.
+
+### Notes
+- Every type ships behind unit tests in `src/__tests__/`, but these change live Tally
+  writes — device-check one voucher type at a time.
+- Quotation still has no write path, by decision: Proforma and Sales Order cover the
+  pre-sale flow and both post to Tally.
+- **Known gap, not fixed here:** ~95 raw `${}` interpolations remain in the older inline
+  XML templates in `tally-write.js` (item names, ledger names, narration). An item named
+  `Nuts & Bolts` still breaks the document and Tally rejects the voucher. Pre-existing and
+  not touched by this change — the tags added here are escaped — but it wants its own
+  change and its own device check.
+
+---
+
 ## 2026-08-18 — Convert Alter sends narration + item lines
 
 Live convert (TDK-PRF-2026-0007) flipped optional→regular and pushed dispatch, but Tally never got narration or convert-form items.

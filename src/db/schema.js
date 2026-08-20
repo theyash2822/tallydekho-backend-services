@@ -468,6 +468,32 @@ export async function initSchema() {
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS synced_at BIGINT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS pincode TEXT;
+      -- Print identity synced from Tally's Company collection (INCOMETAXNUMBER, EMAIL, PHONENUMBER…).
+      -- The Tally invoice header prints all of these, so a preview without them cannot match.
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS pan TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS mobile TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS email TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS website TEXT;
+
+      -- Print-only company details Tally keeps in its print config and never exports:
+      -- jurisdiction line, declaration text, bank block. User-editable from Settings.
+      CREATE TABLE IF NOT EXISTS company_print_profile (
+        company_guid      TEXT PRIMARY KEY,
+        gstin             TEXT,
+        pan               TEXT,
+        email             TEXT,
+        phone             TEXT,
+        jurisdiction      TEXT,
+        declaration_text  TEXT,
+        bank_name         TEXT,
+        bank_account_no   TEXT,
+        bank_ifsc         TEXT,
+        bank_branch       TEXT,
+        pdf_format        TEXT DEFAULT 'tally',
+        pdf_format_overrides JSONB DEFAULT '{}'::jsonb,
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
+      );
 
       -- ledgers migrations (columns referenced in routes but missing from schema)
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS mobile TEXT;
@@ -482,6 +508,10 @@ export async function initSchema() {
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS alter_id BIGINT DEFAULT 0;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS pincode TEXT;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS tax_rate NUMERIC(8,4) DEFAULT 0;
+      -- Written by ingestProcessor and read for Place of Supply / PARTYGSTIN, but
+      -- never created here — a fresh database silently lost both.
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS state_name TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS gst_registration_type TEXT;
 
       -- vouchers migrations (E-Invoice / E-Way Bill columns)
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;
@@ -673,6 +703,9 @@ export async function initSchema() {
       -- Gap 4: Batch & expiry tracking flags from StockItem.xml (IsBatchWise / IsExpDtMaint)
       ALTER TABLE stocks ADD COLUMN IF NOT EXISTS batch_enabled     BOOLEAN DEFAULT FALSE;
       ALTER TABLE stocks ADD COLUMN IF NOT EXISTS expiry_enabled    BOOLEAN DEFAULT FALSE;
+      -- GSTTYPEOFSUPPLY from StockItemFull.xml. Drives GSTOVRDNTYPEOFSUPPLY on
+      -- invoice lines; without it every line posts to Tally as Goods.
+      ALTER TABLE stocks ADD COLUMN IF NOT EXISTS type_of_supply    TEXT;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS reorder_level     DECIMAL(15,4) DEFAULT 0;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
 
