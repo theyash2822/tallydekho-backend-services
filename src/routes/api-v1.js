@@ -3929,7 +3929,8 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
     // which live in e_way_bill_details, not on the voucher row.
     // COALESCE on ewb_date: vouchers already has that column, so an unaliased
     // d.ewb_date would shadow it and blank the date whenever no detail row exists.
-    let q = `SELECT v.*, COALESCE(d.ewb_date, v.ewb_date) AS ewb_date,
+    // The cast is required — the detail column is text, the voucher column is timestamptz.
+    let q = `SELECT v.*, COALESCE(d.ewb_date, v.ewb_date::text) AS ewb_date,
                     d.valid_till, d.vehicle_no, d.transporter_id,
                     d.distance_km, d.supply_type, d.sub_supply_type
                FROM vouchers v
