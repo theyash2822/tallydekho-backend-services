@@ -80,6 +80,41 @@ async function requestDesktopSyncAfterWrite({ userId, companyGuid, companyName, 
   }
 }
 
+/** Post-write number pull for entries that completed outside the live Sales/Purchase route
+ *  (retryOfflineEntries / desktop writeback). Without this, tally_prime_series vouchers stay
+ *  number-less in the app even though Tally assigned one (TDK-SAL-2026-0052). */
+async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], reason = 'deferred_posted', rcpTdkRef = null } = {}) {
+  if (!queueId || !userId) return;
+  try {
+    const { rows } = await query(
+      `SELECT wq.company_guid, wq.payload, wq.tally_id, av.tdk_reference_no
+         FROM write_queue wq
+         LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
+        WHERE wq.id = $1
+        LIMIT 1`,
+      [queueId]
+    );
+    const row = rows[0];
+    if (!row) return;
+    let payload = row.payload;
+    if (typeof payload === 'string') {
+      try { payload = JSON.parse(payload || '{}'); } catch { payload = {}; }
+    }
+    payload = payload || {};
+    const ids = [...tallyIds, row.tally_id].map(String).filter(id => id && id !== '0' && id !== 'undefined');
+    await requestDesktopSyncAfterWrite({
+      userId,
+      companyGuid: row.company_guid,
+      companyName: payload.companyName,
+      tdkRef: row.tdk_reference_no || null,
+      tallyIds: ids,
+      extra: { reason, rcpTdkRef },
+    });
+  } catch (e) {
+    console.warn(`[sync:request] deferred sync for queue ${queueId} failed:`, e.message);
+  }
+}
+
 const router = Router();
 
 // ── Helper: format date YYYYMMDD ──────────────────────────────────────────────
@@ -5569,7 +5604,12 @@ export async function retryOfflineEntries(userId, companyGuid) {
           await query(`UPDATE write_queue SET status='success', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
           // Already posted to Tally without re-running the Sales/Purchase route —
           // still owe a paired Receipt/Payment if Collect/Make Payment Now was set.
-          await ensurePairedVoucherForQueueEntry(entry.id, userId);
+          const pairedEarly = await ensurePairedVoucherForQueueEntry(entry.id, userId);
+          await requestSyncAfterDeferredWrite(entry.id, userId, {
+            tallyIds: [entry.tally_id, pairedEarly?.tallyId],
+            reason: 'retry_already_numbered',
+            rcpTdkRef: pairedEarly?.tdkRef || null,
+          });
           continue;
         }
         const result = await forwardToTally(entry.company_guid, userId, entry.xml);
@@ -5577,9 +5617,16 @@ export async function retryOfflineEntries(userId, companyGuid) {
         // This retry re-pushes stored XML only, so a Sales/Purchase with Collect/Make
         // Payment Now would otherwise post without its paired Receipt/Payment.
         // updateWriteQueue owns the success verdict — read it back rather than re-deriving.
-        const { rows: settled } = await query(`SELECT status FROM write_queue WHERE id=$1`, [entry.id]);
+        const { rows: settled } = await query(`SELECT status, tally_id FROM write_queue WHERE id=$1`, [entry.id]);
         if (settled[0]?.status === 'success') {
-          await ensurePairedVoucherForQueueEntry(entry.id, userId);
+          const paired = await ensurePairedVoucherForQueueEntry(entry.id, userId);
+          // Live Sales/Purchase routes request a post-write sync so tally_voucher_no
+          // lands; retry used to skip that, leaving numbers blank (e.g. TDK-SAL-2026-0052).
+          await requestSyncAfterDeferredWrite(entry.id, userId, {
+            tallyIds: [settled[0].tally_id, result?.tallyId, paired?.tallyId],
+            reason: 'retry_posted',
+            rcpTdkRef: paired?.tdkRef || null,
+          });
         }
         // Update stock_adjustment status if linked
         if (entry.entry_type === 'stock_adjustment' && result?.status !== 'desktop_offline') {
@@ -5946,7 +5993,16 @@ router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
       }
       // Desktop completed a deferred push without going through the Sales/Purchase
       // route, so create the paired Receipt/Payment here if one is still owed.
-      await ensurePairedVoucherForQueueEntry(outboxId, desktop.userId);
+      const paired = await ensurePairedVoucherForQueueEntry(outboxId, desktop.userId);
+      // If desktop did not return a voucher number (common under tally_prime_series),
+      // ask it to pull SingleVoucher so the number lands the same way as the live path.
+      if (!tallyVoucherNumber) {
+        await requestSyncAfterDeferredWrite(outboxId, desktop.userId, {
+          tallyIds: [tallyAlterId, paired?.tallyId],
+          reason: 'writeback_posted',
+          rcpTdkRef: paired?.tdkRef || null,
+        });
+      }
       res.json({ status: true, message: 'Result recorded. Invoice posted.' });
     } else {
       await query(

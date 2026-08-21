@@ -1,3 +1,16 @@
+## 2026-08-21 — Post-write number sync on deferred / retry path
+
+Under `tally_prime_series`, Tally assigns the voucher number and the app only
+learns it via desktop SingleVoucher sync. The live Sales/Receipt routes already
+called `requestDesktopSyncAfterWrite`; `retryOfflineEntries` and writeback
+success did not — so delayed posts (e.g. TDK-SAL-2026-0052) stayed number-less
+even after Tally had the voucher.
+
+### Fixed
+- `requestSyncAfterDeferredWrite` helper; wired into retry success (and
+  already-numbered early-exit) and writeback success when no number was returned.
+- Still runs after paired Receipt/Payment recovery so child MASTER IDs are pulled too.
+
 ## 2026-08-21 — Paired Receipt/Payment recovery on deferred Tally push
 
 Collect Payment Now / Make Payment Now create the child voucher only in the
