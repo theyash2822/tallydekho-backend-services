@@ -1,3 +1,23 @@
+## 2026-08-21 — Paired Receipt/Payment recovery on deferred Tally push
+
+Collect Payment Now / Make Payment Now create the child voucher only in the
+live Sales/Purchase request path. When the first push was deferred
+(`desktop_offline` / retry), `retryOfflineEntries` and desktop writeback
+re-sent the invoice XML only — the Receipt/Payment never existed (e.g.
+TDK-SAL-2026-0052).
+
+### Added
+- `planPairedVoucher` + `ensurePairedVoucherForQueueEntry` — idempotent recovery
+  after delayed success; wired into `retryOfflineEntries` and
+  `POST /desktop/writeback/:outboxId/result`.
+- `scripts/backfill-paired-vouchers.mjs` — dry-run / `--commit` for historical gaps.
+- Unit tests in `paired-voucher-recovery.test.js`.
+
+### Fixed (QA)
+- Recovery never throws into retry/writeback success paths.
+- Already-numbered early-exit in retry also runs paired recovery.
+- Malformed JSON payload returns null instead of throwing.
+
 ## 2026-08-20 — Phase 6/7: Tally XML gap closure + compliance data for prints
 
 Native Tally entries carried tags we never sent, which is why our PDFs printed

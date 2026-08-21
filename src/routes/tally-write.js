@@ -723,6 +723,97 @@ ${bankAllocXml}
   }
 }
 
+// ── ensurePairedVoucherForQueueEntry ──────────────────────────────────────────
+// The paired Receipt/Payment is created inline by the Sales/Purchase route, but only
+// when that route's own push to Tally succeeds. A deferred push (desktop offline, or a
+// transient failure) is completed later by retryOfflineEntries or the desktop writeback
+// endpoint — neither of which re-runs the route, so the invoice landed in Tally with no
+// paired voucher and no error left behind. Call this after any delayed success to close
+// that gap. Idempotent: an existing child voucher short-circuits, so it is safe to call
+// on every completion and safe to re-run for backfills.
+// Pure decision half, kept separate so the gating rules are testable without a database.
+// Returns null when the entry owes no paired voucher.
+export function planPairedVoucher(entryType, payload) {
+  const isSales = entryType === 'sales';
+  const isPurchase = entryType === 'purchase';
+  if (!isSales && !isPurchase) return null;
+
+  let p;
+  try {
+    p = typeof payload === 'string' ? JSON.parse(payload || '{}') : (payload || {});
+  } catch {
+    return null;
+  }
+  const pay = isSales ? p.collect_payment : p.make_payment;
+  const amount = parseFloat(pay?.amount);
+  if (!pay?.ledgerName || !(amount > 0)) return null;
+
+  return {
+    childType: isSales ? 'receipt' : 'payment',
+    bankLedger: pay.ledgerName,
+    amount,
+    paymentMethod: pay.mode || '',
+    instrument: pay.instrument || (pay.reference ? { instrumentNo: pay.reference } : null),
+    reference: pay.reference || p.reference,
+    isOptional: !!p.isOptional,
+    date: p.date,
+    companyName: p.companyName,
+    partyLedger: p.partyLedger,
+  };
+}
+
+export async function ensurePairedVoucherForQueueEntry(queueId, userId) {
+  // Must never throw into retry/writeback success paths — a recovery failure must
+  // not flip a successfully posted parent invoice back to failed / HTTP 500.
+  if (!queueId) return null;
+  try {
+    const { rows } = await query(
+      `SELECT wq.entry_type, wq.payload, wq.company_guid,
+              av.invoice_uuid, av.tdk_reference_no, av.party_name, av.created_at, av.user_id
+         FROM write_queue wq
+         JOIN app_vouchers av ON av.write_queue_id = wq.id
+        WHERE wq.id = $1
+        LIMIT 1`,
+      [queueId]
+    );
+    const row = rows[0];
+    if (!row) return null;
+
+    const plan = planPairedVoucher(row.entry_type, row.payload);
+    if (!plan || !row.invoice_uuid || !row.tdk_reference_no) return null;
+
+    const { rows: existing } = await query(
+      `SELECT 1 FROM app_vouchers WHERE parent_invoice_uuid = $1 AND voucher_type = $2 LIMIT 1`,
+      [row.invoice_uuid, plan.childType]
+    );
+    if (existing[0]) return null;
+
+    const create = plan.childType === 'receipt' ? createReceiptForInvoice : createPaymentForInvoice;
+
+    const result = await create({
+      companyGuid: row.company_guid,
+      companyName: plan.companyName,
+      userId: userId || row.user_id,
+      date: plan.date,
+      partyLedger: plan.partyLedger || row.party_name,
+      bankLedger: plan.bankLedger,
+      amount: plan.amount,
+      parentInvoiceUuid: row.invoice_uuid,
+      parentTdkRef: row.tdk_reference_no,
+      isOptional: plan.isOptional,
+      reference: plan.reference,
+      paymentMethod: plan.paymentMethod,
+      instrument: plan.instrument,
+      parentCreatedAt: row.created_at,
+    });
+    console.log(`[paired-recovery] ${plan.childType} ${result?.tdkRef} created for ${row.tdk_reference_no} (queue ${queueId})`);
+    return result;
+  } catch (e) {
+    console.error(`[paired-recovery] queue ${queueId} failed:`, e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 // ── POST /tally/voucher/sales ───────────────────────────────────
 router.post('/voucher/sales', authMiddleware, async (req, res) => {
   const {
@@ -5476,10 +5567,20 @@ export async function retryOfflineEntries(userId, companyGuid) {
         if (!claimed[0]) continue;
         if (entry.tally_voucher_number) {
           await query(`UPDATE write_queue SET status='success', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
+          // Already posted to Tally without re-running the Sales/Purchase route —
+          // still owe a paired Receipt/Payment if Collect/Make Payment Now was set.
+          await ensurePairedVoucherForQueueEntry(entry.id, userId);
           continue;
         }
         const result = await forwardToTally(entry.company_guid, userId, entry.xml);
         await updateWriteQueue(entry.id, result, null);
+        // This retry re-pushes stored XML only, so a Sales/Purchase with Collect/Make
+        // Payment Now would otherwise post without its paired Receipt/Payment.
+        // updateWriteQueue owns the success verdict — read it back rather than re-deriving.
+        const { rows: settled } = await query(`SELECT status FROM write_queue WHERE id=$1`, [entry.id]);
+        if (settled[0]?.status === 'success') {
+          await ensurePairedVoucherForQueueEntry(entry.id, userId);
+        }
         // Update stock_adjustment status if linked
         if (entry.entry_type === 'stock_adjustment' && result?.status !== 'desktop_offline') {
           const newStatus = (result?.status === 'desktop_offline') ? 'QUEUED' : 'PUSHED_TO_TALLY';
@@ -5843,6 +5944,9 @@ router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
           _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber);
         }
       }
+      // Desktop completed a deferred push without going through the Sales/Purchase
+      // route, so create the paired Receipt/Payment here if one is still owed.
+      await ensurePairedVoucherForQueueEntry(outboxId, desktop.userId);
       res.json({ status: true, message: 'Result recorded. Invoice posted.' });
     } else {
       await query(
