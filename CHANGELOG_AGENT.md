@@ -1,3 +1,8 @@
+## 2026-08-22 — Dashboard unified search API
+
+### Added
+- `GET /api/dashboard/search?q=` — searches vouchers, ledgers, and stock for home / voice search
+
 ## 2026-08-22 — UI Phase 1 + Phase 2 (notifications, onboarding, dashboard)
 
 ### Added

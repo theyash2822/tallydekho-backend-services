@@ -777,6 +777,82 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/dashboard/search?q= — unified search for home / voice search
+router.get('/dashboard/search', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ success: true, data: [] });
+
+  const pattern = `%${q}%`;
+  try {
+    const { rows: vouchers } = await query(
+      `SELECT guid, voucher_number, party_name, voucher_type, amount, date
+       FROM vouchers
+       WHERE company_guid = $1 AND is_cancelled = FALSE
+         AND (party_name ILIKE $2 OR voucher_number ILIKE $2 OR voucher_type ILIKE $2)
+       ORDER BY date DESC NULLS LAST
+       LIMIT 8`,
+      [companyGuid, pattern]
+    );
+
+    const { rows: ledgers } = await query(
+      `SELECT guid, name, parent, closing_balance, balance_type
+       FROM ledgers
+       WHERE company_guid = $1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)
+       ORDER BY ABS(closing_balance) DESC
+       LIMIT 6`,
+      [companyGuid, pattern]
+    );
+
+    const { rows: stocks } = await query(
+      `SELECT name, closing_qty, group_name
+       FROM stocks
+       WHERE company_guid = $1 AND (name ILIKE $2 OR alias ILIKE $2)
+       ORDER BY name ASC
+       LIMIT 6`,
+      [companyGuid, pattern]
+    );
+
+    const results = [
+      ...vouchers.map(v => ({
+        id: `v_${v.guid}`,
+        kind: 'voucher',
+        label: `${v.voucher_type || 'Voucher'}${v.voucher_number ? ` #${v.voucher_number}` : ''}`.trim(),
+        party: v.party_name || '',
+        subtitle: v.date || '',
+        guid: v.guid,
+        amount_raw: Math.abs(parseFloat(v.amount) || 0),
+        is_credit: (v.voucher_type || '').toLowerCase().includes('receipt'),
+        route: v.guid ? `/document/${v.guid}` : null,
+      })),
+      ...ledgers.map(l => ({
+        id: `l_${l.guid || l.name}`,
+        kind: 'ledger',
+        label: l.name,
+        party: l.parent || 'Ledger',
+        subtitle: `Balance ₹${Math.round(Math.abs(parseFloat(l.closing_balance) || 0)).toLocaleString('en-IN')}`,
+        guid: l.guid,
+        route: l.guid ? `/ledger/${l.guid}` : null,
+      })),
+      ...stocks.map(s => ({
+        id: `s_${s.name}`,
+        kind: 'stock',
+        label: s.name,
+        party: s.group_name || 'Stock',
+        subtitle: `Qty ${s.closing_qty ?? 0}`,
+        route: '/stocks/on-hand-stock',
+      })),
+    ];
+
+    res.json({ success: true, data: results });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/dashboard/recent-activity
 router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
