@@ -864,7 +864,7 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
       [companyGuid, from, to]
     );
     const activity = rows.map(r => ({
-      id: String(r.id),
+      id: r.guid || String(r.id),
       // guid drives navigation to the real document preview (/document/[guid]).
       guid: r.guid || null,
       type: (r.voucher_type||'').toLowerCase().includes('receipt') ? 'credit' : 'debit',

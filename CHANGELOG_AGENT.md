@@ -1,3 +1,8 @@
+## 2026-08-22 — Recent activity: prefer guid for stable id
+
+### Fixed
+- `GET /api/dashboard/recent-activity` — `id` field uses `guid` when present (Tally reuses voucher numbers across types)
+
 ## 2026-08-22 — Expenses API: expense-ledger vouchers only
 
 ### Fixed
