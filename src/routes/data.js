@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware, requirePaired, requireCompanySynced } from '../middleware/auth.js';
 import { resolveFYDates } from './api-v1.js';
+import { buildStockDashboardInsights } from '../utils/stockDashboardInsights.js';
 
 const router = Router();
 
@@ -131,28 +132,10 @@ router.post('/stock-dashboard', authMiddleware, async (req, res) => {
   const { companyGuid } = req.body || {};
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: total } = await query('SELECT COUNT(*) as c, SUM(closing_value) as v FROM stocks WHERE company_guid = $1', [companyGuid]);
-    const { rows: low } = await query(`
-      SELECT COUNT(*) as c
-      FROM stocks s
-      LEFT JOIN groups g ON g.company_guid = s.company_guid AND g.name = s.group_name
-      WHERE s.company_guid = $1
-        AND s.closing_qty > 0
-        AND (
-          (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
-          OR
-          (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
-        )
-    `, [companyGuid]);
-    const { rows: out } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid = $1 AND closing_qty = 0', [companyGuid]);
-
-    res.json({ status: true, data: {
-      totalItems: parseInt(total[0].c || 0),
-      totalValue: parseFloat(total[0].v || 0),
-      lowStock: parseInt(low[0].c || 0),
-      outOfStock: parseInt(out[0].c || 0),
-    }});
+    const data = await buildStockDashboardInsights(query, companyGuid);
+    res.json({ status: true, data });
   } catch (err) {
+    console.error('[stock-dashboard]', err.message);
     res.status(500).json({ status: false, message: 'Failed' });
   }
 });

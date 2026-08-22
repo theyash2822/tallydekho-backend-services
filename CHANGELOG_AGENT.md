@@ -1,3 +1,14 @@
+## 2026-08-22 — UI Phase 1 + Phase 2 (notifications, onboarding, dashboard)
+
+### Added
+- `stockDashboardInsights.js` — stock dashboard KPI helpers + tests
+- `notificationAlerts.js` — derived alerts with category, deep links, relative time
+- Extended `GET /api/notifications` (Stock, Receivables, Compliance EWB, Invoices IRN/recent sales)
+- `PATCH /api/notifications/:id/read` + `PATCH /api/notifications/read-all` with read persistence in `alert_settings`
+
+### Changed
+- `POST /app/stock-dashboard` — aged inventory join fix + insight fields for mobile Stock tab
+
 ## 2026-08-21 — Post-write number sync on deferred / retry path
 
 Under `tally_prime_series`, Tally assigns the voucher number and the app only

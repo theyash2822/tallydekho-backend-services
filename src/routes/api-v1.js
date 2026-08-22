@@ -17,6 +17,14 @@ import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
 import { resolveCreditNoteContext } from '../utils/creditNoteContext.js';
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
+import {
+  enrichNotification,
+  stockNotification,
+  receivableNotification,
+  complianceNotification,
+  invoiceNotification,
+  parseReadNotificationIds,
+} from '../utils/notificationAlerts.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -3567,21 +3575,159 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
 // NOTIFICATIONS
 // ══════════════════════════════════════════════════════════════
 
+async function getReadNotificationIds(userId) {
+  const { rows } = await query('SELECT alert_settings FROM users WHERE id=$1', [userId]);
+  return parseReadNotificationIds(rows[0]?.alert_settings);
+}
+
+async function persistReadNotificationIds(userId, ids) {
+  await query(
+    `UPDATE users SET alert_settings = COALESCE(alert_settings, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+    [JSON.stringify({ read_notification_ids: [...ids] }), userId]
+  );
+}
+
+async function buildDerivedNotifications(companyGuid) {
+  const raw = [];
+  if (!companyGuid) return raw;
+
+  const now = new Date();
+  const weekAgo = new Date(now);
+  weekAgo.setDate(weekAgo.getDate() - 7);
+
+  const { rows: lowStock } = await query(
+    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_guid=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3',
+    [companyGuid]
+  );
+  lowStock.forEach((s, i) => {
+    const createdAt = new Date(now.getTime() - i * 3600000);
+    raw.push(stockNotification(s, createdAt));
+  });
+
+  const { rows: overdue } = await query(
+    `SELECT name, ABS(closing_balance) as bal FROM ledgers
+     WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000
+     ORDER BY closing_balance DESC LIMIT 3`,
+    [companyGuid]
+  );
+  overdue.forEach((l, i) => {
+    const createdAt = new Date(now.getTime() - (i + 1) * 7200000);
+    raw.push(receivableNotification(l, createdAt));
+  });
+
+  const fyStart = `${now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1}-04-01`;
+  const fyEnd = `${now.getMonth() >= 3 ? now.getFullYear() + 1 : now.getFullYear()}-03-31`;
+
+  const { rows: pendingEwb } = await query(
+    `SELECT COUNT(*)::int AS c FROM vouchers
+     WHERE company_guid=$1 AND is_cancelled=FALSE
+       AND voucher_type ILIKE '%Sales%'
+       AND voucher_type NOT ILIKE '%Order%'
+       AND amount >= 50000
+       AND (ewb_number IS NULL OR ewb_number='')
+       AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`,
+    [companyGuid, fyStart, fyEnd]
+  ).catch(() => ({ rows: [{ c: 0 }] }));
+
+  const ewbCount = pendingEwb[0]?.c || 0;
+  if (ewbCount > 0) {
+    raw.push(complianceNotification({
+      id: 'ewb_pending',
+      type: 'gst',
+      title: 'E-Way Bill Pending',
+      body: `${ewbCount} invoice${ewbCount > 1 ? 's' : ''} need E-Way Bill generation`,
+      route: '/settings/ewb',
+      actionLabel: 'Generate EWB',
+      createdAt: weekAgo,
+    }));
+  }
+
+  const { rows: pendingIrn } = await query(
+    `SELECT COUNT(*)::int AS c FROM vouchers
+     WHERE company_guid=$1 AND is_cancelled=FALSE
+       AND voucher_type ILIKE '%Sales%'
+       AND amount >= 0
+       AND (irn IS NULL OR irn = '')
+       AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
+       AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`,
+    [companyGuid, fyStart, fyEnd]
+  ).catch(() => ({ rows: [{ c: 0 }] }));
+
+  const irnCount = pendingIrn[0]?.c || 0;
+  if (irnCount > 0) {
+    raw.push(invoiceNotification({
+      id: 'irn_pending',
+      title: 'IRN Generation Due',
+      body: `${irnCount} invoice${irnCount > 1 ? 's' : ''} pending IRN generation`,
+      route: '/settings/einvoice',
+      actionLabel: 'Generate IRN',
+      createdAt: weekAgo,
+    }));
+  }
+
+  const { rows: recentSales } = await query(
+    `SELECT voucher_number, party_name, amount, date FROM vouchers
+     WHERE company_guid=$1 AND is_cancelled=FALSE
+       AND voucher_type ILIKE '%Sales%'
+       AND voucher_type NOT ILIKE '%Order%'
+       AND date >= CURRENT_DATE - INTERVAL '3 days'
+     ORDER BY date DESC LIMIT 2`,
+    [companyGuid]
+  ).catch(() => ({ rows: [] }));
+
+  recentSales.forEach((v, i) => {
+    const amt = Math.round(parseFloat(v.amount) || 0);
+    raw.push(invoiceNotification({
+      id: `sale_${v.voucher_number || i}`,
+      title: 'New Sales Invoice',
+      body: `${v.party_name || 'Party'} — ₹${amt.toLocaleString('en-IN')}`,
+      route: '/sales',
+      actionLabel: 'View invoice',
+      createdAt: v.date ? new Date(v.date) : now,
+    }));
+  });
+
+  return raw;
+}
+
 router.get('/notifications', authMiddleware, async (req, res) => {
-  // Notifications are derived from business data — no separate table yet
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const notifs = [];
-    if (companyGuid) {
-      const { rows: lowStock } = await query('SELECT name, closing_qty, reorder_level FROM stocks WHERE company_guid=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3', [companyGuid]);
-      lowStock.forEach(s => notifs.push({ id: `stock_${s.name}`, type: 'warning', title: 'Low Stock Alert', body: `${s.name} has only ${s.closing_qty} units left`, read: false, created_at: new Date().toISOString() }));
-      const { rows: overdue } = await query(`SELECT name, ABS(closing_balance) as bal FROM ledgers WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000 ORDER BY closing_balance DESC LIMIT 3`, [companyGuid]);
-      overdue.forEach(l => notifs.push({ id: `recv_${l.name}`, type: 'info', title: 'Outstanding Receivable', body: `${l.name} owes ₹${Math.round(l.bal).toLocaleString('en-IN')}`, read: false, created_at: new Date().toISOString() }));
-    }
-    res.json({ success: true, data: notifs });
+    const readIds = await getReadNotificationIds(req.user.userId);
+    const raw = await buildDerivedNotifications(companyGuid);
+    const data = raw.map(n => enrichNotification(n, readIds));
+    res.json({ success: true, data });
   } catch (err) {
+    console.error('[notifications GET]', err.message);
     res.json({ success: true, data: [] });
+  }
+});
+
+router.patch('/notifications/:id/read', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ success: false, error: { code: 'MISSING_ID', message: 'Notification id required' } });
+  try {
+    const readIds = await getReadNotificationIds(req.user.userId);
+    readIds.add(id);
+    await persistReadNotificationIds(req.user.userId, readIds);
+    res.json({ success: true, data: { id, read: true } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.patch('/notifications/read-all', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.body?.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const readIds = await getReadNotificationIds(req.user.userId);
+    const raw = await buildDerivedNotifications(companyGuid);
+    raw.forEach(n => readIds.add(n.id));
+    await persistReadNotificationIds(req.user.userId, readIds);
+    res.json({ success: true, data: { read: true, count: readIds.size } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
 
