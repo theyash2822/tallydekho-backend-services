@@ -1,3 +1,9 @@
+## 2026-08-22 — Expenses API: expense-ledger vouchers only
+
+### Fixed
+- `GET /api/expenses` — returns vouchers with Dr entries in Direct/Indirect Expense ledgers (not all Payment/Journal/Contra)
+- Response includes `expense_ledger`, `expense_group`, `expense_amount`, and `categories` breakdown
+
 ## 2026-08-22 — Dashboard unified search API
 
 ### Added

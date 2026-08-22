@@ -4895,44 +4895,88 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { from, to, page = 1, limit = 30, type } = req.query;
   const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
-  const offset = (parseInt(page)-1)*parseInt(limit);
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const expenseGroupFilter = type === 'Direct'
+    ? `AND l.parent ILIKE '%Direct Expense%'`
+    : type === 'Indirect'
+      ? `AND l.parent ILIKE '%Indirect Expense%'`
+      : `AND (l.parent ILIKE '%Direct Expense%' OR l.parent ILIKE '%Indirect Expense%')`;
+
   try {
-    // Expenses = Journal (adjustments/accruals) + Payment (cash expense payments)
-    // Exclude amount=0 junk records; filter by FY date range
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1
-      AND voucher_type IN ('Journal','Payment','Contra')
-      AND is_cancelled=FALSE
-      AND amount > 0
-      AND date IS NOT NULL AND date != ''
-      AND date BETWEEN $2 AND $3`;
-    const params = [companyGuid, fyFrom, fyTo];
-    // Optional sub-type filter
-    if (type) { q += ` AND voucher_type = $4`; params.push(type); }
-    q += ` ORDER BY date DESC, amount DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
-    params.push(parseInt(limit), offset);
-    const { rows } = await query(q, params);
-    // Total from voucher amounts (not ledger closing balance which can be 0)
+    const baseJoin = `
+      FROM vouchers v
+      JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+      WHERE v.company_guid = $1
+        AND v.is_cancelled = FALSE
+        AND vle.dr_cr = 'Dr'
+        ${expenseGroupFilter}
+        AND v.date IS NOT NULL AND v.date != ''
+        AND v.date BETWEEN $2 AND $3`;
+
+    const { rows } = await query(
+      `SELECT DISTINCT ON (v.guid)
+              v.*,
+              l.name AS expense_ledger,
+              l.parent AS expense_group,
+              ABS(vle.amount) AS expense_amount
+       ${baseJoin}
+       ORDER BY v.guid, ABS(vle.amount) DESC`,
+      [companyGuid, fyFrom, fyTo]
+    );
+    const sorted = rows.sort((a, b) => {
+      const da = String(a.date || '');
+      const db = String(b.date || '');
+      return db.localeCompare(da) || (parseFloat(b.expense_amount) || 0) - (parseFloat(a.expense_amount) || 0);
+    });
+    const paged = sorted.slice(offset, offset + parseInt(limit));
+
     const { rows: totRow } = await query(
-      `SELECT COALESCE(SUM(amount),0) as total FROM vouchers
-       WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra')
-         AND is_cancelled=FALSE AND amount > 0
-         AND date IS NOT NULL AND date != ''
-         AND date BETWEEN $2 AND $3`,
+      `SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS total
+       FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       WHERE v.company_guid = $1
+         AND v.is_cancelled = FALSE
+         AND vle.dr_cr = 'Dr'
+         ${expenseGroupFilter}
+         AND v.date IS NOT NULL AND v.date != ''
+         AND v.date BETWEEN $2 AND $3`,
       [companyGuid, fyFrom, fyTo]
     );
+
+    const { rows: catRows } = await query(
+      `SELECT l.parent AS name, COALESCE(SUM(ABS(vle.amount)), 0) AS total
+       FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       WHERE v.company_guid = $1
+         AND v.is_cancelled = FALSE
+         AND vle.dr_cr = 'Dr'
+         ${expenseGroupFilter}
+         AND v.date IS NOT NULL AND v.date != ''
+         AND v.date BETWEEN $2 AND $3
+       GROUP BY l.parent
+       ORDER BY total DESC
+       LIMIT 8`,
+      [companyGuid, fyFrom, fyTo]
+    );
+
     const totalExpenses = parseFloat(totRow[0]?.total || 0);
-    const cnt = await query(
-      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra')
-       AND is_cancelled=FALSE AND amount > 0 AND date IS NOT NULL AND date != '' AND date BETWEEN $2 AND $3`,
-      [companyGuid, fyFrom, fyTo]
-    );
     res.json({
       success: true,
-      data: rows,
-      summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}` },
-      meta: { total: parseInt(cnt.rows[0].c), page: parseInt(page), limit: parseInt(limit), from: fyFrom, to: fyTo }
+      data: paged,
+      categories: catRows.map((r) => ({
+        id: r.name,
+        name: r.name,
+        amount_raw: parseFloat(r.total) || 0,
+      })),
+      summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}`, count: sorted.length },
+      meta: { total: sorted.length, page: parseInt(page), limit: parseInt(limit), from: fyFrom, to: fyTo },
     });
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
