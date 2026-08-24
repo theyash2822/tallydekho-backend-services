@@ -755,7 +755,8 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
 });
 
 // GET /api/dashboard/cashflow
-// Income/Expense bars = Receipts / Payments (real cash & bank movement), not Sales/Purchase.
+// Bars: Income/Expense = Receipts/Payments (money movement).
+// Metrics: Gross Profit / Net Profit / GP vs Sales % from Sales & Purchase in period.
 router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -764,20 +765,41 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
-    const [rctRes, pmtRes] = await Promise.all([
+    const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND is_cancelled=FALSE`;
+    const purchFilter = `voucher_type ILIKE '%Purchase%' AND voucher_type NOT ILIKE '%Order%' AND is_cancelled=FALSE`;
+    const [rctRes, pmtRes, salesRes, purchRes, expRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${purchFilter} AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      // Indirect-style expenses for a light net-profit estimate (expense-ledger Debits)
+      query(`SELECT COALESCE(
+        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+         WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+           AND (l.parent ILIKE '%Indirect Expense%' OR l.parent ILIKE '%Direct Expense%')
+           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+        0) as v`, [companyGuid, from, to]),
     ]);
     const receipts = +(rctRes.rows?.[0]?.v ?? 0);
     const payments = +(pmtRes.rows?.[0]?.v ?? 0);
+    const sales = +(salesRes.rows?.[0]?.v ?? 0);
+    const purchase = +(purchRes.rows?.[0]?.v ?? 0);
+    const operatingExp = +(expRes.rows?.[0]?.v ?? 0);
     const netCash = +(cash?.[0]?.v ?? 0) + +(bank?.[0]?.v ?? 0);
-    const netFlow = receipts - payments;
+    const grossProfit = sales - purchase;
+    const netProfit = grossProfit - operatingExp;
+    const gpVsSalesPct = sales > 0 ? Math.round((grossProfit / sales) * 100) : 0;
     res.json({ success: true, data: {
       net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
-      // Period net money movement (receipts − payments)
-      gross_profit: netFlow, net_profit: netFlow,
       total_income: receipts, total_expense: payments,
-      income_percentage: receipts > 0 ? Math.round((netFlow / receipts) * 100) : 0,
+      sales, purchase,
+      gross_profit: grossProfit,
+      net_profit: netProfit,
+      gross_profit_vs_sales_pct: gpVsSalesPct,
+      // Status pill % = Gross Profit vs Sales (as before)
+      income_percentage: gpVsSalesPct,
       fy_from: from, fy_to: to,
       updated_at: 'just now',
     }});
