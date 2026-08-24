@@ -1,3 +1,9 @@
+## 2026-08-24 — Fix desktop_online / last_seen bigint coercion
+
+### Fixed
+- `GET /api/tally-sync/status` — coerce pg `bigint` `last_seen` (string) to Number for desktop_online 5‑min check
+- Response `device.last_seen` now always numeric epoch seconds (or null)
+
 ## 2026-08-22 — Recent activity: prefer guid for stable id
 
 ### Fixed

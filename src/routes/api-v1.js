@@ -530,11 +530,13 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
     const device = devices[0] || null;
 
     // Desktop online = last_seen within 5 minutes
+    // pg bigint serializes as string — coerce before compare
     const ONLINE_THRESHOLD_SECS = 5 * 60;
     const nowSecs = Math.floor(Date.now() / 1000);
+    const lastSeenSecs = Number(device?.last_seen);
     const desktopOnline = isPaired && device &&
-      typeof device.last_seen === 'number' &&
-      (nowSecs - device.last_seen) < ONLINE_THRESHOLD_SECS;
+      Number.isFinite(lastSeenSecs) && lastSeenSecs > 0 &&
+      (nowSecs - lastSeenSecs) < ONLINE_THRESHOLD_SECS;
 
     let company = null;
     if (isPaired) {
@@ -554,7 +556,12 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
       data: {
         is_paired: isPaired,
         desktop_online: !!desktopOnline,
-        device: isPaired ? { id: device.device_id, name: device.name || 'Desktop', last_seen: device.last_seen } : null,
+        device: isPaired ? {
+          id: device.device_id,
+          name: device.name || 'Desktop',
+          // Always emit numeric epoch seconds (pg bigint → string otherwise)
+          last_seen: Number.isFinite(lastSeenSecs) ? lastSeenSecs : null,
+        } : null,
         company,
       }
     });
