@@ -3912,6 +3912,12 @@ router.get('/parties', authMiddleware, async (req, res) => {
       params.push('^Direct Expenses?$', '^Indirect Expenses?$');
       idx += 2;
     }
+    // Receipt income ledgers: Direct / Indirect Incomes
+    if (type === 'income') {
+      q += ` AND (parent ~* $${idx} OR parent ~* $${idx + 1})`;
+      params.push('^Direct Incomes?$', '^Indirect Incomes?$');
+      idx += 2;
+    }
     q += ' ORDER BY name LIMIT 500';
     const { rows } = await query(q, params);
     res.json({ success: true, data: rows });
