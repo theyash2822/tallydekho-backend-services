@@ -4016,10 +4016,51 @@ router.get('/kpi/payments', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
-    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 50`, [companyGuid, from, to]);
-    const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
-    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows, from, to } });
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { rows } = await query(
+      `SELECT v.guid, v.voucher_number, v.party_name, v.amount, v.date, v.narration,
+         COALESCE((
+           SELECT CASE
+             WHEN bool_or(l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%') THEN 'Cash'
+             WHEN bool_or(l.parent ILIKE '%Bank%') THEN 'Bank'
+             ELSE 'Other'
+           END
+           FROM voucher_ledger_entries vle
+           JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+           WHERE vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+             AND vle.dr_cr = 'Cr'
+         ), 'Other') AS mode
+       FROM vouchers v
+       WHERE v.company_guid = $1
+         AND v.voucher_type ILIKE '%Payment%'
+         AND v.is_cancelled = FALSE
+         AND v.date BETWEEN $2 AND $3
+       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
+       LIMIT 100`,
+      [companyGuid, from, to]
+    );
+    const txs = rows.map(r => ({
+      guid: r.guid,
+      voucher_number: r.voucher_number,
+      party_name: r.party_name,
+      amount: parseFloat(r.amount || 0),
+      date: r.date,
+      narration: r.narration,
+      mode: r.mode || 'Other',
+    }));
+    const total = txs.reduce((s, r) => s + r.amount, 0);
+    const cashTotal = txs.filter(t => t.mode === 'Cash').reduce((s, t) => s + t.amount, 0);
+    const bankTotal = txs.filter(t => t.mode === 'Bank').reduce((s, t) => s + t.amount, 0);
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayTotal = txs.filter(t => String(t.date).slice(0, 10) === todayIso).reduce((s, t) => s + t.amount, 0);
+    res.json({
+      success: true,
+      data: {
+        total, today_total: todayTotal, cash_total: cashTotal, bank_total: bankTotal,
+        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        transactions: txs, from, to,
+      },
+    });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
@@ -4028,10 +4069,51 @@ router.get('/kpi/receipts', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
-    const { rows } = await query(`SELECT voucher_number, party_name, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 50`, [companyGuid, from, to]);
-    const total = rows.reduce((s,r) => s + parseFloat(r.amount||0), 0);
-    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, transactions: rows, from, to } });
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { rows } = await query(
+      `SELECT v.guid, v.voucher_number, v.party_name, v.amount, v.date, v.narration,
+         COALESCE((
+           SELECT CASE
+             WHEN bool_or(l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%') THEN 'Cash'
+             WHEN bool_or(l.parent ILIKE '%Bank%') THEN 'Bank'
+             ELSE 'Other'
+           END
+           FROM voucher_ledger_entries vle
+           JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+           WHERE vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+             AND vle.dr_cr = 'Dr'
+         ), 'Other') AS mode
+       FROM vouchers v
+       WHERE v.company_guid = $1
+         AND v.voucher_type ILIKE '%Receipt%'
+         AND v.is_cancelled = FALSE
+         AND v.date BETWEEN $2 AND $3
+       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
+       LIMIT 100`,
+      [companyGuid, from, to]
+    );
+    const txs = rows.map(r => ({
+      guid: r.guid,
+      voucher_number: r.voucher_number,
+      party_name: r.party_name,
+      amount: parseFloat(r.amount || 0),
+      date: r.date,
+      narration: r.narration,
+      mode: r.mode || 'Other',
+    }));
+    const total = txs.reduce((s, r) => s + r.amount, 0);
+    const cashTotal = txs.filter(t => t.mode === 'Cash').reduce((s, t) => s + t.amount, 0);
+    const bankTotal = txs.filter(t => t.mode === 'Bank').reduce((s, t) => s + t.amount, 0);
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayTotal = txs.filter(t => String(t.date).slice(0, 10) === todayIso).reduce((s, t) => s + t.amount, 0);
+    res.json({
+      success: true,
+      data: {
+        total, today_total: todayTotal, cash_total: cashTotal, bank_total: bankTotal,
+        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        transactions: txs, from, to,
+      },
+    });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 

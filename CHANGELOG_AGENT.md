@@ -1,3 +1,8 @@
+## 2026-08-24 — KPI Payments/Receipts: mode + real totals
+
+### Fixed
+- `GET /api/kpi/payments` + `/kpi/receipts` — return Cash/Bank `mode` from ledger legs, `today_total` / `cash_total` / `bank_total`, guid, limit 100
+
 ## 2026-08-24 — Fix desktop_online / last_seen bigint coercion
 
 ### Fixed
