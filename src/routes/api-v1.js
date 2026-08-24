@@ -755,27 +755,29 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
 });
 
 // GET /api/dashboard/cashflow
+// Income/Expense bars = Receipts / Payments (real cash & bank movement), not Sales/Purchase.
 router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
-    const [sRes2, pRes2] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+    const [rctRes, pmtRes] = await Promise.all([
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
     ]);
-    const sVal2 = +(sRes2.rows?.[0]?.v ?? 0);
-    const pVal2 = +(pRes2.rows?.[0]?.v ?? 0);
+    const receipts = +(rctRes.rows?.[0]?.v ?? 0);
+    const payments = +(pmtRes.rows?.[0]?.v ?? 0);
     const netCash = +(cash?.[0]?.v ?? 0) + +(bank?.[0]?.v ?? 0);
-    const grossProfit = sVal2 - pVal2;
+    const netFlow = receipts - payments;
     res.json({ success: true, data: {
       net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
-      gross_profit: grossProfit, net_profit: grossProfit,
-      total_income: sVal2, total_expense: pVal2,
-      income_percentage: sVal2 > 0 ? Math.round((grossProfit / sVal2) * 100) : 0,
+      // Period net money movement (receipts − payments)
+      gross_profit: netFlow, net_profit: netFlow,
+      total_income: receipts, total_expense: payments,
+      income_percentage: receipts > 0 ? Math.round((netFlow / receipts) * 100) : 0,
       fy_from: from, fy_to: to,
       updated_at: 'just now',
     }});

@@ -1,3 +1,8 @@
+## 2026-08-24 — Cashflow = Receipts / Payments (not Sales/Purchase)
+
+### Changed
+- `GET /api/dashboard/cashflow` — `total_income` = Receipts, `total_expense` = Payments; net flow = receipts − payments
+
 ## 2026-08-24 — KPI Payments/Receipts: mode + real totals
 
 ### Fixed
