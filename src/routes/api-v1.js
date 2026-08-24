@@ -951,6 +951,46 @@ const voucherListHandler = (voucherType) => async (req, res) => {
 router.get('/sales/invoices',    authMiddleware, voucherListHandler('Sales'));
 router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
 
+// GET /api/sales/home-metrics — Today / MTD / YTD / Outstanding / Credit Notes / Avg Ticket
+router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const today = new Date().toISOString().slice(0, 10);
+    const mtdFrom = `${today.slice(0, 8)}01`;
+    const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND is_cancelled=FALSE`;
+    const [todayRes, mtdRes, ytdRes, cntRes, cnRes, arRes] = await Promise.all([
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date=$2`, [companyGuid, today]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, mtdFrom, today]),
+      query(`SELECT COALESCE(SUM(amount),0) as v, COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
+      query(`SELECT COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Credit Note%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
+      query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyGuid]),
+    ]);
+    const ytd = +(ytdRes.rows?.[0]?.v ?? 0);
+    const count = +(ytdRes.rows?.[0]?.c ?? cntRes.rows?.[0]?.c ?? 0);
+    const avg = count > 0 ? ytd / count : 0;
+    res.json({
+      success: true,
+      data: {
+        today: +(todayRes.rows?.[0]?.v ?? 0),
+        mtd: +(mtdRes.rows?.[0]?.v ?? 0),
+        ytd,
+        outstanding: +(arRes.rows?.[0]?.v ?? 0),
+        credit_notes: +(cnRes.rows?.[0]?.v ?? 0),
+        avg_ticket: avg,
+        invoice_count: count,
+        from: fyFrom,
+        to: fyTo,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/sales/invoices/:id/credit-note-context
 // Everything the Credit Note (Sales Return) screen needs for one Sales invoice:
 // header + party, the invoice's inventory rows with cumulative returned/remaining
@@ -3906,12 +3946,63 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
-    const { rows: cashLedgers } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
-    const { rows: txns } = await query(`SELECT voucher_number, party_name, voucher_type, amount, date, narration FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Payment','Receipt','Contra') AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC LIMIT 30`, [companyGuid, from, to]);
-    const balance = cashLedgers.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
-    res.json({ success: true, data: { current_balance: balance, display: `₹${Math.round(balance).toLocaleString('en-IN')}`, ledgers: cashLedgers, transactions: txns } });
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows: cashLedgers } = await query(
+      `SELECT name, closing_balance FROM ledgers
+       WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%' OR name ILIKE 'Cash')
+       ORDER BY ABS(closing_balance) DESC`,
+      [companyGuid]
+    );
+    const { rows: txns } = await query(
+      `SELECT v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration,
+              COALESCE((
+                SELECT CASE WHEN bool_or(vle.dr_cr='Dr') THEN 'in' ELSE 'out' END
+                FROM voucher_ledger_entries vle
+                JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+                WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
+                  AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
+              ), 'out') AS direction
+       FROM vouchers v
+       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+         AND v.voucher_type IN ('Payment','Receipt','Contra')
+         AND v.date BETWEEN $2 AND $3
+         AND EXISTS (
+           SELECT 1 FROM voucher_ledger_entries vle
+           JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+           WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
+             AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
+         )
+       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
+       LIMIT 50`,
+      [companyGuid, from, to]
+    );
+    const balance = cashLedgers.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const mapped = txns.map(t => ({
+      guid: t.guid,
+      voucher_number: t.voucher_number,
+      party_name: t.party_name,
+      voucher_type: t.voucher_type,
+      amount: Math.abs(parseFloat(t.amount || 0)),
+      date: t.date,
+      narration: t.narration,
+      direction: t.direction === 'in' ? 'in' : 'out',
+    }));
+    const todayIn = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'in').reduce((s, t) => s + t.amount, 0);
+    const todayOut = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'out').reduce((s, t) => s + t.amount, 0);
+    res.json({
+      success: true,
+      data: {
+        current_balance: balance,
+        today_inflow: todayIn,
+        today_outflow: todayOut,
+        display: `₹${Math.round(balance).toLocaleString('en-IN')}`,
+        ledgers: cashLedgers.map(l => ({ name: l.name, balance: Math.abs(parseFloat(l.closing_balance || 0)) })),
+        transactions: mapped,
+        from, to,
+      },
+    });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
 // GET /api/bank-ledgers — bank + cash ledgers (for payment selection in voucher forms)
@@ -3972,31 +4063,163 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: banks } = await query(`SELECT name, closing_balance, gstin FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
-    const total = banks.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
-    res.json({ success: true, data: { total_balance: total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, banks: banks.map(b => ({ name: b.name, balance: parseFloat(b.closing_balance||0) })) } });
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows: banks } = await query(
+      `SELECT name, closing_balance, parent FROM ledgers
+       WHERE company_guid=$1
+         AND (
+           parent ILIKE '%Bank Accounts%' OR parent ILIKE '%Bank Account%'
+           OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%'
+           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
+         )
+       ORDER BY ABS(closing_balance) DESC`,
+      [companyGuid]
+    );
+    const { rows: txnRows } = await query(
+      `SELECT vle.ledger_name, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.date,
+              ABS(vle.amount) AS amount, vle.dr_cr
+       FROM voucher_ledger_entries vle
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+       WHERE vle.company_guid=$1 AND v.is_cancelled=FALSE
+         AND v.date BETWEEN $2 AND $3
+         AND (
+           l.parent ILIKE '%Bank Accounts%' OR l.parent ILIKE '%Bank Account%'
+           OR l.parent ILIKE '%Bank OD%' OR l.parent ILIKE '%Overdraft%'
+           OR (l.parent ILIKE '%Bank%' AND l.parent NOT ILIKE '%Bank Charge%' AND l.parent NOT ILIKE '%Bank Interest%' AND l.parent NOT ILIKE '%Bank Exp%')
+         )
+       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
+       LIMIT 300`,
+      [companyGuid, from, to]
+    );
+    const byBank = new Map();
+    for (const t of txnRows) {
+      const list = byBank.get(t.ledger_name) || [];
+      if (list.length < 15) {
+        list.push({
+          guid: t.guid,
+          voucher_number: t.voucher_number,
+          party_name: t.party_name,
+          voucher_type: t.voucher_type,
+          date: t.date,
+          amount: Math.abs(parseFloat(t.amount || 0)),
+          type: t.dr_cr === 'Dr' ? 'Dr' : 'Cr',
+        });
+        byBank.set(t.ledger_name, list);
+      }
+    }
+    const bankList = banks.map(b => ({
+      name: b.name,
+      balance: Math.abs(parseFloat(b.closing_balance || 0)),
+      transactions: byBank.get(b.name) || [],
+    }));
+    const total = bankList.reduce((s, b) => s + b.balance, 0);
+    const allTx = txnRows.map(t => ({
+      date: t.date,
+      amount: Math.abs(parseFloat(t.amount || 0)),
+      type: t.dr_cr === 'Dr' ? 'Dr' : 'Cr',
+    }));
+    const todayIn = allTx.filter(t => String(t.date).slice(0, 10) === today && t.type === 'Dr').reduce((s, t) => s + t.amount, 0);
+    const todayOut = allTx.filter(t => String(t.date).slice(0, 10) === today && t.type === 'Cr').reduce((s, t) => s + t.amount, 0);
+    res.json({
+      success: true,
+      data: {
+        total_balance: total,
+        today_inflow: todayIn,
+        today_outflow: todayOut,
+        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        banks: bankList,
+        from, to,
+      },
+    });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
+
+function buildAgingBuckets(rows, todayIso) {
+  const buckets = {
+    '0-30d':  { bucket: '0-30d',  amount: 0, count: 0 },
+    '31-60d': { bucket: '31-60d', amount: 0, count: 0 },
+    '61-90d': { bucket: '61-90d', amount: 0, count: 0 },
+    '90+d':   { bucket: '90+d',   amount: 0, count: 0 },
+  };
+  const today = new Date(`${todayIso}T12:00:00`);
+  for (const r of rows) {
+    const refRaw = r.due_date || r.bill_date;
+    const amt = Math.abs(parseFloat(r.pending_amount || 0));
+    if (!amt) continue;
+    let days = 0;
+    if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
+      const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
+      if (!Number.isNaN(ref.getTime())) {
+        days = Math.max(0, Math.floor((today - ref) / 86400000));
+      }
+    }
+    const key = days <= 30 ? '0-30d' : days <= 60 ? '31-60d' : days <= 90 ? '61-90d' : '90+d';
+    buckets[key].amount += amt;
+    buckets[key].count += 1;
+  }
+  return Object.values(buckets);
+}
 
 router.get('/kpi/receivables', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: debtors } = await query(`SELECT name, closing_balance, mobile FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors') AND closing_balance > 0 ORDER BY closing_balance DESC LIMIT 50`, [companyGuid]);
-    const total = debtors.reduce((s,l) => s + parseFloat(l.closing_balance||0), 0);
-    // Aging: based on ledger balance buckets
-    res.json({ success: true, data: {
-      total, display: `₹${Math.round(total).toLocaleString('en-IN')}`,
-      parties: debtors.map(d => ({ name: d.name, amount: parseFloat(d.closing_balance||0), phone: d.mobile||'' })),
-      aging: [
-        { bucket: '0-30d',  amount: total * 0.35, count: Math.ceil(debtors.length * 0.35) },
-        { bucket: '31-60d', amount: total * 0.28, count: Math.ceil(debtors.length * 0.28) },
-        { bucket: '61-90d', amount: total * 0.22, count: Math.ceil(debtors.length * 0.22) },
-        { bucket: '90+d',   amount: total * 0.15, count: Math.ceil(debtors.length * 0.15) },
-      ]
-    }});
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows: debtors } = await query(
+      `SELECT name, closing_balance, mobile FROM ledgers
+       WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')
+         AND ABS(closing_balance) > 0.005
+       ORDER BY ABS(closing_balance) DESC LIMIT 50`,
+      [companyGuid]
+    );
+    const { rows: bills } = await query(
+      `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type
+       FROM bill_outstanding
+       WHERE company_guid=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
+         AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)
+       ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
+       LIMIT 500`,
+      [companyGuid]
+    );
+    const total = debtors.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const aging = buildAgingBuckets(bills, today);
+    const partyDays = new Map();
+    for (const b of bills) {
+      const refRaw = b.due_date || b.bill_date;
+      let days = 0;
+      if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
+        const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
+        if (!Number.isNaN(ref.getTime())) {
+          days = Math.max(0, Math.floor((new Date(`${today}T12:00:00`) - ref) / 86400000));
+        }
+      }
+      const prev = partyDays.get(b.ledger_name) || 0;
+      if (days > prev) partyDays.set(b.ledger_name, days);
+    }
+    res.json({
+      success: true,
+      data: {
+        total,
+        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        parties: debtors.map(d => ({
+          name: d.name,
+          amount: Math.abs(parseFloat(d.closing_balance || 0)),
+          phone: d.mobile || '',
+          days_overdue: partyDays.get(d.name) || 0,
+        })),
+        bills: bills.slice(0, 50).map(b => ({
+          party: b.ledger_name,
+          ref: b.bill_name,
+          date: b.due_date || b.bill_date,
+          amount: Math.abs(parseFloat(b.pending_amount || 0)),
+        })),
+        aging,
+      },
+    });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
 router.get('/kpi/payables', authMiddleware, async (req, res) => {
@@ -4004,13 +4227,59 @@ router.get('/kpi/payables', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows: creditors } = await query(`SELECT name, closing_balance, mobile FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors') AND closing_balance != 0 ORDER BY ABS(closing_balance) DESC LIMIT 50`, [companyGuid]);
-    const total = creditors.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
-    res.json({ success: true, data: {
-      total, display: `₹${Math.round(total).toLocaleString('en-IN')}`,
-      parties: creditors.map(c => ({ name: c.name, amount: Math.abs(parseFloat(c.closing_balance||0)), phone: c.mobile||'' }))
-    }});
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows: creditors } = await query(
+      `SELECT name, closing_balance, mobile FROM ledgers
+       WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')
+         AND ABS(closing_balance) > 0.005
+       ORDER BY ABS(closing_balance) DESC LIMIT 50`,
+      [companyGuid]
+    );
+    const { rows: bills } = await query(
+      `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type
+       FROM bill_outstanding
+       WHERE company_guid=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
+         AND (UPPER(COALESCE(bill_type,'')) = 'CR' OR COALESCE(pending_amount,0) > 0)
+       ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
+       LIMIT 500`,
+      [companyGuid]
+    );
+    const total = creditors.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
+    const aging = buildAgingBuckets(bills, today);
+    const partyDays = new Map();
+    for (const b of bills) {
+      const refRaw = b.due_date || b.bill_date;
+      let days = 0;
+      if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
+        const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
+        if (!Number.isNaN(ref.getTime())) {
+          days = Math.max(0, Math.floor((new Date(`${today}T12:00:00`) - ref) / 86400000));
+        }
+      }
+      const prev = partyDays.get(b.ledger_name) || 0;
+      if (days > prev) partyDays.set(b.ledger_name, days);
+    }
+    res.json({
+      success: true,
+      data: {
+        total,
+        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        parties: creditors.map(c => ({
+          name: c.name,
+          amount: Math.abs(parseFloat(c.closing_balance || 0)),
+          phone: c.mobile || '',
+          days_overdue: partyDays.get(c.name) || 0,
+        })),
+        bills: bills.slice(0, 50).map(b => ({
+          party: b.ledger_name,
+          ref: b.bill_name,
+          date: b.due_date || b.bill_date,
+          amount: Math.abs(parseFloat(b.pending_amount || 0)),
+        })),
+        aging,
+      },
+    });
+  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
 router.get('/kpi/payments', authMiddleware, async (req, res) => {

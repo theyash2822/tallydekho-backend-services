@@ -1,3 +1,14 @@
+## 2026-08-24 — KPI aging + bank txns + sales home metrics
+
+### Added
+- `GET /api/sales/home-metrics` — Today / MTD / YTD / Outstanding / Credit Notes / Avg Ticket
+- `GET /api/kpi/bank-balance` — per-bank recent ledger transactions + today in/out
+- Real AR/AP aging buckets from `bill_outstanding` (0–30 / 31–60 / 61–90 / 90+)
+
+### Changed
+- `GET /api/kpi/cash-in-hand` — cash-leg filtered movements, today inflow/outflow
+- `GET /api/kpi/receivables` + `/payables` — parties + bills + aging (no fake %)
+
 ## 2026-08-24 — Cashflow = Receipts / Payments (not Sales/Purchase)
 
 ### Changed
