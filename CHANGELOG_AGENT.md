@@ -1,3 +1,14 @@
+## 2026-08-25 — Phase B–D AR/AP + Cash series + Bank book label
+
+### Added
+- `src/modules/ar-ap/arApService.js` — due-based aging (incl. NOT_DUE), from/to + overdue filters, dual totals, receipts/payments activity
+- `GET /kpi/cash-in-hand` — `daily_balance` 30d series (C2 derive from cash VLE)
+
+### Changed
+- `GET /kpi/receivables` + `/kpi/payables` use arApService
+- Bank balance response: `balance_source: book`, `balance_label`
+
+
 ## 2026-08-25 — Loans & ODs calc engine (loan-calc-v1)
 
 ### Added

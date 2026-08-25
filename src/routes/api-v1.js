@@ -19,6 +19,7 @@ import { resolveCreditNoteContext } from '../utils/creditNoteContext.js';
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { buildGroupParentMap, inferLedgerNature } from '../utils/ledgerNature.js';
 import { buildLoansOdsPayload } from '../modules/loans-ods/loansOdsService.js';
+import { buildArApPayload } from '../modules/ar-ap/arApService.js';
 import {
   enrichNotification,
   stockNotification,
@@ -4081,6 +4082,61 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
     }));
     const todayIn = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'in').reduce((s, t) => s + t.amount, 0);
     const todayOut = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'out').reduce((s, t) => s + t.amount, 0);
+
+    // C2: derive last-30d daily cash balance + receipts/payments from ledger movements
+    const seriesDays = 30;
+    const seriesFrom = new Date(`${today}T12:00:00`);
+    seriesFrom.setDate(seriesFrom.getDate() - (seriesDays - 1));
+    const seriesFromIso = seriesFrom.toISOString().slice(0, 10);
+    const { rows: dailyMoves } = await query(
+      `SELECT v.date::text AS day,
+              SUM(CASE WHEN vle.dr_cr = 'Dr' THEN ABS(vle.amount) ELSE 0 END) AS inflow,
+              SUM(CASE WHEN vle.dr_cr = 'Cr' THEN ABS(vle.amount) ELSE 0 END) AS outflow
+       FROM voucher_ledger_entries vle
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       WHERE vle.company_guid = $1 AND v.is_cancelled = FALSE
+         AND v.date BETWEEN $2 AND $3
+         AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash in Hand%' OR l.name ILIKE 'Cash')
+       GROUP BY v.date
+       ORDER BY v.date ASC`,
+      [companyGuid, seriesFromIso, today]
+    );
+    const moveMap = new Map();
+    for (const r of dailyMoves) {
+      const day = String(r.day).slice(0, 10);
+      moveMap.set(day, {
+        inflow: Math.abs(parseFloat(r.inflow || 0)),
+        outflow: Math.abs(parseFloat(r.outflow || 0)),
+      });
+    }
+    const dayKeys = [];
+    for (let i = 0; i < seriesDays; i++) {
+      const d = new Date(seriesFrom);
+      d.setDate(seriesFrom.getDate() + i);
+      dayKeys.push(d.toISOString().slice(0, 10));
+    }
+    // Walk backwards from current book cash balance
+    const closingByDay = new Map();
+    let cursor = balance;
+    for (let i = dayKeys.length - 1; i >= 0; i--) {
+      const day = dayKeys[i];
+      closingByDay.set(day, cursor);
+      const m = moveMap.get(day) || { inflow: 0, outflow: 0 };
+      cursor = cursor - m.inflow + m.outflow;
+    }
+    const daily_balance = dayKeys.map((day, i) => ({
+      day,
+      label: String(i + 1),
+      balance: Math.round((closingByDay.get(day) || 0) * 100) / 100,
+      inflow: Math.round(((moveMap.get(day)?.inflow) || 0) * 100) / 100,
+      outflow: Math.round(((moveMap.get(day)?.outflow) || 0) * 100) / 100,
+    }));
+    const lastBal = daily_balance[daily_balance.length - 1]?.balance || balance;
+    const prevBal = daily_balance[daily_balance.length - 2]?.balance || lastBal;
+    const balChange = lastBal - prevBal;
+    const balChangePct = prevBal ? (balChange / Math.abs(prevBal)) * 100 : 0;
+
     res.json({
       success: true,
       data: {
@@ -4090,6 +4146,10 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
         display: `₹${Math.round(balance).toLocaleString('en-IN')}`,
         ledgers: cashLedgers.map(l => ({ name: l.name, balance: Math.abs(parseFloat(l.closing_balance || 0)) })),
         transactions: mapped,
+        daily_balance,
+        balance_change: Math.round(balChange * 100) / 100,
+        balance_change_pct: Math.round(balChangePct * 10) / 10,
+        series_days: seriesDays,
         from, to,
       },
     });
@@ -4236,6 +4296,8 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
         today_inflow: todayIn,
         today_outflow: todayOut,
         display: `₹${Math.round(total).toLocaleString('en-IN')}`,
+        balance_source: 'book',
+        balance_label: 'Book Balance (Tally)',
         banks: bankList,
         from, to,
       },
@@ -4243,89 +4305,18 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
-function buildAgingBuckets(rows, todayIso) {
-  const buckets = {
-    '0-30d':  { bucket: '0-30d',  amount: 0, count: 0 },
-    '31-60d': { bucket: '31-60d', amount: 0, count: 0 },
-    '61-90d': { bucket: '61-90d', amount: 0, count: 0 },
-    '90+d':   { bucket: '90+d',   amount: 0, count: 0 },
-  };
-  const today = new Date(`${todayIso}T12:00:00`);
-  for (const r of rows) {
-    const refRaw = r.due_date || r.bill_date;
-    const amt = Math.abs(parseFloat(r.pending_amount || 0));
-    if (!amt) continue;
-    let days = 0;
-    if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
-      const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
-      if (!Number.isNaN(ref.getTime())) {
-        days = Math.max(0, Math.floor((today - ref) / 86400000));
-      }
-    }
-    const key = days <= 30 ? '0-30d' : days <= 60 ? '31-60d' : days <= 90 ? '61-90d' : '90+d';
-    buckets[key].amount += amt;
-    buckets[key].count += 1;
-  }
-  return Object.values(buckets);
-}
-
 router.get('/kpi/receivables', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const { rows: debtors } = await query(
-      `SELECT name, closing_balance, mobile FROM ledgers
-       WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')
-         AND ABS(closing_balance) > 0.005
-       ORDER BY ABS(closing_balance) DESC LIMIT 50`,
-      [companyGuid]
-    );
-    const { rows: bills } = await query(
-      `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type
-       FROM bill_outstanding
-       WHERE company_guid=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
-         AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)
-       ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
-       LIMIT 500`,
-      [companyGuid]
-    );
-    const total = debtors.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const aging = buildAgingBuckets(bills, today);
-    const partyDays = new Map();
-    for (const b of bills) {
-      const refRaw = b.due_date || b.bill_date;
-      let days = 0;
-      if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
-        const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
-        if (!Number.isNaN(ref.getTime())) {
-          days = Math.max(0, Math.floor((new Date(`${today}T12:00:00`) - ref) / 86400000));
-        }
-      }
-      const prev = partyDays.get(b.ledger_name) || 0;
-      if (days > prev) partyDays.set(b.ledger_name, days);
-    }
-    res.json({
-      success: true,
-      data: {
-        total,
-        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
-        parties: debtors.map(d => ({
-          name: d.name,
-          amount: Math.abs(parseFloat(d.closing_balance || 0)),
-          phone: d.mobile || '',
-          days_overdue: partyDays.get(d.name) || 0,
-        })),
-        bills: bills.slice(0, 50).map(b => ({
-          party: b.ledger_name,
-          ref: b.bill_name,
-          date: b.due_date || b.bill_date,
-          amount: Math.abs(parseFloat(b.pending_amount || 0)),
-        })),
-        aging,
-      },
+    const data = await buildArApPayload(companyGuid, 'AR', {
+      from: req.query.from,
+      to: req.query.to,
+      overdue: req.query.overdue,
+      asOf: req.query.asOf,
     });
+    res.json({ success: true, data });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
@@ -4334,58 +4325,13 @@ router.get('/kpi/payables', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const { rows: creditors } = await query(
-      `SELECT name, closing_balance, mobile FROM ledgers
-       WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')
-         AND ABS(closing_balance) > 0.005
-       ORDER BY ABS(closing_balance) DESC LIMIT 50`,
-      [companyGuid]
-    );
-    const { rows: bills } = await query(
-      `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type
-       FROM bill_outstanding
-       WHERE company_guid=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
-         AND (UPPER(COALESCE(bill_type,'')) = 'CR' OR COALESCE(pending_amount,0) > 0)
-       ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
-       LIMIT 500`,
-      [companyGuid]
-    );
-    const total = creditors.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const aging = buildAgingBuckets(bills, today);
-    const partyDays = new Map();
-    for (const b of bills) {
-      const refRaw = b.due_date || b.bill_date;
-      let days = 0;
-      if (refRaw && /^\d{4}-\d{2}-\d{2}/.test(String(refRaw))) {
-        const ref = new Date(`${String(refRaw).slice(0, 10)}T12:00:00`);
-        if (!Number.isNaN(ref.getTime())) {
-          days = Math.max(0, Math.floor((new Date(`${today}T12:00:00`) - ref) / 86400000));
-        }
-      }
-      const prev = partyDays.get(b.ledger_name) || 0;
-      if (days > prev) partyDays.set(b.ledger_name, days);
-    }
-    res.json({
-      success: true,
-      data: {
-        total,
-        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
-        parties: creditors.map(c => ({
-          name: c.name,
-          amount: Math.abs(parseFloat(c.closing_balance || 0)),
-          phone: c.mobile || '',
-          days_overdue: partyDays.get(c.name) || 0,
-        })),
-        bills: bills.slice(0, 50).map(b => ({
-          party: b.ledger_name,
-          ref: b.bill_name,
-          date: b.due_date || b.bill_date,
-          amount: Math.abs(parseFloat(b.pending_amount || 0)),
-        })),
-        aging,
-      },
+    const data = await buildArApPayload(companyGuid, 'AP', {
+      from: req.query.from,
+      to: req.query.to,
+      overdue: req.query.overdue,
+      asOf: req.query.asOf,
     });
+    res.json({ success: true, data });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
