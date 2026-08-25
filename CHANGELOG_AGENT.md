@@ -1,3 +1,8 @@
+## 2026-08-25 — Bank balance KPI returns parent
+
+### Changed
+- `GET /api/kpi/bank-balance` — each bank object now includes `parent` (was selected in SQL but omitted from JSON) for mobile card secondary labels
+
 ## 2026-08-24 — KPI aging + bank txns + sales home metrics
 
 ### Added

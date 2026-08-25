@@ -4193,6 +4193,7 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
     }
     const bankList = banks.map(b => ({
       name: b.name,
+      parent: b.parent || '',
       balance: Math.abs(parseFloat(b.closing_balance || 0)),
       transactions: byBank.get(b.name) || [],
     }));
