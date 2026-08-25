@@ -1,3 +1,13 @@
+## 2026-08-25 — Loans & ODs calc engine (loan-calc-v1)
+
+### Added
+- `src/modules/loans-ods/loansOdsService.js` — classify LOAN/OD, EMI detection from voucher legs, estimated rate/EMI/next date, 6M outstanding, OD 30D util
+- `ledgers.credit_limit` + ingest from FullLedger/LedgerFull `CreditLimit` / `CREDITLIMIT`
+- `GET /kpi/loans-ods` returns rich `loans[]` / `overdrafts[]` with `source` + `confidence` on derived fields
+
+### Changed
+- Loan filter excludes Loans & Advances (Asset) / Prepaid Vat noise
+
 ## 2026-08-25 — Sync Tally bank A/c + IFSC onto ledgers
 
 ### Added

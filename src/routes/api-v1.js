@@ -18,6 +18,7 @@ import { generateEWB } from '../utils/ewbGenerator.js';
 import { resolveCreditNoteContext } from '../utils/creditNoteContext.js';
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { buildGroupParentMap, inferLedgerNature } from '../utils/ledgerNature.js';
+import { buildLoansOdsPayload } from '../modules/loans-ods/loansOdsService.js';
 import {
   enrichNotification,
   stockNotification,
@@ -673,7 +674,15 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyGuid]);
     const { rows: rec }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyGuid]);
     const { rows: pay }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`, [companyGuid]);
-    const { rows: loans } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Loan%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%')`, [companyGuid]);
+    const { rows: loans } = await query(
+      `SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers
+       WHERE company_guid=$1 AND (
+         parent ILIKE 'Secured Loans' OR parent ILIKE 'Unsecured Loans'
+         OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%'
+         OR parent ILIKE '%Cash Credit%' OR parent ILIKE 'Bank OD A/c' OR parent ILIKE 'Bank OD Accounts'
+       )`,
+      [companyGuid]
+    );
     const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
     const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
 
@@ -4491,10 +4500,37 @@ router.get('/kpi/loans-ods', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { rows } = await query(`SELECT name, closing_balance FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Loan%' OR parent ILIKE '%Secured Loan%' OR parent ILIKE '%Unsecured Loan%' OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%') ORDER BY ABS(closing_balance) DESC`, [companyGuid]);
-    const total = rows.reduce((s,l) => s + Math.abs(parseFloat(l.closing_balance||0)), 0);
-    res.json({ success: true, data: { total, display: `₹${Math.round(total).toLocaleString('en-IN')}`, loans: rows.map(l => ({ name: l.name, balance: Math.abs(parseFloat(l.closing_balance||0)) })) } });
-  } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const data = await buildLoansOdsPayload(companyGuid);
+    // Flat compat list (loans + ODs) lives on `all` — enriched arrays stay on loans/overdrafts
+    const compatLoans = [
+      ...(data.loans || []).map((l) => ({
+        name: l.name,
+        parent: l.parent,
+        balance: l.outstanding?.value ?? l.outstanding ?? 0,
+        facilityType: l.facilityType,
+        mode: l.mode,
+      })),
+      ...(data.overdrafts || []).map((l) => ({
+        name: l.name,
+        parent: l.parent,
+        balance: l.outstanding?.value ?? l.outstanding ?? 0,
+        facilityType: l.facilityType,
+        mode: l.mode,
+      })),
+    ];
+    res.json({
+      success: true,
+      data: {
+        ...data,
+        loans: data.loans,
+        overdrafts: data.overdrafts,
+        all: compatLoans,
+      },
+    });
+  } catch (err) {
+    console.error('[kpi/loans-ods]', err);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
