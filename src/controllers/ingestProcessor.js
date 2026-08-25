@@ -14,6 +14,52 @@ function extractLedgerTaxRate(r) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Pick first non-empty string from Tally XML / JSON variants. */
+function pickBankStr(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (!s || s === '0' || /^null$/i.test(s)) continue;
+    return s;
+  }
+  return null;
+}
+
+/**
+ * Bank A/c fields from LedgerFull / FullLedger (Tally BankAccountDetails + IFS Code).
+ * Returns nulls when absent so ON CONFLICT COALESCE keeps prior values.
+ */
+function extractBankFields(r) {
+  if (!r || typeof r !== 'object') {
+    return { bank_account_no: null, bank_ifsc: null, bank_name: null, bank_branch: null, bank_holder: null };
+  }
+  const badRaw = r.BankAccountDetails || r.BANKACCOUNTDETAILS || r['BANKACCOUNTDETAILS.LIST']
+    || r.bankAccountDetails || r['BankAccountDetails.LIST'];
+  let nested = {};
+  if (Array.isArray(badRaw) && badRaw[0]) nested = badRaw[0];
+  else if (badRaw && typeof badRaw === 'object') nested = badRaw;
+
+  return {
+    bank_account_no: pickBankStr(
+      r.BANKACCOUNTNUMBER, r.BankAccountNo, r.BANKACCOUNTNO, r.AccountNumber,
+      nested.AccountNumber, nested.ACCOUNTNUMBER, nested.BankAccountNo
+    ),
+    bank_ifsc: pickBankStr(
+      r.BANKIFSC, r.IFSC, r.IFSCode, r.IFSCCode, r.IfscCode,
+      nested.IFSCCode, nested.IFSCODE, nested.IFSC, nested.IFSCode
+    ),
+    bank_name: pickBankStr(
+      r.BANKNAME, r.BankName, nested.BankName, nested.BANKNAME
+    ),
+    bank_branch: pickBankStr(
+      r.BANKBRANCH, r.BankBranch, r.BankBranchName, r.BankBranch, nested.BranchName, nested.BANKBRANCH
+    ),
+    bank_holder: pickBankStr(
+      r.BANKACCOUNTHOLDER, r.BankHolder, r.BankAccHolderName, r.BANKACCHOLDERNAME, nested.BankAccHolderName
+    ),
+  };
+}
+
 // ── Dispatch / EWB Extraction ────────────────────────────────────────────────
 // Extracts dispatch + transport details from a TallyPrime voucher record.
 // Field names validated against real TallyPrime XML export (2026-06-24).
@@ -534,9 +580,11 @@ async function processMasters(data, companyGuid) {
           `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
           [companyGuid, name, guid]
         );
+        const bank = extractBankFields(r);
         await client.query(`
-          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate,
+            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -546,7 +594,12 @@ async function processMasters(data, companyGuid) {
             synced_at=EXCLUDED.synced_at,
             gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
             pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode),
-            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END
+            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END,
+            bank_account_no=COALESCE(NULLIF(EXCLUDED.bank_account_no,''), ledgers.bank_account_no),
+            bank_ifsc=COALESCE(NULLIF(EXCLUDED.bank_ifsc,''), ledgers.bank_ifsc),
+            bank_name=COALESCE(NULLIF(EXCLUDED.bank_name,''), ledgers.bank_name),
+            bank_branch=COALESCE(NULLIF(EXCLUDED.bank_branch,''), ledgers.bank_branch),
+            bank_holder=COALESCE(NULLIF(EXCLUDED.bank_holder,''), ledgers.bank_holder)
         `, [
           guid, companyGuid, name, parent,
           r.ALIAS || r.LANGUAGENAME2 || null,
@@ -563,6 +616,7 @@ async function processMasters(data, companyGuid) {
           r.LEDSTATENAME || r.LedStateName || r.STATENAME || r.MAILINGSTATE || null,
           extractNativePincode(r),
           extractLedgerTaxRate(r),
+          bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
         ]);
         saved++;
       } catch (e) {
@@ -1843,10 +1897,12 @@ async function processFullLedger(data, companyGuid) {
           `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
           [companyGuid, name, guid]
         );
+        const bank = extractBankFields(r);
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
-            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate,
+            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
           ON CONFLICT (guid, company_guid) DO UPDATE SET
             name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
@@ -1856,14 +1912,18 @@ async function processFullLedger(data, companyGuid) {
             alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
             gst_registration_type=EXCLUDED.gst_registration_type, state_name=EXCLUDED.state_name,
             pincode=COALESCE(EXCLUDED.pincode, ledgers.pincode),
-            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END
+            tax_rate=CASE WHEN EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate ELSE ledgers.tax_rate END,
+            bank_account_no=COALESCE(NULLIF(EXCLUDED.bank_account_no,''), ledgers.bank_account_no),
+            bank_ifsc=COALESCE(NULLIF(EXCLUDED.bank_ifsc,''), ledgers.bank_ifsc),
+            bank_name=COALESCE(NULLIF(EXCLUDED.bank_name,''), ledgers.bank_name),
+            bank_branch=COALESCE(NULLIF(EXCLUDED.bank_branch,''), ledgers.bank_branch),
+            bank_holder=COALESCE(NULLIF(EXCLUDED.bank_holder,''), ledgers.bank_holder)
         `, [
           guid, companyGuid, name,
           r.Parent || r.PARENT || null,
           r.ALIAS || r.Alias || r.OnlyAlias || null,
           extractNativeGstin(r),
           r.ITPAN || r.PAN || r.IncomeTaxNumber || null,
-          // DEBUG: log raw GST fields for any ledger with null GSTIN (helps diagnose missing GSTINs)
           r.LEDGERMOBILE || r.LedgerMobile || r.PHONE || r.Phone || r.LedPhone || r.LedgerPhone || null,
           r.LEDGEREMAIL || r.LedgerEmail || r.EMAIL || r.Email || null,
           extractNativeAddress(r),
@@ -1875,6 +1935,7 @@ async function processFullLedger(data, companyGuid) {
           extractNativeStateName(r),
           extractNativePincode(r),
           extractLedgerTaxRate(r),
+          bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
         ]);
         saved++;
         // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction

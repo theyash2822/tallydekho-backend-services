@@ -1,3 +1,13 @@
+## 2026-08-25 — Sync Tally bank A/c + IFSC onto ledgers
+
+### Added
+- `ledgers.bank_account_no`, `bank_ifsc`, `bank_name`, `bank_branch`, `bank_holder`
+- Ingest maps LedgerFull / FullLedger bank tags (`BANKACCOUNTNUMBER`, `BankAccountNo`, `IFSC`, …)
+
+### Changed
+- `GET /api/kpi/bank-balance` — returns account_number, ifsc, bank_name, branch, account_holder per bank
+- `GET /api/bank-ledgers` — same bank master fields for Bank Feeds UI
+
 ## 2026-08-25 — Bank balance KPI returns parent
 
 ### Changed

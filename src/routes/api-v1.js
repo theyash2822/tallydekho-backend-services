@@ -4124,7 +4124,9 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
          )`;
     }
     const { rows } = await query(
-      `SELECT name, closing_balance, balance_type, parent FROM ledgers
+      `SELECT name, closing_balance, balance_type, parent,
+              bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder
+       FROM ledgers
        WHERE company_guid=$1 ${whereExtra}
        ORDER BY
          CASE WHEN parent ILIKE '%Cash%' OR name ILIKE 'Cash' THEN 0 ELSE 1 END,
@@ -4135,6 +4137,12 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
       name: r.name,
       balance: parseFloat(r.closing_balance||0),
       balance_type: r.balance_type,
+      parent: r.parent || '',
+      account_number: r.bank_account_no || '',
+      ifsc: r.bank_ifsc || '',
+      bank_name: r.bank_name || '',
+      branch: r.bank_branch || '',
+      account_holder: r.bank_holder || '',
       type: (r.parent?.toLowerCase().includes('cash') || r.name?.toLowerCase() === 'cash') ? 'cash' : 'bank'
     })) });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
@@ -4148,7 +4156,9 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
     const { rows: banks } = await query(
-      `SELECT name, closing_balance, parent FROM ledgers
+      `SELECT name, closing_balance, parent,
+              bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder
+       FROM ledgers
        WHERE company_guid=$1
          AND (
            parent ILIKE '%Bank Accounts%' OR parent ILIKE '%Bank Account%'
@@ -4195,6 +4205,11 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
       name: b.name,
       parent: b.parent || '',
       balance: Math.abs(parseFloat(b.closing_balance || 0)),
+      account_number: b.bank_account_no || '',
+      ifsc: b.bank_ifsc || '',
+      bank_name: b.bank_name || '',
+      branch: b.bank_branch || '',
+      account_holder: b.bank_holder || '',
       transactions: byBank.get(b.name) || [],
     }));
     const total = bankList.reduce((s, b) => s + b.balance, 0);

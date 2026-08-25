@@ -512,6 +512,12 @@ export async function initSchema() {
       -- never created here — a fresh database silently lost both.
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS state_name TEXT;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS gst_registration_type TEXT;
+      -- Bank ledger master fields from Tally (BankAccountDetails / IFS Code, etc.)
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_account_no TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_ifsc TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_name TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_branch TEXT;
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_holder TEXT;
 
       -- vouchers migrations (E-Invoice / E-Way Bill columns)
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;
