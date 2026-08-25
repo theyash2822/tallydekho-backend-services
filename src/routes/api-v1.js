@@ -17,6 +17,7 @@ import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
 import { resolveCreditNoteContext } from '../utils/creditNoteContext.js';
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
+import { buildGroupParentMap, inferLedgerNature } from '../utils/ledgerNature.js';
 import {
   enrichNotification,
   stockNotification,
@@ -1721,6 +1722,7 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   try {
     let q = `
       SELECT l.*,
+        TRIM(COALESCE(l.parent, '')) as parent,
         -- FY-specific computed closing balance
         COALESCE(lfb.opening_balance, l.opening_balance, 0) as fy_opening_abs,
         COALESCE(lfb.balance_type, l.balance_type, 'Dr') as fy_opening_type,
@@ -1732,34 +1734,66 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
             AND (vle.financial_year = $3 OR (vle.financial_year IS NULL AND v.date BETWEEN $4 AND $5))
             AND v.is_cancelled = FALSE
         ), 0) as fy_movement,
-        -- Derive nature from parent group (ledgers.nature is rarely populated directly)
-        COALESCE(l.nature, g.nature) as nature
+        -- Stored nature (often null — inferred below from group hierarchy)
+        COALESCE(NULLIF(TRIM(l.nature), ''), NULLIF(TRIM(g.nature), '')) as stored_nature
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
         ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $3
       LEFT JOIN groups g
-        ON g.company_guid = l.company_guid AND g.name = l.parent
+        ON g.company_guid = l.company_guid AND g.name = TRIM(l.parent)
       WHERE l.company_guid=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
     `;
     const params = [companyGuid, `%${search}%`, financialYear, fyFrom, fyTo];
     let idx = 6;
-    if (nature) { q += ` AND COALESCE(l.nature, g.nature) ILIKE $${idx++}`; params.push(`%${nature}%`); }
-    if (group)  { q += ` AND l.parent = $${idx++}`; params.push(group); }
-    q += ` ORDER BY ABS(l.closing_balance) DESC, l.name LIMIT $${idx++} OFFSET $${idx}`;
-    params.push(parseInt(limit), offset);
-    const { rows } = await query(q, params);
-    // Compute FY closing: openingSigned + movement → abs + type
-    const data = rows.map(l => {
+    // Group filter can stay in SQL; nature is applied after inference (stored nature often blank)
+    if (group)  { q += ` AND TRIM(l.parent) = $${idx++}`; params.push(String(group).trim()); }
+    // When nature is requested, load all matching search/group rows then paginate after inference.
+    // Otherwise apply SQL pagination as usual.
+    if (!nature) {
+      q += ` ORDER BY ABS(l.closing_balance) DESC, l.name LIMIT $${idx++} OFFSET $${idx}`;
+      params.push(parseInt(limit), offset);
+    } else {
+      q += ` ORDER BY ABS(l.closing_balance) DESC, l.name`;
+    }
+
+    const [{ rows }, { rows: groupRows }, { rows: cnt }] = await Promise.all([
+      query(q, params),
+      query('SELECT name, parent, nature FROM groups WHERE company_guid=$1', [companyGuid]),
+      query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]),
+    ]);
+    const parentByName = buildGroupParentMap(groupRows);
+
+    // Compute FY closing + inferred nature
+    let data = rows.map(l => {
       const bt = l.fy_opening_type || 'Dr';
       const openSigned = bt === 'Dr' ? -Math.abs(parseFloat(l.fy_opening_abs||0)) : Math.abs(parseFloat(l.fy_opening_abs||0));
       const closeSigned = openSigned + parseFloat(l.fy_movement||0);
+      const parent = String(l.parent || '').trim();
+      const natureVal = inferLedgerNature(parent, parentByName, l.stored_nature);
       return {
         ...l,
+        parent: parent || null,
+        nature: natureVal || null,
         closing_balance: Math.abs(closeSigned),   // FY-computed closing
         balance_type:    closeSigned <= 0 ? 'Dr' : 'Cr',
       };
     });
-    const { rows: cnt } = await query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]);
+
+    if (nature) {
+      const want = String(nature).trim().toLowerCase();
+      data = data.filter(l => {
+        const n = String(l.nature || '').toLowerCase();
+        return n === want || n.startsWith(want) || (n && want.startsWith(n));
+      });
+      const totalFiltered = data.length;
+      data = data.slice(offset, offset + parseInt(limit));
+      return res.json({
+        success: true,
+        data,
+        meta: { total: totalFiltered, page: parseInt(page), limit: parseInt(limit) },
+      });
+    }
+
     res.json({ success: true, data, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit) } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
