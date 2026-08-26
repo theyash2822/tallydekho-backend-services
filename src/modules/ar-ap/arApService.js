@@ -1,18 +1,13 @@
 /**
- * AR / AP KPI helpers (Phase B)
+ * AR / AP KPI helpers (Phase B + Phase 3 snapshots)
  * Spec: TallyDekho_AR_AP_Cash_Bank_Data_Validation_and_Collection_Spec.md
  */
 import { query } from '../../db/schema.js';
+import {
+  money, isoDay, addDays, computeTrendPct, pickPriorSnapshot,
+} from '../kpi/trendUtil.js';
 
-function money(n) {
-  return Math.round((Math.abs(parseFloat(n) || 0)) * 100) / 100;
-}
-
-function isoDay(d) {
-  if (!d) return null;
-  const s = String(d).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s : null;
-}
+const TREND_LOOKBACK_DAYS = 30;
 
 function daysBetween(asOfIso, dueIso) {
   if (!dueIso) return 0;
@@ -22,7 +17,7 @@ function daysBetween(asOfIso, dueIso) {
   return Math.floor((a - b) / 86400000);
 }
 
-/** Due-date based aging including NOT_DUE. */
+/** Due-date based aging including NOT_DUE. Trends applied later from snapshots. */
 export function buildAgingBucketsDueBased(bills, asOfIso) {
   const buckets = {
     'NOT_DUE': { bucket: 'NOT_DUE', label: 'Not Due', amount: 0, count: 0 },
@@ -45,7 +40,6 @@ export function buildAgingBucketsDueBased(bills, asOfIso) {
     buckets[key].amount += amt;
     buckets[key].count += 1;
   }
-  // Trend badges kept in UI; without historical as-of snapshots we cannot invent MoM %.
   return Object.values(buckets).map((b) => ({
     ...b,
     amount: money(b.amount),
@@ -53,6 +47,56 @@ export function buildAgingBucketsDueBased(bills, asOfIso) {
     trendState: 'UNKNOWN',
     trendSource: 'UNKNOWN',
   }));
+}
+
+function agingToMap(aging) {
+  const map = {};
+  for (const b of aging) {
+    map[b.bucket] = money(b.amount);
+  }
+  return map;
+}
+
+async function upsertArApSnapshot(companyGuid, side, asOf, total, agingMap) {
+  await query(
+    `INSERT INTO kpi_ar_ap_snapshots (company_guid, side, as_of, total, aging, created_at)
+     VALUES ($1, $2, $3::date, $4, $5::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT)
+     ON CONFLICT (company_guid, side, as_of)
+     DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging,
+                   created_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
+    [companyGuid, side, asOf, total, JSON.stringify(agingMap)]
+  );
+}
+
+async function loadPriorArApSnapshot(companyGuid, side, asOf) {
+  const target = addDays(asOf, -TREND_LOOKBACK_DAYS);
+  const from = addDays(target, -3);
+  const to = addDays(target, 3);
+  const { rows } = await query(
+    `SELECT as_of::text AS as_of, total, aging
+     FROM kpi_ar_ap_snapshots
+     WHERE company_guid = $1 AND side = $2
+       AND as_of BETWEEN $3::date AND $4::date
+       AND as_of <> $5::date
+     ORDER BY as_of DESC`,
+    [companyGuid, side, from, to, asOf]
+  );
+  return pickPriorSnapshot(rows, target, 3);
+}
+
+function applyAgingTrends(aging, priorAgingMap) {
+  return aging.map((b) => {
+    const priorAmt = priorAgingMap ? Number(priorAgingMap[b.bucket]) : null;
+    const trend = priorAmt == null || Number.isNaN(priorAmt)
+      ? null
+      : computeTrendPct(b.amount, priorAmt);
+    return {
+      ...b,
+      trend,
+      trendState: trend == null ? 'UNKNOWN' : (trend >= 0 ? 'UP' : 'DOWN'),
+      trendSource: trend == null ? 'UNKNOWN' : 'SNAPSHOT',
+    };
+  });
 }
 
 function mapBillRow(b, asOfIso, side) {
@@ -78,6 +122,7 @@ function mapBillRow(b, asOfIso, side) {
     daysOverdue: Math.max(0, overdueDays),
     status,
     billType: b.bill_type || (side === 'AR' ? 'DR' : 'CR'),
+    voucherGuid: b.voucher_guid || null,
   };
 }
 
@@ -140,7 +185,6 @@ function aggregateParties(debtors, bills, asOfIso, side = 'AR') {
 async function loadSettlementActivity(companyGuid, {
   side, from, to, limit = 40,
 }) {
-  // AR: Receipts touching Sundry Debtors; AP: Payments touching Sundry Creditors
   const partyParent = side === 'AR'
     ? `(l.parent ILIKE '%Sundry Debtor%' OR l.parent = 'Sundry Debtors')`
     : `(l.parent ILIKE '%Sundry Creditor%' OR l.parent = 'Sundry Creditors')`;
@@ -150,7 +194,6 @@ async function loadSettlementActivity(companyGuid, {
   if (from) { params.push(from); dateClause += ` AND v.date >= $${params.length}`; }
   if (to) { params.push(to); dateClause += ` AND v.date <= $${params.length}`; }
   params.push(limit);
-  // DISTINCT ON must ORDER BY guid first; wrap so LIMIT applies to date-desc rows (not guid order).
   const { rows } = await query(
     `SELECT * FROM (
        SELECT DISTINCT ON (v.guid)
@@ -206,7 +249,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   );
 
   const { rows: billsRaw } = await query(
-    `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type
+    `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type, voucher_guid
      FROM bill_outstanding
      WHERE company_guid = $1 AND ABS(COALESCE(pending_amount,0)) > 0.005
        AND ${billTypeClause}
@@ -216,7 +259,53 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   );
 
   let bills = billsRaw.map((b) => mapBillRow(b, asOf, side));
-  // Date range = bill/due date filter on current open bills (decision A)
+
+  const missing = bills.filter((b) => !b.voucherGuid && b.ref);
+  const missingRefs = [...new Set(missing.map((b) => b.ref))];
+  if (missingRefs.length) {
+    const { rows: vrows } = await query(
+      `SELECT guid, voucher_number, party_name, voucher_type, date
+       FROM vouchers
+       WHERE company_guid = $1
+         AND is_cancelled = FALSE
+         AND voucher_number = ANY($2::text[])
+       ORDER BY date DESC NULLS LAST`,
+      [companyGuid, missingRefs]
+    );
+    const byRefParty = new Map();
+    const byRef = new Map();
+    for (const v of vrows) {
+      const ref = String(v.voucher_number);
+      const pk = `${ref}||${String(v.party_name || '').toLowerCase()}`;
+      if (!byRefParty.has(pk)) byRefParty.set(pk, v.guid);
+      if (!byRef.has(ref)) byRef.set(ref, v.guid);
+    }
+    bills = bills.map((b) => {
+      if (b.voucherGuid || !b.ref) return b;
+      const partyKey = `${b.ref}||${String(b.party || '').toLowerCase()}`;
+      const guid = byRefParty.get(partyKey) || byRef.get(String(b.ref)) || null;
+      return guid ? { ...b, voucherGuid: guid } : b;
+    });
+  }
+
+  // Unfiltered aging + total for snapshot / trends (real MoM baseline)
+  const unfilteredAgingSource = bills.map((b) => ({
+    pending_amount: b.amount,
+    due_date: b.dueDate,
+    bill_date: b.billDate,
+  }));
+  const unfilteredAging = buildAgingBucketsDueBased(unfilteredAgingSource, asOf);
+  const accountingBalance = money(partiesRaw.reduce((s, p) => s + Math.abs(parseFloat(p.closing_balance) || 0), 0));
+  const unfilteredOpen = money(bills.reduce((s, b) => s + b.amount, 0));
+  const snapshotTotal = accountingBalance || unfilteredOpen;
+  const agingMap = agingToMap(unfilteredAging);
+
+  try {
+    await upsertArApSnapshot(companyGuid, side, asOf, snapshotTotal, agingMap);
+  } catch (e) {
+    console.warn('[arAp] snapshot upsert skipped:', e.message);
+  }
+
   if (from || to) {
     bills = bills.filter((b) => {
       const ref = b.dueDate || b.billDate;
@@ -230,13 +319,29 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
     bills = bills.filter((b) => b.status === 'OVERDUE');
   }
 
-  // Rebuild raw for aging from filtered set
+  const filteredView = !!(overdueOnly || from || to);
   const agingSource = bills.map((b) => ({
     pending_amount: b.amount,
     due_date: b.dueDate,
     bill_date: b.billDate,
   }));
-  const aging = buildAgingBucketsDueBased(agingSource, asOf);
+  let aging = buildAgingBucketsDueBased(agingSource, asOf);
+
+  let prior = null;
+  try {
+    prior = await loadPriorArApSnapshot(companyGuid, side, asOf);
+  } catch (e) {
+    console.warn('[arAp] prior snapshot load skipped:', e.message);
+  }
+
+  let trend_pct = null;
+  if (!filteredView && prior) {
+    const priorAging = typeof prior.aging === 'string' ? JSON.parse(prior.aging) : (prior.aging || {});
+    aging = applyAgingTrends(aging, priorAging);
+    trend_pct = computeTrendPct(snapshotTotal, prior.total);
+  } else if (filteredView) {
+    aging = aging.map((b) => ({ ...b, trend: null, trendState: 'UNKNOWN', trendSource: 'UNKNOWN' }));
+  }
 
   let parties = aggregateParties(partiesRaw, billsRaw.filter((br) => {
     const mapped = mapBillRow(br, asOf, side);
@@ -253,10 +358,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
     parties = parties.filter((p) => p.overdueOutstanding > 0.005);
   }
 
-  const accountingBalance = money(partiesRaw.reduce((s, p) => s + Math.abs(parseFloat(p.closing_balance) || 0), 0));
   const openBillOutstanding = money(bills.reduce((s, b) => s + b.amount, 0));
-  // When overdue/date filters apply, Total Due must reflect filtered open bills (not full ledger total).
-  const filteredView = !!(overdueOnly || from || to);
   const total = filteredView ? openBillOutstanding : accountingBalance;
 
   const activity = await loadSettlementActivity(companyGuid, {
@@ -272,14 +374,17 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
     to: to || null,
     accountingBalance,
     openBillOutstanding,
-    unallocatedDifference: money(accountingBalance - openBillOutstanding),
+    unallocatedDifference: money(accountingBalance - unfilteredOpen),
     filteredView,
     total,
     display: `₹${Math.round(total).toLocaleString('en-IN')}`,
     aging,
+    trend_pct,
+    trend_positive: trend_pct == null ? null : trend_pct >= 0,
+    trend_lookback_days: TREND_LOOKBACK_DAYS,
+    prior_as_of: prior ? isoDay(prior.as_of) : null,
     parties: parties.slice(0, 80),
     bills: bills.slice(0, 100),
-    // chip lists
     receipts: side === 'AR' ? activity : [],
     payments: side === 'AP' ? activity : [],
     activityLabel: side === 'AR' ? 'Receipts' : 'Payments',

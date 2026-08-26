@@ -21,6 +21,7 @@ import { buildGroupParentMap, inferLedgerNature } from '../utils/ledgerNature.js
 import { buildLoansOdsPayload } from '../modules/loans-ods/loansOdsService.js';
 import { buildArApPayload } from '../modules/ar-ap/arApService.js';
 import { buildPaymentReceiptPayload } from '../modules/kpi/paymentReceiptService.js';
+import { buildCashInHandPayload, buildBankBalancePayload } from '../modules/kpi/cashBankService.js';
 import {
   enrichNotification,
   stockNotification,
@@ -4040,121 +4041,12 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const today = new Date().toISOString().slice(0, 10);
-    const { rows: cashLedgers } = await query(
-      `SELECT name, closing_balance FROM ledgers
-       WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%' OR name ILIKE 'Cash')
-       ORDER BY ABS(closing_balance) DESC`,
-      [companyGuid]
-    );
-    const { rows: txns } = await query(
-      `SELECT v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration,
-              COALESCE((
-                SELECT CASE WHEN bool_or(vle.dr_cr='Dr') THEN 'in' ELSE 'out' END
-                FROM voucher_ledger_entries vle
-                JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-                WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
-                  AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
-              ), 'out') AS direction
-       FROM vouchers v
-       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
-         AND v.voucher_type IN ('Payment','Receipt','Contra')
-         AND v.date BETWEEN $2 AND $3
-         AND EXISTS (
-           SELECT 1 FROM voucher_ledger_entries vle
-           JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-           WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
-             AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
-         )
-       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
-       LIMIT 50`,
-      [companyGuid, from, to]
-    );
-    const balance = cashLedgers.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0);
-    const mapped = txns.map(t => ({
-      guid: t.guid,
-      voucher_number: t.voucher_number,
-      party_name: t.party_name,
-      voucher_type: t.voucher_type,
-      amount: Math.abs(parseFloat(t.amount || 0)),
-      date: t.date,
-      narration: t.narration,
-      direction: t.direction === 'in' ? 'in' : 'out',
-    }));
-    const todayIn = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'in').reduce((s, t) => s + t.amount, 0);
-    const todayOut = mapped.filter(t => String(t.date).slice(0, 10) === today && t.direction === 'out').reduce((s, t) => s + t.amount, 0);
-
-    // C2: derive last-30d daily cash balance + receipts/payments from ledger movements
-    const seriesDays = 30;
-    const seriesFrom = new Date(`${today}T12:00:00`);
-    seriesFrom.setDate(seriesFrom.getDate() - (seriesDays - 1));
-    const seriesFromIso = seriesFrom.toISOString().slice(0, 10);
-    const { rows: dailyMoves } = await query(
-      `SELECT v.date::text AS day,
-              SUM(CASE WHEN vle.dr_cr = 'Dr' THEN ABS(vle.amount) ELSE 0 END) AS inflow,
-              SUM(CASE WHEN vle.dr_cr = 'Cr' THEN ABS(vle.amount) ELSE 0 END) AS outflow
-       FROM voucher_ledger_entries vle
-       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-       WHERE vle.company_guid = $1 AND v.is_cancelled = FALSE
-         AND v.date BETWEEN $2 AND $3
-         AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash in Hand%' OR l.name ILIKE 'Cash')
-       GROUP BY v.date
-       ORDER BY v.date ASC`,
-      [companyGuid, seriesFromIso, today]
-    );
-    const moveMap = new Map();
-    for (const r of dailyMoves) {
-      const day = String(r.day).slice(0, 10);
-      moveMap.set(day, {
-        inflow: Math.abs(parseFloat(r.inflow || 0)),
-        outflow: Math.abs(parseFloat(r.outflow || 0)),
-      });
-    }
-    const dayKeys = [];
-    for (let i = 0; i < seriesDays; i++) {
-      const d = new Date(seriesFrom);
-      d.setDate(seriesFrom.getDate() + i);
-      dayKeys.push(d.toISOString().slice(0, 10));
-    }
-    // Walk backwards from current book cash balance
-    const closingByDay = new Map();
-    let cursor = balance;
-    for (let i = dayKeys.length - 1; i >= 0; i--) {
-      const day = dayKeys[i];
-      closingByDay.set(day, cursor);
-      const m = moveMap.get(day) || { inflow: 0, outflow: 0 };
-      cursor = cursor - m.inflow + m.outflow;
-    }
-    const daily_balance = dayKeys.map((day, i) => ({
-      day,
-      label: String(i + 1),
-      balance: Math.round((closingByDay.get(day) || 0) * 100) / 100,
-      inflow: Math.round(((moveMap.get(day)?.inflow) || 0) * 100) / 100,
-      outflow: Math.round(((moveMap.get(day)?.outflow) || 0) * 100) / 100,
-    }));
-    const lastBal = daily_balance[daily_balance.length - 1]?.balance || balance;
-    const prevBal = daily_balance[daily_balance.length - 2]?.balance || lastBal;
-    const balChange = lastBal - prevBal;
-    const balChangePct = prevBal ? (balChange / Math.abs(prevBal)) * 100 : 0;
-
-    res.json({
-      success: true,
-      data: {
-        current_balance: balance,
-        today_inflow: todayIn,
-        today_outflow: todayOut,
-        display: `₹${Math.round(balance).toLocaleString('en-IN')}`,
-        ledgers: cashLedgers.map(l => ({ name: l.name, balance: Math.abs(parseFloat(l.closing_balance || 0)) })),
-        transactions: mapped,
-        daily_balance,
-        balance_change: Math.round(balChange * 100) / 100,
-        balance_change_pct: Math.round(balChangePct * 10) / 10,
-        series_days: seriesDays,
-        from, to,
-      },
-    });
-  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const data = await buildCashInHandPayload(companyGuid, { from, to });
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('[kpi/cash-in-hand]', err);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 // GET /api/bank-ledgers — bank + cash ledgers (for payment selection in voucher forms)
@@ -4224,86 +4116,12 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const today = new Date().toISOString().slice(0, 10);
-    const { rows: banks } = await query(
-      `SELECT name, closing_balance, parent,
-              bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder
-       FROM ledgers
-       WHERE company_guid=$1
-         AND (
-           parent ILIKE '%Bank Accounts%' OR parent ILIKE '%Bank Account%'
-           OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%'
-           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
-         )
-       ORDER BY ABS(closing_balance) DESC`,
-      [companyGuid]
-    );
-    const { rows: txnRows } = await query(
-      `SELECT vle.ledger_name, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.date,
-              ABS(vle.amount) AS amount, vle.dr_cr
-       FROM voucher_ledger_entries vle
-       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-       WHERE vle.company_guid=$1 AND v.is_cancelled=FALSE
-         AND v.date BETWEEN $2 AND $3
-         AND (
-           l.parent ILIKE '%Bank Accounts%' OR l.parent ILIKE '%Bank Account%'
-           OR l.parent ILIKE '%Bank OD%' OR l.parent ILIKE '%Overdraft%'
-           OR (l.parent ILIKE '%Bank%' AND l.parent NOT ILIKE '%Bank Charge%' AND l.parent NOT ILIKE '%Bank Interest%' AND l.parent NOT ILIKE '%Bank Exp%')
-         )
-       ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
-       LIMIT 300`,
-      [companyGuid, from, to]
-    );
-    const byBank = new Map();
-    for (const t of txnRows) {
-      const list = byBank.get(t.ledger_name) || [];
-      if (list.length < 15) {
-        list.push({
-          guid: t.guid,
-          voucher_number: t.voucher_number,
-          party_name: t.party_name,
-          voucher_type: t.voucher_type,
-          date: t.date,
-          amount: Math.abs(parseFloat(t.amount || 0)),
-          type: t.dr_cr === 'Dr' ? 'Dr' : 'Cr',
-        });
-        byBank.set(t.ledger_name, list);
-      }
-    }
-    const bankList = banks.map(b => ({
-      name: b.name,
-      parent: b.parent || '',
-      balance: Math.abs(parseFloat(b.closing_balance || 0)),
-      account_number: b.bank_account_no || '',
-      ifsc: b.bank_ifsc || '',
-      bank_name: b.bank_name || '',
-      branch: b.bank_branch || '',
-      account_holder: b.bank_holder || '',
-      transactions: byBank.get(b.name) || [],
-    }));
-    const total = bankList.reduce((s, b) => s + b.balance, 0);
-    const allTx = txnRows.map(t => ({
-      date: t.date,
-      amount: Math.abs(parseFloat(t.amount || 0)),
-      type: t.dr_cr === 'Dr' ? 'Dr' : 'Cr',
-    }));
-    const todayIn = allTx.filter(t => String(t.date).slice(0, 10) === today && t.type === 'Dr').reduce((s, t) => s + t.amount, 0);
-    const todayOut = allTx.filter(t => String(t.date).slice(0, 10) === today && t.type === 'Cr').reduce((s, t) => s + t.amount, 0);
-    res.json({
-      success: true,
-      data: {
-        total_balance: total,
-        today_inflow: todayIn,
-        today_outflow: todayOut,
-        display: `₹${Math.round(total).toLocaleString('en-IN')}`,
-        balance_source: 'book',
-        balance_label: 'Book Balance (Tally)',
-        banks: bankList,
-        from, to,
-      },
-    });
-  } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
+    const data = await buildBankBalancePayload(companyGuid, { from, to });
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('[kpi/bank-balance]', err);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
 });
 
 router.get('/kpi/receivables', authMiddleware, async (req, res) => {

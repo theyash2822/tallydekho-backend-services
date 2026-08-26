@@ -1,3 +1,33 @@
+## 2026-08-26 — Phases 2–4 KPI trends: Cash/Bank + AR/AP snapshots + Loans
+
+### Phase 2 — Cash in Hand + Bank Balance
+- Added `src/modules/kpi/cashBankService.js` + `trendUtil.js`
+- `GET /kpi/cash-in-hand`: `kpi_cards` with `trend_pct` (balance vs 30d lookback start; today in/out/net vs yesterday); `balance_change_pct` null when prior=0
+- `GET /kpi/bank-balance`: same pattern + optional `daily_balance` series; account-count card has no trend
+
+### Phase 3 — Receivables + Payables
+- Schema: `kpi_ar_ap_snapshots` (company_guid, side AR|AP, as_of, total, aging JSONB)
+- On each AR/AP build: upsert today's snapshot; trend vs ~30d prior (±3d tolerance)
+- Aging buckets + total get `trend` / `trend_pct` only when prior snapshot exists and view is unfiltered
+- Filtered overdue/date views: trends stay null (no invented %)
+
+### Phase 4 — Loans & ODs
+- Schema: `kpi_loans_snapshots`
+- Upsert today's totals; `kpi_cards` + flat `trend_pct` / `loan_trend_pct` / `od_trend_pct`
+- If no 30d snapshot: MoM proxy from facility `outstandingHistory` for totals only
+
+### How to test
+```bash
+curl -s http://127.0.0.1:3001/api/health
+# With auth: /kpi/cash-in-hand, /kpi/bank-balance, /kpi/receivables, /kpi/payables, /kpi/loans-ods
+```
+
+### Risks / gaps
+- AR/AP/Loans pills need ≥1 prior snapshot (~30d) before % appears (or loans MoM history)
+- First call after deploy creates today's snapshot only
+
+---
+
 ## 2026-08-26 — Phase 1 KPI trends: Payments + Receipts
 
 ### Roadmap

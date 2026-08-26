@@ -1036,6 +1036,34 @@ export async function initSchema() {
         ON app_masters(company_guid, LOWER(master_name));
       CREATE INDEX IF NOT EXISTS idx_app_masters_posted
         ON app_masters(company_guid, books_impact_status);
+
+      -- KPI AR/AP daily snapshots for MoM / prior-window trend pills (Phase 3)
+      CREATE TABLE IF NOT EXISTS kpi_ar_ap_snapshots (
+        id            SERIAL PRIMARY KEY,
+        company_guid  TEXT NOT NULL,
+        side          TEXT NOT NULL,
+        as_of         DATE NOT NULL,
+        total         DECIMAL(18,2) NOT NULL DEFAULT 0,
+        aging         JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE (company_guid, side, as_of)
+      );
+      CREATE INDEX IF NOT EXISTS idx_kpi_ar_ap_snap_lookup
+        ON kpi_ar_ap_snapshots(company_guid, side, as_of DESC);
+
+      -- KPI Loans & ODs daily snapshots for trend pills (Phase 4)
+      CREATE TABLE IF NOT EXISTS kpi_loans_snapshots (
+        id            SERIAL PRIMARY KEY,
+        company_guid  TEXT NOT NULL,
+        as_of         DATE NOT NULL,
+        total         DECIMAL(18,2) NOT NULL DEFAULT 0,
+        loan_total    DECIMAL(18,2) NOT NULL DEFAULT 0,
+        od_total      DECIMAL(18,2) NOT NULL DEFAULT 0,
+        created_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+        UNIQUE (company_guid, as_of)
+      );
+      CREATE INDEX IF NOT EXISTS idx_kpi_loans_snap_lookup
+        ON kpi_loans_snapshots(company_guid, as_of DESC);
     `);
 
     // Backfill historical master writes into app_masters + mark posted when synced.

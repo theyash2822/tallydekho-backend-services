@@ -6,8 +6,12 @@
  * Never present PREDICTED as bank/Tally contractual fact.
  */
 import { query } from '../../db/schema.js';
+import {
+  isoDay as trendIsoDay, addDays, computeTrendPct, pickPriorSnapshot, trendFields,
+} from '../kpi/trendUtil.js';
 
 export const CALC_VERSION = 'loan-calc-v1';
+const TREND_LOOKBACK_DAYS = 30;
 
 const LOAN_PARENT_RE = /^(secured loans|unsecured loans)$/i;
 const OD_PARENT_RE = /bank\s*od|overdraft|cash\s*credit|\bcc\b/i;
@@ -721,6 +725,7 @@ async function enrichOd(companyGuid, facility) {
  */
 export async function buildLoansOdsPayload(companyGuid) {
   const asOf = new Date().toISOString();
+  const asOfDay = trendIsoDay(asOf) || new Date().toISOString().slice(0, 10);
   const facilities = await loadCandidateLedgers(companyGuid);
   const loans = [];
   const overdrafts = [];
@@ -738,6 +743,84 @@ export async function buildLoansOdsPayload(companyGuid) {
   const odSum = overdrafts.reduce((s, l) => s + money(l.outstanding?.value ?? l.outstanding), 0);
   const total = money(loanSum + odSum);
 
+  // Phase 4: daily snapshot + trend vs ~30d prior (null if no history)
+  try {
+    await query(
+      `INSERT INTO kpi_loans_snapshots (company_guid, as_of, total, loan_total, od_total, created_at)
+       VALUES ($1, $2::date, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT)
+       ON CONFLICT (company_guid, as_of)
+       DO UPDATE SET total = EXCLUDED.total, loan_total = EXCLUDED.loan_total,
+                     od_total = EXCLUDED.od_total,
+                     created_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
+      [companyGuid, asOfDay, total, money(loanSum), money(odSum)]
+    );
+  } catch (e) {
+    console.warn('[loans] snapshot upsert skipped:', e.message);
+  }
+
+  let prior = null;
+  try {
+    const target = addDays(asOfDay, -TREND_LOOKBACK_DAYS);
+    const from = addDays(target, -3);
+    const to = addDays(target, 3);
+    const { rows } = await query(
+      `SELECT as_of::text AS as_of, total, loan_total, od_total
+       FROM kpi_loans_snapshots
+       WHERE company_guid = $1
+         AND as_of BETWEEN $2::date AND $3::date
+         AND as_of <> $4::date
+       ORDER BY as_of DESC`,
+      [companyGuid, from, to, asOfDay]
+    );
+    prior = pickPriorSnapshot(rows, target, 3);
+  } catch (e) {
+    console.warn('[loans] prior snapshot load skipped:', e.message);
+  }
+
+  // Immediate proxy when snapshots thin: MoM from facility outstandingHistory (totals only)
+  let totalTrend = prior ? computeTrendPct(total, prior.total) : null;
+  let loanTrend = prior ? computeTrendPct(money(loanSum), prior.loan_total) : null;
+  let odTrend = prior ? computeTrendPct(money(odSum), prior.od_total) : null;
+
+  if (totalTrend == null) {
+    const histSum = (list) => {
+      const months = new Map();
+      for (const f of list) {
+        const hist = Array.isArray(f.outstandingHistory) ? f.outstandingHistory : [];
+        for (const h of hist) {
+          const m = String(h.month || '').slice(0, 7);
+          if (!m) continue;
+          months.set(m, (months.get(m) || 0) + money(h.outstanding));
+        }
+      }
+      const keys = [...months.keys()].sort();
+      if (keys.length < 2) return null;
+      return { cur: months.get(keys[keys.length - 1]), prior: months.get(keys[keys.length - 2]) };
+    };
+    const loanMoM = histSum(loans);
+    const odMoM = histSum(overdrafts);
+    if (loanTrend == null && loanMoM) loanTrend = computeTrendPct(loanMoM.cur, loanMoM.prior);
+    if (odTrend == null && odMoM) odTrend = computeTrendPct(odMoM.cur, odMoM.prior);
+    if (totalTrend == null && (loanMoM || odMoM)) {
+      const cur = (loanMoM?.cur || 0) + (odMoM?.cur || 0);
+      const prv = (loanMoM?.prior || 0) + (odMoM?.prior || 0);
+      totalTrend = computeTrendPct(cur, prv);
+    }
+  }
+
+  const kpi_cards = [
+    { id: 'total', label: 'Total Outstanding', amount: total, ...trendFields(totalTrend) },
+    { id: 'term', label: 'Loans', amount: money(loanSum), ...trendFields(loanTrend) },
+    { id: 'od', label: 'ODs / Overdraft', amount: money(odSum), ...trendFields(odTrend) },
+    {
+      id: 'count',
+      label: 'Accounts',
+      amount: loans.length + overdrafts.length,
+      trend_pct: null,
+      trend_positive: null,
+    },
+  ];
+
   return {
     total,
     loan_total: money(loanSum),
@@ -745,8 +828,14 @@ export async function buildLoansOdsPayload(companyGuid) {
     display: `₹${Math.round(total).toLocaleString('en-IN')}`,
     loans,
     overdrafts,
-    // backward compatible flat list for older clients
     facilities: [...loans, ...overdrafts],
+    kpi_cards,
+    trend_pct: totalTrend,
+    trend_positive: totalTrend == null ? null : totalTrend >= 0,
+    loan_trend_pct: loanTrend,
+    od_trend_pct: odTrend,
+    prior_as_of: prior ? trendIsoDay(prior.as_of) : null,
+    trend_lookback_days: TREND_LOOKBACK_DAYS,
     asOf,
     calculationVersion: CALC_VERSION,
   };
