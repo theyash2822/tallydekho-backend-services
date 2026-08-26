@@ -1,3 +1,27 @@
+## 2026-08-26 — Phase 1 KPI trends: Payments + Receipts
+
+### Roadmap
+- **Phase 1 (this):** Payments/Receipts `daily_series` + `kpi_cards` trend_pct + cash/bank totals
+- **Phase 2:** Cash-in-hand + Bank balance trend pills
+- **Phase 3:** AR/AP snapshot MoM (`kpi_ar_ap_snapshots`)
+- **Phase 4:** Loans & ODs trend pills
+
+### Added
+- `src/modules/kpi/paymentReceiptService.js` — aggregates (no LIMIT), prior-window trends, today vs yesterday, daily series (range capped 30d)
+- `GET /kpi/payments` + `/kpi/receipts` return: `daily_series`, `kpi_cards[]` (`trend_pct` / `trend_positive` or null), keep `total` / `today_total` / `cash_total` / `bank_total` / `transactions`
+
+### Behavior
+- Period trend = current from–to vs equal-length window immediately before
+- Today trend = today vs previous calendar day; null if prior = 0
+- No invented % when denominator is 0
+
+### How to test
+```bash
+curl -s "http://127.0.0.1:3001/api/kpi/payments?companyGuid=GUID&from=YYYY-MM-DD&to=YYYY-MM-DD" -H "Authorization: Bearer TOKEN" | jq '.data | {total, daily_series, kpi_cards}'
+```
+
+---
+
 ## 2026-08-25 — Phase B–D AR/AP + Cash series + Bank book label
 
 ### Added
