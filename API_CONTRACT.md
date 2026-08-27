@@ -60,6 +60,8 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 | GET | /api/kpi/loans-ods |
 All: ?companyGuid&fy
 
+AR/AP (`/kpi/receivables`, `/kpi/payables`): `total`, `trend_pct` (Total Due vs 30d VLE walkback; null if prior=0), `aging[]` with per-bucket `trend` / lookbacks (Not Due|0–30→30d, 31–60→60d, 61–90→90d, 90+→90d), `due_today` (1d lookback). Filtered overdue/date views: trends null.
+
 ## Sales
 | Method | Path |
 |--------|------|

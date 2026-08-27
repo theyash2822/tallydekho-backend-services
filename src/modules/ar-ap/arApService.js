@@ -1,13 +1,21 @@
 /**
- * AR / AP KPI helpers (Phase B + Phase 3 snapshots)
+ * AR / AP KPI helpers (Phase B + reconstructed trends)
  * Spec: TallyDekho_AR_AP_Cash_Bank_Data_Validation_and_Collection_Spec.md
+ *
+ * Trends: Cash-style reconstruction (VLE walkback + bill re-age), not snapshot-only.
+ * Snapshots still upserted as optional enrichment / future use.
  */
 import { query } from '../../db/schema.js';
 import {
   money, isoDay, addDays, computeTrendPct, pickPriorSnapshot,
 } from '../kpi/trendUtil.js';
+import {
+  lookbackDaysForKey,
+  dueTodayAmount,
+  computeArApTrends,
+} from './arApHistory.js';
 
-const TREND_LOOKBACK_DAYS = 30;
+const TREND_LOOKBACK_DAYS = lookbackDaysForKey('TOTAL');
 
 function daysBetween(asOfIso, dueIso) {
   if (!dueIso) return 0;
@@ -84,19 +92,15 @@ async function loadPriorArApSnapshot(companyGuid, side, asOf) {
   return pickPriorSnapshot(rows, target, 3);
 }
 
-function applyAgingTrends(aging, priorAgingMap) {
-  return aging.map((b) => {
-    const priorAmt = priorAgingMap ? Number(priorAgingMap[b.bucket]) : null;
-    const trend = priorAmt == null || Number.isNaN(priorAmt)
-      ? null
-      : computeTrendPct(b.amount, priorAmt);
-    return {
-      ...b,
-      trend,
-      trendState: trend == null ? 'UNKNOWN' : (trend >= 0 ? 'UP' : 'DOWN'),
-      trendSource: trend == null ? 'UNKNOWN' : 'SNAPSHOT',
-    };
-  });
+function blankAgingTrends(aging) {
+  return aging.map((b) => ({
+    ...b,
+    trend: null,
+    trend_pct: null,
+    trend_positive: null,
+    trendState: 'UNKNOWN',
+    trendSource: 'UNKNOWN',
+  }));
 }
 
 function mapBillRow(b, asOfIso, side) {
@@ -254,7 +258,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
      WHERE company_guid = $1 AND ABS(COALESCE(pending_amount,0)) > 0.005
        AND ${billTypeClause}
      ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
-     LIMIT 2000`,
+     LIMIT 5000`,
     [companyGuid]
   );
 
@@ -327,20 +331,81 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   }));
   let aging = buildAgingBucketsDueBased(agingSource, asOf);
 
-  let prior = null;
-  try {
-    prior = await loadPriorArApSnapshot(companyGuid, side, asOf);
-  } catch (e) {
-    console.warn('[arAp] prior snapshot load skipped:', e.message);
-  }
+  const dueTodayCur = dueTodayAmount(
+    unfilteredAgingSource.map((b) => ({
+      pending_amount: b.pending_amount,
+      due_date: b.due_date,
+      bill_date: b.bill_date,
+    })),
+    asOf
+  );
 
   let trend_pct = null;
-  if (!filteredView && prior) {
-    const priorAging = typeof prior.aging === 'string' ? JSON.parse(prior.aging) : (prior.aging || {});
-    aging = applyAgingTrends(aging, priorAging);
-    trend_pct = computeTrendPct(snapshotTotal, prior.total);
-  } else if (filteredView) {
-    aging = aging.map((b) => ({ ...b, trend: null, trendState: 'UNKNOWN', trendSource: 'UNKNOWN' }));
+  let trend_positive = null;
+  let prior_as_of = null;
+  let prior_total = null;
+  let trend_source = null;
+  let due_today = {
+    bucket: 'DUE_TODAY',
+    label: 'Due Today',
+    amount: dueTodayCur.amount,
+    count: dueTodayCur.count,
+    trend: null,
+    trend_pct: null,
+    trend_positive: null,
+    trendState: 'UNKNOWN',
+    trendSource: 'UNKNOWN',
+    trend_lookback_days: lookbackDaysForKey('DUE_TODAY'),
+  };
+
+  if (!filteredView) {
+    try {
+      const trends = await computeArApTrends({
+        companyGuid,
+        side,
+        asOf,
+        currentTotal: snapshotTotal,
+        currentAging: aging,
+        currentBillsRaw: billsRaw.map((b) => ({
+          pending_amount: money(b.pending_amount),
+          due_date: b.due_date,
+          bill_date: b.bill_date,
+          bill_name: b.bill_name,
+          ledger_name: b.ledger_name,
+          amount: b.amount,
+        })),
+        currentDueToday: dueTodayCur.amount,
+      });
+      aging = trends.aging;
+      trend_pct = trends.trend_pct;
+      trend_positive = trends.trend_positive;
+      prior_as_of = trends.prior_as_of;
+      prior_total = trends.prior_total;
+      trend_source = trends.trend_source;
+      due_today = {
+        ...due_today,
+        ...trends.due_today,
+        count: dueTodayCur.count,
+      };
+    } catch (e) {
+      console.warn('[arAp] reconstructed trends failed:', e.message);
+      aging = blankAgingTrends(aging);
+      // Snapshot fallback only if reconstruction threw
+      try {
+        const prior = await loadPriorArApSnapshot(companyGuid, side, asOf);
+        if (prior) {
+          trend_pct = computeTrendPct(snapshotTotal, prior.total);
+          trend_positive = trend_pct == null ? null : trend_pct >= 0;
+          prior_as_of = isoDay(prior.as_of);
+          prior_total = money(prior.total);
+          trend_source = 'SNAPSHOT_FALLBACK';
+        }
+      } catch (e2) {
+        console.warn('[arAp] snapshot fallback skipped:', e2.message);
+      }
+    }
+  } else {
+    aging = blankAgingTrends(aging);
   }
 
   let parties = aggregateParties(partiesRaw, billsRaw.filter((br) => {
@@ -379,10 +444,13 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
     total,
     display: `₹${Math.round(total).toLocaleString('en-IN')}`,
     aging,
+    due_today,
     trend_pct,
-    trend_positive: trend_pct == null ? null : trend_pct >= 0,
+    trend_positive,
     trend_lookback_days: TREND_LOOKBACK_DAYS,
-    prior_as_of: prior ? isoDay(prior.as_of) : null,
+    prior_as_of,
+    prior_total,
+    trend_source,
     parties: parties.slice(0, 80),
     bills: bills.slice(0, 100),
     receipts: side === 'AR' ? activity : [],

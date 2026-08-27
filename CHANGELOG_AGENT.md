@@ -1,3 +1,26 @@
+## 2026-08-27 — AR/AP trend pills via reconstruction (day-1)
+
+### Changed
+- New `src/modules/ar-ap/arApHistory.js` — Cash-style lookbacks without waiting for snapshots:
+  - **Total Due**: VLE walkback on Sundry Debtor/Creditor ledgers vs 30d prior
+  - **Aging buckets**: re-open bills as-of prior date (+ Agst Ref settlement add-back when present), re-age; lookbacks 30/60/90/90 for Not Due|0–30 / 31–60 / 61–90 / 90+
+  - **Due Today**: 1d lookback (vs yesterday); exposed as `due_today` on payload
+- `buildArApPayload`: sets `trend_pct` / aging `trend` / `due_today.trend` from reconstruction; snapshots still upserted as enrichment; snapshot used only if reconstruction throws
+- `computeTrendPct`: null when prior==0 → UI "—" (no invented %)
+
+### How to test
+```bash
+node --check src/modules/ar-ap/arApHistory.js
+# Auth: GET /kpi/receivables + /kpi/payables — expect trend_pct (or null if prior 0)
+# GET /dashboard/kpi-strip — receivable/payable trend_pct from same Total Due 30d logic
+```
+
+### Risks / caveats
+- Aging prior uses still-open bills (+ Agst Ref cleared invoices only). Without bill-wise allocations, collections on open bills are under-reversed → bucket % can be coarse; Total uses VLE and is stronger.
+- Sparse debtor/creditor VLE → walkback may understate moves outside synced history.
+
+---
+
 ## 2026-08-27 — Home kpi-strip: trend_pct for all 7 cards
 
 ### Changed
