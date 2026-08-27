@@ -662,15 +662,16 @@ router.get('/companies', authMiddleware, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 // GET /api/dashboard/kpi-strip?period=7D
+// Amounts from ledger/voucher aggregates; trend_pct/trend_positive reused from KPI builders
+// (same meaning as each detail screen). Null when no prior — client shows "—".
 router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    const { from, to } = req.query;
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     // KPI balances are from ledger closing balances (not date-filtered) — consistent regardless of FY
-    // Voucher-based KPIs (payments/receipts) are filtered by FY when provided
-    // Parameterized date filter for voucher KPIs
+    // Voucher-based KPIs (payments/receipts) are filtered by FY/period when provided
     const pmtParams = from && to ? [companyGuid, from, to] : [companyGuid];
     const pmtDateFilter = from && to ? 'AND date BETWEEN $2 AND $3' : '';
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
@@ -689,16 +690,49 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
     const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
 
+    // Soft-fail each builder so one KPI trend failure does not blank the strip
+    const settled = await Promise.allSettled([
+      buildCashInHandPayload(companyGuid, { from, to }),
+      buildBankBalancePayload(companyGuid, { from, to }),
+      buildArApPayload(companyGuid, 'AR', {}),
+      buildArApPayload(companyGuid, 'AP', {}),
+      buildLoansOdsPayload(companyGuid),
+      buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Payment' }),
+      buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Receipt' }),
+    ]);
+    const pickTrend = (result) => {
+      if (result.status !== 'fulfilled' || !result.value) {
+        return { trend_pct: null, trend_positive: null };
+      }
+      const pct = result.value.trend_pct;
+      if (pct == null || !Number.isFinite(Number(pct))) {
+        return { trend_pct: null, trend_positive: null };
+      }
+      const n = Number(pct);
+      return {
+        trend_pct: n,
+        trend_positive: result.value.trend_positive != null ? !!result.value.trend_positive : n >= 0,
+      };
+    };
+    const [
+      cashTrend, bankTrend, arTrend, apTrend, loansTrend, pmtTrend, rctTrend,
+    ] = settled.map(pickTrend);
+    for (const r of settled) {
+      if (r.status === 'rejected') {
+        console.warn('[kpi-strip] trend enrich failed:', r.reason?.message || r.reason);
+      }
+    }
+
     // Raw values only — formatting is done client-side using user's currency/format settings
     const g = (rows) => +(rows?.[0]?.v ?? 0);
     const kpi = [
-      { id: 'cash',       label: 'Cash In Hand', amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand' },
-      { id: 'bank',       label: 'Bank Balance', amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance' },
-      { id: 'receivable', label: 'Receivables',  amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables' },
-      { id: 'payable',    label: 'Payables',     amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables' },
-      { id: 'loans',      label: 'Loans & ODs',  amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods' },
-      { id: 'payments',   label: 'Payments',     amount_raw: g(pmts),  icon: 'send-outline',                route: '/kpi/payments' },
-      { id: 'receipts',   label: 'Receipts',     amount_raw: g(rcts),  icon: 'download-outline',            route: '/kpi/receipts' },
+      { id: 'cash',       label: 'Cash In Hand', amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand', ...cashTrend },
+      { id: 'bank',       label: 'Bank Balance', amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance', ...bankTrend },
+      { id: 'receivable', label: 'Receivables',  amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables', ...arTrend },
+      { id: 'payable',    label: 'Payables',     amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables', ...apTrend },
+      { id: 'loans',      label: 'Loans & ODs',  amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods', ...loansTrend },
+      { id: 'payments',   label: 'Payments',     amount_raw: g(pmts),  icon: 'send-outline',                route: '/kpi/payments', ...pmtTrend },
+      { id: 'receipts',   label: 'Receipts',     amount_raw: g(rcts),  icon: 'download-outline',            route: '/kpi/receipts', ...rctTrend },
     ];
     res.json({ success: true, data: kpi });
   } catch (err) {

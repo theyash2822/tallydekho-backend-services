@@ -43,7 +43,7 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 ## Dashboard
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | /api/dashboard/kpi-strip | ?companyGuid&fy= |
+| GET | /api/dashboard/kpi-strip | ?companyGuid&from&to&fy — each card: amount_raw + trend_pct + trend_positive (null if no prior) |
 | GET | /api/dashboard/metrics | ?companyGuid&from&to&fy |
 | GET | /api/dashboard/cashflow | ?companyGuid&from&to&fy |
 | GET | /api/dashboard/recent-activity | ?companyGuid&fy |

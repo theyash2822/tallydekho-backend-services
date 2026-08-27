@@ -1,3 +1,20 @@
+## 2026-08-27 — Home kpi-strip: trend_pct for all 7 cards
+
+### Changed
+- `GET /api/dashboard/kpi-strip` — each card now includes `trend_pct` + `trend_positive` from the same builders as detail KPIs (cash/bank/AR/AP/loans/payments/receipts). Null when no prior (client shows "—"). Amounts/labels unchanged.
+- Soft-fail per builder via `Promise.allSettled` so one trend failure does not blank the strip.
+
+### How to test
+```bash
+curl -s http://127.0.0.1:3001/api/health
+# Auth + companyGuid: GET /api/dashboard/kpi-strip — expect trend_pct on each of 7 ids
+```
+
+### Risks
+- Home strip is slower (parallel KPI builders). First AR/AP/loans call may still return null until prior snapshots exist.
+
+---
+
 ## 2026-08-26 — Phases 2–4 KPI trends: Cash/Bank + AR/AP snapshots + Loans
 
 ### Phase 2 — Cash in Hand + Bank Balance
