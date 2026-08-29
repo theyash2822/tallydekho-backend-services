@@ -764,7 +764,8 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
          WHERE vle.company_guid=$1 AND vle.dr_cr='Cr'
            AND (l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')
            AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3)
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+        0
       ) as v`, [companyGuid, from, to]),
       // Purchase = Debit entries (Dr) in Purchase Accounts group
       query(`SELECT COALESCE(
@@ -774,22 +775,24 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
          WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
            AND (l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')
            AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3)
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+        0
       ) as v`, [companyGuid, from, to]),
-      // Expenses = Debit entries in Indirect Expenses group
+      // Expenses = Debit entries in Indirect Expenses group (anchored — not substring of Indirect)
       query(`SELECT COALESCE(
         (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
          JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
          JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
          WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
-           AND l.parent ILIKE '%Indirect Expense%'
+           AND l.parent ~* '^Indirect Expenses?$'
            AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3)
+        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3),
+        0
       ) as v`, [companyGuid, from, to]),
     ]);
-    const sVal = +(sRes.rows?.[0]?.v ?? 0);
-    const pVal = +(pRes.rows?.[0]?.v ?? 0);
-    const eVal = +(eRes.rows?.[0]?.v ?? 0);
+    const sVal = +(sRes.rows?.[0]?.v ?? 0) || 0;
+    const pVal = +(pRes.rows?.[0]?.v ?? 0) || 0;
+    const eVal = +(eRes.rows?.[0]?.v ?? 0) || 0;
     // Raw values only — formatting done client-side
     res.json({ success: true, data: [
       { id: 'sales',     label: 'Sales',     amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales' },
