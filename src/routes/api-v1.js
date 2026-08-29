@@ -5391,6 +5391,26 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
 // EXPENSES
 // ══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Recursive Direct/Indirect expense group tree.
+ * Matches charge-ledgers pattern — ledgers under sub-groups (e.g. parent='Salary'
+ * under 'Indirect Expenses') must count, not only direct children of the root.
+ * $1 = company_guid in the CTE.
+ */
+const EXPENSE_GROUPS_CTE = `
+WITH RECURSIVE expense_groups AS (
+  SELECT g.name,
+         CASE WHEN g.name ~* '^Direct Expenses?$' THEN 'Direct' ELSE 'Indirect' END AS root_type
+    FROM groups g
+   WHERE g.company_guid = $1
+     AND (g.name ~* '^Direct Expenses?$' OR g.name ~* '^Indirect Expenses?$')
+  UNION ALL
+  SELECT child.name, eg.root_type
+    FROM groups child
+    JOIN expense_groups eg ON child.parent = eg.name
+   WHERE child.company_guid = $1
+)`;
+
 /** Expense register filter counts — type (Direct/Indirect) + category parents. */
 router.get('/expenses/counts', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -5398,37 +5418,38 @@ router.get('/expenses/counts', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   try {
-    const baseJoin = `
+    const baseFrom = `
+      ${EXPENSE_GROUPS_CTE}
+      SELECT COUNT(DISTINCT v.guid)::int AS c
       FROM vouchers v
       JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+      JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
       WHERE v.company_guid = $1
         AND v.is_cancelled = FALSE
         AND vle.dr_cr = 'Dr'
         AND v.date IS NOT NULL AND v.date != ''
         AND v.date BETWEEN $2 AND $3`;
     const [allRes, directRes, indirectRes, catRes] = await Promise.all([
+      query(baseFrom, [companyGuid, from, to]),
+      query(`${baseFrom} AND eg.root_type = 'Direct'`, [companyGuid, from, to]),
+      query(`${baseFrom} AND eg.root_type = 'Indirect'`, [companyGuid, from, to]),
       query(
-        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin}
-           AND (l.parent ~* $4 OR l.parent ~* $5)`,
-        [companyGuid, from, to, '^Direct Expenses?$', '^Indirect Expenses?$']
-      ),
-      query(
-        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin} AND l.parent ~* $4`,
-        [companyGuid, from, to, '^Direct Expenses?$']
-      ),
-      query(
-        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin} AND l.parent ~* $4`,
-        [companyGuid, from, to, '^Indirect Expenses?$']
-      ),
-      query(
-        `SELECT l.parent AS name, COUNT(DISTINCT v.guid)::int AS c
-         ${baseJoin}
-           AND (l.parent ~* $4 OR l.parent ~* $5)
+        `${EXPENSE_GROUPS_CTE}
+         SELECT l.parent AS name, COUNT(DISTINCT v.guid)::int AS c
+         FROM vouchers v
+         JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+         JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+         JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
+         WHERE v.company_guid = $1
+           AND v.is_cancelled = FALSE
+           AND vle.dr_cr = 'Dr'
+           AND v.date IS NOT NULL AND v.date != ''
+           AND v.date BETWEEN $2 AND $3
          GROUP BY l.parent
          ORDER BY c DESC
          LIMIT 50`,
-        [companyGuid, from, to, '^Direct Expenses?$', '^Indirect Expenses?$']
+        [companyGuid, from, to]
       ),
     ]);
     res.json({
@@ -5465,30 +5486,19 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   const wantAllTypes = !typesRaw.length
     || typesRaw.some((t) => /^all$/i.test(t))
     || (wantDirect && wantIndirect);
-  let expenseGroupFilter;
-  if (wantAllTypes) {
-    expenseGroupFilter = `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
-  } else if (wantDirect) {
-    expenseGroupFilter = `AND l.parent ~* $TYPE_DIRECT`;
-  } else if (wantIndirect) {
-    expenseGroupFilter = `AND l.parent ~* $TYPE_INDIRECT`;
-  } else {
-    expenseGroupFilter = `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
-  }
-  // Multi-select categories=A,B (or legacy category=A).
+  // Type scopes via recursive root_type (Direct / Indirect), not immediate parent name.
+  let rootTypeSql = '';
+  if (!wantAllTypes && wantDirect) rootTypeSql = ` AND eg.root_type = 'Direct'`;
+  else if (!wantAllTypes && wantIndirect) rootTypeSql = ` AND eg.root_type = 'Indirect'`;
+  // Multi-select categories=A,B (or legacy category=A) — immediate ledger.parent under the tree.
   const categoryNames = parseCsvParam(req.query.categories).length
     ? parseCsvParam(req.query.categories)
     : (typeof category === 'string' && category.trim() ? [category.trim()] : []);
 
   try {
-    const typeParams = ['^Direct Expenses?$', '^Indirect Expenses?$'];
-    const rewriteFilter = (sql, startIdx) => sql
-      .replace(/\$TYPE_DIRECT/g, `$${startIdx}`)
-      .replace(/\$TYPE_INDIRECT/g, `$${startIdx + 1}`);
-
-    const buildWhere = (baseIdx) => {
-      let idx = baseIdx;
+    const buildFilters = () => {
       const params = [companyGuid, fyFrom, fyTo];
+      let idx = 4;
       let catSql = '';
       if (categoryNames.length === 1) {
         params.push(categoryNames[0]);
@@ -5499,31 +5509,29 @@ router.get('/expenses', authMiddleware, async (req, res) => {
         catSql = ` AND LOWER(TRIM(COALESCE(l.parent,''))) = ANY(SELECT LOWER(TRIM(x)) FROM unnest($${idx}::text[]) AS x)`;
         idx += 1;
       }
-      const typeIdx = idx;
-      params.push(...typeParams);
-      const filterSql = rewriteFilter(expenseGroupFilter, typeIdx) + catSql;
-      return { params, filterSql, nextIdx: typeIdx + 2 };
+      return { params, catSql };
     };
 
-    const listBuilt = buildWhere(4);
-    const baseJoin = `
-      FROM vouchers v
-      JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-      WHERE v.company_guid = $1
-        AND v.is_cancelled = FALSE
-        AND vle.dr_cr = 'Dr'
-        ${listBuilt.filterSql}
-        AND v.date IS NOT NULL AND v.date != ''
-        AND v.date BETWEEN $2 AND $3`;
-
+    const listBuilt = buildFilters();
     const { rows } = await query(
-      `SELECT DISTINCT ON (v.guid)
+      `${EXPENSE_GROUPS_CTE}
+       SELECT DISTINCT ON (v.guid)
               v.*,
               l.name AS expense_ledger,
               l.parent AS expense_group,
+              eg.root_type AS expense_type,
               ABS(vle.amount) AS expense_amount
-       ${baseJoin}
+       FROM vouchers v
+       JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
+       WHERE v.company_guid = $1
+         AND v.is_cancelled = FALSE
+         AND vle.dr_cr = 'Dr'
+         ${rootTypeSql}
+         ${listBuilt.catSql}
+         AND v.date IS NOT NULL AND v.date != ''
+         AND v.date BETWEEN $2 AND $3
        ORDER BY v.guid, ABS(vle.amount) DESC`,
       listBuilt.params
     );
@@ -5534,51 +5542,55 @@ router.get('/expenses', authMiddleware, async (req, res) => {
     });
     const paged = sorted.slice(offset, offset + parseInt(limit));
 
-    const totBuilt = buildWhere(4);
+    const totBuilt = buildFilters();
     const { rows: totRow } = await query(
-      `SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS total
+      `${EXPENSE_GROUPS_CTE}
+       SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
        JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
        JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
        WHERE v.company_guid = $1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
-         ${totBuilt.filterSql}
+         ${rootTypeSql}
+         ${totBuilt.catSql}
          AND v.date IS NOT NULL AND v.date != ''
          AND v.date BETWEEN $2 AND $3`,
       totBuilt.params
     );
 
-    // Categories always from Direct+Indirect parents (not narrowed by type filter),
-    // so the filter sheet can list all expense groups. Optional type still scopes amounts.
-    const catTypeFilter = `AND (l.parent ~* $4 OR l.parent ~* $5)`;
+    // Categories = immediate ledger parents under the Direct/Indirect tree (not narrowed by type),
+    // so the Category tab lists real sub-groups (Salary, Rent, …) with amounts in range.
     const { rows: catRows } = await query(
-      `SELECT l.parent AS name, COALESCE(SUM(ABS(vle.amount)), 0) AS total
+      `${EXPENSE_GROUPS_CTE}
+       SELECT l.parent AS name, COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
        JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
        JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
        WHERE v.company_guid = $1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
-         ${catTypeFilter}
          AND v.date IS NOT NULL AND v.date != ''
          AND v.date BETWEEN $2 AND $3
        GROUP BY l.parent
        ORDER BY total DESC
        LIMIT 50`,
-      [companyGuid, fyFrom, fyTo, '^Direct Expenses?$', '^Indirect Expenses?$']
+      [companyGuid, fyFrom, fyTo]
     );
 
-    // Also expose distinct ledger-parent categories under Direct/Indirect for the sheet
-    // even when amount is 0 in range — prefer parents from ledgers master.
+    // Master fill: all ledger parents that sit under the expense tree (even if 0 in range).
     const { rows: parentRows } = await query(
-      `SELECT DISTINCT parent AS name
-         FROM ledgers
-        WHERE company_guid = $1
-          AND (parent ~* $2 OR parent ~* $3)
-        ORDER BY parent
+      `${EXPENSE_GROUPS_CTE}
+       SELECT DISTINCT l.parent AS name
+         FROM ledgers l
+         JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
+        WHERE l.company_guid = $1
+          AND COALESCE(TRIM(l.parent), '') <> ''
+        ORDER BY name
         LIMIT 50`,
-      [companyGuid, '^Direct Expenses?$', '^Indirect Expenses?$']
+      [companyGuid]
     );
     const amountByParent = new Map(catRows.map((r) => [r.name, parseFloat(r.total) || 0]));
     const categoryList = [];
@@ -5604,6 +5616,8 @@ router.get('/expenses', authMiddleware, async (req, res) => {
         ...r,
         voucher_type: r.voucher_type,
         is_optional: r.is_optional ?? false,
+        expense_type: r.expense_type || null,
+        expense_group: r.expense_group || null,
       })),
       categories: categoryList,
       summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}`, count: sorted.length },

@@ -1,3 +1,22 @@
+## 2026-08-29 — Expense filter recursive groups + voucher type list badges (backend)
+
+### Changed
+- **`GET /expenses` + `/expenses/counts`**: walk Direct/Indirect **group tree** (recursive CTE, same pattern as charge-ledgers). Type filter uses `root_type`; Category lists **immediate ledger parents** under that tree (Salary, Rent, …) with counts — no longer only rows whose parent is literally `Direct/Indirect Expenses`.
+- List rows now include `expense_type` (`Direct`|`Indirect`) + `expense_group`.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# Auth: GET /expenses/counts?companyGuid=… → categories[] should include sub-groups
+# Auth: GET /expenses?types=Direct&companyGuid=… → only Direct-rooted ledger Debits
+# Auth: GET /expenses?categories=SomeSubGroup&companyGuid=…
+```
+
+### Risks
+- Companies with no `groups` rows for Direct/Indirect roots return empty expense lists (same as before if roots missing).
+
+---
+
 ## 2026-08-29 — Register filters: multi-select Type + Party/Category Groups
 
 ### Changed
