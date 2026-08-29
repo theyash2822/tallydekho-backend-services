@@ -1213,8 +1213,39 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   }
 };
 
+/** Per–doc-type counts for register filter sheet (current from/to). */
+const voucherCountsHandler = (module) => async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const types = module === 'purchase'
+    ? ['invoice', 'order', 'debit_note']
+    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
+  const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
+  try {
+    const pairs = await Promise.all(types.map(async (docType) => {
+      const pred = predFn(docType);
+      if (!pred) return [docType, 0];
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS c FROM vouchers v
+          WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND ${pred}
+            AND v.date BETWEEN $2 AND $3`,
+        [companyGuid, from, to]
+      );
+      return [docType, parseInt(rows[0]?.c || 0, 10)];
+    }));
+    const data = Object.fromEntries(pairs);
+    data.all = pairs.reduce((sum, [, n]) => sum + n, 0);
+    res.json({ success: true, data, meta: { from, to } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+};
+
 router.get('/sales/invoices',    authMiddleware, strictInvoiceListHandler('sales'));
 router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
+router.get('/sales/vouchers/counts', authMiddleware, voucherCountsHandler('sales'));
 router.get('/sales/vouchers',    authMiddleware, combinedVoucherListHandler('sales'));
 
 // GET /api/sales/home-metrics — Today / MTD / YTD / Outstanding / Credit Notes / Avg Ticket
@@ -1534,6 +1565,7 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
 
 router.get('/purchase/invoices', authMiddleware, strictInvoiceListHandler('purchase'));
 router.get('/purchase/orders',   authMiddleware, voucherListHandler('Purchase Order'));
+router.get('/purchase/vouchers/counts', authMiddleware, voucherCountsHandler('purchase'));
 router.get('/purchase/vouchers', authMiddleware, combinedVoucherListHandler('purchase'));
 
 // GET /api/purchase/invoices/:id/debit-note-context
@@ -5287,6 +5319,64 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // EXPENSES
 // ══════════════════════════════════════════════════════════════════════════════
+
+/** Expense register filter counts — type (Direct/Indirect) + category parents. */
+router.get('/expenses/counts', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  try {
+    const baseJoin = `
+      FROM vouchers v
+      JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+      WHERE v.company_guid = $1
+        AND v.is_cancelled = FALSE
+        AND vle.dr_cr = 'Dr'
+        AND v.date IS NOT NULL AND v.date != ''
+        AND v.date BETWEEN $2 AND $3`;
+    const [allRes, directRes, indirectRes, catRes] = await Promise.all([
+      query(
+        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin}
+           AND (l.parent ~* $4 OR l.parent ~* $5)`,
+        [companyGuid, from, to, '^Direct Expenses?$', '^Indirect Expenses?$']
+      ),
+      query(
+        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin} AND l.parent ~* $4`,
+        [companyGuid, from, to, '^Direct Expenses?$']
+      ),
+      query(
+        `SELECT COUNT(DISTINCT v.guid)::int AS c ${baseJoin} AND l.parent ~* $4`,
+        [companyGuid, from, to, '^Indirect Expenses?$']
+      ),
+      query(
+        `SELECT l.parent AS name, COUNT(DISTINCT v.guid)::int AS c
+         ${baseJoin}
+           AND (l.parent ~* $4 OR l.parent ~* $5)
+         GROUP BY l.parent
+         ORDER BY c DESC
+         LIMIT 50`,
+        [companyGuid, from, to, '^Direct Expenses?$', '^Indirect Expenses?$']
+      ),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        all: parseInt(allRes.rows[0]?.c || 0, 10),
+        direct: parseInt(directRes.rows[0]?.c || 0, 10),
+        indirect: parseInt(indirectRes.rows[0]?.c || 0, 10),
+        categories: (catRes.rows || []).map((r) => ({
+          name: r.name,
+          count: parseInt(r.c || 0, 10),
+        })),
+      },
+      meta: { from, to },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
 
 router.get('/expenses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;

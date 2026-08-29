@@ -1,3 +1,24 @@
+## 2026-08-29 — Voucher counts for Register filter sheets
+
+### Changed
+- **New** `GET /sales/vouchers/counts?from=&to=` → `{ invoice, order, credit_note, delivery_note, proforma, quotation, all }`
+- **New** `GET /purchase/vouchers/counts?from=&to=` → `{ invoice, order, debit_note, all }`
+- **New** `GET /expenses/counts?from=&to=` → `{ all, direct, indirect, categories:[{ name, count }] }`
+- Existing `/sales/vouchers`, `/purchase/vouchers`, `/expenses` list APIs unchanged (still accept `docTypes` / `type` / `category`)
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# Auth: GET /sales/vouchers/counts?companyGuid=…&from=…&to=…
+# Auth: GET /purchase/vouchers/counts?companyGuid=…
+# Auth: GET /expenses/counts?companyGuid=…
+```
+
+### Risks
+- Counts are independent per doc-type predicate (same SQL as list filters); `all` is the sum of those buckets (vouchers are mutually exclusive by classify rules).
+
+---
+
 ## 2026-08-29 — Sales/Purchase/Expense combined Recent + filter APIs
 
 ### Changed
