@@ -1138,10 +1138,51 @@ const strictInvoiceListHandler = (module) => async (req, res) => {
   }
 };
 
+/** Parse comma-separated query list (trim, drop empties). */
+function parseCsvParam(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  return raw.split(',').map((t) => t.trim()).filter(Boolean);
+}
+
+/**
+ * EXISTS: voucher's party ledger (by party_guid or party_name) has parent in $paramIdx::text[].
+ * Used for Sales/Purchase "Party Group" filter — real ledgers.parent from DB.
+ */
+function partyGroupExistsSql(paramIdx) {
+  return `EXISTS (
+    SELECT 1 FROM ledgers pl
+    WHERE pl.company_guid = v.company_guid
+      AND (
+        (NULLIF(TRIM(COALESCE(v.party_guid, '')), '') IS NOT NULL AND pl.guid = v.party_guid)
+        OR LOWER(TRIM(pl.name)) = LOWER(TRIM(COALESCE(v.party_name, '')))
+      )
+      AND LOWER(TRIM(COALESCE(pl.parent, ''))) = ANY(
+        SELECT LOWER(TRIM(x)) FROM unnest($${paramIdx}::text[]) AS x
+      )
+  )`;
+}
+
+/** Join party ledger once for group aggregation (prefer party_guid, else name). */
+const PARTY_LEDGER_JOIN = `
+  JOIN LATERAL (
+    SELECT TRIM(COALESCE(l.parent, '')) AS parent
+    FROM ledgers l
+    WHERE l.company_guid = v.company_guid
+      AND (
+        (NULLIF(TRIM(COALESCE(v.party_guid, '')), '') IS NOT NULL AND l.guid = v.party_guid)
+        OR LOWER(TRIM(l.name)) = LOWER(TRIM(COALESCE(v.party_name, '')))
+      )
+    ORDER BY CASE
+      WHEN NULLIF(TRIM(COALESCE(v.party_guid, '')), '') IS NOT NULL AND l.guid = v.party_guid THEN 0
+      ELSE 1
+    END
+    LIMIT 1
+  ) pl ON TRUE`;
+
 /**
  * Combined Recent feed — one paginated list across selected docTypes.
- * GET /sales/vouchers?docTypes=invoice,order,credit_note,delivery_note,proforma,quotation
- * GET /purchase/vouchers?docTypes=invoice,order,debit_note
+ * GET /sales/vouchers?docTypes=invoice,order,credit_note&partyGroups=Local%20Debtors,Export
+ * GET /purchase/vouchers?docTypes=invoice,order,debit_note&partyGroups=...
  */
 const combinedVoucherListHandler = (module) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -1151,20 +1192,19 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
+  const partyGroups = parseCsvParam(req.query.partyGroups);
   const defaultTypes = module === 'purchase'
     ? ['invoice', 'order', 'debit_note']
     : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
-  const rawTypes = typeof req.query.docTypes === 'string' ? req.query.docTypes : '';
-  const requested = rawTypes
-    ? rawTypes.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean)
-    : defaultTypes;
+  const requested = parseCsvParam(req.query.docTypes).map((t) => t.toLowerCase());
+  const effectiveTypes = requested.length ? requested : defaultTypes;
   const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
-  const predicates = requested.map(predFn).filter(Boolean);
+  const predicates = effectiveTypes.map(predFn).filter(Boolean);
   if (!predicates.length) {
     return res.json({
       success: true,
       data: [],
-      meta: { total: 0, page: parseInt(page), limit: parseInt(limit), from, to, docTypes: [] },
+      meta: { total: 0, page: parseInt(page), limit: parseInt(limit), from, to, docTypes: [], partyGroups: [] },
     });
   }
   const typeOr = `(${predicates.join(' OR ')})`;
@@ -1180,6 +1220,10 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
       params.push(partyName);
       q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
     }
+    if (partyGroups.length) {
+      params.push(partyGroups);
+      q += ` AND ${partyGroupExistsSql(params.length)}`;
+    }
     q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
@@ -1188,6 +1232,10 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
     if (partyName) {
       cntParams.push(partyName);
       cntQ += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
+    }
+    if (partyGroups.length) {
+      cntParams.push(partyGroups);
+      cntQ += ` AND ${partyGroupExistsSql(cntParams.length)}`;
     }
     const { rows: cnt } = await query(cntQ, cntParams);
     const classify = module === 'purchase' ? classifyPurchaseDocType : classifySalesDocType;
@@ -1205,7 +1253,8 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
         limit: parseInt(limit),
         from,
         to,
-        docTypes: requested,
+        docTypes: effectiveTypes,
+        partyGroups,
       },
     });
   } catch (err) {
@@ -1213,7 +1262,10 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   }
 };
 
-/** Per–doc-type counts for register filter sheet (current from/to). */
+/**
+ * Per–doc-type + party-group counts for register filter sheet (current from/to).
+ * partyGroups = distinct ledgers.parent of voucher parties in range.
+ */
 const voucherCountsHandler = (module) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -1223,6 +1275,8 @@ const voucherCountsHandler = (module) => async (req, res) => {
     ? ['invoice', 'order', 'debit_note']
     : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
   const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
+  const allPreds = types.map(predFn).filter(Boolean);
+  const typeOrAll = allPreds.length ? `(${allPreds.join(' OR ')})` : 'FALSE';
   try {
     const pairs = await Promise.all(types.map(async (docType) => {
       const pred = predFn(docType);
@@ -1235,8 +1289,25 @@ const voucherCountsHandler = (module) => async (req, res) => {
       );
       return [docType, parseInt(rows[0]?.c || 0, 10)];
     }));
+    const { rows: groupRows } = await query(
+      `SELECT pl.parent AS name, COUNT(DISTINCT v.guid)::int AS c
+         FROM vouchers v
+         ${PARTY_LEDGER_JOIN}
+        WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+          AND ${typeOrAll}
+          AND v.date BETWEEN $2 AND $3
+          AND pl.parent <> ''
+        GROUP BY pl.parent
+        ORDER BY c DESC, pl.parent ASC
+        LIMIT 50`,
+      [companyGuid, from, to]
+    );
     const data = Object.fromEntries(pairs);
     data.all = pairs.reduce((sum, [, n]) => sum + n, 0);
+    data.partyGroups = (groupRows || []).map((r) => ({
+      name: r.name,
+      count: parseInt(r.c || 0, 10),
+    }));
     res.json({ success: true, data, meta: { from, to } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -5385,34 +5456,47 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   const { from, to, page = 1, limit = 30, type, category } = req.query;
   const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  // Anchored regex — avoid '%Direct%' matching "Indirect Expenses" (see parties?type=expense).
-  const typeNorm = String(type || 'All').trim();
-  const expenseGroupFilter = typeNorm === 'Direct'
-    ? `AND l.parent ~* $TYPE_DIRECT`
-    : typeNorm === 'Indirect'
-      ? `AND l.parent ~* $TYPE_INDIRECT`
-      : `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
-  const categoryName = typeof category === 'string' ? category.trim() : '';
+  // Multi-select: types=Direct,Indirect (or legacy type=Direct). Empty / All → both.
+  const typesRaw = parseCsvParam(req.query.types).length
+    ? parseCsvParam(req.query.types)
+    : (type ? [String(type).trim()] : []);
+  const wantDirect = typesRaw.some((t) => /^direct$/i.test(t));
+  const wantIndirect = typesRaw.some((t) => /^indirect$/i.test(t));
+  const wantAllTypes = !typesRaw.length
+    || typesRaw.some((t) => /^all$/i.test(t))
+    || (wantDirect && wantIndirect);
+  let expenseGroupFilter;
+  if (wantAllTypes) {
+    expenseGroupFilter = `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
+  } else if (wantDirect) {
+    expenseGroupFilter = `AND l.parent ~* $TYPE_DIRECT`;
+  } else if (wantIndirect) {
+    expenseGroupFilter = `AND l.parent ~* $TYPE_INDIRECT`;
+  } else {
+    expenseGroupFilter = `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
+  }
+  // Multi-select categories=A,B (or legacy category=A).
+  const categoryNames = parseCsvParam(req.query.categories).length
+    ? parseCsvParam(req.query.categories)
+    : (typeof category === 'string' && category.trim() ? [category.trim()] : []);
 
   try {
-    // Params: $1 company, $2 from, $3 to, then optional category, then type regexes placed last
-    // Use numbered placeholders after rewriting markers.
     const typeParams = ['^Direct Expenses?$', '^Indirect Expenses?$'];
-    const rewriteFilter = (sql, startIdx) => {
-      let out = sql
-        .replace(/\$TYPE_DIRECT/g, `$${startIdx}`)
-        .replace(/\$TYPE_INDIRECT/g, `$${startIdx + 1}`);
-      return out;
-    };
+    const rewriteFilter = (sql, startIdx) => sql
+      .replace(/\$TYPE_DIRECT/g, `$${startIdx}`)
+      .replace(/\$TYPE_INDIRECT/g, `$${startIdx + 1}`);
 
     const buildWhere = (baseIdx) => {
-      // baseIdx = first free index after company/from/to (=4)
       let idx = baseIdx;
       const params = [companyGuid, fyFrom, fyTo];
       let catSql = '';
-      if (categoryName) {
-        params.push(categoryName);
+      if (categoryNames.length === 1) {
+        params.push(categoryNames[0]);
         catSql = ` AND LOWER(TRIM(COALESCE(l.parent,''))) = LOWER(TRIM($${idx}))`;
+        idx += 1;
+      } else if (categoryNames.length > 1) {
+        params.push(categoryNames);
+        catSql = ` AND LOWER(TRIM(COALESCE(l.parent,''))) = ANY(SELECT LOWER(TRIM(x)) FROM unnest($${idx}::text[]) AS x)`;
         idx += 1;
       }
       const typeIdx = idx;
@@ -5511,6 +5595,9 @@ router.get('/expenses', authMiddleware, async (req, res) => {
     }
 
     const totalExpenses = parseFloat(totRow[0]?.total || 0);
+    const typeMeta = wantAllTypes
+      ? 'All'
+      : [wantDirect && 'Direct', wantIndirect && 'Indirect'].filter(Boolean).join(',');
     res.json({
       success: true,
       data: paged.map((r) => ({
@@ -5526,8 +5613,10 @@ router.get('/expenses', authMiddleware, async (req, res) => {
         limit: parseInt(limit),
         from: fyFrom,
         to: fyTo,
-        type: typeNorm || 'All',
-        category: categoryName || null,
+        type: typeMeta,
+        types: wantAllTypes ? [] : [wantDirect && 'Direct', wantIndirect && 'Indirect'].filter(Boolean),
+        category: categoryNames.length === 1 ? categoryNames[0] : null,
+        categories: categoryNames,
       },
     });
   } catch (err) {

@@ -1,3 +1,24 @@
+## 2026-08-29 — Register filters: multi-select Type + Party/Category Groups
+
+### Changed
+- **Sales/Purchase** `GET .../vouchers` — accepts multi `docTypes` (already) + new `partyGroups=Parent1,Parent2` (join party ledger via `party_guid`/`party_name` → `ledgers.parent`)
+- **Sales/Purchase** `GET .../vouchers/counts` — also returns `partyGroups:[{ name, count }]` (top 50 party ledger parents in range)
+- **Expenses** `GET /expenses` — multi `types=Direct,Indirect` + multi `categories=...` (legacy `type`/`category` still work)
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# Auth: GET /sales/vouchers?docTypes=credit_note,order&partyGroups=Sundry%20Debtors&companyGuid=…
+# Auth: GET /sales/vouchers/counts?companyGuid=…  → data.partyGroups[]
+# Auth: GET /expenses?types=Direct&categories=Direct%20Expenses&companyGuid=…
+```
+
+### Risks
+- Party group filter needs a matching ledger row; vouchers with unknown party names are excluded when `partyGroups` is set.
+- Expense "categories" are still immediate `ledgers.parent` under Direct/Indirect anchors (often just those two names unless sub-groups are used as parents).
+
+---
+
 ## 2026-08-29 — Voucher counts for Register filter sheets
 
 ### Changed
