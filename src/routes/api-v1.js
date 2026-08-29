@@ -5407,7 +5407,8 @@ WITH RECURSIVE expense_groups AS (
   UNION ALL
   SELECT child.name, eg.root_type
     FROM groups child
-    JOIN expense_groups eg ON child.parent = eg.name
+    JOIN expense_groups eg
+      ON LOWER(TRIM(COALESCE(child.parent, ''))) = LOWER(TRIM(eg.name))
    WHERE child.company_guid = $1
 )`;
 

@@ -1,4 +1,22 @@
+## 2026-08-29 — Expense Type filter: radio + includes('direct') fix
+
+### Changed
+- **`EXPENSE_GROUPS_CTE`**: recursive child join uses `LOWER(TRIM(...))` (case/whitespace safe).
+- **New** `scripts/verify-expense-type-filter.mjs` — prints Direct vs Indirect counts (DB + optional `--api`).
+
+### How to test
+```bash
+node scripts/verify-expense-type-filter.mjs --api
+# Expect diverge=true for Yash Ki Company (Direct=0, Indirect>0) or Y.K Industries (Direct>0, Indirect=0)
+```
+
+### Risks
+- Companies with only one expense root still show All ≡ that type in the list (correct); the other type is empty.
+
+---
+
 ## 2026-08-29 — Expense filter recursive groups + voucher type list badges (backend)
+
 
 ### Changed
 - **`GET /expenses` + `/expenses/counts`**: walk Direct/Indirect **group tree** (recursive CTE, same pattern as charge-ledgers). Type filter uses `root_type`; Category lists **immediate ledger parents** under that tree (Salary, Rent, …) with counts — no longer only rows whose parent is literally `Direct/Indirect Expenses`.
