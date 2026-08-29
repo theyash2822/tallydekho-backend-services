@@ -66,12 +66,17 @@ AR/AP (`/kpi/receivables`, `/kpi/payables`): `total`, `trend_pct` (Total Due vs 
 | Method | Path |
 |--------|------|
 | GET | /api/sales/invoices |
+| GET | /api/sales/vouchers |
 | GET | /api/sales/orders |
 | GET | /api/sales/credit-notes |
 | GET | /api/sales/delivery-notes |
 | GET | /api/sales/ewaybills |
 All: ?companyGuid&fy&from&to&page&limit&search&partyName
 `partyName` (optional): exact party match, case- and whitespace-insensitive. Omit for the full list.
+
+`GET /sales/invoices` — true Sales invoices only (excludes Order/Delivery/Quotation). Default `is_optional=false`; pass `is_optional=true` (proforma) or `is_optional=all`. Each row includes `doc_type`, `voucher_type`, `is_optional`.
+
+`GET /sales/vouchers?docTypes=invoice,order,credit_note,delivery_note,proforma,quotation` — combined Recent feed (server-side OR + single pagination). Omitting `docTypes` selects all six. Rows include `doc_type`.
 
 ### GET /api/sales/invoices/:id/credit-note-context
 Return-context for the Credit Note (Sales Return) flow. `:id` = invoice GUID (preferred) or voucher number. Requires `?companyGuid=`.
@@ -98,10 +103,15 @@ Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_SALES_INVOICE` (400).
 | Method | Path |
 |--------|------|
 | GET | /api/purchase/invoices |
+| GET | /api/purchase/vouchers |
 | GET | /api/purchase/invoices/:id/debit-note-context |
 | GET | /api/purchase/orders |
 | GET | /api/purchase/debit-notes |
 All list routes: ?companyGuid&fy&from&to&page&limit&search&partyName
+
+`GET /purchase/invoices` — true Purchase invoices only (excludes Purchase Order). Default `is_optional=false`; `is_optional=true|all` supported. Rows include `doc_type`.
+
+`GET /purchase/vouchers?docTypes=invoice,order,debit_note` — combined Recent feed. Omitting `docTypes` selects all three.
 
 ### GET /api/purchase/invoices/:id/debit-note-context
 Purchase Return mirror of credit-note-context. Errors: `INVOICE_NOT_FOUND` (404), `NOT_A_PURCHASE_INVOICE` (400).
@@ -163,7 +173,7 @@ Response mirrors credit-note (`tdkReferenceNo`, `voucherNumber`, `invoiceUuid`, 
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | /api/daybook | Daily voucher log |
-| GET | /api/expenses | Expense vouchers |
+| GET | /api/expenses | Expense vouchers. ?type=All\|Direct\|Indirect (anchored `^Direct Expenses?$` / `^Indirect Expenses?$`) & optional `category` (exact ledger parent) |
 | GET | /api/parties | Party ledger list |
 | GET | /api/bank-ledgers | Bank account ledgers |
 | GET | /api/notifications | User notifications |

@@ -1,3 +1,27 @@
+## 2026-08-29 — Sales/Purchase/Expense combined Recent + filter APIs
+
+### Changed
+- `GET /sales/invoices` — true Sales invoices only (excludes Order/Delivery/Quotation); default `is_optional=false` (`true`/`all` supported). Rows include `doc_type`.
+- `GET /purchase/invoices` — excludes Purchase Order; same `is_optional` query. Rows include `doc_type`.
+- **New** `GET /sales/vouchers?docTypes=invoice,order,credit_note,delivery_note,proforma,quotation` — server-side combined paginated Recent feed.
+- **New** `GET /purchase/vouchers?docTypes=invoice,order,debit_note` — same for Purchase.
+- `GET /sales/home-metrics` — excludes optional (proforma) from sales totals.
+- `GET /expenses` — Direct/Indirect via anchored `^Direct Expenses?$` / `^Indirect Expenses?$`; accepts `type` + optional `category`; categories from ledger parents.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# Auth: GET /sales/vouchers?docTypes=invoice,order&companyGuid=…
+# Auth: GET /purchase/vouchers?docTypes=invoice,debit_note&companyGuid=…
+# Auth: GET /expenses?type=Direct&companyGuid=…  (must not return Indirect parents)
+```
+
+### Risks
+- Quotation returns `[]` until voucher_type containing Quotation exists in sync.
+- Multi-category expenses: single `category` query param; mobile intersects when >1 selected.
+
+---
+
 ## 2026-08-27 — AR/AP trend pills via reconstruction (day-1)
 
 ### Changed

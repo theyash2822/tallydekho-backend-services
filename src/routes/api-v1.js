@@ -976,6 +976,81 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
 // SALES
 // ══════════════════════════════════════════════════════════════
 
+/** Shared voucher SELECT + app_vouchers lateral join (list screens). */
+const VOUCHER_LIST_SELECT = `
+      SELECT v.*,
+             av_info.tdk_reference_no,
+             av_info.current_entry_type,
+             av_info.original_entry_type
+      FROM vouchers v
+      LEFT JOIN LATERAL (
+        SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
+        FROM app_vouchers av
+        WHERE av.company_guid = v.company_guid
+          AND av.tally_voucher_no = v.voucher_number
+          AND av.voucher_date::text = v.date
+          AND (
+            (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
+            OR COALESCE(av.tdk_reference_no, '') = ''
+          )
+        ORDER BY av.id DESC LIMIT 1
+      ) av_info ON true`;
+
+// True Sales invoice (metrics-aligned): Sales but not Order/Delivery/Quotation.
+const SALES_INVOICE_SQL = `v.voucher_type ILIKE '%Sales%' AND v.voucher_type NOT ILIKE '%Order%' AND v.voucher_type NOT ILIKE '%Delivery%' AND v.voucher_type NOT ILIKE '%Quotation%'`;
+// True Purchase invoice: Purchase but not Purchase Order.
+const PURCHASE_INVOICE_SQL = `v.voucher_type ILIKE '%Purchase%' AND v.voucher_type NOT ILIKE '%Order%'`;
+
+/** Map mobile docType → SQL predicate (alias `v`). */
+function salesDocTypePredicate(docType) {
+  switch (String(docType || '').toLowerCase()) {
+    case 'invoice':
+      return `(${SALES_INVOICE_SQL} AND COALESCE(v.is_optional, FALSE) = FALSE)`;
+    case 'order':
+      return `(v.voucher_type ILIKE '%Sales Order%')`;
+    case 'credit_note':
+      return `(v.voucher_type ILIKE '%Credit Note%')`;
+    case 'delivery_note':
+      return `(v.voucher_type ILIKE '%Delivery Note%')`;
+    case 'proforma':
+      return `(${SALES_INVOICE_SQL} AND COALESCE(v.is_optional, FALSE) = TRUE)`;
+    case 'quotation':
+      return `(v.voucher_type ILIKE '%Quotation%')`;
+    default:
+      return null;
+  }
+}
+
+function purchaseDocTypePredicate(docType) {
+  switch (String(docType || '').toLowerCase()) {
+    case 'invoice':
+      return `(${PURCHASE_INVOICE_SQL} AND COALESCE(v.is_optional, FALSE) = FALSE)`;
+    case 'order':
+      return `(v.voucher_type ILIKE '%Purchase Order%')`;
+    case 'debit_note':
+      return `(v.voucher_type ILIKE '%Debit Note%')`;
+    default:
+      return null;
+  }
+}
+
+function classifySalesDocType(row) {
+  const vt = String(row.voucher_type || '');
+  if (/quotation/i.test(vt)) return 'quotation';
+  if (/credit\s*note/i.test(vt)) return 'credit_note';
+  if (/delivery\s*note/i.test(vt)) return 'delivery_note';
+  if (/sales\s*order/i.test(vt)) return 'order';
+  if (row.is_optional) return 'proforma';
+  return 'invoice';
+}
+
+function classifyPurchaseDocType(row) {
+  const vt = String(row.voucher_type || '');
+  if (/debit\s*note/i.test(vt)) return 'debit_note';
+  if (/purchase\s*order/i.test(vt)) return 'order';
+  return 'invoice';
+}
+
 const voucherListHandler = (voucherType) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -988,25 +1063,7 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
   try {
     let q = `
-      SELECT v.*,
-             av_info.tdk_reference_no,
-             av_info.current_entry_type,
-             av_info.original_entry_type
-      FROM vouchers v
-      LEFT JOIN LATERAL (
-        SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
-        FROM app_vouchers av
-        WHERE av.company_guid = v.company_guid
-          AND av.tally_voucher_no = v.voucher_number
-          AND av.voucher_date::text = v.date
-          -- When multiple Tally vouchers share the same voucher_number, guard by TDK ref (REFERENCE)
-          -- so the list mapping doesn't accidentally attach the wrong app_voucher.
-          AND (
-            (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
-            OR COALESCE(av.tdk_reference_no, '') = ''
-          )
-        ORDER BY av.id DESC LIMIT 1
-      ) av_info ON true
+      ${VOUCHER_LIST_SELECT}
       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE $2
         AND (v.party_name ILIKE $3 OR v.voucher_number ILIKE $3)
         AND v.date BETWEEN $4 AND $5`;
@@ -1031,8 +1088,134 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   }
 };
 
-router.get('/sales/invoices',    authMiddleware, voucherListHandler('Sales'));
+/**
+ * Strict invoice list — aligns with home-metrics (excludes Order/Delivery/Quotation).
+ * Query `is_optional`: omit/false → regular invoices only; true → proforma only; all → both.
+ */
+const strictInvoiceListHandler = (module) => async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { search = '', page = 1, limit = 30 } = req.query;
+  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
+  const optRaw = String(req.query.is_optional ?? 'false').toLowerCase();
+  const baseSql = module === 'purchase' ? PURCHASE_INVOICE_SQL : SALES_INVOICE_SQL;
+  let optionalSql = ' AND COALESCE(v.is_optional, FALSE) = FALSE';
+  if (optRaw === 'true' || optRaw === '1') optionalSql = ' AND COALESCE(v.is_optional, FALSE) = TRUE';
+  else if (optRaw === 'all') optionalSql = '';
+  try {
+    let q = `
+      ${VOUCHER_LIST_SELECT}
+      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+        AND (${baseSql})${optionalSql}
+        AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)
+        AND v.date BETWEEN $3 AND $4`;
+    const params = [companyGuid, `%${search}%`, from, to];
+    if (partyName) {
+      params.push(partyName);
+      q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
+    }
+    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const cntParams = [companyGuid, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND (${baseSql})${optionalSql} AND v.date BETWEEN $2 AND $3`;
+    if (partyName) {
+      cntParams.push(partyName);
+      cntQ += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
+    }
+    const { rows: cnt } = await query(cntQ, cntParams);
+    const classify = module === 'purchase' ? classifyPurchaseDocType : classifySalesDocType;
+    res.json({
+      success: true,
+      data: rows.map((r) => ({ ...r, doc_type: classify(r) })),
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+};
+
+/**
+ * Combined Recent feed — one paginated list across selected docTypes.
+ * GET /sales/vouchers?docTypes=invoice,order,credit_note,delivery_note,proforma,quotation
+ * GET /purchase/vouchers?docTypes=invoice,order,debit_note
+ */
+const combinedVoucherListHandler = (module) => async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const { search = '', page = 1, limit = 30 } = req.query;
+  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
+  const defaultTypes = module === 'purchase'
+    ? ['invoice', 'order', 'debit_note']
+    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
+  const rawTypes = typeof req.query.docTypes === 'string' ? req.query.docTypes : '';
+  const requested = rawTypes
+    ? rawTypes.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean)
+    : defaultTypes;
+  const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
+  const predicates = requested.map(predFn).filter(Boolean);
+  if (!predicates.length) {
+    return res.json({
+      success: true,
+      data: [],
+      meta: { total: 0, page: parseInt(page), limit: parseInt(limit), from, to, docTypes: [] },
+    });
+  }
+  const typeOr = `(${predicates.join(' OR ')})`;
+  try {
+    let q = `
+      ${VOUCHER_LIST_SELECT}
+      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+        AND ${typeOr}
+        AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)
+        AND v.date BETWEEN $3 AND $4`;
+    const params = [companyGuid, `%${search}%`, from, to];
+    if (partyName) {
+      params.push(partyName);
+      q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
+    }
+    q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit), offset);
+    const { rows } = await query(q, params);
+    const cntParams = [companyGuid, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND ${typeOr} AND v.date BETWEEN $2 AND $3`;
+    if (partyName) {
+      cntParams.push(partyName);
+      cntQ += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
+    }
+    const { rows: cnt } = await query(cntQ, cntParams);
+    const classify = module === 'purchase' ? classifyPurchaseDocType : classifySalesDocType;
+    res.json({
+      success: true,
+      data: rows.map((r) => ({
+        ...r,
+        doc_type: classify(r),
+        voucher_type: r.voucher_type,
+        is_optional: r.is_optional ?? false,
+      })),
+      meta: {
+        total: parseInt(cnt[0].c),
+        page: parseInt(page),
+        limit: parseInt(limit),
+        from,
+        to,
+        docTypes: requested,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+};
+
+router.get('/sales/invoices',    authMiddleware, strictInvoiceListHandler('sales'));
 router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order'));
+router.get('/sales/vouchers',    authMiddleware, combinedVoucherListHandler('sales'));
 
 // GET /api/sales/home-metrics — Today / MTD / YTD / Outstanding / Credit Notes / Avg Ticket
 router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
@@ -1043,7 +1226,7 @@ router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
     const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
     const mtdFrom = `${today.slice(0, 8)}01`;
-    const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND is_cancelled=FALSE`;
+    const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND COALESCE(is_optional, FALSE)=FALSE AND is_cancelled=FALSE`;
     const [todayRes, mtdRes, ytdRes, cntRes, cnRes, arRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date=$2`, [companyGuid, today]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, mtdFrom, today]),
@@ -1349,8 +1532,9 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
 // PURCHASE
 // ══════════════════════════════════════════════════════════════
 
-router.get('/purchase/invoices', authMiddleware, voucherListHandler('Purchase'));
+router.get('/purchase/invoices', authMiddleware, strictInvoiceListHandler('purchase'));
 router.get('/purchase/orders',   authMiddleware, voucherListHandler('Purchase Order'));
+router.get('/purchase/vouchers', authMiddleware, combinedVoucherListHandler('purchase'));
 
 // GET /api/purchase/invoices/:id/debit-note-context
 // Purchase Return mirror of credit-note-context — remaining qty accounts for Debit
@@ -5108,16 +5292,46 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from, to, page = 1, limit = 30, type } = req.query;
+  const { from, to, page = 1, limit = 30, type, category } = req.query;
   const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  const expenseGroupFilter = type === 'Direct'
-    ? `AND l.parent ILIKE '%Direct Expense%'`
-    : type === 'Indirect'
-      ? `AND l.parent ILIKE '%Indirect Expense%'`
-      : `AND (l.parent ILIKE '%Direct Expense%' OR l.parent ILIKE '%Indirect Expense%')`;
+  // Anchored regex — avoid '%Direct%' matching "Indirect Expenses" (see parties?type=expense).
+  const typeNorm = String(type || 'All').trim();
+  const expenseGroupFilter = typeNorm === 'Direct'
+    ? `AND l.parent ~* $TYPE_DIRECT`
+    : typeNorm === 'Indirect'
+      ? `AND l.parent ~* $TYPE_INDIRECT`
+      : `AND (l.parent ~* $TYPE_DIRECT OR l.parent ~* $TYPE_INDIRECT)`;
+  const categoryName = typeof category === 'string' ? category.trim() : '';
 
   try {
+    // Params: $1 company, $2 from, $3 to, then optional category, then type regexes placed last
+    // Use numbered placeholders after rewriting markers.
+    const typeParams = ['^Direct Expenses?$', '^Indirect Expenses?$'];
+    const rewriteFilter = (sql, startIdx) => {
+      let out = sql
+        .replace(/\$TYPE_DIRECT/g, `$${startIdx}`)
+        .replace(/\$TYPE_INDIRECT/g, `$${startIdx + 1}`);
+      return out;
+    };
+
+    const buildWhere = (baseIdx) => {
+      // baseIdx = first free index after company/from/to (=4)
+      let idx = baseIdx;
+      const params = [companyGuid, fyFrom, fyTo];
+      let catSql = '';
+      if (categoryName) {
+        params.push(categoryName);
+        catSql = ` AND LOWER(TRIM(COALESCE(l.parent,''))) = LOWER(TRIM($${idx}))`;
+        idx += 1;
+      }
+      const typeIdx = idx;
+      params.push(...typeParams);
+      const filterSql = rewriteFilter(expenseGroupFilter, typeIdx) + catSql;
+      return { params, filterSql, nextIdx: typeIdx + 2 };
+    };
+
+    const listBuilt = buildWhere(4);
     const baseJoin = `
       FROM vouchers v
       JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
@@ -5125,7 +5339,7 @@ router.get('/expenses', authMiddleware, async (req, res) => {
       WHERE v.company_guid = $1
         AND v.is_cancelled = FALSE
         AND vle.dr_cr = 'Dr'
-        ${expenseGroupFilter}
+        ${listBuilt.filterSql}
         AND v.date IS NOT NULL AND v.date != ''
         AND v.date BETWEEN $2 AND $3`;
 
@@ -5137,7 +5351,7 @@ router.get('/expenses', authMiddleware, async (req, res) => {
               ABS(vle.amount) AS expense_amount
        ${baseJoin}
        ORDER BY v.guid, ABS(vle.amount) DESC`,
-      [companyGuid, fyFrom, fyTo]
+      listBuilt.params
     );
     const sorted = rows.sort((a, b) => {
       const da = String(a.date || '');
@@ -5146,6 +5360,7 @@ router.get('/expenses', authMiddleware, async (req, res) => {
     });
     const paged = sorted.slice(offset, offset + parseInt(limit));
 
+    const totBuilt = buildWhere(4);
     const { rows: totRow } = await query(
       `SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
@@ -5154,12 +5369,15 @@ router.get('/expenses', authMiddleware, async (req, res) => {
        WHERE v.company_guid = $1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
-         ${expenseGroupFilter}
+         ${totBuilt.filterSql}
          AND v.date IS NOT NULL AND v.date != ''
          AND v.date BETWEEN $2 AND $3`,
-      [companyGuid, fyFrom, fyTo]
+      totBuilt.params
     );
 
+    // Categories always from Direct+Indirect parents (not narrowed by type filter),
+    // so the filter sheet can list all expense groups. Optional type still scopes amounts.
+    const catTypeFilter = `AND (l.parent ~* $4 OR l.parent ~* $5)`;
     const { rows: catRows } = await query(
       `SELECT l.parent AS name, COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
@@ -5168,26 +5386,59 @@ router.get('/expenses', authMiddleware, async (req, res) => {
        WHERE v.company_guid = $1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
-         ${expenseGroupFilter}
+         ${catTypeFilter}
          AND v.date IS NOT NULL AND v.date != ''
          AND v.date BETWEEN $2 AND $3
        GROUP BY l.parent
        ORDER BY total DESC
-       LIMIT 8`,
-      [companyGuid, fyFrom, fyTo]
+       LIMIT 50`,
+      [companyGuid, fyFrom, fyTo, '^Direct Expenses?$', '^Indirect Expenses?$']
     );
+
+    // Also expose distinct ledger-parent categories under Direct/Indirect for the sheet
+    // even when amount is 0 in range — prefer parents from ledgers master.
+    const { rows: parentRows } = await query(
+      `SELECT DISTINCT parent AS name
+         FROM ledgers
+        WHERE company_guid = $1
+          AND (parent ~* $2 OR parent ~* $3)
+        ORDER BY parent
+        LIMIT 50`,
+      [companyGuid, '^Direct Expenses?$', '^Indirect Expenses?$']
+    );
+    const amountByParent = new Map(catRows.map((r) => [r.name, parseFloat(r.total) || 0]));
+    const categoryList = [];
+    const seen = new Set();
+    for (const r of catRows) {
+      if (!r.name || seen.has(r.name)) continue;
+      seen.add(r.name);
+      categoryList.push({ id: r.name, name: r.name, amount_raw: amountByParent.get(r.name) || 0 });
+    }
+    for (const r of parentRows) {
+      if (!r.name || seen.has(r.name)) continue;
+      seen.add(r.name);
+      categoryList.push({ id: r.name, name: r.name, amount_raw: 0 });
+    }
 
     const totalExpenses = parseFloat(totRow[0]?.total || 0);
     res.json({
       success: true,
-      data: paged,
-      categories: catRows.map((r) => ({
-        id: r.name,
-        name: r.name,
-        amount_raw: parseFloat(r.total) || 0,
+      data: paged.map((r) => ({
+        ...r,
+        voucher_type: r.voucher_type,
+        is_optional: r.is_optional ?? false,
       })),
+      categories: categoryList,
       summary: { total: totalExpenses, display: `₹${Math.round(totalExpenses).toLocaleString('en-IN')}`, count: sorted.length },
-      meta: { total: sorted.length, page: parseInt(page), limit: parseInt(limit), from: fyFrom, to: fyTo },
+      meta: {
+        total: sorted.length,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        from: fyFrom,
+        to: fyTo,
+        type: typeNorm || 'All',
+        category: categoryName || null,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
