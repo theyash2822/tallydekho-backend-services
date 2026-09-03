@@ -22,6 +22,7 @@ import { buildLoansOdsPayload } from '../modules/loans-ods/loansOdsService.js';
 import { buildArApPayload } from '../modules/ar-ap/arApService.js';
 import { buildPaymentReceiptPayload } from '../modules/kpi/paymentReceiptService.js';
 import { buildCashInHandPayload, buildBankBalancePayload } from '../modules/kpi/cashBankService.js';
+import { computeTrendPct, addDays } from '../modules/kpi/trendUtil.js';
 import {
   enrichNotification,
   stockNotification,
@@ -153,15 +154,50 @@ async function verifyCompanyOwnership(req, res, companyGuid) {
 
 // FY date resolver — returns from/to/financialYear for a company
 // V2: also returns financialYear label (e.g. "2025-2026") for direct DB queries
+export function normalizeFinYearLabel(fyParam) {
+  if (!fyParam) return null;
+  let s = String(fyParam).trim().replace(/^FY\s*/i, '');
+  const full = s.match(/^(\d{4})-(\d{4})$/);
+  if (full) return `${full[1]}-${full[2]}`;
+  const short = s.match(/^(\d{4})-(\d{2})$/);
+  if (short) {
+    const y1 = parseInt(short[1], 10);
+    const y2 = parseInt(short[2], 10);
+    const endYear = y2 >= 100 ? y2 : (y2 < 50 ? 2000 + y2 : 1900 + y2);
+    return endYear === y1 + 1 ? `${y1}-${endYear}` : `${y1}-${y1 + 1}`;
+  }
+  return s;
+}
+
+/** FY label variants stored in Tally sync (2024-2025 vs 2024-25) */
+function fyLikePrefix(financialYear) {
+  const fy = normalizeFinYearLabel(financialYear) || financialYear;
+  return `${String(fy).slice(0, 4)}-%`;
+}
+
+function sqlLfbJoin(alias = 'lfb', fyIdx, prefixIdx) {
+  return `(${alias}.financial_year = $${fyIdx} OR ${alias}.financial_year LIKE $${prefixIdx})`;
+}
+
 export async function resolveFYDates(companyGuid, from, to, fyParam) {
+  const normalizedFy = normalizeFinYearLabel(fyParam);
   // If explicit financialYear label passed (e.g. "2025-2026"), look up its dates
   // If BOTH fy + from/to are passed: use custom date range but keep FY label for stock/ledger lookups
-  if (fyParam) {
+  if (normalizedFy) {
     try {
-      const { rows } = await query(
+      let { rows } = await query(
         'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND fin_year=$2 LIMIT 1',
-        [companyGuid, fyParam]
+        [companyGuid, normalizedFy]
       );
+      if (!rows[0]) {
+        const startYear = normalizedFy.slice(0, 4);
+        ({ rows } = await query(
+          `SELECT begin_date, end_date, fin_year FROM company_years
+           WHERE company_guid=$1 AND fin_year LIKE $2
+           ORDER BY begin_date DESC LIMIT 1`,
+          [companyGuid, `${startYear}-%`]
+        ));
+      }
       if (rows[0]) {
         // Use custom from/to if provided (date picker selection), otherwise use full FY range
         return {
@@ -173,7 +209,17 @@ export async function resolveFYDates(companyGuid, from, to, fyParam) {
     } catch {}
   }
   if (from && to) {
-    // Compute financialYear label from dates
+    try {
+      const { rows } = await query(
+        `SELECT fin_year, begin_date, end_date FROM company_years
+         WHERE company_guid=$1 AND begin_date::date <= $3::date AND end_date::date >= $2::date
+         ORDER BY begin_date DESC LIMIT 1`,
+        [companyGuid, from, to]
+      );
+      if (rows[0]) {
+        return { from, to, financialYear: rows[0].fin_year };
+      }
+    } catch {}
     const yr = parseInt(String(from).slice(0, 4), 10);
     return { from, to, financialYear: `${yr}-${yr + 1}` };
   }
@@ -657,6 +703,155 @@ router.get('/companies', authMiddleware, async (req, res) => {
   }
 });
 
+function dashboardSeriesInterval(period, from, to) {
+  const p = String(period || '').toUpperCase();
+  if (p === '7D') return 'day';
+  if (p === '1M') return 'day';
+  if (p === '3M') return 'week';
+  if (p === '6M') return 'month';
+  const a = new Date(`${String(from).slice(0, 10)}T12:00:00`);
+  const b = new Date(`${String(to).slice(0, 10)}T12:00:00`);
+  const days = Number.isFinite(b - a) ? Math.max(1, Math.round((b - a) / 86400000) + 1) : 30;
+  if (days <= 14) return 'day';
+  if (days <= 92) return 'week';
+  return 'month';
+}
+
+function pgDateTrunc(interval) {
+  if (interval === 'week') return 'week';
+  if (interval === 'month') return 'month';
+  return 'day';
+}
+
+function isoDateLocal(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function enumerateSeriesBuckets(from, to, interval) {
+  const start = new Date(`${String(from).slice(0, 10)}T12:00:00`);
+  const end = new Date(`${String(to).slice(0, 10)}T12:00:00`);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) return [];
+  const out = [];
+  if (interval === 'month') {
+    const d = new Date(start.getFullYear(), start.getMonth(), 1);
+    const last = new Date(end.getFullYear(), end.getMonth(), 1);
+    while (d <= last) {
+      out.push(isoDateLocal(d));
+      d.setMonth(d.getMonth() + 1);
+    }
+  } else if (interval === 'week') {
+    const d = new Date(start);
+    const dow = d.getDay();
+    d.setDate(d.getDate() + (dow === 0 ? -6 : 1 - dow));
+    while (d <= end) {
+      out.push(isoDateLocal(d));
+      d.setDate(d.getDate() + 7);
+    }
+  } else {
+    const d = new Date(start);
+    while (d <= end) {
+      out.push(isoDateLocal(d));
+      d.setDate(d.getDate() + 1);
+    }
+  }
+  return out;
+}
+
+function seriesPointLabel(dateStr, interval) {
+  const d = new Date(`${dateStr}T12:00:00`);
+  if (!Number.isFinite(d.getTime())) return dateStr;
+  if (interval === 'month') return d.toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
+  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+}
+
+function rowsToBucketMap(rows) {
+  const map = {};
+  for (const r of rows || []) {
+    const key = String(r.bucket || '').slice(0, 10);
+    if (key) map[key] = +(r.v || 0);
+  }
+  return map;
+}
+
+async function voucherSeriesMap(companyGuid, from, to, interval, typeSql) {
+  const trunc = pgDateTrunc(interval);
+  const { rows } = await query(
+    `SELECT date_trunc('${trunc}', date::timestamp)::date::text AS bucket,
+            COALESCE(SUM(amount), 0)::float AS v
+     FROM vouchers
+     WHERE company_guid = $1 AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
+       AND (${typeSql})
+     GROUP BY 1`,
+    [companyGuid, from, to]
+  );
+  return rowsToBucketMap(rows);
+}
+
+async function ledgerEntrySeriesMap(companyGuid, from, to, interval, drCr, parentSql) {
+  const trunc = pgDateTrunc(interval);
+  const { rows } = await query(
+    `SELECT date_trunc('${trunc}', v.date::timestamp)::date::text AS bucket,
+            COALESCE(SUM(ABS(vle.amount)), 0)::float AS v
+     FROM voucher_ledger_entries vle
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+     WHERE vle.company_guid = $1 AND vle.dr_cr = $2
+       AND (${parentSql})
+       AND v.is_cancelled = FALSE AND v.date BETWEEN $3 AND $4
+     GROUP BY 1`,
+    [companyGuid, drCr, from, to]
+  );
+  return rowsToBucketMap(rows);
+}
+
+function preferLedgerSeries(ledgerMap, voucherMap) {
+  const sum = Object.values(ledgerMap || {}).reduce((s, v) => s + v, 0);
+  return sum > 0 ? ledgerMap : voucherMap;
+}
+
+const METRICS_SALES_SQL =
+  `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%'`;
+const METRICS_PURCHASE_SQL =
+  `voucher_type ILIKE '%Purchase%' AND voucher_type NOT ILIKE '%Order%'`;
+const METRICS_EXPENSE_SQL =
+  `voucher_type IN ('Journal', 'Payment', 'Contra') AND amount > 0`;
+const METRICS_SALES_PARENT =
+  `(l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')`;
+const METRICS_PURCHASE_PARENT =
+  `(l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')`;
+const METRICS_EXPENSE_PARENT = `l.parent ~* '^Indirect Expenses?$'`;
+const CASHFLOW_RECEIPT_SQL = `voucher_type ILIKE '%Receipt%'`;
+const CASHFLOW_PAYMENT_SQL = `voucher_type ILIKE '%Payment%'`;
+
+async function buildDashboardChartSeries(companyGuid, from, to, period) {
+  const interval = dashboardSeriesInterval(period, from, to);
+  const buckets = enumerateSeriesBuckets(from, to, interval);
+  const [salesLed, purchLed, expLed, salesV, purchV, expV] = await Promise.all([
+    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Cr', METRICS_SALES_PARENT),
+    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Dr', METRICS_PURCHASE_PARENT),
+    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Dr', METRICS_EXPENSE_PARENT),
+    voucherSeriesMap(companyGuid, from, to, interval, METRICS_SALES_SQL),
+    voucherSeriesMap(companyGuid, from, to, interval, METRICS_PURCHASE_SQL),
+    voucherSeriesMap(companyGuid, from, to, interval, METRICS_EXPENSE_SQL),
+  ]);
+  const salesMap = preferLedgerSeries(salesLed, salesV);
+  const purchMap = preferLedgerSeries(purchLed, purchV);
+  const expMap = preferLedgerSeries(expLed, expV);
+  return {
+    interval,
+    series: buckets.map(date => ({
+      date,
+      label: seriesPointLabel(date, interval),
+      sales: salesMap[date] || 0,
+      purchase: purchMap[date] || 0,
+      expenses: expMap[date] || 0,
+    })),
+  };
+}
+
 // ══════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════
@@ -740,65 +935,104 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
   }
 });
 
+function inclusiveMetricDays(from, to) {
+  const a = new Date(`${from}T12:00:00`);
+  const b = new Date(`${to}T12:00:00`);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 1;
+  return Math.max(1, Math.floor((b - a) / 86400000) + 1);
+}
+
+/** Sales / purchase / expense totals for a window — same queries as GET /dashboard/metrics tiles. */
+async function dashboardMetricAmounts(companyGuid, from, to) {
+  const [sRes, pRes, eRes] = await Promise.all([
+    query(`SELECT COALESCE(
+      (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+       WHERE vle.company_guid=$1 AND vle.dr_cr='Cr'
+         AND (l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')
+         AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+      0
+    ) as v`, [companyGuid, from, to]),
+    query(`SELECT COALESCE(
+      (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+       WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+         AND (l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')
+         AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+      0
+    ) as v`, [companyGuid, from, to]),
+    query(`SELECT COALESCE(
+      (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
+       WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+         AND l.parent ~* '^Indirect Expenses?$'
+         AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3),
+      0
+    ) as v`, [companyGuid, from, to]),
+  ]);
+  return {
+    sales: +(sRes.rows?.[0]?.v ?? 0) || 0,
+    purchases: +(pRes.rows?.[0]?.v ?? 0) || 0,
+    expenses: +(eRes.rows?.[0]?.v ?? 0) || 0,
+  };
+}
+
+function metricTrendTile(id, label, amount, icon, route, pct, invert) {
+  const up = pct == null ? null : pct >= 0;
+  const positive = invert ? (pct == null ? false : pct <= 0) : (pct == null ? true : pct >= 0);
+  return {
+    id, label, amount_raw: amount, icon, route,
+    change: pct == null ? 0 : pct,
+    positive,
+    trend_pct: pct,
+    trend_positive: up,
+  };
+}
+
 // GET /api/dashboard/metrics?period=7D&companyGuid=xxx
 router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    // Use from/to from query params if provided (FY change), else fall back to latest FY from DB
-    let from = req.query.from;
-    let to   = req.query.to;
-    if (!from || !to) {
-      const { rows: fy } = await query('SELECT begin_date, end_date FROM company_years WHERE company_guid=$1 ORDER BY begin_date DESC LIMIT 1', [companyGuid]);
-      from = fy[0]?.begin_date || new Date().getFullYear() + '-04-01';
-      to   = fy[0]?.end_date   || (new Date().getFullYear() + 1) + '-03-31';
-    }
-    const [sRes, pRes, eRes] = await Promise.all([
-      // Sales = Credit entries (Cr) in ledgers under Sales Accounts group
-      // Falls back to voucher_type match if ledger entries not populated yet
-      query(`SELECT COALESCE(
-        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-         WHERE vle.company_guid=$1 AND vle.dr_cr='Cr'
-           AND (l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')
-           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
-        0
-      ) as v`, [companyGuid, from, to]),
-      // Purchase = Debit entries (Dr) in Purchase Accounts group
-      query(`SELECT COALESCE(
-        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-         WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
-           AND (l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')
-           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
-        0
-      ) as v`, [companyGuid, from, to]),
-      // Expenses = Debit entries in Indirect Expenses group (anchored — not substring of Indirect)
-      query(`SELECT COALESCE(
-        (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-         WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
-           AND l.parent ~* '^Indirect Expenses?$'
-           AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-        (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3),
-        0
-      ) as v`, [companyGuid, from, to]),
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const periodDays = inclusiveMetricDays(from, to);
+    const priorTo = addDays(from, -1);
+    const priorFrom = addDays(priorTo, -(periodDays - 1));
+    const [cur, prior] = await Promise.all([
+      dashboardMetricAmounts(companyGuid, from, to),
+      dashboardMetricAmounts(companyGuid, priorFrom, priorTo),
     ]);
-    const sVal = +(sRes.rows?.[0]?.v ?? 0) || 0;
-    const pVal = +(pRes.rows?.[0]?.v ?? 0) || 0;
-    const eVal = +(eRes.rows?.[0]?.v ?? 0) || 0;
-    // Raw values only — formatting done client-side
+    const sTrend = computeTrendPct(cur.sales, prior.sales);
+    const pTrend = computeTrendPct(cur.purchases, prior.purchases);
+    const eTrend = computeTrendPct(cur.expenses, prior.expenses);
+    // data stays a tile array so mobile `met.data` is unchanged. Chart series is GET /dashboard/chart.
+    // change / trend_pct = current window vs prior equal-length window (1M → previous month).
     res.json({ success: true, data: [
-      { id: 'sales',     label: 'Sales',     amount_raw: sVal, change: 0, positive: true,  icon: 'stats-chart-outline', route: '/sales' },
-      { id: 'purchases', label: 'Purchases', amount_raw: pVal, change: 0, positive: true,  icon: 'cart-outline',        route: '/purchase' },
-      { id: 'expenses',  label: 'Expenses',  amount_raw: eVal, change: 0, positive: false, icon: 'trending-up-outline', route: '/expenses' },
+      metricTrendTile('sales',     'Sales',     cur.sales,     'stats-chart-outline',  '/sales',     sTrend, false),
+      metricTrendTile('purchases', 'Purchases', cur.purchases, 'cart-outline',         '/purchase',  pTrend, false),
+      metricTrendTile('expenses',  'Expenses',  cur.expenses,  'trending-up-outline',  '/expenses',  eTrend, true),
     ]});
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/chart — turnover series (sales / purchase / expenses) for the selected window
+router.get('/dashboard/chart', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { interval, series } = await buildDashboardChartSeries(companyGuid, from, to, req.query.period);
+    res.json({ success: true, data: { interval, series, fy_from: from, fy_to: to } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -829,7 +1063,9 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
            AND v.is_cancelled=FALSE AND v.date BETWEEN $4 AND $5`,
         [companyGuid, drCr, parentRegex, from, to]
       );
-    const [rctRes, pmtRes, salesRes, purchRes, dirExpRes, indExpRes, dirIncRes, indIncRes] = await Promise.all([
+    const interval = dashboardSeriesInterval(req.query.period, from, to);
+    const buckets = enumerateSeriesBuckets(from, to, interval);
+    const [rctRes, pmtRes, salesRes, purchRes, dirExpRes, indExpRes, dirIncRes, indIncRes, rctSeries, pmtSeries] = await Promise.all([
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
       query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
@@ -838,6 +1074,8 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
       plLeg('^Indirect Expenses?$', 'Dr'),
       plLeg('^Direct Incomes?$', 'Cr'),
       plLeg('^Indirect Incomes?$', 'Cr'),
+      voucherSeriesMap(companyGuid, from, to, interval, CASHFLOW_RECEIPT_SQL),
+      voucherSeriesMap(companyGuid, from, to, interval, CASHFLOW_PAYMENT_SQL),
     ]);
     const receipts = +(rctRes.rows?.[0]?.v ?? 0);
     const payments = +(pmtRes.rows?.[0]?.v ?? 0);
@@ -852,6 +1090,11 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
     const grossProfit = sales - purchase - directExpenses + directIncome;
     const netProfit = grossProfit - indirectExpenses + indirectIncome;
     const gpVsSalesPct = sales > 0 ? Math.round((grossProfit / sales) * 100) : 0;
+    const series = buckets.map(date => {
+      const inflow = rctSeries[date] || 0;
+      const outflow = pmtSeries[date] || 0;
+      return { date, label: seriesPointLabel(date, interval), inflow, outflow, net: inflow - outflow };
+    });
     res.json({ success: true, data: {
       net_cash: netCash, gross_cash: netCash, net_realisable_balance: netCash,
       total_income: receipts, total_expense: payments,
@@ -866,6 +1109,8 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
       income_percentage: gpVsSalesPct,
       fy_from: from, fy_to: to,
       updated_at: 'just now',
+      series,
+      interval,
     }});
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -953,7 +1198,7 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { rows } = await query(
       `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
       [companyGuid, from, to]
@@ -970,6 +1215,103 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
       party: r.party_name || '',
     }));
     res.json({ success: true, data: activity });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/top-customers — sales by party for the selected window
+router.get('/dashboard/top-customers', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const limit = Math.min(10, Math.max(1, parseInt(req.query.limit, 10) || 5));
+    const { rows } = await query(
+      `SELECT party_name AS name,
+              COALESCE(SUM(ABS(amount)), 0)::float AS v,
+              COUNT(*)::int AS invoices
+       FROM vouchers
+       WHERE company_guid = $1 AND is_cancelled = FALSE
+         AND voucher_type ILIKE '%Sales%'
+         AND voucher_type NOT ILIKE '%Order%'
+         AND voucher_type NOT ILIKE '%Delivery%'
+         AND voucher_type NOT ILIKE '%Quotation%'
+         AND party_name IS NOT NULL AND TRIM(party_name) <> ''
+         AND date BETWEEN $2 AND $3
+       GROUP BY party_name
+       ORDER BY v DESC
+       LIMIT $4`,
+      [companyGuid, from, to, limit]
+    );
+    const total = rows.reduce((s, r) => s + +(r.v || 0), 0);
+    const data = rows.map(r => {
+      const amount_raw = +(r.v || 0);
+      return {
+        name: r.name,
+        amount_raw,
+        revenue: amount_raw,
+        invoices: +(r.invoices || 0),
+        pct: total > 0 ? Math.round((amount_raw / total) * 100) : 0,
+      };
+    });
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/dashboard/cost-analysis — Direct + Indirect expense ledger heads for the window
+router.get('/dashboard/cost-analysis', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    let { rows } = await query(
+      `SELECT l.name, l.parent,
+              COALESCE(SUM(ABS(vle.amount)), 0)::float AS v
+       FROM voucher_ledger_entries vle
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       WHERE vle.company_guid = $1 AND vle.dr_cr = 'Dr'
+         AND (l.parent ~* '^Direct Expenses?$' OR l.parent ~* '^Indirect Expenses?$')
+         AND v.is_cancelled = FALSE AND v.date BETWEEN $2 AND $3
+       GROUP BY l.name, l.parent
+       HAVING SUM(ABS(vle.amount)) > 0
+       ORDER BY v DESC`,
+      [companyGuid, from, to]
+    );
+    if (!rows.length) {
+      const fallback = await query(
+        `SELECT voucher_type AS name, '' AS parent,
+                COALESCE(SUM(amount), 0)::float AS v
+         FROM vouchers
+         WHERE company_guid = $1 AND is_cancelled = FALSE
+           AND voucher_type IN ('Journal', 'Payment', 'Contra') AND amount > 0
+           AND date BETWEEN $2 AND $3
+         GROUP BY voucher_type
+         HAVING SUM(amount) > 0
+         ORDER BY v DESC`,
+        [companyGuid, from, to]
+      );
+      rows = fallback.rows;
+    }
+    const sorted = rows.map(r => ({
+      name: r.name,
+      parent: r.parent || '',
+      amount_raw: +(r.v || 0),
+    })).filter(h => h.amount_raw > 0);
+    const total_raw = sorted.reduce((s, h) => s + h.amount_raw, 0);
+    const top = sorted.slice(0, 6);
+    const rest = sorted.slice(6).reduce((s, h) => s + h.amount_raw, 0);
+    if (rest > 0) top.push({ name: 'Other', parent: '', amount_raw: rest });
+    const heads = top.map(h => ({
+      ...h,
+      pct: total_raw > 0 ? Math.max(1, Math.round((h.amount_raw / total_raw) * 100)) : 0,
+    }));
+    res.json({ success: true, data: { total_raw, heads } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -1322,6 +1664,146 @@ router.get('/sales/orders',      authMiddleware, voucherListHandler('Sales Order
 router.get('/sales/vouchers/counts', authMiddleware, voucherCountsHandler('sales'));
 router.get('/sales/vouchers',    authMiddleware, combinedVoucherListHandler('sales'));
 
+const SALES_HOME_FILTER = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND COALESCE(is_optional, FALSE)=FALSE AND is_cancelled=FALSE`;
+const PURCHASE_HOME_FILTER = `voucher_type ILIKE '%Purchase%' AND voucher_type NOT ILIKE '%Order%'`;
+
+function shiftYearIso(iso, years = -1) {
+  const d = new Date(`${iso}T12:00:00`);
+  d.setFullYear(d.getFullYear() + years);
+  return d.toISOString().slice(0, 10);
+}
+
+function priorMtdWindow(asOf) {
+  const mtdFrom = `${asOf.slice(0, 8)}01`;
+  const prevMonthEnd = addDays(mtdFrom, -1);
+  const prevMtdFrom = `${prevMonthEnd.slice(0, 8)}01`;
+  const dayNum = parseInt(asOf.slice(8, 10), 10);
+  const prevMonthLastDay = parseInt(prevMonthEnd.slice(8, 10), 10);
+  const prevDay = Math.min(dayNum, prevMonthLastDay);
+  const prevMtdTo = `${prevMtdFrom.slice(0, 8)}${String(prevDay).padStart(2, '0')}`;
+  return { from: mtdFrom, to: asOf, priorFrom: prevMtdFrom, priorTo: prevMtdTo };
+}
+
+function homeMetricTrend(cur, prior, invert = false) {
+  const trend_pct = computeTrendPct(cur, prior);
+  const trend_positive = trend_pct == null ? null : (invert ? trend_pct <= 0 : trend_pct >= 0);
+  return { trend_pct, trend_positive };
+}
+
+async function sumVoucherAmount(companyGuid, filterSql, from, to) {
+  if (!from || !to) return 0;
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
+    [companyGuid, from, to]
+  );
+  return +(rows?.[0]?.v ?? 0);
+}
+
+async function countVouchers(companyGuid, filterSql, from, to) {
+  if (!from || !to) return 0;
+  const { rows } = await query(
+    `SELECT COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
+    [companyGuid, from, to]
+  );
+  return +(rows?.[0]?.c ?? 0);
+}
+
+async function sumNoteAmount(companyGuid, typePattern, from, to) {
+  if (!from || !to) return 0;
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE AND date BETWEEN $3 AND $4`,
+    [companyGuid, typePattern, from, to]
+  );
+  return +(rows?.[0]?.v ?? 0);
+}
+
+async function sumLedgerOutstanding(companyGuid, side) {
+  const parentFilter = side === 'AR'
+    ? `(parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`
+    : `(parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`;
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND ${parentFilter}`,
+    [companyGuid]
+  );
+  return +(rows?.[0]?.v ?? 0);
+}
+
+async function buildAvgTicketMetrics(companyGuid, filterSql, fyFrom, fyTo, ytdVal) {
+  const priorFyFrom = shiftYearIso(fyFrom, -1);
+  const priorFyTo = shiftYearIso(fyTo, -1);
+  const [count, priorYtd, priorCount] = await Promise.all([
+    countVouchers(companyGuid, filterSql, fyFrom, fyTo),
+    sumVoucherAmount(companyGuid, filterSql, priorFyFrom, priorFyTo),
+    countVouchers(companyGuid, filterSql, priorFyFrom, priorFyTo),
+  ]);
+  const avg = count > 0 ? ytdVal / count : 0;
+  const priorAvg = priorCount > 0 ? priorYtd / priorCount : 0;
+  const trend = homeMetricTrend(avg, priorAvg, false);
+  return {
+    avg_ticket: avg,
+    avg_ticket_trend_pct: trend.trend_pct,
+    avg_ticket_trend_positive: trend.trend_positive,
+    invoice_count: count,
+  };
+}
+
+async function buildNoteMetrics(companyGuid, typePattern, fyFrom, fyTo) {
+  const priorFyFrom = shiftYearIso(fyFrom, -1);
+  const priorFyTo = shiftYearIso(fyTo, -1);
+  const [cur, prior] = await Promise.all([
+    sumNoteAmount(companyGuid, typePattern, fyFrom, fyTo),
+    sumNoteAmount(companyGuid, typePattern, priorFyFrom, priorFyTo),
+  ]);
+  const trend = homeMetricTrend(cur, prior, false);
+  return { amount: cur, trend_pct: trend.trend_pct, trend_positive: trend.trend_positive };
+}
+
+async function buildOutstandingMetrics(companyGuid, side) {
+  const payload = await buildArApPayload(companyGuid, side, {}).catch((e) => {
+    console.warn(`[home-metrics] ${side} trend failed:`, e.message);
+    return null;
+  });
+  const outstanding = await sumLedgerOutstanding(companyGuid, side);
+  return {
+    outstanding,
+    outstanding_trend_pct: payload?.trend_pct ?? null,
+    outstanding_trend_positive: payload?.trend_positive ?? null,
+  };
+}
+
+async function buildVoucherHomeCoreMetrics(companyGuid, filterSql, fyFrom, fyTo, today, invertTrend = false) {
+  const yesterday = addDays(today, -1);
+  const mtdWin = priorMtdWindow(today);
+  const priorFyFrom = shiftYearIso(fyFrom, -1);
+  const priorFyTo = shiftYearIso(fyTo, -1);
+  const [
+    todayVal, yesterdayVal,
+    mtdVal, priorMtdVal,
+    ytdVal, priorYtdVal,
+  ] = await Promise.all([
+    sumVoucherAmount(companyGuid, filterSql, today, today),
+    sumVoucherAmount(companyGuid, filterSql, yesterday, yesterday),
+    sumVoucherAmount(companyGuid, filterSql, mtdWin.from, mtdWin.to),
+    sumVoucherAmount(companyGuid, filterSql, mtdWin.priorFrom, mtdWin.priorTo),
+    sumVoucherAmount(companyGuid, filterSql, fyFrom, fyTo),
+    sumVoucherAmount(companyGuid, filterSql, priorFyFrom, priorFyTo),
+  ]);
+  const todayTrend = homeMetricTrend(todayVal, yesterdayVal, invertTrend);
+  const mtdTrend = homeMetricTrend(mtdVal, priorMtdVal, invertTrend);
+  const ytdTrend = homeMetricTrend(ytdVal, priorYtdVal, invertTrend);
+  return {
+    today: todayVal,
+    mtd: mtdVal,
+    ytd: ytdVal,
+    today_trend_pct: todayTrend.trend_pct,
+    today_trend_positive: todayTrend.trend_positive,
+    mtd_trend_pct: mtdTrend.trend_pct,
+    mtd_trend_positive: mtdTrend.trend_positive,
+    ytd_trend_pct: ytdTrend.trend_pct,
+    ytd_trend_positive: ytdTrend.trend_positive,
+  };
+}
+
 // GET /api/sales/home-metrics — Today / MTD / YTD / Outstanding / Credit Notes / Avg Ticket
 router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -1330,29 +1812,21 @@ router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
-    const mtdFrom = `${today.slice(0, 8)}01`;
-    const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND COALESCE(is_optional, FALSE)=FALSE AND is_cancelled=FALSE`;
-    const [todayRes, mtdRes, ytdRes, cntRes, cnRes, arRes] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date=$2`, [companyGuid, today]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, mtdFrom, today]),
-      query(`SELECT COALESCE(SUM(amount),0) as v, COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
-      query(`SELECT COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Credit Note%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, fyFrom, fyTo]),
-      query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyGuid]),
+    const core = await buildVoucherHomeCoreMetrics(companyGuid, SALES_HOME_FILTER, fyFrom, fyTo, today, false);
+    const [avgMetrics, creditNotes, outstanding] = await Promise.all([
+      buildAvgTicketMetrics(companyGuid, SALES_HOME_FILTER, fyFrom, fyTo, core.ytd),
+      buildNoteMetrics(companyGuid, '%Credit Note%', fyFrom, fyTo),
+      buildOutstandingMetrics(companyGuid, 'AR'),
     ]);
-    const ytd = +(ytdRes.rows?.[0]?.v ?? 0);
-    const count = +(ytdRes.rows?.[0]?.c ?? cntRes.rows?.[0]?.c ?? 0);
-    const avg = count > 0 ? ytd / count : 0;
     res.json({
       success: true,
       data: {
-        today: +(todayRes.rows?.[0]?.v ?? 0),
-        mtd: +(mtdRes.rows?.[0]?.v ?? 0),
-        ytd,
-        outstanding: +(arRes.rows?.[0]?.v ?? 0),
-        credit_notes: +(cnRes.rows?.[0]?.v ?? 0),
-        avg_ticket: avg,
-        invoice_count: count,
+        ...core,
+        ...outstanding,
+        credit_notes: creditNotes.amount,
+        credit_notes_trend_pct: creditNotes.trend_pct,
+        credit_notes_trend_positive: creditNotes.trend_positive,
+        ...avgMetrics,
         from: fyFrom,
         to: fyTo,
       },
@@ -1636,6 +2110,38 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // PURCHASE
 // ══════════════════════════════════════════════════════════════
+
+// GET /api/purchase/home-metrics — Today / MTD / YTD / Avg Ticket (+ trend pills)
+router.get('/purchase/home-metrics', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const today = new Date().toISOString().slice(0, 10);
+    const core = await buildVoucherHomeCoreMetrics(companyGuid, PURCHASE_HOME_FILTER, fyFrom, fyTo, today, false);
+    const [avgMetrics, debitNotes, outstanding] = await Promise.all([
+      buildAvgTicketMetrics(companyGuid, PURCHASE_HOME_FILTER, fyFrom, fyTo, core.ytd),
+      buildNoteMetrics(companyGuid, '%Debit Note%', fyFrom, fyTo),
+      buildOutstandingMetrics(companyGuid, 'AP'),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        ...core,
+        ...outstanding,
+        debit_notes: debitNotes.amount,
+        debit_notes_trend_pct: debitNotes.trend_pct,
+        debit_notes_trend_positive: debitNotes.trend_positive,
+        ...avgMetrics,
+        from: fyFrom,
+        to: fyTo,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
 
 router.get('/purchase/invoices', authMiddleware, strictInvoiceListHandler('purchase'));
 router.get('/purchase/orders',   authMiddleware, voucherListHandler('Purchase Order'));
@@ -2055,6 +2561,7 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   const offset = (parseInt(page) - 1) * parseInt(limit);
   // If FY params provided, compute FY-specific closing balance (opening + net movement)
   const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+  const fyPrefix = fyLikePrefix(financialYear);
   try {
     let q = `
       SELECT l.*,
@@ -2067,25 +2574,39 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
           FROM voucher_ledger_entries vle
           JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
           WHERE vle.company_guid = l.company_guid AND vle.ledger_name = l.name
-            AND (vle.financial_year = $3 OR (vle.financial_year IS NULL AND v.date BETWEEN $4 AND $5))
-            AND v.is_cancelled = FALSE
+            AND v.date >= $4 AND v.date <= $5
+            AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
         ), 0) as fy_movement,
         -- Stored nature (often null — inferred below from group hierarchy)
         COALESCE(NULLIF(TRIM(l.nature), ''), NULLIF(TRIM(g.nature), '')) as stored_nature
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $3
-      LEFT JOIN groups g
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 3, 6)}
+      -- DISTINCT ON: Tally can sync duplicate group rows with the same name; a plain
+      -- JOIN fans out every ledger under that parent (same guid twice → React key crash).
+      LEFT JOIN (
+        SELECT DISTINCT ON (company_guid, name) company_guid, name, nature
+        FROM groups
+        ORDER BY company_guid, name
+      ) g
         ON g.company_guid = l.company_guid AND g.name = TRIM(l.parent)
       WHERE l.company_guid=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
     `;
-    const params = [companyGuid, `%${search}%`, financialYear, fyFrom, fyTo];
-    let idx = 6;
-    // Group filter can stay in SQL; nature is applied after inference (stored nature often blank)
-    if (group)  { q += ` AND TRIM(l.parent) = $${idx++}`; params.push(String(group).trim()); }
+    const params = [companyGuid, `%${search}%`, financialYear, fyFrom, fyTo, fyPrefix];
+    let idx = 7;
+    // Group filter (supports comma-separated multi)
+    const groupList = String(group || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (groupList.length === 1) {
+      q += ` AND TRIM(l.parent) = $${idx++}`;
+      params.push(groupList[0]);
+    } else if (groupList.length > 1) {
+      q += ` AND TRIM(l.parent) = ANY($${idx++})`;
+      params.push(groupList);
+    }
     // When nature is requested, load all matching search/group rows then paginate after inference.
     // Otherwise apply SQL pagination as usual.
-    if (!nature) {
+    const natureList = String(nature || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (natureList.length === 0) {
       q += ` ORDER BY ABS(l.closing_balance) DESC, l.name LIMIT $${idx++} OFFSET $${idx}`;
       params.push(parseInt(limit), offset);
     } else {
@@ -2115,11 +2636,12 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
       };
     });
 
-    if (nature) {
-      const want = String(nature).trim().toLowerCase();
+    if (natureList.length > 0) {
+      const wants = natureList.map((s) => s.toLowerCase());
       data = data.filter(l => {
         const n = String(l.nature || '').toLowerCase();
-        return n === want || n.startsWith(want) || (n && want.startsWith(n));
+        if (!n) return false;
+        return wants.some((want) => n === want || n.startsWith(want) || want.startsWith(n));
       });
       const totalFiltered = data.length;
       data = data.slice(offset, offset + parseInt(limit));
@@ -2142,10 +2664,11 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+  const fyPrefix = fyLikePrefix(financialYear);
   try {
     // V2: Use financial_year column directly + ledger_fy_balances for opening
     // opening = from ledger_fy_balances (LedgerOpeningBalance.xml per FY)
-    // closing = opening + SUM(vle WHERE financial_year = fy)
+    // closing = opening + SUM(vle in date window)
     const { rows } = await query(`
       SELECT
         l.guid, l.name, l.parent, l.balance_type,
@@ -2157,19 +2680,16 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
           JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
           WHERE vle.company_guid = l.company_guid
             AND vle.ledger_name  = l.name
-            AND (
-              vle.financial_year = $2
-              OR (vle.financial_year IS NULL AND v.date IS NOT NULL AND v.date BETWEEN $3 AND $4)
-            )
-            AND v.is_cancelled = FALSE
+            AND v.date >= $3 AND v.date <= $4
+            AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
         ), 0) as fy_movement
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
         ON lfb.company_guid = l.company_guid
         AND lfb.ledger_name  = l.name
-        AND lfb.financial_year = $2
+        AND ${sqlLfbJoin('lfb', 2, 5)}
       WHERE l.company_guid = $1
-    `, [companyGuid, financialYear, fyFrom, fyTo]);
+    `, [companyGuid, financialYear, fyFrom, fyTo, fyPrefix]);
 
     const data = rows.map(l => {
       const bt             = l.fy_balance_type || 'Dr';
@@ -2322,6 +2842,68 @@ router.get('/ledgers/:id', authMiddleware, async (req, res) => {
 // STOCKS
 // ══════════════════════════════════════════════════════════════
 
+/** Comma-separated query param → trimmed string list (Ledger-style multi filter). */
+function parseCsvQueryParam(val) {
+  return String(val || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Warehouse filter: union of items in any selected WH; one row per item with combined qty/value.
+ * Uses stock_transactions net qty per godown (same model as negative-stock breakdown).
+ */
+async function applyMultiWarehouseStockFilter(companyGuid, rows, warehouseList, { fyTo = null } = {}) {
+  if (!warehouseList.length) return rows;
+
+  const normWh = (w) => (w && String(w).trim()) || 'Main Location';
+  const whNormList = warehouseList.map(normWh);
+
+  const { rows: whQtyRows } = await query(
+    fyTo
+      ? `SELECT stock_guid,
+                COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
+                SUM(CASE WHEN type = 'inward' THEN ABS(qty) ELSE -ABS(qty) END) AS net_qty
+         FROM stock_transactions
+         WHERE company_guid = $1
+           AND date <= $2
+           AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = ANY($3)
+           AND voucher_type != 'Physical Stock'
+         GROUP BY stock_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')`
+      : `SELECT stock_guid,
+                COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
+                SUM(CASE WHEN type = 'inward' THEN ABS(qty) ELSE -ABS(qty) END) AS net_qty
+         FROM stock_transactions
+         WHERE company_guid = $1
+           AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = ANY($2)
+           AND voucher_type != 'Physical Stock'
+         GROUP BY stock_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')`,
+    fyTo ? [companyGuid, fyTo, whNormList] : [companyGuid, whNormList]
+  );
+
+  const qtyByStock = {};
+  const activeSet = new Set();
+  for (const r of whQtyRows) {
+    activeSet.add(r.stock_guid);
+    if (!qtyByStock[r.stock_guid]) qtyByStock[r.stock_guid] = 0;
+    qtyByStock[r.stock_guid] += parseFloat(r.net_qty || 0);
+  }
+
+  return rows
+    .filter((r) => activeSet.has(r.name))
+    .map((r) => {
+      const qty = qtyByStock[r.name] ?? 0;
+      const rate = parseFloat(r.closing_rate || 0);
+      const value = qty * rate;
+      return {
+        ...r,
+        closing_qty: qty,
+        closing_value: value,
+        fy_closing_qty: qty,
+        fy_closing_value: value,
+        primary_warehouse: warehouseList.length === 1 ? whNormList[0] : (r.primary_warehouse || null),
+      };
+    });
+}
+
 // GET /api/stocks/items
 // Per Tally FY guide §3.4: Stock qty is NEVER static. It's always derived from transactions.
 // When fy= param is passed: compute FY-specific closing qty from stock_transactions
@@ -2330,7 +2912,9 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { search = '', category, warehouse, page = 1, limit = 500 } = req.query; // Default 500
+  const { search = '', category, warehouse, group, page = 1, limit = 500 } = req.query; // Default 500
+  const warehouseList = parseCsvQueryParam(warehouse);
+  const groupList = parseCsvQueryParam(group);
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
@@ -2381,18 +2965,15 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       `;
       params = [companyGuid, `%${search}%`, fyTo];
       if (category) { q = q.replace('GROUP BY', `AND s.category = $4 GROUP BY`); params.push(category); }
-      const { rows: rawRows } = await query(q, params);
-      // Warehouse filter: keep only items that have transactions in the selected warehouse
-      let allRows = rawRows;
-      if (warehouse) {
-        const { rows: whRows } = await query(
-          `SELECT DISTINCT stock_guid FROM stock_transactions WHERE company_guid=$1 AND warehouse=$2`,
-          [companyGuid, warehouse]
-        );
-        // stock_transactions.stock_guid stores stock NAME, not guid — match on s.name
-        const whSet = new Set(whRows.map(r => r.stock_guid));
-        allRows = rawRows.filter(r => whSet.has(r.name));
+      if (groupList.length === 1) {
+        q = q.replace('GROUP BY', `AND TRIM(s.group_name) = $${params.length + 1} GROUP BY`);
+        params.push(groupList[0]);
+      } else if (groupList.length > 1) {
+        q = q.replace('GROUP BY', `AND TRIM(s.group_name) = ANY($${params.length + 1}) GROUP BY`);
+        params.push(groupList);
       }
+      const { rows: rawRows } = await query(q, params);
+      let allRows = await applyMultiWarehouseStockFilter(companyGuid, rawRows, warehouseList, { fyTo });
       // Apply pagination in JS after FY computation
       const totalRows = allRows.length;
       const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
@@ -2437,25 +3018,28 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     params = [companyGuid, `%${search}%`];
     idx = 3;
     if (category) { q += ` AND category = $${idx++}`; params.push(category); }
-    // Warehouse filter: stock_transactions.stock_guid stores stock NAME (not guid)
-    // so match on stocks.name, not stocks.guid
-    if (warehouse) {
-      q += ` AND name IN (SELECT DISTINCT stock_guid FROM stock_transactions WHERE company_guid=$${idx++} AND warehouse=$${idx++})`;
-      params.push(companyGuid, warehouse);
+    if (groupList.length === 1) {
+      q += ` AND TRIM(group_name) = $${idx++}`;
+      params.push(groupList[0]);
+    } else if (groupList.length > 1) {
+      q += ` AND TRIM(group_name) = ANY($${idx++})`;
+      params.push(groupList);
     }
-    q += ` ORDER BY closing_value DESC NULLS LAST, name LIMIT $${idx++} OFFSET $${idx}`;
-    params.push(parseInt(limit), offset);
+    q += ` ORDER BY closing_value DESC NULLS LAST, name`;
     const { rows: rawItems } = await query(q, params);
-    const { rows: cnt } = await query('SELECT COUNT(*) as c, COALESCE(SUM(closing_value),0) as v FROM stocks WHERE company_guid=$1', [companyGuid]);
-    const { rows: low } = await query('SELECT COUNT(*) as c FROM stocks WHERE company_guid=$1 AND closing_qty > 0 AND closing_qty <= reorder_level AND reorder_level > 0', [companyGuid]);
-    const items = rawItems.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
+    let allRows = await applyMultiWarehouseStockFilter(companyGuid, rawItems, warehouseList);
+    const totalRows = allRows.length;
+    const pageRows = allRows.slice(offset, offset + parseInt(limit));
+    const totalValue = allRows.reduce((s, r) => s + parseFloat(r.closing_value || 0), 0);
+    const lowStockCnt = allRows.filter(r => parseFloat(r.closing_qty || 0) > 0 && parseFloat(r.closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
+    const items = pageRows.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
     res.json({
       success: true,
       data: {
-        summary: { total_value: `₹${(+(cnt?.[0]?.v ?? 0)/1e5).toFixed(1)}L`, total_skus: parseInt(cnt[0].c), low_stock_count: parseInt(low[0].c) },
+        summary: { total_value: `₹${(totalValue/1e5).toFixed(1)}L`, total_skus: totalRows, low_stock_count: lowStockCnt },
         items,
       },
-      meta: { total: parseInt(cnt[0].c), page: parseInt(page) }
+      meta: { total: totalRows, page: parseInt(page) }
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -3655,6 +4239,7 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const fyPrefix = fyLikePrefix(financialYear);
 
     // Ledger balance = FY anchor (opening at FY start) + SUM(movements within date range)
     // fyFrom/fyTo filter voucher dates — supports both full FY and custom date range selection
@@ -3670,16 +4255,15 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
             FROM voucher_ledger_entries vle
             JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
             WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
-              AND vle.financial_year = $2
               AND v.date >= $3 AND v.date <= $4
               AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
               AND v.voucher_type NOT ILIKE '%Order%'  -- exclude Sales Orders / Purchase Orders (non-P&L)
           ), 0) as fy_signed
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
+        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 2, 5)}
       WHERE l.company_guid = $1
-    `, [companyGuid, financialYear, fyFrom, fyTo]);
+    `, [companyGuid, financialYear, fyFrom, fyTo, fyPrefix]);
 
     const toAmount = (l) => Math.abs(parseFloat(l.fy_signed || 0));
     const isDr = (l) => parseFloat(l.fy_signed || 0) < 0;
@@ -5415,6 +5999,80 @@ WITH RECURSIVE expense_groups AS (
    WHERE child.company_guid = $1
 )`;
 
+async function sumExpenseAmount(companyGuid, from, to) {
+  if (!from || !to) return 0;
+  const { rows } = await query(
+    `${EXPENSE_GROUPS_CTE}
+     SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS v
+     FROM voucher_ledger_entries vle
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+     JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
+     WHERE v.company_guid = $1
+       AND v.is_cancelled = FALSE
+       AND vle.dr_cr = 'Dr'
+       AND v.date IS NOT NULL AND v.date != ''
+       AND v.date BETWEEN $2 AND $3`,
+    [companyGuid, from, to]
+  );
+  return +(rows?.[0]?.v ?? 0);
+}
+
+async function buildExpenseHomeCoreMetrics(companyGuid, fyFrom, fyTo, today) {
+  const yesterday = addDays(today, -1);
+  const mtdWin = priorMtdWindow(today);
+  const priorFyFrom = shiftYearIso(fyFrom, -1);
+  const priorFyTo = shiftYearIso(fyTo, -1);
+  const [
+    todayVal, yesterdayVal,
+    mtdVal, priorMtdVal,
+    ytdVal, priorYtdVal,
+  ] = await Promise.all([
+    sumExpenseAmount(companyGuid, today, today),
+    sumExpenseAmount(companyGuid, yesterday, yesterday),
+    sumExpenseAmount(companyGuid, mtdWin.from, mtdWin.to),
+    sumExpenseAmount(companyGuid, mtdWin.priorFrom, mtdWin.priorTo),
+    sumExpenseAmount(companyGuid, fyFrom, fyTo),
+    sumExpenseAmount(companyGuid, priorFyFrom, priorFyTo),
+  ]);
+  const todayTrend = homeMetricTrend(todayVal, yesterdayVal, true);
+  const mtdTrend = homeMetricTrend(mtdVal, priorMtdVal, true);
+  const ytdTrend = homeMetricTrend(ytdVal, priorYtdVal, true);
+  return {
+    today: todayVal,
+    mtd: mtdVal,
+    ytd: ytdVal,
+    today_trend_pct: todayTrend.trend_pct,
+    today_trend_positive: todayTrend.trend_positive,
+    mtd_trend_pct: mtdTrend.trend_pct,
+    mtd_trend_positive: mtdTrend.trend_positive,
+    ytd_trend_pct: ytdTrend.trend_pct,
+    ytd_trend_positive: ytdTrend.trend_positive,
+  };
+}
+
+// GET /api/expenses/home-metrics — Today / MTD / YTD (+ trend pills; lower spend = positive)
+router.get('/expenses/home-metrics', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const today = new Date().toISOString().slice(0, 10);
+    const core = await buildExpenseHomeCoreMetrics(companyGuid, fyFrom, fyTo, today);
+    res.json({
+      success: true,
+      data: {
+        ...core,
+        from: fyFrom,
+        to: fyTo,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 /** Expense register filter counts — type (Direct/Indirect) + category parents. */
 router.get('/expenses/counts', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -6383,18 +7041,29 @@ router.get('/reports/other-taxes/summary', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const fyPrefix = fyLikePrefix(financialYear);
+    // Lazy backfill for companies synced before tax extraction existed
+    try {
+      const { rows: tc } = await query('SELECT COUNT(*)::int AS c FROM tax_transactions WHERE company_guid=$1', [companyGuid]);
+      if ((tc[0]?.c || 0) === 0) {
+        const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
+        await backfillTaxTransactions(companyGuid);
+      }
+    } catch (e) { console.warn('[other-taxes/summary] backfill skipped:', e.message); }
+    const taxDateFilter = `(
+        (NULLIF(voucher_date,'') IS NOT NULL AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date)
+        OR ((financial_year = $4 OR financial_year LIKE $5) AND (voucher_date IS NULL OR voucher_date = ''))
+      )`;
     const { rows } = await query(`
       SELECT tax_type,
              COUNT(DISTINCT voucher_guid) AS voucher_count,
              SUM(tax_amount)              AS total_tax_amount,
              MAX(COALESCE(NULLIF(voucher_date,''), financial_year)) AS last_transaction_date
       FROM tax_transactions
-      WHERE company_guid=$1
-        AND (voucher_date BETWEEN $2 AND $3
-          OR (financial_year = $4 AND (voucher_date IS NULL OR voucher_date = '')))
+      WHERE company_guid=$1 AND ${taxDateFilter}
       GROUP BY tax_type
       ORDER BY total_tax_amount DESC
-    `, [companyGuid, from, to, financialYear]);
+    `, [companyGuid, from, to, financialYear, fyPrefix]);
     res.json({
       success: true,
       data: rows.map(r => ({
@@ -6418,14 +7087,19 @@ router.get('/reports/other-taxes/transactions', authMiddleware, async (req, res)
   const offset = (parseInt(page) - 1) * parseInt(limit);
   try {
     const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const fyPrefix = fyLikePrefix(financialYear);
     const params = [companyGuid, from, to];
     // typeFilter is TOP-LEVEL — must apply to ALL rows (including null-date FY fallback)
     let typeFilter = '';
     if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
     const fyParam = params.length + 1;
-    const fyParams = [...params, financialYear];
+    const prefixParam = params.length + 2;
+    const fyParams = [...params, financialYear, fyPrefix];
     // Date filter: real date range OR null-date fallback by FY — typeFilter applies to BOTH branches
-    const dateFilter = `(voucher_date BETWEEN $2 AND $3 OR (financial_year = $${fyParam} AND (voucher_date IS NULL OR voucher_date = '')))`;
+    const dateFilter = `(
+      (NULLIF(voucher_date,'') IS NOT NULL AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date)
+      OR ((financial_year = $${fyParam} OR financial_year LIKE $${prefixParam}) AND (voucher_date IS NULL OR voucher_date = ''))
+    )`;
     const { rows } = await query(`
       SELECT * FROM tax_transactions
       WHERE company_guid=$1${typeFilter} AND ${dateFilter}
@@ -6460,9 +7134,9 @@ router.get('/reports/other-taxes/late-challans', authMiddleware, async (req, res
     const { rows } = await query(`
       SELECT tax_type, return_period, challan_no, due_date, paid_date,
              SUM(tax_amount) AS tax_amount,
-             EXTRACT(DAY FROM (COALESCE(paid_date::date, NOW()::date) - due_date::date)) AS late_days
+             (COALESCE(paid_date::date, NOW()::date) - due_date::date) AS late_days
       FROM tax_transactions
-      WHERE company_guid=$1 AND voucher_date BETWEEN $2 AND $3${typeFilter}
+      WHERE company_guid=$1 AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date${typeFilter}
         AND due_date IS NOT NULL
         AND COALESCE(paid_date::date, NOW()::date) > due_date::date
       GROUP BY tax_type, return_period, challan_no, due_date, paid_date
@@ -7156,50 +7830,345 @@ function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
   return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM NAME="${stockName}" ACTION="Alter"><NAME>${stockName}</NAME><NAME.LIST TYPE="String">${nameList}</NAME.LIST></STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
 
-// POST /api/inventory/barcodes/generate-bulk — generate barcodes for multiple/all unlinked items
-router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res) => {
-  const { companyGuid, stockGuids, all, barcodeType = 'CODE128', syncTarget = 'app_only' } = req.body;
+/** Shared barcode list filters — mutates params[], returns AND-clauses (empty string if none). */
+function applyBarcodeListFilters({ period, group, status, search }, params) {
+  const clauses = [];
+  const isAllToken = (v) => !v || ['All', 'all'].includes(String(v).trim());
+
+  const groupList = (Array.isArray(group)
+    ? group.map(String).map((s) => s.trim()).filter(Boolean)
+    : parseCsvQueryParam(group)
+  ).filter((g) => !isAllToken(g));
+
+  if (groupList.length === 1) {
+    params.push(groupList[0]);
+    clauses.push(`TRIM(s.group_name) = $${params.length}`);
+  } else if (groupList.length > 1) {
+    params.push(groupList);
+    clauses.push(`TRIM(s.group_name) = ANY($${params.length}::text[])`);
+  }
+
+  if (period && !isAllToken(period)) {
+    const d = period === 'Today' ? new Date().setHours(0, 0, 0, 0)
+      : period === '7 Days' ? Date.now() - 7 * 864e5
+      : period === '30 Days' ? Date.now() - 30 * 864e5 : null;
+    if (d) {
+      params.push(new Date(d).toISOString());
+      clauses.push(`(sb.created_at IS NULL OR sb.created_at >= $${params.length})`);
+    }
+  }
+
+  const statusList = (Array.isArray(status)
+    ? status.map(String).map((s) => s.trim()).filter(Boolean)
+    : parseCsvQueryParam(status)
+  ).filter((st) => !isAllToken(st));
+  if (statusList.length) {
+    const statusClauses = [];
+    for (const st of statusList) {
+      if (st === 'Linked')              statusClauses.push('sb.barcode IS NOT NULL');
+      else if (st === 'Unlinked')       statusClauses.push('sb.barcode IS NULL');
+      else if (st === 'In Stock')       statusClauses.push('s.closing_qty > 0');
+      else if (st === 'Low Stock')      statusClauses.push('s.closing_qty > 0 AND s.reorder_level > 0 AND s.closing_qty <= s.reorder_level');
+      else if (st === 'Out of Stock')   statusClauses.push('s.closing_qty <= 0');
+      else if (st === 'Duplicate')      statusClauses.push("sb.status = 'duplicate'");
+      else if (st === 'Invalid')        statusClauses.push("sb.status = 'invalid'");
+      else if (st === 'Pending Tally Sync') statusClauses.push("sb.tally_sync_status IN ('pending_tally','failed')");
+    }
+    if (statusClauses.length) clauses.push(`(${statusClauses.join(' OR ')})`);
+  }
+
+  if (search && String(search).trim()) {
+    params.push(`%${String(search).trim()}%`);
+    clauses.push(`(s.name ILIKE $${params.length} OR s.sku ILIKE $${params.length} OR s.alias ILIKE $${params.length} OR sb.barcode ILIKE $${params.length})`);
+  }
+
+  return clauses.join(' AND ');
+}
+
+/** Build WHERE for unlinked barcode generation targets (requires sb LEFT JOIN). */
+function buildBarcodeTargetWhere(companyGuid, { all, stockGuids, period, group, status, search }, params) {
+  const whereParts = ['s.company_guid = $1'];
+  params.push(companyGuid);
+  const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
+  if (filterSql) whereParts.push(filterSql);
+  if (!all && Array.isArray(stockGuids) && stockGuids.length) {
+    params.push(stockGuids);
+    whereParts.push(`s.guid = ANY($${params.length}::text[])`);
+  }
+  return whereParts.join(' AND ');
+}
+
+async function fetchBarcodeGenerateTargets(companyGuid, opts) {
+  const params = [];
+  const where = buildBarcodeTargetWhere(companyGuid, opts, params);
+  const { rows } = await query(`
+    SELECT s.guid, s.name FROM stocks s
+    LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+    WHERE ${where}
+    AND NOT EXISTS (
+      SELECT 1 FROM stock_barcodes sb2
+      WHERE sb2.stock_guid = s.guid AND sb2.company_guid = $1 AND sb2.is_primary = TRUE AND sb2.status = 'active'
+    )
+    ORDER BY s.name`, params);
+  return rows.map(r => ({ guid: r.guid, name: r.name }));
+}
+
+async function generateOneBarcodeForStock(companyGuid, item, barcodeType, syncTarget, seqOffset) {
+  const { rows: [{ cnt }] } = await query(
+    `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid],
+  );
+  const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
+  let barcode;
+  let tries = 0;
+  do {
+    barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + seqOffset + tries + 1);
+    tries++;
+    const { rows: [dup] } = await query(
+      `SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode],
+    );
+    if (!dup) break;
+  } while (tries < 10);
+  if (!barcode) throw new Error('Could not allocate unique barcode');
+  await query(`
+    INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+    VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
+    ON CONFLICT (company_guid, barcode) DO NOTHING`,
+    [companyGuid, item.guid, item.name, barcode, barcodeType, syncTarget, tallyStatus],
+  );
+  return barcode;
+}
+
+const ACTIVE_BARCODE_GEN_JOBS = new Set();
+
+async function processBarcodeGenerateJob(jobId) {
+  if (ACTIVE_BARCODE_GEN_JOBS.has(jobId)) return;
+  ACTIVE_BARCODE_GEN_JOBS.add(jobId);
+  try {
+    const { rows: [job] } = await query(
+      `SELECT * FROM barcode_generate_jobs WHERE id=$1`, [jobId],
+    );
+    if (!job || !['pending', 'running'].includes(job.status)) return;
+
+    await query(`UPDATE barcode_generate_jobs SET status='running' WHERE id=$1`, [jobId]);
+
+    const targets = Array.isArray(job.target_guids)
+      ? job.target_guids
+      : (typeof job.target_guids === 'string' ? JSON.parse(job.target_guids) : []);
+    const BATCH = 25;
+    let processed = job.processed || 0;
+    let generated = job.generated || 0;
+    let errors = job.errors || 0;
+
+    for (let i = processed; i < targets.length; i += BATCH) {
+      const batch = targets.slice(i, i + BATCH);
+      for (const item of batch) {
+        try {
+          await generateOneBarcodeForStock(
+            job.company_guid, item, job.barcode_type, job.sync_target, generated,
+          );
+          generated++;
+        } catch {
+          errors++;
+        }
+        processed++;
+      }
+      await query(
+        `UPDATE barcode_generate_jobs SET processed=$2, generated=$3, errors=$4 WHERE id=$1`,
+        [jobId, processed, generated, errors],
+      );
+      await new Promise((r) => setImmediate(r));
+    }
+
+    await query(
+      `UPDATE barcode_generate_jobs SET status='completed', processed=$2, generated=$3, errors=$4, completed_at=NOW() WHERE id=$1`,
+      [jobId, processed, generated, errors],
+    );
+  } catch (err) {
+    console.error('[barcode-generate-job]', jobId, err.message);
+    await query(
+      `UPDATE barcode_generate_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`,
+      [jobId, err.message],
+    ).catch(() => {});
+  } finally {
+    ACTIVE_BARCODE_GEN_JOBS.delete(jobId);
+  }
+}
+
+function kickBarcodeGenerateJob(jobId) {
+  setImmediate(() => {
+    processBarcodeGenerateJob(jobId).catch((err) => {
+      console.error('[barcode-generate-job kick]', jobId, err.message);
+    });
+  });
+}
+
+// POST /inventory/barcodes/generate-bulk/start — async background job with progress
+router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, stockGuids, all,
+    period, group, status, search,
+    barcodeType = 'CODE128', syncTarget = 'app_only',
+  } = req.body;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!all && (!Array.isArray(stockGuids) || !stockGuids.length))
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'stockGuids[] or all=true required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    // Fetch target items that have NO active primary barcode
-    const baseFilter = all
-      ? `s.company_guid = $1`
-      : `s.company_guid = $1 AND s.guid = ANY($2::text[])`;
-    const baseParams = all ? [companyGuid] : [companyGuid, stockGuids];
-    const { rows: targets } = await query(`
-      SELECT s.guid, s.name FROM stocks s
-      WHERE ${baseFilter}
-      AND NOT EXISTS (
-        SELECT 1 FROM stock_barcodes sb
-        WHERE sb.stock_guid = s.guid AND sb.company_guid = $1 AND sb.is_primary = TRUE AND sb.status = 'active'
-      )
-      ORDER BY s.name`, baseParams);
+    const { rows: [running] } = await query(
+      `SELECT id, total, processed, generated, errors, status FROM barcode_generate_jobs
+       WHERE company_guid=$1 AND status IN ('pending','running')
+       ORDER BY created_at DESC LIMIT 1`, [companyGuid],
+    );
+    if (running) {
+      return res.json({
+        success: true,
+        data: {
+          jobId: running.id,
+          total: running.total,
+          processed: running.processed,
+          generated: running.generated,
+          errors: running.errors,
+          status: running.status,
+          resumed: true,
+        },
+      });
+    }
+
+    const targets = await fetchBarcodeGenerateTargets(companyGuid, {
+      all, stockGuids, period, group, status, search,
+    });
+    if (!targets.length) {
+      return res.json({ success: true, data: { jobId: null, total: 0, status: 'completed', generated: 0, errors: 0 } });
+    }
+
+    const { randomUUID } = await import('crypto');
+    const jobId = randomUUID();
+    const filtersJson = JSON.stringify({ all: !!all, stockGuids, period, group, status, search });
+
+    await query(`
+      INSERT INTO barcode_generate_jobs
+        (id, company_guid, status, total, processed, generated, errors, barcode_type, sync_target, filters_json, target_guids)
+      VALUES ($1,$2,'pending',$3,0,0,0,$4,$5,$6,$7)`,
+      [jobId, companyGuid, targets.length, barcodeType, syncTarget, filtersJson, JSON.stringify(targets)],
+    );
+
+    kickBarcodeGenerateJob(jobId);
+
+    res.json({
+      success: true,
+      data: { jobId, total: targets.length, processed: 0, generated: 0, errors: 0, status: 'pending' },
+    });
+  } catch (err) {
+    console.error('[inventory/barcodes GENERATE-BULK START]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /inventory/barcodes/generate-bulk/status/:jobId — poll job progress
+router.get('/inventory/barcodes/generate-bulk/status/:jobId', authMiddleware, async (req, res) => {
+  const { jobId } = req.params;
+  const { companyGuid } = req.query;
+  if (!companyGuid || !jobId) {
+    return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and jobId required' } });
+  }
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: [job] } = await query(
+      `SELECT id, status, total, processed, generated, errors, error_message, created_at, completed_at
+       FROM barcode_generate_jobs WHERE id=$1 AND company_guid=$2`, [jobId, companyGuid],
+    );
+    if (!job) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Job not found' } });
+
+    const pct = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : 100;
+    res.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        status: job.status,
+        total: job.total,
+        processed: job.processed,
+        generated: job.generated,
+        errors: job.errors,
+        pct,
+        errorMessage: job.error_message || null,
+        completedAt: job.completed_at,
+      },
+    });
+  } catch (err) {
+    console.error('[inventory/barcodes GENERATE-BULK STATUS]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /inventory/barcodes/generate-bulk/active — resume polling if job still running
+router.get('/inventory/barcodes/generate-bulk/active', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.query;
+  if (!companyGuid) {
+    return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid required' } });
+  }
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const { rows: [job] } = await query(
+      `SELECT id, status, total, processed, generated, errors, error_message
+       FROM barcode_generate_jobs
+       WHERE company_guid=$1 AND status IN ('pending','running')
+       ORDER BY created_at DESC LIMIT 1`, [companyGuid],
+    );
+    if (!job) return res.json({ success: true, data: null });
+    const pct = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : 100;
+    res.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        status: job.status,
+        total: job.total,
+        processed: job.processed,
+        generated: job.generated,
+        errors: job.errors,
+        pct,
+        errorMessage: job.error_message || null,
+      },
+    });
+  } catch (err) {
+    console.error('[inventory/barcodes GENERATE-BULK ACTIVE]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /inventory/barcodes/generate-bulk — sync path for small stockGuids batches (print queue)
+router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res) => {
+  const {
+    companyGuid, stockGuids, all,
+    period, group, status, search,
+    barcodeType = 'CODE128', syncTarget = 'app_only',
+  } = req.body;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!all && (!Array.isArray(stockGuids) || !stockGuids.length))
+    return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'stockGuids[] or all=true required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+
+  if (all) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'USE_ASYNC_JOB',
+        message: 'Use POST /inventory/barcodes/generate-bulk/start for all=true bulk generation',
+      },
+    });
+  }
+
+  try {
+    const targets = await fetchBarcodeGenerateTargets(companyGuid, {
+      all: false, stockGuids, period, group, status, search,
+    });
 
     if (!targets.length)
       return res.json({ success: true, data: { generated: 0, alreadyLinked: stockGuids?.length || 0, errors: 0 } });
 
-    const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid]);
-    const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
     let generated = 0, errors = 0;
-
-    for (let i = 0; i < targets.length; i++) {
-      const item = targets[i];
+    for (const item of targets) {
       try {
-        let barcode, tries = 0;
-        do {
-          barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + generated + tries + 1);
-          tries++;
-          const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode]);
-          if (!dup) break;
-        } while (tries < 10);
-        await query(`
-          INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-          VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
-          ON CONFLICT (company_guid, barcode) DO NOTHING`,
-          [companyGuid, item.guid, item.name, barcode, barcodeType, syncTarget, tallyStatus]);
+        await generateOneBarcodeForStock(companyGuid, item, barcodeType, syncTarget, generated);
         generated++;
       } catch { errors++; }
     }
@@ -7261,30 +8230,8 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
     const off  = (Math.max(1, parseInt(page)) - 1) * lim;
     const params = [companyGuid];
     let where = 's.company_guid = $1';
-
-    if (group && group !== 'All' && group !== 'all') {
-      params.push(group); where += ` AND s.group_name = $${params.length}`;
-    }
-    if (period && !['All','all'].includes(period)) {
-      const d = period === 'Today' ? new Date().setHours(0,0,0,0)
-              : period === '7 Days'  ? Date.now() - 7*864e5
-              : period === '30 Days' ? Date.now() - 30*864e5 : null;
-      if (d) { params.push(new Date(d).toISOString()); where += ` AND (sb.created_at IS NULL OR sb.created_at >= $${params.length})`; }
-    }
-    if (status && !['All','all'].includes(status)) {
-      if (status === 'Linked')              where += ` AND sb.barcode IS NOT NULL`;
-      else if (status === 'Unlinked')       where += ` AND sb.barcode IS NULL`;
-      else if (status === 'In Stock')       where += ` AND s.closing_qty > 0`;
-      else if (status === 'Low Stock')      where += ` AND s.closing_qty > 0 AND s.reorder_level > 0 AND s.closing_qty <= s.reorder_level`;
-      else if (status === 'Out of Stock')   where += ` AND s.closing_qty <= 0`;
-      else if (status === 'Duplicate')      where += ` AND sb.status = 'duplicate'`;
-      else if (status === 'Invalid')        where += ` AND sb.status = 'invalid'`;
-      else if (status === 'Pending Tally Sync') where += ` AND sb.tally_sync_status IN ('pending_tally','failed')`;
-    }
-    if (search && search.trim()) {
-      params.push(`%${search.trim()}%`);
-      where += ` AND (s.name ILIKE $${params.length} OR s.sku ILIKE $${params.length} OR s.alias ILIKE $${params.length} OR sb.barcode ILIKE $${params.length})`;
-    }
+    const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
+    if (filterSql) where += ` AND ${filterSql}`;
 
     const sumRes = await query(`
       SELECT
@@ -7313,6 +8260,14 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
 
     const total  = parseInt(rows[0]?._total ?? 0);
     const linked = parseInt(sr.linked || 0);
+
+    const unlinkedFilterRes = await query(`
+      SELECT COUNT(DISTINCT s.guid)::int AS unlinked_in_filter
+      FROM stocks s
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+      WHERE ${where} AND sb.barcode IS NULL`, params);
+    const unlinkedInFilter = parseInt(unlinkedFilterRes.rows[0]?.unlinked_in_filter ?? 0);
+
     const items  = rows.map(r => ({
       stockGuid:       r.stock_guid,
       displayName:     computeDisplayName(r, displayField),
@@ -7333,13 +8288,19 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
       unit:            r.unit || 'Pcs',
     }));
 
-    const groupsRes = await query(`SELECT DISTINCT group_name FROM stocks WHERE company_guid=$1 AND group_name IS NOT NULL AND group_name != '' ORDER BY group_name`, [companyGuid]);
+    const groupsRes = await query(`SELECT DISTINCT TRIM(group_name) AS group_name FROM stocks WHERE company_guid=$1 AND group_name IS NOT NULL AND TRIM(group_name) != '' ORDER BY 1`, [companyGuid]);
     const groups = ['All', ...groupsRes.rows.map(r => r.group_name)];
 
     res.json({
       success: true,
       data: {
-        summary: { totalItems: parseInt(sr.total_items||0), linked, unlinked: Math.max(0, parseInt(sr.total_items||0) - linked), duplicates: parseInt(sr.duplicates||0), invalid: parseInt(sr.invalid||0), pendingTallySync: parseInt(sr.pending_tally_sync||0) },
+        summary: {
+          totalItems: parseInt(sr.total_items||0), linked,
+          unlinked: Math.max(0, parseInt(sr.total_items||0) - linked),
+          unlinkedInFilter,
+          duplicates: parseInt(sr.duplicates||0), invalid: parseInt(sr.invalid||0),
+          pendingTallySync: parseInt(sr.pending_tally_sync||0),
+        },
         items,
         filters: { groups, statuses: ['All','In Stock','Low Stock','Out of Stock','Linked','Unlinked','Duplicate','Invalid','Pending Tally Sync'] },
         pagination: { page: parseInt(page), pageSize: lim, total },

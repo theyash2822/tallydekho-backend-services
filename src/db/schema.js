@@ -874,6 +874,24 @@ export async function initSchema() {
         completed_at     TIMESTAMPTZ
       );
 
+      CREATE TABLE IF NOT EXISTS barcode_generate_jobs (
+        id               TEXT PRIMARY KEY,
+        company_guid     TEXT NOT NULL,
+        status           TEXT DEFAULT 'pending',
+        total            INTEGER DEFAULT 0,
+        processed        INTEGER DEFAULT 0,
+        generated        INTEGER DEFAULT 0,
+        errors           INTEGER DEFAULT 0,
+        barcode_type     TEXT DEFAULT 'CODE128',
+        sync_target      TEXT DEFAULT 'app_only',
+        filters_json     TEXT,
+        target_guids     JSONB,
+        error_message    TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        completed_at     TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_barcode_gen_jobs_company ON barcode_generate_jobs(company_guid, status);
+
       CREATE TABLE IF NOT EXISTS barcode_import_errors (
         id               SERIAL PRIMARY KEY,
         job_id           TEXT NOT NULL,

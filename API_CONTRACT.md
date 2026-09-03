@@ -43,10 +43,13 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 ## Dashboard
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | /api/dashboard/kpi-strip | ?companyGuid&from&to&fy — each card: amount_raw + trend_pct + trend_positive (null if no prior) |
-| GET | /api/dashboard/metrics | ?companyGuid&from&to&fy |
-| GET | /api/dashboard/cashflow | ?companyGuid&from&to&fy |
-| GET | /api/dashboard/recent-activity | ?companyGuid&fy |
+| GET | /api/dashboard/kpi-strip | ?companyGuid&from&to&fy&period — each card: amount_raw + trend_pct + trend_positive (null if no prior) |
+| GET | /api/dashboard/metrics | ?companyGuid&from&to&fy&period — `data` is the tile array (mobile-safe) |
+| GET | /api/dashboard/chart | ?companyGuid&from&to&fy&period — turnover series: `{ interval, series: [{ date, label, sales, purchase, expenses }] }` (7D/1M day, 3M week, 6M month) |
+| GET | /api/dashboard/cashflow | ?companyGuid&from&to&fy&period — totals unchanged. Additive `data.series` `{ date, label, inflow, outflow, net }` + `data.interval` |
+| GET | /api/dashboard/recent-activity | ?companyGuid&from&to&fy |
+| GET | /api/dashboard/top-customers | ?companyGuid&from&to&fy&period&limit — sales by party: `{ name, amount_raw, revenue, invoices, pct }` |
+| GET | /api/dashboard/cost-analysis | ?companyGuid&from&to&fy&period — Direct+Indirect expense heads: `{ total_raw, heads: [{ name, parent, amount_raw, pct }] }` |
 
 ## KPI (individual drill-downs)
 | Method | Path |

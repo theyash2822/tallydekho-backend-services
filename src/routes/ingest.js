@@ -459,6 +459,16 @@ router.post('/ingest/complete', async (req, res) => {
       if (rowCount > 0) console.log(`[INGEST] Backfilled ${rowCount} tax_transaction dates from vouchers`);
     } catch (e) { console.warn('[INGEST] Tax date backfill failed (non-fatal):', e.message); }
 
+    // One-time tax extraction if table is empty (legacy companies synced before tax feature)
+    try {
+      const { rows: tc } = await query('SELECT COUNT(*)::int AS c FROM tax_transactions WHERE company_guid=$1', [companyGuid]);
+      if ((tc[0]?.c || 0) === 0) {
+        const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
+        const n = await backfillTaxTransactions(companyGuid);
+        console.log(`[INGEST] Tax backfill: extracted from ${n} vouchers for ${companyGuid}`);
+      }
+    } catch (e) { console.warn('[INGEST] Tax backfill failed (non-fatal):', e.message); }
+
     if (userId) {
       try { socketService.notifySynced(userId, companyGuid); } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }

@@ -1,3 +1,77 @@
+## 2026-09-01 — Metrics tiles: real trend vs prior window
+
+### Changed
+- `GET /api/dashboard/metrics` no longer hardcodes `change: 0`.
+- Each sales / purchases / expenses tile includes `change`, `positive`, `trend_pct`, `trend_positive`.
+- Trend % = current selected window vs the previous equal-length window (7D → prior 7 days; 1M → prior month). Null when prior total is 0.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# GET /api/dashboard/metrics?companyGuid=…&period=1M&from=…&to=…
+# data[].trend_pct is a number or null; change matches for mobile ModuleTiles
+```
+
+### Risks
+- Expenses `positive` is inverted (increase is unfavorable) so mobile ModuleTiles color stays honest. Not pushed.
+
+---
+
+## 2026-08-31 — GET /api/dashboard/chart (turnover series)
+
+### Changed
+- New `GET /api/dashboard/chart` returns `{ interval, series: [{ date, label, sales, purchase, expenses }] }` for the selected window.
+- `GET /api/dashboard/metrics` is tiles-only again (mobile `data` array unchanged).
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# GET /api/dashboard/chart?companyGuid=…&period=1M&from=…&to=… → data.series[] + data.interval
+```
+
+### Risks
+- Portal must call `/chart` for the graph; metrics no longer includes `series`. Not pushed.
+
+---
+
+## 2026-08-31 — Dashboard top-customers + cost-analysis GETs
+
+### Changed
+- New `GET /api/dashboard/top-customers` — sales by party for `from`/`to` (`amount_raw`, `revenue`, `invoices`, `pct`).
+- New `GET /api/dashboard/cost-analysis` — Direct + Indirect expense ledger heads for the same window (`total_raw`, `heads[]`). Falls back to Journal/Payment/Contra voucher types if ledger entries are empty.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# GET /api/dashboard/top-customers?companyGuid=…&period=1M&from=…&to=…
+# GET /api/dashboard/cost-analysis?companyGuid=…&period=1M&from=…&to=…
+```
+
+### Risks
+- Cost heads follow the selected period, not full-FY P&L opening balances. Not pushed.
+
+---
+
+## 2026-08-31 — Real chart series on metrics + cashflow (mobile-safe)
+
+### Changed
+- `GET /api/dashboard/metrics` still returns `data` as the sales/purchases/expenses tile array. Adds sibling `series` + `interval` from ledger entries (voucher-type fallback).
+- `GET /api/dashboard/cashflow` still returns the same totals object. Adds `data.series` (receipts/payments per bucket) + `data.interval`.
+- Interval: 7D/1M daily, 3M weekly, 6M monthly. Custom ranges pick day/week/month from span.
+- Mobile home is unchanged: it only reads `data` tiles / cashflow totals.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js
+# GET /api/dashboard/metrics?companyGuid=…&period=1M&from=…&to=… → data[] + series[] + interval
+# GET /api/dashboard/cashflow?companyGuid=…&period=1M&from=…&to=… → data.series[] + data.interval
+```
+
+### Risks
+- Extra grouped queries on dashboard GETs. Series sum can differ slightly from tile totals when tiles use ledger COALESCE and series fills zero buckets. Not pushed.
+
+---
+
 ## 2026-08-29 — Expense Type filter: radio + includes('direct') fix
 
 ### Changed
