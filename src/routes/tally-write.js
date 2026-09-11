@@ -5699,36 +5699,108 @@ router.get('/write-queue/history', authMiddleware, async (req, res) => {
 });
 
 // ── POST /tally/master/bank ─────────────────────────────────────────────────────────────────────
+// Bank Feeds / Settings → create Bank Accounts (or OD) ledger in Tally.
+//
+// Forensic map (2026-09-09) — form field → Tally Bank Account Details:
+//   accountNumber → $BankAccountDetails[1].AccountNumber  (+ legacy $BankDetails)
+//   ifsc          → $IFSCode AND $BankAccountDetails[1].IFSCCode  (flat IFSCODE alone worked)
+//   bankName      → ledger <NAME> AND $BankAccountDetails[1].BankName
+//   branch        → $BankBranchName  (ledger-level BANKBRANCHNAME — NOT inside the LIST)
+//   accountType   → PARENT: Bank Accounts | Bank OD A/c  (+ DESCRIPTION so SAVING/CURRENT
+//                   is not silently discarded — Tally has no SAVING/CURRENT UI field here)
+//   companyName   → $BankAccHolderName (A/c Holder’s Name)
+//
+// Wrong old tag <BANKACNO> alone does NOT fill A/c No. Branch was never even in the XML.
 router.post('/master/bank', authMiddleware, async (req, res) => {
-  const { companyGuid, bankName, accountNumber, ifsc, accountType, openingBalance } = req.body;
+  const {
+    companyGuid, companyName,
+    bankName, accountNumber, ifsc, accountType, openingBalance, branch,
+    ledgerName: bodyLedgerName,
+    accountHolderName,
+  } = req.body;
   if (!companyGuid || !bankName)
     return res.status(400).json({ status: false, message: 'companyGuid and bankName required' });
 
-  const ledgerName = bankName.trim();
-  const parentGroup = accountType === 'OD' || accountType === 'CC'
+  const institutionName = String(bankName).trim();
+  // Optional separate ledger name; default = bank name (Bank Feeds form has one field).
+  const ledgerName = String(bodyLedgerName || institutionName).trim();
+  const accNo = String(accountNumber || '').trim();
+  const ifscCode = String(ifsc || '').trim().toUpperCase();
+  const branchName = String(branch || '').trim();
+  const holderName = String(accountHolderName || companyName || '').trim();
+  const typeRaw = String(accountType || 'SAVING').trim().toUpperCase();
+  const parentGroup = (typeRaw === 'OD' || typeRaw === 'CC')
     ? 'Bank OD A/c'
     : 'Bank Accounts';
   const openBal = parseFloat(openingBalance) || 0;
+  const openBalXml = openBal !== 0
+    ? (openBal > 0
+      ? `${openBal.toFixed(2)} Dr`
+      : `${Math.abs(openBal).toFixed(2)} Cr`)
+    : '0';
+
+  // Prefer Alter when ledger already exists locally (re-save / fix empty A/c after partial create).
+  let tallyAction = 'Create';
+  try {
+    const { rows: existingRows } = await query(
+      `SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+      [companyGuid, ledgerName]
+    );
+    if (existingRows.length) tallyAction = 'Alter';
+  } catch { /* Create */ }
+
+  // Type label kept on the ledger so SAVING/CURRENT is not lost (Tally UI has no such field).
+  const typeDesc = `Account Type: ${typeRaw}`;
+
+  // Bank Account Details collection — A/c No + IFSC + Bank Name (List of Banks / free text).
+  // Branch stays OUTSIDE this list (Tally Excel import maps Branch → Bank Branch Name).
+  const bankAccountDetailsXml = (accNo || ifscCode || institutionName) ? `
+  <BANKACCOUNTDETAILS.LIST>
+${accNo ? `    <ACCOUNTNUMBER>${escapeXml(accNo)}</ACCOUNTNUMBER>` : ''}
+${ifscCode ? `    <IFSCCODE>${escapeXml(ifscCode)}</IFSCCODE>` : ''}
+${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
+    <BANKNAME>${escapeXml(institutionName)}</BANKNAME>
+  </BANKACCOUNTDETAILS.LIST>` : '';
 
   const xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
-<REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC>
+<REQUESTDESC>
+  <REPORTNAME>All Masters</REPORTNAME>
+  ${companyName ? `<STATICVARIABLES><SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>` : ''}
+</REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<LEDGER NAME="${ledgerName}" ACTION="Create">
-  <NAME>${ledgerName}</NAME>
+<LEDGER NAME="${escapeXml(ledgerName)}" ACTION="${tallyAction}">
+  <NAME>${escapeXml(ledgerName)}</NAME>
   <PARENT>${parentGroup}</PARENT>
-  <OPENINGBALANCE>${openBal > 0 ? openBal.toFixed(2) + ' Dr' : Math.abs(openBal).toFixed(2) + ' Cr'}</OPENINGBALANCE>
-  ${ifsc ? `<IFSCODE>${ifsc}</IFSCODE>` : ''}
-  ${accountNumber ? `<BANKACNO>${accountNumber}</BANKACNO>` : ''}
+  <OPENINGBALANCE>${openBalXml}</OPENINGBALANCE>
+  <DESCRIPTION>${escapeXml(typeDesc)}</DESCRIPTION>
+  ${holderName ? `<BANKACCHOLDERNAME>${escapeXml(holderName)}</BANKACCHOLDERNAME>` : ''}
+  ${ifscCode ? `<IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
+  ${accNo ? `<BANKDETAILS>${escapeXml(accNo)}</BANKDETAILS>` : ''}
+  ${accNo ? `<BANKACCNO>${escapeXml(accNo)}</BANKACCNO>` : ''}
+  ${institutionName ? `<BANKNAME>${escapeXml(institutionName)}</BANKNAME>` : ''}
+  ${branchName ? `<BANKBRANCHNAME>${escapeXml(branchName)}</BANKBRANCHNAME>` : ''}
+  ${bankAccountDetailsXml}
   <ISDEFAULTLEDGER>No</ISDEFAULTLEDGER>
 </LEDGER>
 </TALLYMESSAGE>
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const payload = { companyGuid, bankName, accountNumber, ifsc, accountType, openingBalance };
+  const payload = {
+    companyGuid, companyName,
+    bankName: institutionName,
+    ledgerName,
+    accountNumber: accNo,
+    ifsc: ifscCode,
+    accountType: typeRaw,
+    openingBalance,
+    branch: branchName,
+    accountHolderName: holderName || null,
+    tallyAction,
+  };
   const queueId = await logWriteQueue(req.user.userId, companyGuid, 'bank', ledgerName, openBal, payload, xml);
   if (queueId) {
     await insertAppMaster({
@@ -5740,28 +5812,100 @@ router.post('/master/bank', authMiddleware, async (req, res) => {
       payload,
     });
   }
+
+  // Immediate local ledgers upsert — Bank Feeds + Bank Balance read ledgers only.
+  // Without this, new banks are invisible until LedgerFull sync; A/c/branch stay blank
+  // if Tally still had the old wrong XML tags. Ingest COALESCE keeps non-empty local values.
+  const upsertLocalBank = async () => {
+    try {
+      await query(
+        `INSERT INTO ledgers (
+           guid, company_guid, name, parent,
+           opening_balance, closing_balance, balance_type,
+           bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, bank_account_type
+         )
+         SELECT gen_random_uuid()::text, $1, $2, $3, $4, $4, 'Dr', $5, $6, $7, $8, $9, $10
+         WHERE NOT EXISTS (
+           SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+         )`,
+        [
+          companyGuid, ledgerName, parentGroup, openBal,
+          accNo || null, ifscCode || null, institutionName || null,
+          branchName || null, holderName || null, typeRaw || null,
+        ]
+      );
+      await query(
+        `UPDATE ledgers SET
+           parent             = COALESCE(NULLIF($3, ''), parent),
+           bank_account_no    = COALESCE(NULLIF($4, ''), bank_account_no),
+           bank_ifsc          = COALESCE(NULLIF($5, ''), bank_ifsc),
+           bank_name          = COALESCE(NULLIF($6, ''), bank_name),
+           bank_branch        = COALESCE(NULLIF($7, ''), bank_branch),
+           bank_holder        = COALESCE(NULLIF($8, ''), bank_holder),
+           bank_account_type  = COALESCE(NULLIF($9, ''), bank_account_type)
+         WHERE company_guid = $1 AND LOWER(name) = LOWER($2)`,
+        [
+          companyGuid, ledgerName, parentGroup,
+          accNo, ifscCode, institutionName, branchName, holderName, typeRaw,
+        ]
+      );
+    } catch (e) {
+      console.warn('[bank-immediate-upsert]', e.message);
+    }
+  };
+
   let result;
   try {
     result = await forwardToTally(companyGuid, req.user.userId, xml);
     await updateWriteQueue(queueId, result, null);
+    await upsertLocalBank();
     const offline = result?.status === 'desktop_offline';
     if (!offline) {
       setImmediate(() => {
         requestDesktopSyncAfterWrite({
           userId: req.user.userId,
           companyGuid,
-          companyName: req.body.companyName || null,
+          companyName: companyName || req.body.companyName || null,
           tdkRef: null,
           tallyIds: [],
           extra: { reason: 'master_created', masterType: 'bank', masterName: ledgerName },
         });
       });
     }
-    return res.json({ status: true, data: { message: 'Bank ledger created in Tally', bankName: ledgerName, queueId, tallyResult: result } });
+    return res.json({
+      status: true,
+      data: {
+        message: offline
+          ? 'Bank ledger queued - will push when Tally is online'
+          : `Bank ledger ${tallyAction === 'Alter' ? 'updated' : 'created'} in Tally`,
+        bankName: ledgerName,
+        accountNumber: accNo,
+        ifsc: ifscCode,
+        branch: branchName,
+        accountType: typeRaw,
+        queueId,
+        tallyAction,
+        tallyResult: result,
+      },
+    });
   } catch (err) {
     await updateWriteQueue(queueId, null, err.message);
-    // Still return 200 - entry is queued for when desktop comes online
-    return res.json({ status: true, data: { message: 'Bank ledger queued - will push when Tally is online', bankName: ledgerName, queueId, error: err.message } });
+    // Still upsert locally so Bank Feeds / Bank Balance show the account immediately
+    await upsertLocalBank();
+    return res.json({
+      status: true,
+      data: {
+        message: 'Bank ledger queued - will push when Tally is online',
+        bankName: ledgerName,
+        accountNumber: accNo,
+        ifsc: ifscCode,
+        branch: branchName,
+        accountType: typeRaw,
+        queueId,
+        tallyAction,
+        error: err.message,
+      },
+    });
   }
 });
 

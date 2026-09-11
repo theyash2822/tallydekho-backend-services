@@ -519,6 +519,8 @@ export async function initSchema() {
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_branch TEXT;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_holder TEXT;
       ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,2);
+      -- App Bank Feeds account type (SAVING|CURRENT|OD|CC) — not a Tally Bank Accounts field
+      ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS bank_account_type TEXT;
 
       -- vouchers migrations (E-Invoice / E-Way Bill columns)
       ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS irn TEXT;

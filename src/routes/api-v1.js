@@ -24,6 +24,9 @@ import { buildPaymentReceiptPayload } from '../modules/kpi/paymentReceiptService
 import { buildCashInHandPayload, buildBankBalancePayload } from '../modules/kpi/cashBankService.js';
 import { computeTrendPct, addDays } from '../modules/kpi/trendUtil.js';
 import {
+  resolveVoucherListParty,
+} from '../utils/resolveVoucherListParty.js';
+import {
   enrichNotification,
   stockNotification,
   receivableNotification,
@@ -1326,7 +1329,25 @@ const VOUCHER_LIST_SELECT = `
       SELECT v.*,
              av_info.tdk_reference_no,
              av_info.current_entry_type,
-             av_info.original_entry_type
+             av_info.original_entry_type,
+             (
+               SELECT vle.ledger_name
+               FROM voucher_ledger_entries vle
+               WHERE vle.voucher_guid = v.guid
+                 AND vle.company_guid = v.company_guid
+                 AND NULLIF(TRIM(vle.ledger_name), '') IS NOT NULL
+               ORDER BY
+                 CASE
+                   WHEN vle.ledger_name ILIKE '%Profit%Loss%' THEN 9
+                   WHEN vle.ledger_name ~* '(CGST|SGST|IGST|UTGST|\\mGST\\M|Cess|Tax)' THEN 6
+                   WHEN vle.ledger_name ~* '(Cash|Bank)' THEN 5
+                   WHEN vle.ledger_name ~* '(Sales|Purchase)'
+                        AND vle.ledger_name !~* '(Order|Return)' THEN 4
+                   ELSE 0
+                 END,
+                 ABS(COALESCE(vle.amount, 0)) DESC
+               LIMIT 1
+             ) AS primary_ledger
       FROM vouchers v
       LEFT JOIN LATERAL (
         SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
@@ -1340,6 +1361,16 @@ const VOUCHER_LIST_SELECT = `
           )
         ORDER BY av.id DESC LIMIT 1
       ) av_info ON true`;
+
+/** Attach resolved party_name for list tiles (Journal / SO / Proforma often NULL). */
+function mapVoucherListRow(r, extra = {}) {
+  return {
+    ...r,
+    party_name: resolveVoucherListParty(r),
+    primary_ledger: r.primary_ledger || null,
+    ...extra,
+  };
+}
 
 // True Sales invoice (metrics-aligned): Sales but not Order/Delivery/Quotation.
 const SALES_INVOICE_SQL = `v.voucher_type ILIKE '%Sales%' AND v.voucher_type NOT ILIKE '%Order%' AND v.voucher_type NOT ILIKE '%Delivery%' AND v.voucher_type NOT ILIKE '%Quotation%'`;
@@ -1361,6 +1392,10 @@ function salesDocTypePredicate(docType) {
       return `(${SALES_INVOICE_SQL} AND COALESCE(v.is_optional, FALSE) = TRUE)`;
     case 'quotation':
       return `(v.voucher_type ILIKE '%Quotation%')`;
+    case 'receipt':
+      return `(v.voucher_type ILIKE '%Receipt%' AND v.voucher_type NOT ILIKE '%Receipt Note%')`;
+    case 'journal':
+      return `(v.voucher_type ILIKE '%Journal%')`;
     default:
       return null;
   }
@@ -1374,6 +1409,10 @@ function purchaseDocTypePredicate(docType) {
       return `(v.voucher_type ILIKE '%Purchase Order%')`;
     case 'debit_note':
       return `(v.voucher_type ILIKE '%Debit Note%')`;
+    case 'payment':
+      return `(v.voucher_type ILIKE '%Payment%')`;
+    case 'contra':
+      return `(v.voucher_type ILIKE '%Contra%')`;
     default:
       return null;
   }
@@ -1385,6 +1424,9 @@ function classifySalesDocType(row) {
   if (/credit\s*note/i.test(vt)) return 'credit_note';
   if (/delivery\s*note/i.test(vt)) return 'delivery_note';
   if (/sales\s*order/i.test(vt)) return 'order';
+  if (/receipt\s*note/i.test(vt)) return 'invoice'; // inventory — not money Receipt
+  if (/receipt/i.test(vt)) return 'receipt';
+  if (/journal/i.test(vt)) return 'journal';
   if (row.is_optional) return 'proforma';
   return 'invoice';
 }
@@ -1393,6 +1435,8 @@ function classifyPurchaseDocType(row) {
   const vt = String(row.voucher_type || '');
   if (/debit\s*note/i.test(vt)) return 'debit_note';
   if (/purchase\s*order/i.test(vt)) return 'order';
+  if (/payment/i.test(vt)) return 'payment';
+  if (/contra/i.test(vt)) return 'contra';
   return 'invoice';
 }
 
@@ -1427,7 +1471,11 @@ const voucherListHandler = (voucherType) => async (req, res) => {
       cntQ += ` AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
     }
     const { rows: cnt } = await query(cntQ, cntParams);
-    res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to } });
+    res.json({
+      success: true,
+      data: rows.map((r) => mapVoucherListRow(r)),
+      meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to },
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -1475,7 +1523,7 @@ const strictInvoiceListHandler = (module) => async (req, res) => {
     const classify = module === 'purchase' ? classifyPurchaseDocType : classifySalesDocType;
     res.json({
       success: true,
-      data: rows.map((r) => ({ ...r, doc_type: classify(r) })),
+      data: rows.map((r) => mapVoucherListRow(r, { doc_type: classify(r) })),
       meta: { total: parseInt(cnt[0].c), page: parseInt(page), limit: parseInt(limit), from, to },
     });
   } catch (err) {
@@ -1539,8 +1587,8 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
   const partyGroups = parseCsvParam(req.query.partyGroups);
   const defaultTypes = module === 'purchase'
-    ? ['invoice', 'order', 'debit_note']
-    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
+    ? ['invoice', 'order', 'debit_note', 'payment', 'contra']
+    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation', 'receipt', 'journal'];
   const requested = parseCsvParam(req.query.docTypes).map((t) => t.toLowerCase());
   const effectiveTypes = requested.length ? requested : defaultTypes;
   const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
@@ -1586,8 +1634,7 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
     const classify = module === 'purchase' ? classifyPurchaseDocType : classifySalesDocType;
     res.json({
       success: true,
-      data: rows.map((r) => ({
-        ...r,
+      data: rows.map((r) => mapVoucherListRow(r, {
         doc_type: classify(r),
         voucher_type: r.voucher_type,
         is_optional: r.is_optional ?? false,
@@ -1617,8 +1664,8 @@ const voucherCountsHandler = (module) => async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
   const types = module === 'purchase'
-    ? ['invoice', 'order', 'debit_note']
-    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation'];
+    ? ['invoice', 'order', 'debit_note', 'payment', 'contra']
+    : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation', 'receipt', 'journal'];
   const predFn = module === 'purchase' ? purchaseDocTypePredicate : salesDocTypePredicate;
   const allPreds = types.map(predFn).filter(Boolean);
   const typeOrAll = allPreds.length ? `(${allPreds.join(' OR ')})` : 'FALSE';
@@ -4969,52 +5016,76 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
   try {
     let whereExtra = '';
     if (type === 'cash') {
-      whereExtra = `AND (parent ILIKE '%Cash In Hand%' OR parent ILIKE '%Cash-In-Hand%' OR name ILIKE 'Cash')`;
+      whereExtra = `AND (l.parent ILIKE '%Cash In Hand%' OR l.parent ILIKE '%Cash-In-Hand%' OR l.name ILIKE 'Cash')`;
     } else if (type === 'bank') {
       whereExtra = `AND (
-           parent ILIKE '%Bank Accounts%'
-           OR parent ILIKE '%Bank Account%'
-           OR parent ILIKE '%Bank OD%'
-           OR parent ILIKE '%Overdraft%'
-           OR parent ILIKE '%Bank A/c%'
-           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
+           l.parent ILIKE '%Bank Accounts%'
+           OR l.parent ILIKE '%Bank Account%'
+           OR l.parent ILIKE '%Bank OD%'
+           OR l.parent ILIKE '%Overdraft%'
+           OR l.parent ILIKE '%Bank A/c%'
+           OR (l.parent ILIKE '%Bank%' AND l.parent NOT ILIKE '%Bank Charge%' AND l.parent NOT ILIKE '%Bank Interest%' AND l.parent NOT ILIKE '%Bank Exp%')
          )`;
     } else {
       // all: bank + cash
       whereExtra = `AND (
-           parent ILIKE '%Bank Accounts%'
-           OR parent ILIKE '%Bank Account%'
-           OR parent ILIKE '%Bank OD%'
-           OR parent ILIKE '%Overdraft%'
-           OR parent ILIKE '%Bank A/c%'
-           OR parent ILIKE '%Cash In Hand%'
-           OR parent ILIKE '%Cash-In-Hand%'
-           OR name ILIKE 'Cash'
-           OR (parent ILIKE '%Bank%' AND parent NOT ILIKE '%Bank Charge%' AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
+           l.parent ILIKE '%Bank Accounts%'
+           OR l.parent ILIKE '%Bank Account%'
+           OR l.parent ILIKE '%Bank OD%'
+           OR l.parent ILIKE '%Overdraft%'
+           OR l.parent ILIKE '%Bank A/c%'
+           OR l.parent ILIKE '%Cash In Hand%'
+           OR l.parent ILIKE '%Cash-In-Hand%'
+           OR l.name ILIKE 'Cash'
+           OR (l.parent ILIKE '%Bank%' AND l.parent NOT ILIKE '%Bank Charge%' AND l.parent NOT ILIKE '%Bank Interest%' AND l.parent NOT ILIKE '%Bank Exp%')
          )`;
     }
     const { rows } = await query(
-      `SELECT name, closing_balance, balance_type, parent,
-              bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder
-       FROM ledgers
-       WHERE company_guid=$1 ${whereExtra}
+      `SELECT l.name, l.closing_balance, l.balance_type, l.parent,
+              l.bank_account_no, l.bank_ifsc, l.bank_name, l.bank_branch, l.bank_holder,
+              l.bank_account_type,
+              (
+                SELECT UPPER(COALESCE(am.payload->>'accountType', am.payload->>'account_type', ''))
+                FROM app_masters am
+                WHERE am.company_guid = l.company_guid
+                  AND am.master_type = 'bank'
+                  AND LOWER(am.master_name) = LOWER(l.name)
+                ORDER BY am.updated_at DESC NULLS LAST
+                LIMIT 1
+              ) AS app_account_type
+       FROM ledgers l
+       WHERE l.company_guid=$1 ${whereExtra}
        ORDER BY
-         CASE WHEN parent ILIKE '%Cash%' OR name ILIKE 'Cash' THEN 0 ELSE 1 END,
-         ABS(closing_balance) DESC`,
+         CASE WHEN l.parent ILIKE '%Cash%' OR l.name ILIKE 'Cash' THEN 0 ELSE 1 END,
+         ABS(l.closing_balance) DESC`,
       [companyGuid]
     );
-    res.json({ success: true, data: rows.map(r => ({
-      name: r.name,
-      balance: parseFloat(r.closing_balance||0),
-      balance_type: r.balance_type,
-      parent: r.parent || '',
-      account_number: r.bank_account_no || '',
-      ifsc: r.bank_ifsc || '',
-      bank_name: r.bank_name || '',
-      branch: r.bank_branch || '',
-      account_holder: r.bank_holder || '',
-      type: (r.parent?.toLowerCase().includes('cash') || r.name?.toLowerCase() === 'cash') ? 'cash' : 'bank'
-    })) });
+    const normalizeType = (v) => {
+      const t = String(v || '').trim().toUpperCase();
+      return ['SAVING', 'CURRENT', 'OD', 'CC'].includes(t) ? t : '';
+    };
+    res.json({ success: true, data: rows.map(r => {
+      const parent = r.parent || '';
+      let accountType = normalizeType(r.bank_account_type) || normalizeType(r.app_account_type);
+      if (!accountType) {
+        if (/Bank\s*OD|Overdraft/i.test(parent)) accountType = 'OD';
+        else if (/Cash\s*Credit/i.test(parent)) accountType = 'CC';
+        else accountType = 'CURRENT';
+      }
+      return {
+        name: r.name,
+        balance: parseFloat(r.closing_balance||0),
+        balance_type: r.balance_type,
+        parent,
+        account_number: r.bank_account_no || '',
+        ifsc: r.bank_ifsc || '',
+        bank_name: r.bank_name || '',
+        branch: r.bank_branch || '',
+        account_holder: r.bank_holder || '',
+        account_type: accountType,
+        type: (parent.toLowerCase().includes('cash') || r.name?.toLowerCase() === 'cash') ? 'cash' : 'bank'
+      };
+    }) });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 

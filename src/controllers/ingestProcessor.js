@@ -6,6 +6,10 @@ import { deriveVoucherTypeParent, REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../util
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
 import { emitVoucherRegularized, emitVoucherSynced } from '../socket/socketHandler.js';
 import { confirmAppMasterFromIngest } from '../utils/appMasters.js';
+import {
+  formatLedgerDisplayName,
+  pickPartyNameFromLedgerEntries,
+} from '../utils/resolveVoucherListParty.js';
 
 /** Tally Duties & Taxes: RateOfTaxCalculation exported as TAXRATE in LedgerFull.xml */
 function extractLedgerTaxRate(r) {
@@ -848,8 +852,14 @@ async function processVouchers(data, companyGuid) {
             synced_at             = EXCLUDED.synced_at
         `, [
           guid, companyGuid, voucherNumber, voucherType, deriveVoucherTypeParent(voucherType), date,
-          // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml
-          r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null,
+          // PartyName is the field in AllVoucher.xml; PartyLedgerName in Voucher.xml.
+          // Journal / Sales Order / Proforma often omit it — fall back to best ledger line
+          // (and flatten Tally multi-party JSON array names).
+          (() => {
+            const rawParty = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
+            if (rawParty) return formatLedgerDisplayName(rawParty) || rawParty;
+            return pickPartyNameFromLedgerEntries(ledgerEntries);
+          })(),
           partyGuid,
           amount,
           r.Narration || r.NARRATION || r.narration || null,

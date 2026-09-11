@@ -1,3 +1,26 @@
+## 2026-09-11 — Voucher list party resolve + bank master write fields
+
+### Why
+Journal/SO/Proforma list tiles often blank party; Bank Feeds create missing branch/holder/account type on write-back and local upsert; sales/purchase combined lists needed receipt/journal/payment/contra alignment.
+
+### Change
+- `resolveVoucherListParty.js` + list enrichment for primary ledger fallback when `party_name` empty.
+- `tally-write` bank master XML/payload: branch, holder, account type; local ledger upsert including `bank_account_type`.
+- Schema: `ledgers.bank_account_type TEXT` (app-only).
+- Combined sales/purchase voucher feeds include additional doc types; ingest party_guid coalesce hardening where touched.
+
+### How to test
+```bash
+node --check src/routes/api-v1.js src/routes/tally-write.js src/controllers/ingestProcessor.js src/utils/resolveVoucherListParty.js
+npm test
+# Bank Feeds create bank → /bank-ledgers shows fields; Journal list tile not blank
+```
+
+### Risks
+- QA YELLOW: bank upsert may show before Tally confirms; list party resolve is display-only (filters still DB column).
+
+---
+
 ## 2026-09-01 — Metrics tiles: real trend vs prior window
 
 ### Changed
