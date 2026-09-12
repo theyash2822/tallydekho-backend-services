@@ -22,7 +22,8 @@ import { setPairingSocket } from './routes/pairing.js';
 import dataRoutes from './routes/data.js';
 import integrationRoutes from './routes/integrations.js';
 import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
-import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler } from './routes/desktopWorkspace.js';
+import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler, setDesktopWorkspaceSocket } from './routes/desktopWorkspace.js';
+import { setWorkspaceApiSocket } from './routes/workspaceApi.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -99,6 +100,8 @@ setSocketService(socketService);
 setTallyWriteSocket(socketService);
 setPairingSocket(socketService);
 setApiSocket(socketService);
+setDesktopWorkspaceSocket(socketService);
+setWorkspaceApiSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()

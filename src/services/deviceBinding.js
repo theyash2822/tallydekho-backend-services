@@ -14,8 +14,30 @@ export class BindingError extends Error {
   }
 }
 
-export async function pairDeviceToWorkspace({ device, userId }) {
-  const workspace = await ensurePersonalWorkspace(userId);
+export async function pairDeviceToWorkspace({ device, userId, workspaceId = null }) {
+  let workspace;
+  if (workspaceId) {
+    const { rows } = await query('SELECT * FROM workspaces WHERE id = $1', [workspaceId]);
+    workspace = rows[0];
+    if (!workspace) {
+      throw new BindingError('WORKSPACE_NOT_FOUND', 'Workspace not found', 404);
+    }
+    const { rows: mem } = await query(
+      `SELECT membership_type, status FROM workspace_memberships
+       WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+      [workspaceId, userId]
+    );
+    const m = mem[0];
+    if (!m || (m.membership_type !== 'OWNER' && m.membership_type !== 'ADMIN')) {
+      throw new BindingError(
+        'WORKSPACE_ACCESS_DENIED',
+        'Only Owner or Admin can pair Tally for this workspace.',
+        403
+      );
+    }
+  } else {
+    workspace = await ensurePersonalWorkspace(userId);
+  }
 
   if (device.paired && device.user_id && device.user_id !== userId) {
     throw new BindingError(

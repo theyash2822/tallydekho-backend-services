@@ -15,6 +15,28 @@ import crypto from 'crypto';
 
 const router = Router();
 
+/** Fail closed: workspace-scoped generate requires ACTIVE workspace integration. */
+async function assertWorkspaceIntegrationActive(req, domain) {
+  const h = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'];
+  const workspaceId = Array.isArray(h) ? h[0] : h;
+  if (!workspaceId) {
+    const err = new Error('X-Workspace-Id required for integration generate');
+    err.code = 'WORKSPACE_ACCESS_DENIED';
+    err.httpStatus = 403;
+    throw err;
+  }
+  const { rows } = await query(
+    `SELECT status FROM workspace_integrations WHERE workspace_id = $1 AND domain = $2 LIMIT 1`,
+    [String(workspaceId), domain]
+  ).catch(() => ({ rows: [] }));
+  if (!rows[0] || rows[0].status !== 'ACTIVE') {
+    const err = new Error('Configure and activate this integration for the Workspace first');
+    err.code = 'INTEGRATION_NOT_CONFIGURED';
+    err.httpStatus = 409;
+    throw err;
+  }
+}
+
 // ── Encryption helpers (AES-256-GCM for credentials at rest) ─────────────────
 // SECURITY: Never use a hardcoded fallback key — it exposes all credentials in the repo
 const ENCRYPTION_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY;
@@ -198,6 +220,7 @@ router.post('/eway-bill/generate', authMiddleware, async (req, res) => {
   if (!companyGuid || !voucherId) return res.status(400).json({ status: false, message: 'companyGuid and voucherId required' });
 
   try {
+    await assertWorkspaceIntegrationActive(req, 'eway');
     // Get voucher details from DB
     const { rows: vRows } = await query(
       `SELECT * FROM vouchers WHERE id=$1 AND company_guid=$2`,
@@ -262,7 +285,8 @@ router.post('/eway-bill/generate', authMiddleware, async (req, res) => {
     res.json({ status: true, ewbNumber: data.ewayBillNo, validUpto: data.validUpto, data });
   } catch (e) {
     console.error('[EWB] Generate error:', e.message);
-    res.status(500).json({ status: false, message: e.message });
+    const status = e.httpStatus || 500;
+    res.status(status).json({ status: false, message: e.message, error: { code: e.code || 'SERVER_ERROR' } });
   }
 });
 
@@ -326,6 +350,11 @@ router.get('/eway-bill/get', authMiddleware, async (req, res) => {
 router.post('/eway-bill/bulk-generate', authMiddleware, async (req, res) => {
   const { companyGuid, voucherIds } = req.body;
   if (!companyGuid || !voucherIds?.length) return res.status(400).json({ status: false, message: 'companyGuid and voucherIds required' });
+  try {
+    await assertWorkspaceIntegrationActive(req, 'eway');
+  } catch (e) {
+    return res.status(e.httpStatus || 409).json({ status: false, message: e.message, error: { code: e.code || 'INTEGRATION_NOT_CONFIGURED' } });
+  }
   const results = [];
   for (const vid of voucherIds) {
     try {
@@ -467,6 +496,7 @@ router.post('/e-invoice/generate-irn', authMiddleware, async (req, res) => {
   const { companyGuid, voucherId } = req.body;
   if (!companyGuid || !voucherId) return res.status(400).json({ status: false, message: 'companyGuid and voucherId required' });
   try {
+    await assertWorkspaceIntegrationActive(req, 'einvoice');
     // Get voucher from DB
     const { rows: vRows } = await query(
       `SELECT * FROM vouchers WHERE id=$1 AND company_guid=$2`,
@@ -560,7 +590,8 @@ router.post('/e-invoice/generate-irn', authMiddleware, async (req, res) => {
     });
   } catch (e) {
     console.error('[EINV] Generate IRN error:', e.message);
-    res.status(500).json({ status: false, message: e.message });
+    const status = e.httpStatus || 500;
+    res.status(status).json({ status: false, message: e.message, error: { code: e.code || 'SERVER_ERROR' } });
   }
 });
 
@@ -636,6 +667,12 @@ router.get('/e-invoice/pending', authMiddleware, async (req, res) => {
 router.post('/e-invoice/bulk-generate-irn', authMiddleware, async (req, res) => {
   const { companyGuid, voucherIds } = req.body;
   if (!companyGuid || !voucherIds?.length) return res.status(400).json({ status: false, message: 'companyGuid and voucherIds required' });
+
+  try {
+    await assertWorkspaceIntegrationActive(req, 'einvoice');
+  } catch (e) {
+    return res.status(e.httpStatus || 409).json({ status: false, message: e.message, error: { code: e.code || 'INTEGRATION_NOT_CONFIGURED' } });
+  }
 
   const results = [];
   let generated = 0;

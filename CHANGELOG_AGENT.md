@@ -1,4 +1,212 @@
-## 2026-09-12 — Workspace binding + cloud backup/restore
+## 2026-09-12 — Fail-closed company access + writeback workspace routing + lifecycle aliases
+
+### Why
+Universal MD §45/§46/§83 — RBAS must apply on data/write paths; writeback must use Workspace Desktop; web lifecycle paths must match APIs.
+
+### Change
+- `middleware/companyAccess.js` — fail-closed `verifyCompanyAccess` + `requireTallyWriteAccess` + capability map
+- `api-v1.js` / `data.js` — ownership no longer fail-opens; view caps + company/FY scope
+- `tally-write.js` — per-route write authz; `write_queue.workspace_id` + queue as workspace owner; pending/claim by workspace
+- `authorizationService.js` — Entry Mode accepts OPTIONAL/REGULAR/BOTH
+- `socketHandler.js` — `company:register` checks membership + company scope
+- `workspaceService.js` / `workspaceApi.js` — lifecycle GET helpers + close/confirm + reset/close complete aliases
+- `__tests__/rbas-foundation.test.js` — foundation unit tests
+
+### Needs / dependencies (blocked externally)
+- Razorpay keys for live recharge (manual complete works in dev)
+- AWS SES for ownership/reset email links (tokens returned in API when SES off)
+- Mobile + Desktop apps for full Universal DoD
+- Full §81 integration suite + full Tally XML goldens
+- AWS S3 for production cloud backup object store (if not already configured)
+
+---
+
+## 2026-09-12 — View caps + Razorpay + lifecycle polish
+
+### Why
+Yash decisions: enforce `*.view` on reads; Razorpay recharge; ownership transfer/reset/close now; AWS S3 later.
+
+### Change
+- `api-v1.js` — `resolveViewCapability` + pass into `verifyCompanyAccess`
+- `billingService.js` / `workspaceApi.js` — Razorpay create/status/verify + webhook
+- `workspaceService.js` / scheduler — transfer accept, reset/close email confirm, 15m grace jobs
+- `tally-write.js` — remove broken `router.post` monkey-patch (crash on boot)
+- `.env.example` — `RAZORPAY_*` placeholders
+
+### Needs
+Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` before live recharge.
+
+---
+
+## 2026-09-12 — Desktop backup/restore forensic gaps
+
+Socket verifies device_secret; Hard Sync / restore approvals emit to Desktop + workspace room; `/desktop/me` returns Tally companies; restore completion checks backup manifest overlap; init-sync requires device credential when hashed; register no longer rotates an unclaimed secret; unpair is not reported as WORKSPACE_CLOSED.
+
+---
+
+## 2026-09-12 — MD-critical: invitations, ownership transfer, reset/close, billing orders
+
+### Why
+Replace lifecycle stubs with durable flows matching product MD; fix invite TTL + no auto-create users; add payment orders / invoices / usage drilldown.
+
+### Change
+- `workspaceSchema.js` — ownership transfer columns (confirm_count, tokens, grace_ends_at, …); `workspace_lifecycle_requests`; `billing_payment_orders`, `billing_invoices`, `usage_events`
+- `workspaceService.js` — invitations: 48h TTL, INVITEE_NOT_FOUND (no auto-create), seat reserve kept; durable ownership transfer (3 hashed tokens → grace → complete + 1000 credit charge on base); reset (3 phrase confirms → grace → execute: unpair/detach/remove members); close (grace → CLOSED)
+- `email.js` — export `sendEmail`, `sendOwnershipConfirmEmail`
+- `billingService.js` — `createPaymentOrder` / `completePaymentOrder` (manual), `listInvoices`, `listUsageEvents`, `creditWallet`, `recordUsageEvent` (Razorpay `createRechargeOrder`/`fulfillRechargePayment` retained)
+- `workspaceApi.js` — transfer confirm/revoke/complete; reset confirm/execute; close execute; billing payment-orders + invoices + usage filters
+- `API_CONTRACT.md` / `DB_CONTRACT.md` — documented
+
+### How to test
+```bash
+node --check src/services/workspaceService.js src/services/billingService.js src/routes/workspaceApi.js
+# Restart API so applyWorkspaceSchema runs
+TOKEN=... WS=... MEMBER_USER_ID=... ROLE_ID=...
+
+# Invite (existing user mobile only)
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"mobile":"9999999999","roleId":"'"$ROLE_ID"'"}' \
+  "http://localhost:3001/api/workspaces/$WS/invitations"
+
+# Ownership transfer
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"targetUserId":'"$MEMBER_USER_ID"',"outgoingRoleId":"'"$ROLE_ID"'"}' \
+  "http://localhost:3001/api/workspaces/$WS/transfer/initiate"
+# Use returned confirmTokens (×3), then after grace_ends_at:
+# POST .../transfer/:transferId/complete
+
+# Reset (base)
+curl -s -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:3001/api/workspaces/$WS/reset/request"
+# POST .../reset/confirm with {"phrase":"RESET WORKSPACE"} three times; after grace POST .../reset/execute
+
+# Billing manual order
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"credits":100,"amountInr":100}' "http://localhost:3001/api/billing/payment-orders"
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3001/api/billing/payment-orders/ORDER_ID/complete"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:3001/api/billing/invoices"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:3001/api/billing/usage?kind=TOPUP"
+```
+
+### Risks
+- Grace periods are real 24h — for local QA, set `grace_ends_at` in DB to past before calling execute/complete.
+- Reset/close are destructive (company detach / membership purge); keep wallet + Owner + workspace on reset.
+- Manual payment complete bypasses Razorpay (dev/ops only); production should use Razorpay fulfill path.
+
+---
+
+## 2026-09-12 — Workspace lifecycle / member-role / billing ledger APIs
+
+
+
+### Why
+Web Team & Access + billing UI need role assign, ownership/reset/close stubs, wallet ledger, and payment-mode map.
+
+### Change
+- `workspaceSchema.js` — expand-only: `workspace_ownership_transfers`; `workspaces.reset_requested_at` / `close_requested_at`
+- `workspaceService.js` — `changeMemberRole`, `initiateOwnershipTransfer` (stub), `requestWorkspaceReset` / `Close` (stubs), payment-mode map get/put
+- `billingService.js` — `listWalletTransactions`
+- `workspaceApi.js` — PATCH members/:userId/role; POST transfer/initiate, reset/request, close/request; GET billing/usage + transactions; GET/PUT payment-mode-map
+- `API_CONTRACT.md` / `DB_CONTRACT.md` — documented
+
+### How to test
+```bash
+node --check src/routes/workspaceApi.js src/services/workspaceService.js src/services/billingService.js
+# See curl examples in agent response / below
+TOKEN=... WS=... 
+curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"roleId":"ROLE_UUID"}' "http://localhost:3000/api/workspaces/$WS/members/USER_ID/role"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:3000/api/billing/transactions"
+```
+
+### Risks
+- Transfer/reset/close are stubs only (no email, no destructive wipe, no ownership flip).
+- Role route uses `members.role_assign` (Admin has it; Owner always ALLOW).
+
+---
+
+## 2026-09-12 — Workspace RBAS finish pass (verify + gaps)
+
+### Why
+Prior RBAS work was on disk but incomplete: `integrationService` could not import `authzService`, older DBs risked missing `system_key`/`display_name`/`granted`/`fy_key` columns, and Owner ALLOW lacked a unit test.
+
+### Change
+- `authzService.js` — re-export `authorizationService` + add `resolveMembership` / `isOwnerOrAdminMembership` (fixes `integrationService` import)
+- `authorizationService.js` — extract `membershipAuthzGate` (Owner ACTIVE → ALLOW); authorize uses it
+- `workspaceSchema.js` — expand-only ALTER COLUMN parity + display_name backfill for older drafts
+- `inviteService.js` — documented as unused by routes; `workspaceService` remains SoT for invites
+- `workspace-lineage.test.js` — Owner ALLOW / suspend / member-continue gate tests
+
+### Already OK (verified, not rebuilt)
+- `api-v1.js` mounts `router.use(workspaceApi)`
+- featureFlags all ON; billing/roles/workspace/context/middleware present
+- Routes use `workspaceService.createInvitation` (not inviteService)
+- Syntax + dynamic import of critical modules pass
+
+### How to test
+```bash
+node --test src/__tests__/workspace-lineage.test.js
+node --check src/services/authorizationService.js src/services/authzService.js src/db/workspaceSchema.js
+# After login:
+# GET /api/me/workspaces
+# GET /api/workspaces/:id/context  (X-Workspace-Id)
+# GET /api/workspaces/:id/roles
+# GET /api/billing/overview
+```
+
+### Risks
+- `inviteService` still has draft SQL (`invitee_mobile`, `occupied_membership_id`) — do not wire to routes
+- `billingStubService` unused by workspaceApi (activation uses `billingService.deductCredits`)
+
+---
+
+## 2026-09-12 — Member company scope on /app/companies + context
+
+### Why
+Invited members could not be granted visible companies from web; list used member user_id for legacy rows and ignored company scope.
+
+### Change
+- `companies.js` — workspace companies fall back to Owner user_id; filter by membership company_mode ALL|SELECTED|NONE
+- `workspaceService.getWorkspaceContext` — same company scope filter for non-Owner
+- Web Team & Access Data access UI (portal) saves via PUT .../members/:id/scopes
+
+### How to test
+Owner: Settings → Team & Access → member → Data access → All or Selected → Save.
+Member refreshes: company switcher shows allowed companies only.
+
+---
+
+## 2026-09-12 — Workspace RBAS / billing / roles API
+
+### Why
+Product Workspace model: personal workspace bootstrap with billing wallet, builtin roles (system_key), authorization, member/invite/seat APIs.
+
+### Change
+- `billingService.js` — ensureBillingAccount (+10 signup credits / 5yr), wallet, rates, deductCredits
+- `roleService.js` — seedBuiltinRoles (ADMIN/ACCOUNTANT/SALES/COLLECTION/VIEWER/AUDITOR); Admin protected caps forced on save; delete blocked if in use
+- `authorizationService.js` — authorize ALLOW/DENY fail-closed; Owner always ALLOW; getEffectiveAccess
+- `workspaceService.js` — bootstrap billing+roles+OWNER seat (role_id null); list/context/rename/createAdditional; members/invites/seats
+- `middleware/workspaceContext.js` — resolveWorkspaceMiddleware (header or personal fallback), requireCapability
+- `workspaceApi.js` — me/workspaces, context, roles, members, invitations, billing, seats; approvals use workspace header
+- `auth.js` + `api-v1.js` — ensurePersonalWorkspace after full-token verify-otp / verify-pin / onboarding / register
+- `companies.js` — list prefers `X-Workspace-Id` + workspace_id (legacy user_id fallback)
+- `api-v1.js` — verifyCompanyOwnership accepts workspace membership
+- `capabilityRegistry.js` — SENSITIVE_POLICIES + defaultKeysForTemplate + CAPABILITY_ALIASES
+- `featureFlags.js` — all flags ON; exports `flag` + `flags.*()`
+
+### How to test
+```bash
+node --test src/__tests__/workspace-lineage.test.js
+node --check src/services/billingService.js src/services/roleService.js src/services/authorizationService.js src/services/workspaceService.js src/middleware/workspaceContext.js src/routes/workspaceApi.js
+# Login → GET /api/me/workspaces; GET /api/workspaces/:id/context with X-Workspace-Id
+```
+
+### Risks
+- Signup wallet is 10 credits; ADDITIONAL_WORKSPACE rate is 1000 — creating extra workspaces needs top-up or rate change.
+- Parallel authzService/inviteService stubs may overlap; canonical decision API for routes is authorizationService + requireCapability.
+- Existing DBs that created workspace_roles via older drafts need column parity (system_key/display_name/granted).
+
+---
 
 ### Why
 Desktop program: Device → Workspace, cloud backups (latest 3), Owner/Admin Hard Sync + restore approval. Tally XML freeze.

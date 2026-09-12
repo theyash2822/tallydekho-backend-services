@@ -44,6 +44,27 @@ export function evaluateLineage(knownGuids = [], incomingGuids = []) {
   return { ok: true, reason: extra.length ? 'new_companies' : 'match', extra, missing };
 }
 
+/** Restore may only activate if discovered/restored GUIDs overlap the approved backup manifest. */
+export function lineageMatchesBackupManifest(backupManifest = [], lineageGuids = []) {
+  let manifest = backupManifest;
+  if (typeof manifest === 'string') {
+    try { manifest = JSON.parse(manifest); } catch { manifest = []; }
+  }
+  const fromManifest = [...new Set(
+    (Array.isArray(manifest) ? manifest : [])
+      .map((c) => c?.guid || c.tally_company_guid)
+      .filter(Boolean)
+  )];
+  const incoming = [...new Set((lineageGuids || []).filter(Boolean))];
+  if (!fromManifest.length || !incoming.length) return { ok: true, reason: 'skipped' };
+  const set = new Set(fromManifest);
+  const overlap = incoming.filter((g) => set.has(g));
+  if (overlap.length === 0) {
+    return { ok: false, code: 'TALLY_DATA_MISMATCH', reason: 'restore_manifest_mismatch', extra: incoming, missing: fromManifest };
+  }
+  return { ok: true, reason: 'overlap', overlap };
+}
+
 export function pickRetentionDeletes(successfulBackups, keep = 3) {
   const list = [...(successfulBackups || [])].sort((a, b) => {
     const ta = Number(a.completed_at || a.created_at || 0);

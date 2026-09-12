@@ -63,16 +63,25 @@ export function setupSocket(io) {
     socket.on('register', ({ token, type, deviceId, deviceSecret }) => {
       // Desktop sends: { type: 'desktop', deviceId, deviceSecret? }
       if (type === 'desktop' && deviceId) {
-        socket.deviceId = deviceId;
-        socket.clientType = 'desktop';
-        connectedClients.set(`desktop_${deviceId}`, socket);
-        console.log(`[WS] registered desktop via register event: ${deviceId}`);
-        socket.emit('registered', { status: true });
-        query('SELECT user_id, workspace_id, device_secret_hash, paired FROM devices WHERE device_id=$1 LIMIT 1', [deviceId])
+        query('SELECT user_id, workspace_id, device_secret_hash, paired, binding_status FROM devices WHERE device_id=$1 LIMIT 1', [deviceId])
           .then(async ({ rows }) => {
-            if (!rows[0] || !rows[0].paired) return;
-            if (rows[0].workspace_id) socket.join(`workspace:${rows[0].workspace_id}`);
-            const userId = rows[0].user_id;
+            const d = rows[0];
+            if (d?.device_secret_hash) {
+              const { verifySecret } = await import('../services/deviceCredential.js');
+              const ok = deviceSecret ? await verifySecret(deviceSecret, d.device_secret_hash) : false;
+              if (!ok) {
+                socket.emit('error', { code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential invalid' });
+                return;
+              }
+            }
+            socket.deviceId = deviceId;
+            socket.clientType = 'desktop';
+            connectedClients.set(`desktop_${deviceId}`, socket);
+            console.log(`[WS] registered desktop via register event: ${deviceId}`);
+            socket.emit('registered', { status: true });
+            if (!d || !d.paired) return;
+            if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
+            const userId = d.user_id;
             if (_retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
               _retryOfflineEntries(userId, null);
@@ -111,6 +120,97 @@ export function setupSocket(io) {
           }).catch(() => {});
       } catch {
         socket.emit('error', { message: 'Invalid token' });
+      }
+    });
+
+    // Mobile/Web: join workspace room after picking active Workspace (JWT stays user-only)
+    socket.on('workspace:register', async ({ workspaceId }) => {
+      try {
+        if (!socket.userId || !workspaceId) return;
+        const { rows } = await query(
+          `SELECT status FROM workspace_memberships
+           WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+          [workspaceId, socket.userId]
+        );
+        if (!rows[0]) {
+          socket.emit('workspace_access_denied', { workspaceId });
+          return;
+        }
+        if (socket.workspaceRoom) socket.leave(socket.workspaceRoom);
+        if (Array.isArray(socket.companyRooms)) {
+          for (const room of socket.companyRooms) socket.leave(room);
+        }
+        socket.companyRooms = [];
+        socket.workspaceRoom = `workspace:${workspaceId}`;
+        socket.join(socket.workspaceRoom);
+        socket.workspaceId = workspaceId;
+        console.log(`[WS] user ${socket.userId} joined ${socket.workspaceRoom}`);
+        const { rows: cos } = await query(
+          `SELECT guid FROM companies
+           WHERE (workspace_id = $1 OR (workspace_id IS NULL AND user_id = (
+             SELECT owner_user_id FROM workspaces WHERE id = $1
+           ))) AND (is_active = TRUE OR is_active IS NULL)`,
+          [workspaceId]
+        );
+        for (const c of cos) {
+          if (c.guid) {
+            const room = `company:${c.guid}`;
+            socket.join(room);
+            socket.companyRooms.push(room);
+          }
+        }
+        socket.emit('workspace_registered', { workspaceId, companies: cos.map((c) => c.guid) });
+      } catch (err) {
+        console.warn('[WS] workspace:register failed', err.message);
+      }
+    });
+
+    socket.on('company:register', async ({ companyGuid }) => {
+      try {
+        if (!companyGuid || !socket.userId) return;
+        const workspaceId = socket.workspaceId;
+        if (!workspaceId) {
+          socket.emit('company_access_denied', { companyGuid, code: 'WORKSPACE_REQUIRED' });
+          return;
+        }
+        const { rows: mem } = await query(
+          `SELECT id, membership_type FROM workspace_memberships
+           WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+          [workspaceId, socket.userId]
+        );
+        if (!mem[0]) {
+          socket.emit('company_access_denied', { companyGuid, code: 'WORKSPACE_ACCESS_DENIED' });
+          return;
+        }
+        const { rows: cos } = await query(
+          `SELECT guid FROM companies
+           WHERE guid = $1 AND (
+             workspace_id = $2
+             OR (workspace_id IS NULL AND user_id = (SELECT owner_user_id FROM workspaces WHERE id = $2))
+           ) LIMIT 1`,
+          [companyGuid, workspaceId]
+        );
+        if (!cos[0]) {
+          socket.emit('company_access_denied', { companyGuid, code: 'COMPANY_SCOPE_DENIED' });
+          return;
+        }
+        if (mem[0].membership_type !== 'OWNER') {
+          try {
+            const { assertCompanyAccess } = await import('../services/scopeService.js');
+            await assertCompanyAccess(mem[0].id, companyGuid);
+          } catch {
+            socket.emit('company_access_denied', { companyGuid, code: 'COMPANY_SCOPE_DENIED' });
+            return;
+          }
+        }
+        const room = `company:${companyGuid}`;
+        if (!Array.isArray(socket.companyRooms)) socket.companyRooms = [];
+        if (!socket.companyRooms.includes(room)) {
+          socket.join(room);
+          socket.companyRooms.push(room);
+        }
+      } catch (err) {
+        console.warn('[WS] company:register failed', err.message);
       }
     });
 
@@ -174,6 +274,11 @@ export function setupSocket(io) {
     notifyDesktop: (deviceId, event, payload) => {
       const s = connectedClients.get(`desktop_${deviceId}`);
       if (s?.connected) s.emit(event, payload);
+    },
+
+    notifyWorkspaceRoom: (workspaceId, event, payload) => {
+      if (!_io || !workspaceId) return;
+      _io.to(`workspace:${workspaceId}`).emit(event, payload);
     },
 
     notifyWorkspace: (userId, event, payload) => {

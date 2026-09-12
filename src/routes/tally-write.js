@@ -5,6 +5,7 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
+import { requireTallyWriteAccess } from '../middleware/companyAccess.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
 import {
@@ -117,6 +118,9 @@ async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], r
 
 const router = Router();
 
+// Write authz: each route uses requireTallyWriteAccess(pathKey) explicitly
+// (see companyAccess.TALLY_WRITE_CAPABILITIES). Do not monkey-patch router.post.
+
 // ── Helper: format date YYYYMMDD ──────────────────────────────────────────────
 const tallyDate = (d) => {
   if (!d) return new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -191,16 +195,31 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
   return { deviceId: device.device_id, jobId, status: 'desktop_offline', message: 'Desktop not connected. Entry saved — will push when desktop comes online.' };
 };
 
-// ── Helper: log entry to write_queue ─────────────────────────────────────────
-const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml) => {
-  // Use 'processing' status so retryOfflineEntries won't grab this entry
-  // while forwardToTally is still in flight (prevents duplicate sends).
-  // Status will be updated to 'success', 'desktop_offline', or 'failed' after the attempt.
+// ── Helper: log entry to write_queue (workspace-scoped; owner desktop via workspace_id) ─
+const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml, workspaceId = null) => {
+  // Prefer explicit workspace; else resolve from company binding
+  let wsId = workspaceId;
+  if (!wsId) {
+    const { rows: cRows } = await query(
+      `SELECT workspace_id FROM companies WHERE guid = $1 LIMIT 1`,
+      [companyGuid]
+    ).catch(() => ({ rows: [] }));
+    wsId = cRows[0]?.workspace_id || null;
+  }
+  // Queue owner = Workspace Owner's user_id so Desktop pull never uses member personal desktop
+  let queueUserId = userId;
+  if (wsId) {
+    const { rows: wRows } = await query(
+      `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+      [wsId]
+    ).catch(() => ({ rows: [] }));
+    if (wRows[0]?.owner_user_id) queueUserId = wRows[0].owner_user_id;
+  }
   const { rows } = await query(
-    `INSERT INTO write_queue (user_id, company_guid, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT)
+    `INSERT INTO write_queue (user_id, company_guid, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at, workspace_id, actor_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT, $8, $9)
      RETURNING id`,
-    [userId, companyGuid, entryType, entryLabel, amount || null, JSON.stringify(payload), xml]
+    [queueUserId, companyGuid, entryType, entryLabel, amount || null, JSON.stringify(payload), xml, wsId, userId]
   );
   return rows[0]?.id;
 };
@@ -861,7 +880,7 @@ export async function ensurePairedVoucherForQueueEntry(queueId, userId) {
 }
 
 // ── POST /tally/voucher/sales ───────────────────────────────────
-router.post('/voucher/sales', authMiddleware, async (req, res) => {
+router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/sales'), async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
     partyLedger, totalAmount,
@@ -1194,7 +1213,7 @@ ${consigneeAddrXml}
 
 // ── POST /tally/voucher/proforma ─────────────────────────────────────────────
 // Always optional Sales in Tally. Separate app identity (proforma_invoice / TDK-PRF).
-router.post('/voucher/proforma', authMiddleware, async (req, res) => {
+router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/voucher/proforma'), async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
     partyLedger, totalAmount,
@@ -1297,7 +1316,7 @@ router.post('/voucher/proforma', authMiddleware, async (req, res) => {
 // Same Tally voucher: DATE + TAGNAME=MASTER ID Alter. Flip ISOPTIONAL → No.
 // Also send narration + convert-form item lines (no GUID/REMOTEID rebuild).
 // Proven 2026-08-18 (narration-only probe on MASTERID 8560).
-router.post('/voucher/proforma/convert', authMiddleware, async (req, res) => {
+router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess('/voucher/proforma/convert'), async (req, res) => {
   const {
     companyGuid, companyName, tdkRef,
     partyLedger: bodyParty, date: bodyDate, items: bodyItems, taxes: bodyTaxes,
@@ -1583,7 +1602,7 @@ router.post('/debug/alter-probe', authMiddleware, async (req, res) => {
 // ── POST /tally/voucher/payment ───────────────────────────────────────────────
 // 2026-07-13 rewrite: Receipt parity — multi-bill allocation, instrument details,
 // numbering policy, app_vouchers, preview/share flow. Cash/Bank leg ISPARTYLEDGER=Yes (Tally export parity).
-router.post('/voucher/payment', authMiddleware, async (req, res) => {
+router.post('/voucher/payment', authMiddleware, requireTallyWriteAccess('/voucher/payment'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration, reference,
     partyLedger, ledgerAccount, bankLedger,
@@ -1806,7 +1825,7 @@ ${bankAllocXml}
 //   entryType: 'regular'|'optional',
 //   numbering_policy: 'tally_prime_series'|'tallydekho_series',
 //   narration?, reference?
-router.post('/voucher/receipt', authMiddleware, async (req, res) => {
+router.post('/voucher/receipt', authMiddleware, requireTallyWriteAccess('/voucher/receipt'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration, reference,
     partyLedger, ledgerAccount, bankLedger,
@@ -2002,7 +2021,7 @@ ${bankAllocXml}
 // ── POST /tally/voucher/journal ───────────────────────────────────────────────
 // 2026-07-14 rewrite: Payment/Receipt parity — single Dr+Cr pair, TDK-JOR,
 // app_vouchers, numbering, optional. Depreciation meta stored in payload only.
-router.post('/voucher/journal', authMiddleware, async (req, res) => {
+router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/voucher/journal'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration, reference,
     drLedger, crLedger, amount,
@@ -2151,7 +2170,7 @@ router.post('/voucher/journal', authMiddleware, async (req, res) => {
 // ── POST /tally/voucher/contra ────────────────────────────────────────────────
 // 2026-07-14 rewrite: Source(From)=Cr → Destination(To)=Dr, TDK-CON, BANKALLOCATIONS,
 // optional matched CASHDENOMINATION (Contra_2), app_vouchers, numbering.
-router.post('/voucher/contra', authMiddleware, async (req, res) => {
+router.post('/voucher/contra', authMiddleware, requireTallyWriteAccess('/voucher/contra'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration, reference,
     fromLedger, toLedger, amount,
@@ -2387,7 +2406,7 @@ ${toBankAlloc}
 });
 
 // ── POST /tally/voucher/sales-order ──────────────────────────────────────────
-router.post('/voucher/sales-order', authMiddleware, async (req, res) => {
+router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/voucher/sales-order'), async (req, res) => {
   const {
     companyGuid, companyName, date, dueDate, voucherNumber, reference, narration,
     partyLedger, totalAmount,
@@ -2590,7 +2609,7 @@ ${soExtrasXml}
 });
 
 // ── POST /tally/master/party ──────────────────────────────────────────────────
-router.post('/master/party', authMiddleware, async (req, res) => {
+router.post('/master/party', authMiddleware, requireTallyWriteAccess('/master/party'), async (req, res) => {
   const {
     companyGuid, companyName,
     name: _name, partyName,
@@ -2942,7 +2961,7 @@ router.post('/report', authMiddleware, async (req, res) => {
 });
 
 // POST /tally/master/warehouse - Create Godown/Warehouse in Tally
-router.post('/master/warehouse', authMiddleware, async (req, res) => {
+router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/master/warehouse'), async (req, res) => {
   const { companyGuid, companyName, name, parentGodown = '', address = '' } = req.body;
   if (!companyGuid || !name) return res.status(400).json({ status: false, message: 'companyGuid and name required' });
   const addressXml = address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : '';
@@ -2989,7 +3008,7 @@ router.post('/master/warehouse', authMiddleware, async (req, res) => {
 // POST /tally/voucher/purchase-order
 // Mirrors Sales Order with purchase signs (party Cr +, inventory/tax Dr −).
 // TDK ref prefix POR; ORDERNO/ORDERDUEDATE on batches (desktop CreatePurchaseOrder.xml).
-router.post('/voucher/purchase-order', authMiddleware, async (req, res) => {
+router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('/voucher/purchase-order'), async (req, res) => {
   const {
     companyGuid, companyName, date, dueDate, voucherNumber, reference, narration,
     partyLedger, totalAmount,
@@ -3197,7 +3216,7 @@ ${poExtrasXml}
 // POST /tally/voucher/purchase
 // Mirrors Sales create signs flipped for purchase (party Cr +, inventory/tax Dr −).
 // Reference: TallyPrime Purchase export — VCHTYPE Purchase, Item Invoice, BILLALLOCATIONS New Ref.
-router.post('/voucher/purchase', authMiddleware, async (req, res) => {
+router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/voucher/purchase'), async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
     partyLedger, totalAmount, items = [], taxes = [], logistics = [],
@@ -3720,7 +3739,7 @@ export function prepareCreditNoteLines({ items = [], taxes = [], context, invoic
 // company ownership, invoice is Sales, exact party match, item membership, positive
 // qty/rate, cumulative returned qty across prior synced + queued Credit Notes, and
 // that the Sales ledger belongs to the original invoice.
-router.post('/voucher/credit-note', authMiddleware, async (req, res) => {
+router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/voucher/credit-note'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration,
     partyLedger, totalAmount,
@@ -4197,7 +4216,7 @@ export function prepareDebitNoteLines({ items = [], taxes = [], context, invoice
 
 // ── POST /tally/voucher/debit-note ────────────────────────────────────────────
 // Purchase Return only, always linked to a Purchase invoice. Prefix DBN (not DN).
-router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
+router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/voucher/debit-note'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration,
     partyLedger, totalAmount,
@@ -4409,7 +4428,7 @@ router.post('/voucher/debit-note', authMiddleware, async (req, res) => {
 // reference, TallyDekho series numbering, app_vouchers lifecycle row, offline queue)
 // and XML aligned with a real TallyPrime Delivery Note export — Invoice Voucher View,
 // ISINVOICE No, DIFFACTUALQTY Yes, BASICSHIP* dispatch tags, INVOICEORDERLIST.LIST.
-router.post('/voucher/delivery-note', authMiddleware, async (req, res) => {
+router.post('/voucher/delivery-note', authMiddleware, requireTallyWriteAccess('/voucher/delivery-note'), async (req, res) => {
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
     partyLedger, totalAmount,
@@ -4718,14 +4737,14 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
   }
 });
 
-router.post('/voucher/cancel', authMiddleware, async (req, res) => {
+router.post('/voucher/cancel', authMiddleware, requireTallyWriteAccess('/voucher/cancel'), async (req, res) => {
   const { companyGuid, companyName, voucherGuid, voucherType, voucherNumber, date } = req.body;
   if (!companyGuid || !voucherGuid) return res.status(400).json({ status: false, message: 'voucherGuid required' });
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${voucherType}" ACTION="Cancel"><DATE>${tallyDate(date)}</DATE><VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><GUID>${voucherGuid}</GUID></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
-router.post('/master/stock-item', authMiddleware, async (req, res) => {
+router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/master/stock-item'), async (req, res) => {
   const {
     companyGuid, companyName,
     name, groupName,
@@ -5062,7 +5081,7 @@ router.post('/master/stock-item', authMiddleware, async (req, res) => {
 
 // POST /tally/master/stock-item-alter — Stock Item Master Alteration (NOT a voucher)
 // Used for editing: name, HSN, unit, reorder level, GST rate, etc.
-router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
+router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess('/master/stock-item-alter'), async (req, res) => {
   const { companyGuid, companyName, existingName, changes = {} } = req.body;
   if (!companyGuid || !existingName) return res.status(400).json({ status: false, message: 'existingName required' });
 
@@ -5121,7 +5140,7 @@ router.post('/master/stock-item-alter', authMiddleware, async (req, res) => {
 
 // POST /tally/voucher/stock-transfer
 // Stock Journal — multi-item; per-item fromGodown (Option A) + shared toGodown.
-router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
+router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('/voucher/stock-transfer'), async (req, res) => {
   const {
     companyGuid, companyName, date, narration, note,
     fromGodown, toGodown,
@@ -5281,7 +5300,7 @@ router.post('/voucher/stock-transfer', authMiddleware, async (req, res) => {
 // Reasons: Damage, Shortage, Expired, Lost → outward (reduces stock)
 //          Excess → inward (increases stock)
 //          Correction + direction(Add/Reduce) → inward or outward
-router.post('/voucher/stock-adjustment', authMiddleware, async (req, res) => {
+router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess('/voucher/stock-adjustment'), async (req, res) => {
   const {
     companyGuid, companyName,
     stockGuid, stockName,
@@ -5722,7 +5741,7 @@ router.get('/write-queue/history', authMiddleware, async (req, res) => {
 //   companyName   → $BankAccHolderName (A/c Holder’s Name)
 //
 // Wrong old tag <BANKACNO> alone does NOT fill A/c No. Branch was never even in the XML.
-router.post('/master/bank', authMiddleware, async (req, res) => {
+router.post('/master/bank', authMiddleware, requireTallyWriteAccess('/master/bank'), async (req, res) => {
   const {
     companyGuid, companyName,
     bankName, accountNumber, ifsc, accountType, openingBalance, branch,
@@ -6022,16 +6041,23 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
 // ────────────────────────────────────────────────────────────────────────────
 const LOCK_TTL_SECONDS = 300; // 5 minutes — if desktop crashes, entry re-opens after this
 
-// Helper: resolve userId from device-id header (desktop auth)
+// Helper: resolve desktop from device-id — prefer workspace binding over personal user_id
 async function resolveDesktopUser(req, res) {
   const deviceId = req.headers['device-id'] || req.headers['x-device-id'] || req.body?.deviceId;
   if (!deviceId) { res.status(401).json({ status: false, message: 'device-id header required' }); return null; }
-  const { rows } = await query(`SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1`, [deviceId]);
+  const { rows } = await query(
+    `SELECT user_id, workspace_id, device_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1`,
+    [deviceId]
+  );
   if (!rows[0]) { res.status(403).json({ status: false, message: 'Device not paired' }); return null; }
-  return { userId: rows[0].user_id, deviceId };
+  return {
+    userId: rows[0].user_id,
+    deviceId: rows[0].device_id || deviceId,
+    workspaceId: rows[0].workspace_id || null,
+  };
 }
 
-// POST /tally/desktop/writeback/pending — desktop pulls its pending offline entries
+// POST /tally/desktop/writeback/pending — desktop pulls pending offline entries for its Workspace
 router.post('/desktop/writeback/pending', async (req, res) => {
   try {
     const desktop = await resolveDesktopUser(req, res);
@@ -6041,15 +6067,20 @@ router.post('/desktop/writeback/pending', async (req, res) => {
     const maxLimit = Math.min(parseInt(limit) || 10, 25);
     const now = Math.floor(Date.now() / 1000);
 
+    // Prefer workspace_id match; fall back to owner user_id for legacy rows
     const { rows } = await query(
       `SELECT id, company_guid, entry_type, entry_label, payload, attempt_count
        FROM write_queue
-       WHERE user_id=$1 AND company_guid=$2
+       WHERE company_guid=$1
          AND status IN ('desktop_offline','failed')
          AND attempt_count < 5
-         AND (lock_expires_at IS NULL OR lock_expires_at < $3)
-       ORDER BY created_at ASC LIMIT $4`,
-      [desktop.userId, companyGuid, now, maxLimit]
+         AND (lock_expires_at IS NULL OR lock_expires_at < $2)
+         AND (
+           ($3::text IS NOT NULL AND workspace_id = $3)
+           OR user_id = $4
+         )
+       ORDER BY created_at ASC LIMIT $5`,
+      [companyGuid, now, desktop.workspaceId, desktop.userId, maxLimit]
     );
 
     res.json({
@@ -6082,11 +6113,15 @@ router.post('/desktop/writeback/:outboxId/claim', async (req, res) => {
       `UPDATE write_queue
        SET locked_by_device_id=$1, locked_at=$2, lock_expires_at=$3, status='processing',
            updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-       WHERE id=$4 AND user_id=$5
+       WHERE id=$4
+         AND (
+           user_id=$5
+           OR ($6::text IS NOT NULL AND workspace_id = $6)
+         )
          AND status IN ('desktop_offline','failed')
          AND (lock_expires_at IS NULL OR lock_expires_at < $2)
        RETURNING id, xml, payload, entry_type, company_guid`,
-      [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.userId]
+      [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.userId, desktop.workspaceId]
     );
 
     if (!rows[0]) return res.status(409).json({ status: false, message: 'Entry already claimed or not found' });
@@ -6175,7 +6210,7 @@ router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
 });
 
 // POST /tally/invoice/:tdkRef/pdf-log — mobile logs a PDF generation event
-router.post('/invoice/:tdkRef/pdf-log', authMiddleware, async (req, res) => {
+router.post('/invoice/:tdkRef/pdf-log', authMiddleware, requireTallyWriteAccess('/invoice/:tdkRef/share-pdf'), async (req, res) => {
   try {
     const { tdkRef } = req.params;
     const { companyGuid, pdfType = 'provisional', invoiceNumber, invoiceNumberLabel, watermark, fileName } = req.body;
@@ -6843,7 +6878,7 @@ router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {
 
 // ── POST /tally/invoice/:tdkRef/share-pdf ────────────────────────────────────
 // Returns invoice snapshot (provisional or final) after optionally waiting for Tally number.
-router.post('/invoice/:tdkRef/share-pdf', authMiddleware, async (req, res) => {
+router.post('/invoice/:tdkRef/share-pdf', authMiddleware, requireTallyWriteAccess('/invoice/:tdkRef/share-pdf'), async (req, res) => {
   try {
     const { tdkRef } = req.params;
     const { companyGuid, waitForTallyNumber: shouldWait = true, maxWaitMs = 10000 } = req.body;

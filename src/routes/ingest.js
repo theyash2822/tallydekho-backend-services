@@ -7,6 +7,7 @@ import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
 import { consumeApprovedHardSync } from '../services/hardSyncService.js';
 import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
 import { evaluateLineage } from '../utils/tallyLineage.js';
+import { requireDeviceCredential } from '../middleware/auth.js';
 
 let _socketService = null;
 export function setSocketService(s) { _socketService = s; }
@@ -33,14 +34,13 @@ function normalizeGstType(raw) {
 // Body: { companies, isHardSync? }
 // Hard sync: purge Tally projection for selected GUIDs, then proceed (rebuild).
 // Normal sync: unchanged (no purge).
-router.post('/desktop/init-sync', async (req, res) => {
-  const deviceId = req.headers['device-id'];
+router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
+  const deviceId = req.deviceId || req.headers['device-id'];
   const { companies, isHardSync = false } = req.body || {};
   console.log(`[SYNC] init-sync from device ${deviceId}, companies: ${companies?.length}, hard=${!!isHardSync}`);
 
   try {
-    const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
-    const device = devices[0];
+    const device = req.device || (await query('SELECT * FROM devices WHERE device_id = $1', [deviceId])).rows[0];
     const userId = device?.user_id;
 
     if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });

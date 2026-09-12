@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateLineage, pickRetentionDeletes } from '../utils/tallyLineage.js';
+import { evaluateLineage, pickRetentionDeletes, lineageMatchesBackupManifest } from '../utils/tallyLineage.js';
 import { generateDeviceSecret, hashSecret, verifySecret, hashToken } from '../services/deviceCredential.js';
+import {
+  defaultKeysForTemplate,
+  adminProtectedKeys,
+  ownerOnlyKeys,
+  getCapability,
+  BUILTIN_ROLE_DEFS,
+} from '../services/capabilityRegistry.js';
+import { membershipAuthzGate } from '../services/authorizationService.js';
 
 test('lineage: first bind allowed', () => {
   const v = evaluateLineage([], ['A', 'B']);
@@ -28,6 +36,15 @@ test('lineage: GUID replacement candidate blocked for normal sync', () => {
   assert.equal(v.reason, 'guid_replacement_candidate');
 });
 
+test('restore: backup manifest must overlap restored GUIDs', () => {
+  const miss = lineageMatchesBackupManifest([{ guid: 'A' }, { guid: 'B' }], ['X']);
+  assert.equal(miss.ok, false);
+  const hit = lineageMatchesBackupManifest([{ guid: 'A' }, { guid: 'B' }], ['B']);
+  assert.equal(hit.ok, true);
+  const skip = lineageMatchesBackupManifest([{ guid: 'A' }], []);
+  assert.equal(skip.ok, true);
+});
+
 test('retention: failed backups are not in the successful list; keep latest 3', () => {
   const extras = pickRetentionDeletes([
     { id: '1', completed_at: 10 },
@@ -44,4 +61,50 @@ test('device secret hashes and verifies', async () => {
   assert.equal(await verifySecret(secret, hash), true);
   assert.equal(await verifySecret('nope', hash), false);
   assert.notEqual(hashToken('ABC'), hashToken('ABD'));
+});
+
+test('capability registry: Admin template excludes OWNER-only keys', () => {
+  const adminKeys = new Set(defaultKeysForTemplate('ADMIN'));
+  for (const k of ownerOnlyKeys()) {
+    assert.equal(adminKeys.has(k), false, `Admin must not include ${k}`);
+  }
+  for (const k of adminProtectedKeys()) {
+    assert.equal(adminKeys.has(k), true, `Admin must include protected ${k}`);
+  }
+});
+
+test('capability registry: builtin system_keys are unique and non-display', () => {
+  const keys = BUILTIN_ROLE_DEFS.map((d) => d.system_key);
+  assert.equal(new Set(keys).size, keys.length);
+  assert.ok(keys.includes('ADMIN'));
+  assert.ok(keys.includes('ACCOUNTANT'));
+  assert.ok(keys.includes('SALES'));
+  assert.ok(keys.includes('COLLECTION'));
+  assert.ok(keys.includes('INVENTORY'));
+  assert.ok(keys.includes('VIEWER'));
+  assert.ok(keys.includes('AUDITOR'));
+  assert.ok(getCapability('tally.pair')?.protected_authority === 'OWNER_ADMIN');
+  assert.ok(getCapability('sales_invoice.create')?.supports_entry_mode === true);
+  assert.equal(getCapability('sales_invoice.edit'), null); // LOCKED: no generic edit
+  assert.equal(getCapability('sales_invoice.delete'), null); // LOCKED: no generic delete
+});
+
+test('authorize decision shape helpers: unknown capability key is falsy in registry', () => {
+  assert.equal(getCapability('not.a.real.capability'), null);
+});
+
+test('authorize: Owner membership always ALLOW', () => {
+  assert.deepEqual(
+    membershipAuthzGate({ id: 'm1', membership_type: 'OWNER', status: 'ACTIVE' }),
+    { decision: 'ALLOW' }
+  );
+  assert.deepEqual(
+    membershipAuthzGate({ id: 'm2', membership_type: 'OWNER', status: 'SUSPENDED' }),
+    { decision: 'DENY', reason: 'MEMBERSHIP_SUSPENDED' }
+  );
+  assert.equal(
+    membershipAuthzGate({ id: 'm3', membership_type: 'MEMBER', status: 'ACTIVE', role_id: 'r1' }),
+    null
+  );
+  assert.deepEqual(membershipAuthzGate(null), { decision: 'DENY', reason: 'NO_MEMBERSHIP' });
 });

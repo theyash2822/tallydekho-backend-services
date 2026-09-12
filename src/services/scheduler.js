@@ -33,7 +33,22 @@ export function startScheduler() {
     }
   });
 
-  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM daily)');
+  // ─── Workspace grace: ownership transfer / reset / close ──────────────────
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      const { processWorkspaceGraceJobs } = await import('./workspaceService.js');
+      const result = await processWorkspaceGraceJobs();
+      const n =
+        (result.transfers?.length || 0) +
+        (result.resets?.length || 0) +
+        (result.closes?.length || 0);
+      if (n > 0) console.log('[Scheduler] workspace grace jobs:', JSON.stringify(result));
+    } catch (err) {
+      console.error('[Scheduler] Workspace grace job failed:', err.message);
+    }
+  });
+
+  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM), workspace grace (15m)');
 }
 
 // ─── Payment Reminder Job ─────────────────────────────────────────────────────

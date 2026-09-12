@@ -4,6 +4,7 @@ import { audit } from './auditService.js';
 import { generateShortCode, hashSecret, verifySecret, hashToken, generateDeviceSecret } from './deviceCredential.js';
 import { listAvailableBackups, getBackup, downloadAuthFor } from './backupService.js';
 import { getWorkspaceById, isOwnerOrAdmin } from './workspaceService.js';
+import { lineageMatchesBackupManifest } from '../utils/tallyLineage.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const REQUEST_TTL = 30 * 60;
@@ -89,6 +90,33 @@ export async function approveRestore({ userId, workspaceId, code, backupId }) {
   return { sessionId: session.id, deviceId: session.new_device_id };
 }
 
+export async function rejectRestore({ userId, workspaceId, sessionId }) {
+  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  if (!allowed) {
+    const err = new Error('Not authorized');
+    err.code = 'WORKSPACE_ACCESS_DENIED';
+    err.httpStatus = 403;
+    throw err;
+  }
+  const { rows } = await query(`SELECT * FROM restore_sessions WHERE id = $1`, [sessionId]);
+  const session = rows[0];
+  if (!session) {
+    const err = new Error('Restore request not found');
+    err.code = 'NOT_FOUND';
+    err.httpStatus = 404;
+    throw err;
+  }
+  if (session.status !== 'PENDING') {
+    const err = new Error('Restore request is not pending');
+    err.code = 'RESTORE_SESSION_EXPIRED';
+    err.httpStatus = 409;
+    throw err;
+  }
+  await query(`UPDATE restore_sessions SET status = 'REJECTED' WHERE id = $1`, [sessionId]);
+  await audit(workspaceId, userId, 'restore.rejected', { sessionId });
+  return { sessionId, status: 'REJECTED' };
+}
+
 export async function restoreStatusForDevice(deviceId) {
   const session = await getRestoreRequestForDevice(deviceId);
   if (!session) return { status: 'NONE' };
@@ -138,6 +166,18 @@ export async function completeRestore({ deviceId, ok, lineageGuids = [] }) {
   if (!ok) {
     await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1`, [session.id]);
     return { activated: false };
+  }
+
+  const backup = session.backup_id && session.workspace_id
+    ? await getBackup(session.workspace_id, session.backup_id)
+    : null;
+  const match = lineageMatchesBackupManifest(backup?.company_manifest_json, lineageGuids);
+  if (!match.ok) {
+    await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1`, [session.id]);
+    const err = new Error('Restored Tally data does not match the approved backup.');
+    err.code = match.code || 'TALLY_DATA_MISMATCH';
+    err.httpStatus = 409;
+    throw err;
   }
 
   const { rows: old } = await query(

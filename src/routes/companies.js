@@ -1,17 +1,56 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { loadMembership } from '../services/authorizationService.js';
+import { getMemberScopes } from '../services/workspaceService.js';
 
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
+/** Filter company rows by membership company scope (ALL / SELECTED / NONE). */
+async function filterCompaniesByScope(userId, workspaceId, companies) {
+  if (!workspaceId || !companies?.length) return companies || [];
+  const membership = await loadMembership(userId, workspaceId);
+  if (!membership) return [];
+  if (membership.membership_type === 'OWNER') return companies;
+  const scopes = await getMemberScopes(membership.id);
+  const mode = scopes?.policy?.company_mode || 'ALL';
+  if (mode === 'NONE') return [];
+  if (mode === 'ALL') return companies;
+  const allowed = new Set(scopes.companies || []);
+  return companies.filter((c) => allowed.has(c.guid));
+}
+
 // GET /app/companies
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
-    const { rows: companies } = await query(
-      'SELECT * FROM companies WHERE user_id = $1 AND (is_active = TRUE OR is_active IS NULL) ORDER BY name',
-      [req.user.userId]
-    );
+    const workspaceId = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
+    let companies;
+    if (workspaceId) {
+      // Prefer workspace-bound companies; legacy rows fall back to workspace Owner (not the caller).
+      const { rows: wsRows } = await query(
+        `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      const ownerId = wsRows[0]?.owner_user_id || req.user.userId;
+      const { rows } = await query(
+        `SELECT c.* FROM companies c
+         WHERE (c.is_active = TRUE OR c.is_active IS NULL)
+           AND (
+             c.workspace_id = $1
+             OR (c.workspace_id IS NULL AND c.user_id = $2)
+           )
+         ORDER BY c.name`,
+        [workspaceId, ownerId]
+      );
+      companies = await filterCompaniesByScope(req.user.userId, workspaceId, rows);
+    } else {
+      const { rows } = await query(
+        'SELECT * FROM companies WHERE user_id = $1 AND (is_active = TRUE OR is_active IS NULL) ORDER BY name',
+        [req.user.userId]
+      );
+      companies = rows;
+    }
 
     // Fetch all financial years for all companies in one query
     const guids = companies.map(c => c.guid);

@@ -9,6 +9,9 @@ import { createBackupSession, completeBackup, failBackup, listAvailableBackups }
 import { createRestoreRequest, restoreStatusForDevice, completeRestore } from '../services/restoreService.js';
 import { storeLocalUpload, readLocalDownload } from '../services/objectStore.js';
 
+let _socket = null;
+export function setDesktopWorkspaceSocket(s) { _socket = s; }
+
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -32,6 +35,13 @@ export async function desktopMeHandler(req, res) {
        ORDER BY completed_at DESC LIMIT 1`,
       [d.workspace_id]
     ).catch(() => ({ rows: [] }));
+    const { rows: tallyCompanies } = await query(
+      `SELECT tally_company_guid AS guid, company_name AS name
+       FROM workspace_tally_lineage_companies
+       WHERE workspace_id = $1 AND status = 'ACTIVE'
+       ORDER BY company_name NULLS LAST`,
+      [d.workspace_id]
+    ).catch(() => ({ rows: [] }));
     res.json({
       status: true,
       data: {
@@ -47,6 +57,7 @@ export async function desktopMeHandler(req, res) {
           bindingStatus: d.binding_status,
         },
         lastCloudBackupAt: lastBackup[0]?.completed_at || null,
+        tallyCompanies,
       },
     });
   } catch (err) {
@@ -79,6 +90,13 @@ router.post('/hard-sync/request', requireDeviceCredential, async (req, res) => {
       newGuid: newGuid || null,
       companyManifest: companies || [],
     });
+    if (!result.autoApproved && result.request?.status === 'PENDING') {
+      _socket?.notifyWorkspaceRoom?.(req.workspaceId, 'hard_sync_request', {
+        requestId: result.request.id,
+        operation: result.request.operation,
+        deviceId: req.deviceId,
+      });
+    }
     res.json({
       status: true,
       data: {

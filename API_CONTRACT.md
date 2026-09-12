@@ -49,6 +49,28 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 | POST | /desktop/restore/complete | Activate new device / revoke old |
 | PUT | /desktop/backup/objects/:token | Local object-store PUT when S3 is not configured |
 
+## Workspace RBAS / billing (workspaceApi.js)
+Header `X-Workspace-Id` preferred; path `:id` binds workspace via `bindWorkspaceParam`.
+| Method | Path | Notes |
+|--------|------|-------|
+| PATCH | /api/workspaces/:id/members/:userId/role | Body `{ roleId }`. Cap: `members.role_assign`. Cannot change Owner |
+| POST | /api/workspaces/:id/invitations | Body `{ mobile, roleId, scopes? }`. Existing users only (`INVITEE_NOT_FOUND` 404). TTL 48h. Reserves seat |
+| POST | /api/workspaces/:id/transfer/initiate | Owner. Body `{ targetUserId, outgoingRoleId }`. Creates PENDING_CONFIRM + 3 tokens (24h confirm window). Free/base requires ≥1000 credits on Owner wallet. Returns `confirmTokens`/`confirmUrls` in non-prod or when SES mock |
+| POST | /api/workspaces/:id/transfer/:transferId/confirm | Body `{ token }` (or `?token=`). Increments confirms; at 3 → PENDING_GRACE (24h) |
+| POST | /api/workspaces/:id/transfer/:transferId/revoke | Owner. Cancels PENDING_* transfer |
+| POST | /api/workspaces/:id/transfer/:transferId/complete | Owner (or system). After grace: flips Owner, assigns outgoing role, deducts 1000 if base |
+| POST | /api/workspaces/:id/reset/request | Owner, base only. PENDING_CONFIRM; phrase `RESET WORKSPACE` |
+| POST | /api/workspaces/:id/reset/confirm | Owner. Body `{ phrase }`. 3 confirms → PENDING_GRACE 24h |
+| POST | /api/workspaces/:id/reset/execute | Owner after grace. Unpair devices, detach companies → Demo, remove non-owners, UNPAIRED |
+| POST | /api/workspaces/:id/close/request | Owner, non-base. PENDING_GRACE 24h |
+| POST | /api/workspaces/:id/close/execute | Owner after grace. Purge memberships, lifecycle CLOSED |
+| GET | /api/billing/usage | Filters: `workspaceId`, `kind`, `limit`. Merges `usage_events` + `wallet_transactions` |
+| GET | /api/billing/transactions | Owner wallet_transactions |
+| GET/POST | /api/billing/payment-orders | Create PENDING MANUAL order `{ credits, amountInr }`. List Owner orders |
+| POST | /api/billing/payment-orders/:id/complete | Owner manual/dev settle (no Razorpay). Credits wallet + invoice. Prod Razorpay: see `createRechargeOrder` / `fulfillRechargePayment` |
+| GET | /api/billing/invoices | Owner billing_invoices |
+| GET/PUT | /api/workspaces/:id/companies/:companyGuid/payment-mode-map | Uses `payment_mode_posting_map`. PUT body `{ mappings: [{ paymentMode, ledgerGuid, ledgerName }] }` |
+
 ## Company
 | Method | Path | Notes |
 |--------|------|-------|

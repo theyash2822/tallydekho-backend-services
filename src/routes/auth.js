@@ -6,6 +6,16 @@ import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendEmailVerificationOTP } from '../services/notifications.js';
+import { ensurePersonalWorkspace } from '../services/workspaceService.js';
+
+/** Bootstrap Personal Workspace + billing/roles; never fail the auth response. */
+async function bootstrapWorkspaceSafe(userId) {
+  try {
+    await ensurePersonalWorkspace(userId);
+  } catch (err) {
+    console.warn('[AUTH] workspace bootstrap failed for', userId, err.message);
+  }
+}
 
 // Pre-auth token — issued after OTP, before 2FA PIN verified
 // Has limited scope: only usable for /app/verify-pin and /app/reset-pin
@@ -116,6 +126,8 @@ router.post('/verify-otp', async (req, res) => {
 
     await query(`UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3`,
       [token, now(), user.id]);
+
+    await bootstrapWorkspaceSafe(user.id);
 
     // Check if device is paired
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
@@ -233,6 +245,8 @@ router.post('/onboarding', authMiddleware, async (req, res) => {
   try {
     await query('UPDATE users SET name = $1, email = $2, language = $3, updated_at = $4 WHERE id = $5',
       [name?.trim() || '', email?.trim() || '', language || 'English', now(), req.user.userId]);
+    // Refresh "{Name}'s Workspace" after profile name is set (LOCKED signup bootstrap).
+    await bootstrapWorkspaceSafe(req.user.userId);
     res.json({ status: true, message: 'Profile saved successfully' });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed to save profile' });
@@ -352,6 +366,8 @@ router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
 
     const token = generateToken({ userId: user.id, mobile: user.mobile });
     await query('UPDATE users SET token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
+
+    await bootstrapWorkspaceSafe(user.id);
 
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
     const isPaired = devices.length > 0;

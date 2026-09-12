@@ -23,9 +23,27 @@ Companies synced from Tally
 ## Workspace / Backup (2026-09-12)
 ### workspaces
 - id, name, owner_user_id, workspace_type, lifecycle_status, commercial_status, tally_connection, setup_generation, is_base
+- reset_requested_at / close_requested_at (lifecycle timestamps; expand-only)
 
 ### workspace_memberships
 - workspace_id + user_id unique; OWNER membership on personal workspace bootstrap
+
+### workspace_ownership_transfers
+- from/target users, outgoing_role_id
+- status: PENDING_EMAIL | PENDING_CONFIRM | PENDING_GRACE | COMPLETED | CANCELLED | EXPIRED
+- confirm_count, confirm_tokens_json (hashed tokens), email_count, expires_at (confirm window), grace_ends_at, completed_at, cancelled_at
+
+### workspace_lifecycle_requests
+- kind RESET | CLOSE; status PENDING_CONFIRM | PENDING_GRACE | COMPLETED | EXPIRED | CANCELLED
+- confirm_count, confirm_phrase, grace_ends_at, expires_at
+
+### billing_payment_orders / billing_invoices / usage_events
+- Payment orders: PENDING → COMPLETED (MANUAL complete or Razorpay fulfill)
+- Invoices linked to order_id
+- usage_events: owner/workspace/kind drilldown (also mirrored from wallet_transactions)
+
+### payment_mode_posting_map
+- workspace_id + company_guid + payment_mode → ledger_guid/name
 
 ### workspace_tally_bindings / workspace_tally_lineage_companies
 - One active desktop per workspace; lineage GUIDs for TALLY_DATA_MISMATCH

@@ -4,30 +4,86 @@ import { query } from '../db/schema.js';
 import { authMiddleware, requirePaired, requireCompanySynced } from '../middleware/auth.js';
 import { resolveFYDates } from './api-v1.js';
 import { buildStockDashboardInsights } from '../utils/stockDashboardInsights.js';
+import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.js';
 
 const router = Router();
 
-// ── Ownership guard — verifies companyGuid belongs to the authenticated user ────
+// After verifyCompanyAccess sets req.authz.masking, mask JSON responses
+router.use((req, res, next) => {
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    if (req.authz?.masking) {
+      try {
+        return origJson(maskIfNeeded(req, body));
+      } catch {
+        return origJson(body);
+      }
+    }
+    return origJson(body);
+  };
+  next();
+});
+
+// Fail-closed workspace + company scope (Universal §45)
 async function verifyCompanyOwnership(req, res, companyGuid) {
-  if (!companyGuid) return true;
+  const fy = req.body?.fy || req.body?.financialYear || null;
+  const ok = await verifyCompanyAccess(req, res, companyGuid, {
+    financialYear: fy,
+    responseShape: 'data',
+  });
+  return ok;
+}
+
+/** List company cost centres (masters table, with optional allocation fallback). */
+async function listCostCentresForCompany(companyGuid) {
   try {
     const { rows } = await query(
-      'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      `SELECT guid, name, parent_name FROM cost_centres
+       WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
+       ORDER BY name`,
+      [companyGuid]
     );
-    if (rows.length === 0) {
-      res.status(403).json({ status: false, message: 'Access denied: company not owned by this user' });
-      return false;
-    }
-    return true;
-  } catch (err) {
-    res.status(500).json({ status: false, message: 'Ownership check failed' });
-    return false;
+    if (rows.length) return rows;
+  } catch {
+    /* table may be missing on older DBs */
   }
+
+  const fallbackSqls = [
+    `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
+     FROM voucher_cost_centre_allocations
+     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
+     ORDER BY 2`,
+    `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
+     FROM voucher_cost_allocations
+     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
+     ORDER BY 2`,
+  ];
+  for (const sql of fallbackSqls) {
+    try {
+      const { rows } = await query(sql, [companyGuid]);
+      if (rows.length) return rows;
+    } catch {
+      /* allocation table does not exist */
+    }
+  }
+  return [];
 }
 
 // GET /ping — lightweight health check for desktop connectivity detection
 router.get('/ping', (_req, res) => res.json({ ok: true }));
+
+// POST /cost-centres — company cost centre list (for member scope UI)
+router.post('/cost-centres', authMiddleware, async (req, res) => {
+  const { companyGuid } = req.body || {};
+  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    const rows = await listCostCentresForCompany(companyGuid);
+    res.json({ status: true, data: { costCentres: rows } });
+  } catch (e) {
+    res.status(500).json({ status: false, message: e.message });
+  }
+});
 
 // ─── Ledgers ──────────────────────────────────────────────────────────────────
 // POST /parties — unique party names from vouchers (customers/vendors)

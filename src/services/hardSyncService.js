@@ -111,7 +111,12 @@ export async function listPendingHardSync(workspaceId) {
 
 export async function getHardSyncRequest(id) {
   const { rows } = await query('SELECT * FROM hard_sync_requests WHERE id = $1', [id]);
-  return rows[0] || null;
+  const row = rows[0];
+  if (row?.status === 'PENDING' && row.expires_at && Number(row.expires_at) < now()) {
+    await query(`UPDATE hard_sync_requests SET status = 'EXPIRED', decided_at = $2 WHERE id = $1 AND status = 'PENDING'`, [id, now()]);
+    return { ...row, status: 'EXPIRED' };
+  }
+  return row || null;
 }
 
 export async function consumeApprovedHardSync(workspaceId, deviceId, companies, guidReplacement) {

@@ -1,5 +1,5 @@
 /**
- * Workspace / device-credential / backup-restore tables.
+ * Workspace / device-credential / backup-restore / RBAS tables.
  * Expand-only: never drops legacy user_id ownership columns.
  */
 export async function applyWorkspaceSchema(client) {
@@ -33,6 +33,160 @@ export async function applyWorkspaceSchema(client) {
       UNIQUE (workspace_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_ws_memberships_user ON workspace_memberships(user_id);
+
+    CREATE TABLE IF NOT EXISTS workspace_roles (
+      id              TEXT PRIMARY KEY,
+      workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+      system_key      TEXT,
+      display_name    TEXT NOT NULL,
+      entry_mode      TEXT NOT NULL DEFAULT 'BOTH',
+      is_builtin      BOOLEAN NOT NULL DEFAULT FALSE,
+      is_editable     BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      updated_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_roles_ws ON workspace_roles(workspace_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ws_roles_system
+      ON workspace_roles(workspace_id, system_key) WHERE system_key IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS role_capabilities (
+      role_id         TEXT NOT NULL REFERENCES workspace_roles(id) ON DELETE CASCADE,
+      capability_key  TEXT NOT NULL,
+      granted         BOOLEAN NOT NULL DEFAULT FALSE,
+      PRIMARY KEY (role_id, capability_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS role_sensitive_policies (
+      role_id         TEXT NOT NULL REFERENCES workspace_roles(id) ON DELETE CASCADE,
+      policy_key      TEXT NOT NULL,
+      granted         BOOLEAN NOT NULL DEFAULT TRUE,
+      PRIMARY KEY (role_id, policy_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS membership_scope_policy (
+      membership_id   TEXT PRIMARY KEY REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      company_mode    TEXT NOT NULL DEFAULT 'ALL',
+      fy_mode         TEXT NOT NULL DEFAULT 'ALL',
+      ledger_mode     TEXT NOT NULL DEFAULT 'ALL',
+      godown_mode     TEXT NOT NULL DEFAULT 'ALL',
+      cost_centre_mode TEXT NOT NULL DEFAULT 'ALL'
+    );
+
+    CREATE TABLE IF NOT EXISTS member_company_access (
+      membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      company_guid    TEXT NOT NULL,
+      PRIMARY KEY (membership_id, company_guid)
+    );
+    CREATE TABLE IF NOT EXISTS member_fy_access (
+      membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      fy_key          TEXT NOT NULL,
+      PRIMARY KEY (membership_id, fy_key)
+    );
+    CREATE TABLE IF NOT EXISTS member_ledger_access (
+      membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      ledger_guid     TEXT NOT NULL,
+      ledger_name     TEXT,
+      PRIMARY KEY (membership_id, ledger_guid)
+    );
+    CREATE TABLE IF NOT EXISTS member_godown_access (
+      membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      godown_guid     TEXT NOT NULL,
+      godown_name     TEXT,
+      PRIMARY KEY (membership_id, godown_guid)
+    );
+    CREATE TABLE IF NOT EXISTS member_cost_centre_access (
+      membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
+      cost_centre_guid TEXT NOT NULL,
+      cost_centre_name TEXT,
+      PRIMARY KEY (membership_id, cost_centre_guid)
+    );
+
+    CREATE TABLE IF NOT EXISTS workspace_seats (
+      id                TEXT PRIMARY KEY,
+      workspace_id      TEXT NOT NULL REFERENCES workspaces(id),
+      seat_kind         TEXT NOT NULL DEFAULT 'PAID',
+      status            TEXT NOT NULL DEFAULT 'AVAILABLE',
+      period_start      BIGINT,
+      period_end        BIGINT,
+      assigned_user_id  INTEGER REFERENCES users(id),
+      created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_seats_ws ON workspace_seats(workspace_id, status);
+
+    CREATE TABLE IF NOT EXISTS workspace_invitations (
+      id                  TEXT PRIMARY KEY,
+      workspace_id        TEXT NOT NULL REFERENCES workspaces(id),
+      invitee_user_id     INTEGER NOT NULL REFERENCES users(id),
+      role_id             TEXT REFERENCES workspace_roles(id),
+      reserved_seat_id    TEXT REFERENCES workspace_seats(id),
+      status              TEXT NOT NULL DEFAULT 'PENDING',
+      expires_at          BIGINT NOT NULL,
+      invited_by_user_id  INTEGER REFERENCES users(id),
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      accepted_at         BIGINT,
+      declined_at         BIGINT,
+      revoked_at          BIGINT,
+      scope_snapshot_json JSONB
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_invites_invitee ON workspace_invitations(invitee_user_id, status);
+
+    CREATE TABLE IF NOT EXISTS billing_accounts (
+      id              TEXT PRIMARY KEY,
+      owner_user_id   INTEGER NOT NULL UNIQUE REFERENCES users(id),
+      created_at      BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE TABLE IF NOT EXISTS wallets (
+      id                  TEXT PRIMARY KEY,
+      billing_account_id  TEXT NOT NULL UNIQUE REFERENCES billing_accounts(id),
+      balance_credits     NUMERIC(14,2) NOT NULL DEFAULT 0,
+      updated_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE TABLE IF NOT EXISTS credit_lots (
+      id                  TEXT PRIMARY KEY,
+      wallet_id           TEXT NOT NULL REFERENCES wallets(id),
+      credits_remaining   NUMERIC(14,2) NOT NULL,
+      credits_original    NUMERIC(14,2) NOT NULL,
+      source              TEXT NOT NULL DEFAULT 'SIGNUP',
+      expires_at          BIGINT,
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id                  TEXT PRIMARY KEY,
+      wallet_id           TEXT NOT NULL REFERENCES wallets(id),
+      workspace_id        TEXT,
+      amount              NUMERIC(14,2) NOT NULL,
+      kind                TEXT NOT NULL,
+      reference           TEXT,
+      meta_json           JSONB,
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE TABLE IF NOT EXISTS service_rates (
+      key           TEXT PRIMARY KEY,
+      credits       NUMERIC(14,2) NOT NULL,
+      version       INTEGER NOT NULL DEFAULT 1,
+      updated_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_mode_posting_map (
+      id              TEXT PRIMARY KEY,
+      workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+      company_guid    TEXT NOT NULL,
+      payment_mode    TEXT NOT NULL,
+      ledger_guid     TEXT,
+      ledger_name     TEXT,
+      UNIQUE (workspace_id, company_guid, payment_mode)
+    );
+
+    CREATE TABLE IF NOT EXISTS cost_centres (
+      guid            TEXT NOT NULL,
+      company_guid    TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      parent_guid     TEXT,
+      parent_name     TEXT,
+      is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+      workspace_id    TEXT,
+      PRIMARY KEY (company_guid, guid)
+    );
 
     CREATE TABLE IF NOT EXISTS workspace_tally_bindings (
       id                  TEXT PRIMARY KEY,
@@ -125,5 +279,160 @@ export async function applyWorkspaceSchema(client) {
 
     ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS workspace_id TEXT;
     ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS actor_user_id INTEGER;
+
+    CREATE TABLE IF NOT EXISTS workspace_integrations (
+      id            TEXT PRIMARY KEY,
+      workspace_id  TEXT NOT NULL REFERENCES workspaces(id),
+      domain        TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'NOT_CONFIGURED',
+      config_json   JSONB,
+      activated_at  BIGINT,
+      updated_at    BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      UNIQUE (workspace_id, domain)
+    );
+
+    -- Ownership transfer (3 email confirms → 24h grace → execute)
+    CREATE TABLE IF NOT EXISTS workspace_ownership_transfers (
+      id                  TEXT PRIMARY KEY,
+      workspace_id        TEXT NOT NULL REFERENCES workspaces(id),
+      from_user_id        INTEGER NOT NULL REFERENCES users(id),
+      target_user_id      INTEGER NOT NULL REFERENCES users(id),
+      outgoing_role_id    TEXT,
+      status              TEXT NOT NULL DEFAULT 'PENDING_CONFIRM',
+      confirm_count       INTEGER NOT NULL DEFAULT 0,
+      confirm_tokens_json JSONB,
+      email_count         INTEGER NOT NULL DEFAULT 0,
+      expires_at          BIGINT,
+      grace_ends_at       BIGINT,
+      completed_at        BIGINT,
+      cancelled_at        BIGINT,
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      updated_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_ownership_transfers_ws
+      ON workspace_ownership_transfers(workspace_id, status);
+
+    CREATE TABLE IF NOT EXISTS workspace_lifecycle_requests (
+      id                TEXT PRIMARY KEY,
+      workspace_id      TEXT NOT NULL REFERENCES workspaces(id),
+      kind              TEXT NOT NULL,
+      actor_user_id     INTEGER REFERENCES users(id),
+      status            TEXT NOT NULL DEFAULT 'PENDING_CONFIRM',
+      confirm_count     INTEGER NOT NULL DEFAULT 0,
+      confirm_phrase    TEXT,
+      grace_ends_at     BIGINT,
+      expires_at        BIGINT,
+      meta_json         JSONB,
+      created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      updated_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      completed_at      BIGINT,
+      cancelled_at      BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_lifecycle_ws
+      ON workspace_lifecycle_requests(workspace_id, kind, status);
+
+    CREATE TABLE IF NOT EXISTS billing_payment_orders (
+      id                TEXT PRIMARY KEY,
+      billing_account_id TEXT NOT NULL REFERENCES billing_accounts(id),
+      owner_user_id     INTEGER NOT NULL REFERENCES users(id),
+      credits           NUMERIC(14,2) NOT NULL,
+      amount_inr        NUMERIC(14,2) NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'PENDING',
+      provider          TEXT DEFAULT 'MANUAL',
+      provider_order_id TEXT,
+      meta_json         JSONB,
+      created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      completed_at      BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_billing_orders_owner
+      ON billing_payment_orders(owner_user_id, status, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS billing_invoices (
+      id                TEXT PRIMARY KEY,
+      billing_account_id TEXT NOT NULL REFERENCES billing_accounts(id),
+      owner_user_id     INTEGER NOT NULL REFERENCES users(id),
+      order_id          TEXT REFERENCES billing_payment_orders(id),
+      credits           NUMERIC(14,2) NOT NULL,
+      amount_inr        NUMERIC(14,2) NOT NULL,
+      currency          TEXT NOT NULL DEFAULT 'INR',
+      status            TEXT NOT NULL DEFAULT 'PAID',
+      invoice_number    TEXT,
+      meta_json         JSONB,
+      created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_billing_invoices_owner
+      ON billing_invoices(owner_user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id                TEXT PRIMARY KEY,
+      owner_user_id     INTEGER NOT NULL REFERENCES users(id),
+      workspace_id      TEXT,
+      kind              TEXT NOT NULL,
+      amount            NUMERIC(14,2) NOT NULL DEFAULT 0,
+      reference         TEXT,
+      wallet_txn_id     TEXT,
+      meta_json         JSONB,
+      created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_events_owner
+      ON usage_events(owner_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_ws
+      ON usage_events(workspace_id, kind, created_at DESC);
   `);
+
+  await client.query(`
+    INSERT INTO service_rates (key, credits, version) VALUES
+      ('ADDITIONAL_WORKSPACE', 1000, 1),
+      ('SEAT_MONTHLY', 100, 1),
+      ('TALLY_WRITE', 0.10, 1),
+      ('PDF_GENERATE', 0.10, 1),
+      ('GST_ACTIVATION', 100, 1),
+      ('EINVOICE_ACTIVATION', 100, 1),
+      ('EWAY_ACTIVATION', 100, 1)
+    ON CONFLICT (key) DO NOTHING
+  `);
+
+  // Expand-only column parity for older workspace drafts (CREATE IF NOT EXISTS does not alter).
+  await client.query(`
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS system_key TEXT;
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS display_name TEXT;
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS entry_mode TEXT DEFAULT 'BOTH';
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN DEFAULT FALSE;
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS is_editable BOOLEAN DEFAULT TRUE;
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS created_at BIGINT;
+    ALTER TABLE workspace_roles ADD COLUMN IF NOT EXISTS updated_at BIGINT;
+    ALTER TABLE role_capabilities ADD COLUMN IF NOT EXISTS granted BOOLEAN DEFAULT FALSE;
+    ALTER TABLE role_sensitive_policies ADD COLUMN IF NOT EXISTS granted BOOLEAN DEFAULT TRUE;
+    ALTER TABLE member_fy_access ADD COLUMN IF NOT EXISTS fy_key TEXT;
+    ALTER TABLE workspace_invitations ADD COLUMN IF NOT EXISTS scope_snapshot_json JSONB;
+    ALTER TABLE workspace_invitations ADD COLUMN IF NOT EXISTS invitee_mobile TEXT;
+    ALTER TABLE workspace_invitations ADD COLUMN IF NOT EXISTS declined_at BIGINT;
+    ALTER TABLE workspace_invitations ADD COLUMN IF NOT EXISTS revoked_at BIGINT;
+    ALTER TABLE workspace_seats ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER;
+    ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS reset_requested_at BIGINT;
+    ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS close_requested_at BIGINT;
+
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS confirm_count INTEGER DEFAULT 0;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS confirm_tokens_json JSONB;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS email_count INTEGER DEFAULT 0;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS grace_ends_at BIGINT;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS completed_at BIGINT;
+    ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS cancelled_at BIGINT;
+  `);
+
+  // Backfill display_name from legacy `name` if that column exists on older drafts.
+  try {
+    await client.query(`
+      UPDATE workspace_roles
+      SET display_name = COALESCE(NULLIF(display_name, ''), name, system_key, 'Role')
+      WHERE display_name IS NULL OR display_name = ''
+    `);
+  } catch {
+    await client.query(`
+      UPDATE workspace_roles
+      SET display_name = COALESCE(NULLIF(display_name, ''), system_key, 'Role')
+      WHERE display_name IS NULL OR display_name = ''
+    `).catch(() => {});
+  }
 }

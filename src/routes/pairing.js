@@ -266,7 +266,9 @@ router.post('/register', async (req, res) => {
     const isPaired = device?.paired === true;
 
     let issuedSecret = null;
-    if (isPaired && !device.credential_claimed_at) {
+    // Issue a secret only once. Re-register must not rotate the hash or the
+    // Desktop copy from pairing_confirmed becomes invalid (spec §7/§8).
+    if (isPaired && !device.device_secret_hash) {
       const secret = generateDeviceSecret();
       const secretHash = await hashSecret(secret);
       await query(

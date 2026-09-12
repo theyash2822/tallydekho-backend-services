@@ -539,6 +539,8 @@ export async function initSchema() {
       ALTER TABLE vouchers              ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE voucher_ledger_entries ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE stock_transactions    ADD COLUMN IF NOT EXISTS financial_year TEXT;
+      ALTER TABLE stock_transactions    ADD COLUMN IF NOT EXISTS warehouse_guid TEXT;
+      ALTER TABLE batch_allocations     ADD COLUMN IF NOT EXISTS godown_guid TEXT;
       ALTER TABLE voucher_inventory_items ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE gst_voucher_details   ADD COLUMN IF NOT EXISTS financial_year TEXT;
 

@@ -90,8 +90,54 @@ export async function sendPaymentReminderEmail({
   return sendEmail({ to: toEmail, subject, html });
 }
 
+// ─── Ownership transfer confirmation ─────────────────────────────────────────
+export async function sendOwnershipConfirmEmail({ toEmail, workspaceName, confirmUrl, step, total = 3 }) {
+  const subject = `Confirm ownership transfer (${step}/${total}) — ${workspaceName || 'Workspace'}`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 520px; margin: auto; padding: 32px; border: 1px solid #E5E7EB; border-radius: 12px;">
+      <h2 style="color: #1A1A1A;">Ownership transfer confirmation</h2>
+      <p style="color: #555; font-size: 15px;">
+        Confirm step <strong>${step}</strong> of <strong>${total}</strong> for transferring ownership of
+        <strong>${workspaceName || 'your workspace'}</strong>.
+      </p>
+      <p style="margin: 24px 0;">
+        <a href="${confirmUrl}" style="display:inline-block;background:#1A1A1A;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;">
+          Confirm transfer (${step}/${total})
+        </a>
+      </p>
+      <p style="color: #777; font-size: 13px;">If you did not start this transfer, ignore this email or revoke it in Settings.</p>
+      <hr style="border: none; border-top: 1px solid #E5E7EB; margin: 24px 0;">
+      <p style="color: #AEACA8; font-size: 12px;">TallyDekho · Made in India</p>
+    </div>
+  `;
+  return sendEmail({ to: toEmail, subject, html });
+}
+
+export async function sendLifecycleConfirmEmail({
+  toEmail, workspaceName, confirmUrl, step, total = 3, kind = 'RESET',
+}) {
+  const label = kind === 'CLOSE' ? 'close' : 'reset';
+  const subject = `Confirm workspace ${label} (${step}/${total}) — ${workspaceName || 'Workspace'}`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 520px; margin: auto; padding: 32px; border: 1px solid #E5E7EB; border-radius: 12px;">
+      <h2 style="color: #1A1A1A;">Confirm workspace ${label}</h2>
+      <p style="color: #555; font-size: 15px;">
+        Confirm step <strong>${step}</strong> of <strong>${total}</strong> to ${label}
+        <strong>${workspaceName || 'your workspace'}</strong>.
+      </p>
+      <p style="margin: 24px 0;">
+        <a href="${confirmUrl}" style="display:inline-block;background:#B91C1C;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;">
+          Confirm ${label} (${step}/${total})
+        </a>
+      </p>
+      <p style="color: #777; font-size: 13px;">If you did not request this, ignore this email.</p>
+    </div>
+  `;
+  return sendEmail({ to: toEmail, subject, html });
+}
+
 // ─── Core send function ───────────────────────────────────────────────────────
-async function sendEmail({ to, subject, html, text }) {
+export async function sendEmail({ to, subject, html, text }) {
   const transport = getTransport();
 
   if (!transport) {
@@ -116,4 +162,4 @@ async function sendEmail({ to, subject, html, text }) {
   }
 }
 
-export default { sendOTPEmail, sendPaymentReminderEmail };
+export default { sendOTPEmail, sendPaymentReminderEmail, sendOwnershipConfirmEmail, sendEmail };

@@ -11,6 +11,7 @@ import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { pairDeviceToWorkspace, BindingError, unpairDevice } from '../services/deviceBinding.js';
 import workspaceApi from './workspaceApi.js';
+import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
@@ -36,6 +37,7 @@ import {
   invoiceNotification,
   parseReadNotificationIds,
 } from '../utils/notificationAlerts.js';
+import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -55,6 +57,23 @@ const preAuthMiddleware = (req, res, next) => {
 };
 
 const router = Router();
+
+// After verifyCompanyAccess sets req.authz.masking, mask JSON responses
+router.use((req, res, next) => {
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    if (req.authz?.masking) {
+      try {
+        return origJson(maskIfNeeded(req, body));
+      } catch {
+        return origJson(body);
+      }
+    }
+    return origJson(body);
+  };
+  next();
+});
+
 router.use(workspaceApi);
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
@@ -141,21 +160,64 @@ function computeDisplayName(item, field) {
   }
 }
 
-// Ownership check helper — verifies companyGuid belongs to req.user.userId
-// Returns true if owned (or no companyGuid provided), false + sends 403 if not owned
-async function verifyCompanyOwnership(req, res, companyGuid) {
-  if (!companyGuid) return true; // no GUID to check — let route handle it
-  try {
-    const { rows } = await query(
-      'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
-    );
-    if (rows.length === 0) {
-      res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Company not found or access denied' } });
-      return false;
-    }
-    return true;
-  } catch { return true; } // on DB error, allow through (don't block on check failure)
+// Fail-closed company access (workspace + membership + company/FY scope + view capability).
+function resolveViewCapability(req) {
+  const u = String(req.originalUrl || `${req.baseUrl || ''}${req.path || ''}`)
+    .toLowerCase()
+    .split('?')[0];
+  if (u.includes('/dashboard') || u.includes('/kpi/')) return 'dashboard.view';
+  if (u.includes('/sales')) return 'sales.view';
+  if (u.includes('/purchase')) return 'purchase.view';
+  if (u.includes('/expenses')) return 'expenses.view';
+  if (u.includes('/daybook')) return 'daybook.view';
+  if (u.includes('/my-entries') || u.includes('/my_entries')) return 'my_entries.view';
+  if (u.includes('/audit')) return 'audit_trail.view';
+  if (u.includes('/ai-insights') || u.includes('/ai_insights') || u.includes('/insights')) return 'ai_insights.view';
+  if (u.includes('/ledgers') || u.includes('/parties') || u.includes('/party')) return 'ledgers.view';
+  if (u.includes('/stocks') || u.includes('/inventory')) {
+    if (u.includes('negative')) return 'inventory.negative_stock.view';
+    if (u.includes('aged')) return 'inventory.aged_items.view';
+    if (u.includes('expiry')) return 'inventory.expiry.view';
+    if (u.includes('warehouse') || u.includes('godown')) return 'inventory.warehouses.view';
+    if (u.includes('barcode')) return 'inventory.barcodes.view';
+    if (u.includes('reorder')) return 'inventory.reorder.view';
+    if (u.includes('ledger')) return 'inventory.stock_ledger.view';
+    return 'inventory.view';
+  }
+  if (
+    u.includes('/financial') || u.includes('/receivable') || u.includes('/payable')
+    || u.includes('/cash-in-hand') || u.includes('/bank-balance') || u.includes('/loans')
+    || u.includes('/profit') || u.includes('/balance-sheet') || u.includes('/trial-balance')
+  ) {
+    if (u.includes('receivable')) return 'financials.receivables.view';
+    if (u.includes('payable')) return 'financials.payables.view';
+    if (u.includes('bank')) return 'financials.bank_balance.view';
+    if (u.includes('loan')) return 'financials.loans_od.view';
+    if (u.includes('profit')) return 'financials.profit_loss.view';
+    if (u.includes('balance-sheet')) return 'financials.balance_sheet.view';
+    if (u.includes('trial')) return 'financials.trial_balance.view';
+    if (u.includes('cash')) return 'financials.cash_register.view';
+    return 'financials.view';
+  }
+  if (u.includes('/eway') || u.includes('/einvoice') || u.includes('/e-invoice') || u.includes('/gst')) {
+    if (u.includes('eway') || u.includes('e-way')) return 'eway.view';
+    if (u.includes('einvoice') || u.includes('e-invoice')) return 'einvoice.view';
+    return 'gst.view';
+  }
+  if (u.includes('/voucher')) return 'vouchers.view';
+  return null;
+}
+
+async function verifyCompanyOwnership(req, res, companyGuid, capabilityOverride = undefined) {
+  const fy = req.body?.fy || req.body?.financialYear || req.query?.fy || null;
+  const capability = capabilityOverride !== undefined
+    ? capabilityOverride
+    : resolveViewCapability(req);
+  return verifyCompanyAccess(req, res, companyGuid, {
+    capability,
+    financialYear: fy,
+    responseShape: 'api-v1',
+  });
 }
 
 // FY date resolver — returns from/to/financialYear for a company
@@ -358,6 +420,12 @@ router.post('/auth/verify-otp', async (req, res) => {
     const isNewUser = !user.name;
     console.log(`[API AUTH] Login: ${cleanMobile} | User: ${user.id} | Paired: ${isPaired} | New: ${isNewUser}`);
 
+    try {
+      await ensurePersonalWorkspace(user.id);
+    } catch (wsErr) {
+      console.warn('[API AUTH] workspace bootstrap skipped:', wsErr.message);
+    }
+
     res.json({
       success: true,
       data: {
@@ -398,6 +466,12 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
     // Generate a fresh token
     const token = generateToken({ userId: user.id, mobile: user.mobile });
     await query('UPDATE users SET token = $1 WHERE id = $2', [token, user.id]);
+
+    try {
+      await ensurePersonalWorkspace(user.id);
+    } catch (wsErr) {
+      console.warn('[API REGISTER] workspace bootstrap skipped:', wsErr.message);
+    }
 
     res.status(201).json({
       success: true,
@@ -531,7 +605,12 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
     }
 
-    const bound = await pairDeviceToWorkspace({ device, userId: req.user.userId });
+    const workspaceId = req.headers['x-workspace-id'] || req.body?.workspaceId || null;
+    const bound = await pairDeviceToWorkspace({
+      device,
+      userId: req.user.userId,
+      workspaceId: workspaceId ? String(workspaceId) : null,
+    });
     if (_socketService) {
       _socketService.notifyPaired(req.user.userId, device.name || 'Desktop');
       _socketService.notifyDesktop?.(device.device_id, 'pairing_confirmed', {
@@ -570,8 +649,90 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
 });
 
 // GET /api/tally-sync/status
+// Workspace-aware: invited members inherit CONNECTED status from the workspace desktop,
+// not from their personal device pairing.
 router.get('/tally-sync/status', authMiddleware, async (req, res) => {
   try {
+    const workspaceId = req.workspaceId
+      || req.headers['x-workspace-id']
+      || req.headers['X-Workspace-Id']
+      || null;
+
+    const ONLINE_THRESHOLD_SECS = 5 * 60;
+    const nowSecs = Math.floor(Date.now() / 1000);
+
+    // Prefer workspace binding when X-Workspace-Id is present and caller is an ACTIVE member
+    if (workspaceId) {
+      const { rows: mem } = await query(
+        `SELECT 1 FROM workspace_memberships
+         WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+        [workspaceId, req.user.userId]
+      );
+      if (mem[0]) {
+        const { rows: wsRows } = await query(
+          `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
+          [workspaceId]
+        );
+        const { rows: binding } = await query(
+          `SELECT connection_status, active_device_id FROM workspace_tally_bindings
+           WHERE workspace_id = $1 LIMIT 1`,
+          [workspaceId]
+        );
+        const status = binding[0]?.connection_status || wsRows[0]?.tally_connection || 'UNPAIRED';
+        const isPaired = status === 'CONNECTED' || status === 'RECONNECTING';
+        let device = null;
+        let desktopOnline = false;
+        const deviceId = binding[0]?.active_device_id;
+        if (deviceId) {
+          const { rows: devices } = await query(
+            `SELECT device_id, name, last_seen FROM devices WHERE device_id = $1 AND paired = TRUE LIMIT 1`,
+            [deviceId]
+          );
+          device = devices[0] || null;
+          const lastSeenSecs = Number(device?.last_seen);
+          desktopOnline = !!(device && Number.isFinite(lastSeenSecs) && lastSeenSecs > 0
+            && (nowSecs - lastSeenSecs) < ONLINE_THRESHOLD_SECS);
+        }
+        let company = null;
+        if (isPaired) {
+          const { rows: companies } = await query(
+            `SELECT guid, name, gstin FROM companies
+             WHERE workspace_id = $1 AND is_active = TRUE
+               AND LOWER(COALESCE(name,'')) NOT LIKE 'demo%'
+             ORDER BY synced_at DESC NULLS LAST, name ASC
+             LIMIT 1`,
+            [workspaceId]
+          );
+          if (companies[0]) {
+            company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
+          } else {
+            const { rows: anyCo } = await query(
+              `SELECT guid, name, gstin FROM companies
+               WHERE workspace_id = $1 AND is_active = TRUE
+               ORDER BY synced_at DESC NULLS LAST, name ASC LIMIT 1`,
+              [workspaceId]
+            );
+            if (anyCo[0]) company = { guid: anyCo[0].guid, name: anyCo[0].name, gstin: anyCo[0].gstin || null };
+          }
+        }
+        const lastSeenSecs = Number(device?.last_seen);
+        return res.json({
+          success: true,
+          data: {
+            is_paired: isPaired,
+            desktop_online: !!desktopOnline,
+            workspace_status: status,
+            device: device ? {
+              id: device.device_id,
+              name: device.name || 'Desktop',
+              last_seen: Number.isFinite(lastSeenSecs) ? lastSeenSecs : null,
+            } : null,
+            company,
+          },
+        });
+      }
+    }
+
     const { rows: devices } = await query(
       'SELECT d.device_id, d.name, d.last_seen FROM devices d WHERE d.user_id = $1 AND d.paired = TRUE LIMIT 1',
       [req.user.userId]
@@ -581,8 +742,6 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
 
     // Desktop online = last_seen within 5 minutes
     // pg bigint serializes as string — coerce before compare
-    const ONLINE_THRESHOLD_SECS = 5 * 60;
-    const nowSecs = Math.floor(Date.now() / 1000);
     const lastSeenSecs = Number(device?.last_seen);
     const desktopOnline = isPaired && device &&
       Number.isFinite(lastSeenSecs) && lastSeenSecs > 0 &&
@@ -654,6 +813,53 @@ router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/cost-centres — company cost centre masters (member scope UI)
+router.post('/cost-centres', authMiddleware, async (req, res) => {
+  const companyGuid = req.body?.companyGuid || req.query?.companyGuid;
+  if (!companyGuid) {
+    return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'companyGuid required' } });
+  }
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  try {
+    let rows = [];
+    try {
+      const result = await query(
+        `SELECT guid, name, parent_name FROM cost_centres
+         WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
+         ORDER BY name`,
+        [companyGuid]
+      );
+      rows = result.rows;
+    } catch {
+      rows = [];
+    }
+    if (!rows.length) {
+      const fallbackSqls = [
+        `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
+         FROM voucher_cost_centre_allocations
+         WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
+        `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
+         FROM voucher_cost_allocations
+         WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
+      ];
+      for (const sql of fallbackSqls) {
+        try {
+          const result = await query(sql, [companyGuid]);
+          if (result.rows.length) {
+            rows = result.rows;
+            break;
+          }
+        } catch {
+          /* table missing */
+        }
+      }
+    }
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/company/years — financial years for a company
 router.get('/company/years', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -680,13 +886,41 @@ router.get('/company/years', authMiddleware, async (req, res) => {
 // GET /api/companies
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
-    const { rows } = await query(
-      'SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE ORDER BY name ASC',
-      [req.user.userId]
-    );
+    const workspaceId = req.workspaceId
+      || req.headers['x-workspace-id']
+      || req.headers['X-Workspace-Id']
+      || null;
+    let rows;
+    if (workspaceId) {
+      // Workspace-scoped: any ACTIVE member can list companies in that workspace
+      const { rows: mem } = await query(
+        `SELECT 1 FROM workspace_memberships
+         WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+        [workspaceId, req.user.userId]
+      );
+      if (!mem[0]) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not a member of this workspace' },
+        });
+      }
+      ({ rows } = await query(
+        `SELECT guid, name, gstin FROM companies
+         WHERE workspace_id = $1 AND is_active = TRUE
+         ORDER BY name ASC`,
+        [workspaceId]
+      ));
+    } else {
+      ({ rows } = await query(
+        `SELECT guid, name, gstin FROM companies
+         WHERE user_id = $1 AND is_active = TRUE
+         ORDER BY name ASC`,
+        [req.user.userId]
+      ));
+    }
     res.json({
       success: true,
-      data: rows.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true }))
+      data: rows.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true })),
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch companies' } });

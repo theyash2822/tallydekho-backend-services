@@ -80,11 +80,25 @@ export async function requireDeviceCredential(req, res, next) {
   try {
     const attached = await attachDevice(req);
     if (attached.error) return res.status(attached.error.status).json(attached.error.body);
-    if (attached.device.binding_status === 'REVOKED') {
-      return res.status(403).json({ status: false, code: 'WORKSPACE_CLOSED', message: 'Workspace connection is no longer active.' });
-    }
-    if (!attached.device.paired) {
-      return res.status(403).json({ status: false, code: 'DEVICE_NOT_PAIRED', message: 'Device not paired' });
+    if (!attached.device.paired || attached.device.binding_status === 'REVOKED') {
+      if (attached.device.workspace_id) {
+        const { rows: ws } = await query(
+          `SELECT lifecycle_status FROM workspaces WHERE id = $1 LIMIT 1`,
+          [attached.device.workspace_id]
+        );
+        const life = ws[0]?.lifecycle_status;
+        if (life === 'CLOSED' || life === 'CLOSE_PENDING') {
+          return res.status(403).json({ status: false, code: 'WORKSPACE_CLOSED', message: 'Workspace connection is no longer active.' });
+        }
+        if (life === 'RESET_PENDING' || life === 'RESET') {
+          return res.status(403).json({ status: false, code: 'WORKSPACE_RESET', message: 'Workspace was reset. Pair again after restore or new Tally setup.' });
+        }
+      }
+      return res.status(403).json({
+        status: false,
+        code: attached.device.binding_status === 'REVOKED' ? 'DEVICE_CREDENTIAL_INVALID' : 'DEVICE_NOT_PAIRED',
+        message: 'Device is not paired to a workspace.',
+      });
     }
     const secret = await enforceSecret(req, attached.device, { requiredIfHashed: true });
     if (secret.error) return res.status(secret.error.status).json(secret.error.body);
