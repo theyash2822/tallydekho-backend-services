@@ -1,3 +1,24 @@
+## 2026-09-12 — Sensitive masking + cost centres + RBAS foundation tests
+
+### Why
+Leftover MD: non-owner responses must mask via role sensitive policies; cost-centre pickers need a list API; foundation unit tests must cover entry mode + cancel deny + 83 caps.
+
+### Change
+- `companyAccess.js` — after `verifyCompanyAccess` success, non-OWNER loads `getPolicies(roleId)` into `req.authz.masking`; `maskIfNeeded` uses that full VISIBLE/HIDDEN map
+- `data.js` / `api-v1.js` — router middleware wraps `res.json` → `maskIfNeeded` when `req.authz.masking` is set
+- `data.js` POST `/app/cost-centres`, `api-v1` POST `/api/cost-centres`, `workspaceApi` GET `/api/workspaces/:id/companies/:companyGuid/cost-centres` — query `cost_centres`, fallback allocation tables or `[]`
+- `authorizationService.js` — export `normalizeEntryMode` + `entryModeGate`
+- `rbas-foundation.test.js` — OPTIONAL denies REGULAR, cancel deny, CAPABILITIES length 83
+- `API_CONTRACT.md` — cost-centres routes
+
+### How to test
+```bash
+node --check src/middleware/companyAccess.js src/routes/data.js src/routes/api-v1.js src/routes/workspaceApi.js src/services/authorizationService.js
+node --test src/__tests__/rbas-foundation.test.js
+```
+
+---
+
 ## 2026-09-12 — Fail-closed company access + writeback workspace routing + lifecycle aliases
 
 ### Why

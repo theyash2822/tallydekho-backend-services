@@ -70,6 +70,9 @@ Header `X-Workspace-Id` preferred; path `:id` binds workspace via `bindWorkspace
 | POST | /api/billing/payment-orders/:id/complete | Owner manual/dev settle (no Razorpay). Credits wallet + invoice. Prod Razorpay: see `createRechargeOrder` / `fulfillRechargePayment` |
 | GET | /api/billing/invoices | Owner billing_invoices |
 | GET/PUT | /api/workspaces/:id/companies/:companyGuid/payment-mode-map | Uses `payment_mode_posting_map`. PUT body `{ mappings: [{ paymentMode, ledgerGuid, ledgerName }] }` |
+| GET | /api/workspaces/:id/companies/:companyGuid/cost-centres | Company cost centres (`guid, name, parent_name`). Empty masters → try voucher allocation tables if present, else `[]`. Requires workspace membership + company access |
+| POST | /api/cost-centres | Body `{ companyGuid }`. Same list as workspace GET; company access via `verifyCompanyAccess` |
+| POST | /app/cost-centres | Legacy data-route shape `{ status, data: { costCentres } }` |
 
 ## Company
 | Method | Path | Notes |
