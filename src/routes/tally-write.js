@@ -5593,32 +5593,44 @@ const _retryDebounce = new Map(); // userId → lastRunMs
 const RETRY_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 const RETRY_MAX_PER_RUN  = 25; // cap per startup/reconnect
 
-export async function retryOfflineEntries(userId, companyGuid) {
-  // Debounce: skip if already ran within the last 5 minutes for this user
-  const lastRun = _retryDebounce.get(userId) || 0;
+export async function retryOfflineEntries(userId, companyGuid, workspaceId = null) {
+  // Debounce: skip if already ran within the last 5 minutes for this workspace/user
+  const debounceKey = workspaceId || userId;
+  const lastRun = _retryDebounce.get(debounceKey) || 0;
   if (Date.now() - lastRun < RETRY_DEBOUNCE_MS) {
-    console.log(`[write_queue] retryOfflineEntries debounced for user ${userId} (last run ${Math.round((Date.now()-lastRun)/1000)}s ago)`);
+    console.log(`[write_queue] retryOfflineEntries debounced for ${debounceKey} (last run ${Math.round((Date.now()-lastRun)/1000)}s ago)`);
     return;
   }
-  _retryDebounce.set(userId, Date.now());
+  _retryDebounce.set(debounceKey, Date.now());
 
   try {
-    // companyGuid may be null when called on desktop reconnect — fetch ALL pending for this user
+    // Prefer workspace binding. companyGuid is an optional extra filter, never the auth key.
     // Only retry 'desktop_offline' and 'failed' entries.
     // Do NOT include 'pending' or 'processing' — those are actively being forwarded
     // and picking them up here would cause duplicate entries in Tally.
-    // Phase C: capped at RETRY_MAX_PER_RUN entries per run
-    const { rows } = companyGuid
-      ? await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND company_guid=$2 AND status IN ('desktop_offline','failed') AND attempt_count < 5 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT) ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
-          [userId, companyGuid]
-        )
-      : await query(
-          `SELECT * FROM write_queue WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT) ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
-          [userId]
-        );
+    const params = [];
+    const clauses = [
+      `status IN ('desktop_offline','failed')`,
+      `attempt_count < 5`,
+      `(lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`,
+    ];
+    if (workspaceId) {
+      params.push(workspaceId);
+      clauses.unshift(`workspace_id = $${params.length}`);
+    } else {
+      params.push(userId);
+      clauses.unshift(`user_id = $${params.length}`);
+    }
+    if (companyGuid) {
+      params.push(companyGuid);
+      clauses.push(`company_guid = $${params.length}`);
+    }
+    const { rows } = await query(
+      `SELECT * FROM write_queue WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
+      params
+    );
     if (!rows.length) return;
-    console.log(`[write_queue] auto-retry: ${rows.length} entries for user ${userId}`);
+    console.log(`[write_queue] auto-retry: ${rows.length} entries for ${workspaceId ? `workspace ${workspaceId}` : `user ${userId}`}`);
     for (const entry of rows) {
       if (!entry.xml) continue;
       try {
@@ -6058,29 +6070,39 @@ async function resolveDesktopUser(req, res) {
 }
 
 // POST /tally/desktop/writeback/pending — desktop pulls pending offline entries for its Workspace
+// Auth is the paired device. Backend resolves workspace. companyGuid is optional filter only.
 router.post('/desktop/writeback/pending', async (req, res) => {
   try {
     const desktop = await resolveDesktopUser(req, res);
     if (!desktop) return;
-    const { companyGuid, limit = 10 } = req.body;
-    if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    const { companyGuid = null, limit = 10 } = req.body || {};
     const maxLimit = Math.min(parseInt(limit) || 10, 25);
     const now = Math.floor(Date.now() / 1000);
 
-    // Prefer workspace_id match; fall back to owner user_id for legacy rows
+    const params = [now];
+    const clauses = [
+      `status IN ('desktop_offline','failed')`,
+      `attempt_count < 5`,
+      `(lock_expires_at IS NULL OR lock_expires_at < $1)`,
+    ];
+    if (desktop.workspaceId) {
+      params.push(desktop.workspaceId);
+      clauses.unshift(`workspace_id = $${params.length}`);
+    } else {
+      params.push(desktop.userId);
+      clauses.unshift(`user_id = $${params.length}`);
+    }
+    if (companyGuid) {
+      params.push(companyGuid);
+      clauses.push(`company_guid = $${params.length}`);
+    }
+    params.push(maxLimit);
     const { rows } = await query(
       `SELECT id, company_guid, entry_type, entry_label, payload, attempt_count
        FROM write_queue
-       WHERE company_guid=$1
-         AND status IN ('desktop_offline','failed')
-         AND attempt_count < 5
-         AND (lock_expires_at IS NULL OR lock_expires_at < $2)
-         AND (
-           ($3::text IS NOT NULL AND workspace_id = $3)
-           OR user_id = $4
-         )
-       ORDER BY created_at ASC LIMIT $5`,
-      [companyGuid, now, desktop.workspaceId, desktop.userId, maxLimit]
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY created_at ASC LIMIT $${params.length}`,
+      params
     );
 
     res.json({
@@ -6154,8 +6176,13 @@ router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
 
     // Verify this device owns the lock
     const { rows: lockRows } = await query(
-      `SELECT id, company_guid FROM write_queue WHERE id=$1 AND locked_by_device_id=$2 AND user_id=$3`,
-      [outboxId, desktop.deviceId, desktop.userId]
+      `SELECT id, company_guid FROM write_queue
+       WHERE id=$1 AND locked_by_device_id=$2
+         AND (
+           user_id=$3
+           OR ($4::text IS NOT NULL AND workspace_id = $4)
+         )`,
+      [outboxId, desktop.deviceId, desktop.userId, desktop.workspaceId]
     );
     if (!lockRows[0]) return res.status(403).json({ status: false, message: 'Not the lock owner or not found' });
     const { company_guid } = lockRows[0];

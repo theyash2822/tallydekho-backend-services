@@ -1239,7 +1239,7 @@ router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, as
       },
     });
   } catch (err) {
-    if (err?.code === 'DEVICE_ALREADY_PAIRED') {
+    if (err?.code === 'DEVICE_ALREADY_PAIRED' || err?.code === 'WORKSPACE_ALREADY_HAS_DESKTOP') {
       return res.status(err.httpStatus || 409).json({
         success: false,
         error: { code: err.code, message: err.message },

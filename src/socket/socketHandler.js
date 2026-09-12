@@ -82,20 +82,25 @@ export function setupSocket(io) {
             if (!d || !d.paired) return;
             if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
             const userId = d.user_id;
+            const workspaceId = d.workspace_id || null;
             if (_retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-              _retryOfflineEntries(userId, null);
+              _retryOfflineEntries(userId, null, workspaceId);
             }
-            const { rows: pendingRows } = await query(
-              `SELECT company_guid, COUNT(*) AS cnt FROM write_queue
-               WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
-               AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)
-               GROUP BY company_guid`,
-              [userId]
-            ).catch(() => ({ rows: [] }));
-            for (const p of pendingRows) {
+            const pendingSql = workspaceId
+              ? `SELECT COUNT(*) AS cnt FROM write_queue
+                 WHERE workspace_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
+                 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`
+              : `SELECT COUNT(*) AS cnt FROM write_queue
+                 WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
+                 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`;
+            const { rows: pendingRows } = await query(pendingSql, [workspaceId || userId]).catch(() => ({ rows: [] }));
+            const pendingCount = parseInt(pendingRows[0]?.cnt || 0, 10);
+            if (pendingCount) {
               socket.emit('pending_tally_writeback_available', {
-                companyGuid: p.company_guid, count: parseInt(p.cnt), entityType: 'mixed',
+                count: pendingCount,
+                entityType: 'mixed',
+                workspaceId: workspaceId || null,
               });
             }
           }).catch(() => {});
@@ -221,11 +226,11 @@ export function setupSocket(io) {
       connectedClients.set(`desktop_${deviceId}`, socket);
       console.log(`[WS] registered desktop: ${deviceId}`);
       // Auto-retry offline entries for this device
-      query('SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+      query('SELECT user_id, workspace_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
         .then(({ rows }) => {
           if (rows[0] && _retryOfflineEntries) {
             console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-            _retryOfflineEntries(rows[0].user_id, null);
+            _retryOfflineEntries(rows[0].user_id, null, rows[0].workspace_id || null);
           }
         }).catch(() => {});
     });

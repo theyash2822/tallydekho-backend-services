@@ -42,7 +42,7 @@ export async function pairDeviceToWorkspace({ device, userId, workspaceId = null
   if (device.paired && device.user_id && device.user_id !== userId) {
     throw new BindingError(
       'DEVICE_ALREADY_PAIRED',
-      'This Tally Desktop is already connected to another TallyDekho workspace.',
+      'This Tally Desktop is already connected to another TallyDekho workspace. Unpair it from that workspace first (Settings → Tally Sync → Unpair), then pair it here. One Desktop can belong to only one workspace at a time.',
       409
     );
   }
@@ -50,7 +50,7 @@ export async function pairDeviceToWorkspace({ device, userId, workspaceId = null
   if (device.workspace_id && device.workspace_id !== workspace.id && device.paired) {
     throw new BindingError(
       'DEVICE_ALREADY_PAIRED',
-      'This Tally Desktop is already connected to another TallyDekho workspace.',
+      'This Tally Desktop is already connected to another TallyDekho workspace. Unpair it from that workspace first (Settings → Tally Sync → Unpair), then pair it here. One Desktop can belong to only one workspace at a time.',
       409
     );
   }
@@ -63,8 +63,8 @@ export async function pairDeviceToWorkspace({ device, userId, workspaceId = null
   );
   if (bound[0]) {
     throw new BindingError(
-      'DEVICE_ALREADY_PAIRED',
-      'This TallyDekho workspace already has a connected Tally Desktop.',
+      'WORKSPACE_ALREADY_HAS_DESKTOP',
+      'This workspace already has a connected Tally Desktop. Unpair that machine first (Settings → Tally Sync → Unpair) if you want to connect a different computer.',
       409
     );
   }

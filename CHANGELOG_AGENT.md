@@ -1,3 +1,19 @@
+## 2026-09-12 — Writeback by workspace + thicker already-paired copy
+
+### Why
+Desktop writeback still keyed pending pulls on companyGuid + device auth. Pairing conflict copy did not tell the user what to do.
+
+### Change
+- `tally-write.js` — `/desktop/writeback/pending` no longer requires companyGuid; device binding resolves workspace. Result lock also matches `workspace_id`.
+- `retryOfflineEntries(userId, companyGuid, workspaceId)` — workspace-first query.
+- `socketHandler.js` — emit one workspace pending count; retry with workspace id.
+- `deviceBinding.js` — thicker DEVICE_ALREADY_PAIRED copy; `WORKSPACE_ALREADY_HAS_DESKTOP` when this workspace already has a machine.
+
+### Test
+`node --check src/routes/tally-write.js src/socket/socketHandler.js src/services/deviceBinding.js src/routes/workspaceApi.js`
+
+---
+
 ## 2026-09-12 — Sensitive masking + cost centres + RBAS foundation tests
 
 ### Why
@@ -16,6 +32,23 @@ Leftover MD: non-owner responses must mask via role sensitive policies; cost-cen
 node --check src/middleware/companyAccess.js src/routes/data.js src/routes/api-v1.js src/routes/workspaceApi.js src/services/authorizationService.js
 node --test src/__tests__/rbas-foundation.test.js
 ```
+
+---
+
+## 2026-09-12 — Leftover: sensitive mask + cost-centres + suspend socket revoke
+
+### Change
+- `companyAccess.js` / `data.js` / `api-v1.js` — attach role sensitive policies; mask `res.json` for members
+- Cost-centres list: `POST /api/cost-centres`, `GET .../companies/:guid/cost-centres`
+- `workspaceEmit.js` + suspend/remove → `membership_revoked` / `access_revoked`
+- Foundation tests expanded (11)
+
+### Ask Yash for (still external)
+- `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`
+- `AWS_SES_ACCESS_KEY`, `AWS_SES_SECRET_KEY`, `AWS_SES_FROM_EMAIL`
+- `CREDENTIALS_ENCRYPTION_KEY` (GST/E-Way)
+- S3/object-store env if backups not already configured
+- Mobile/Desktop implementation authorization (separate repos)
 
 ---
 
@@ -39,6 +72,21 @@ Universal MD §45/§46/§83 — RBAS must apply on data/write paths; writeback m
 - Mobile + Desktop apps for full Universal DoD
 - Full §81 integration suite + full Tally XML goldens
 - AWS S3 for production cloud backup object store (if not already configured)
+
+---
+
+## 2026-09-12 — Mobile MD exit criteria closure
+
+### Why
+Close remaining Mobile+Backend RBAS gaps after founder decisions.
+
+### Change
+- PDF share capability on share-pdf/pdf-log; response masking wrap; invite/role sockets
+- EWB/IRN generate requires workspace integration ACTIVE
+- Mobile: §31 toasts, tab/module caps, suspended WS UX, per-WS storage, integrations UI, scope filter, PDF gates
+
+### Needs
+Razorpay keys; Desktop HS/Restore requests + godown GUID ingest; Web Checkout UI.
 
 ---
 
