@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { getDb, query } from '../db/schema.js';
+import { verifySecret } from '../services/deviceCredential.js';
 
 export function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
@@ -28,6 +29,69 @@ export function desktopAuth(req, res, next) {
     } catch {}
   }
   next();
+}
+
+async function attachDevice(req) {
+  const deviceId = req.headers['device-id'] || req.headers['x-device-id'];
+  if (!deviceId) return { error: { status: 401, body: { status: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Missing device-id header' } } };
+  const { rows } = await query('SELECT * FROM devices WHERE device_id = $1 LIMIT 1', [deviceId]);
+  const device = rows[0];
+  if (!device) return { error: { status: 401, body: { status: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device not registered' } } };
+  req.deviceId = deviceId;
+  req.device = device;
+  req.workspaceId = device.workspace_id || null;
+  return { device };
+}
+
+async function enforceSecret(req, device, { requiredIfHashed }) {
+  const presented = req.headers['x-device-secret'];
+  if (device.device_secret_hash) {
+    if (!presented) {
+      if (requiredIfHashed) {
+        return { error: { status: 401, body: { status: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential required' } } };
+      }
+      return {};
+    }
+    const ok = await verifySecret(presented, device.device_secret_hash);
+    if (!ok) {
+      return { error: { status: 401, body: { status: false, code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential invalid' } } };
+    }
+    req.deviceSecretOk = true;
+  }
+  return {};
+}
+
+export async function optionalDeviceCredential(req, res, next) {
+  try {
+    const attached = await attachDevice(req);
+    if (attached.error) {
+      req.deviceId = req.headers['device-id'] || req.headers['x-device-id'];
+      return next();
+    }
+    const secret = await enforceSecret(req, attached.device, { requiredIfHashed: false });
+    if (secret.error) return res.status(secret.error.status).json(secret.error.body);
+    next();
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Device auth failed' });
+  }
+}
+
+export async function requireDeviceCredential(req, res, next) {
+  try {
+    const attached = await attachDevice(req);
+    if (attached.error) return res.status(attached.error.status).json(attached.error.body);
+    if (attached.device.binding_status === 'REVOKED') {
+      return res.status(403).json({ status: false, code: 'WORKSPACE_CLOSED', message: 'Workspace connection is no longer active.' });
+    }
+    if (!attached.device.paired) {
+      return res.status(403).json({ status: false, code: 'DEVICE_NOT_PAIRED', message: 'Device not paired' });
+    }
+    const secret = await enforceSecret(req, attached.device, { requiredIfHashed: true });
+    if (secret.error) return res.status(secret.error.status).json(secret.error.body);
+    next();
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Device auth failed' });
+  }
 }
 
 export function generateToken(payload) {

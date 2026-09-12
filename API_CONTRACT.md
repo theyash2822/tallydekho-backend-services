@@ -28,6 +28,26 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 | POST | /api/tally-sync/pair | Body: {pairingCode}. Links device to user |
 | GET | /api/tally-sync/status | Returns sync/pairing status |
 | POST | /api/tally-sync/unpair | Removes device pairing |
+| GET | /api/workspace/approvals | Owner/Admin: pending Hard Sync, latest 3 backups, restore requests |
+| POST | /api/workspace/hard-sync/:id/approve | First approval wins |
+| POST | /api/workspace/hard-sync/:id/reject | Reject pending Hard Sync |
+| GET | /api/workspace/backups | Latest 3 AVAILABLE backups |
+| POST | /api/workspace/restore/approve | Body: {code, backupId} — approve new-PC restore |
+
+## Desktop Workspace (device-id + x-device-secret)
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | /desktop/me | Workspace identity, last cloud backup |
+| POST | /desktop/claim-credential | Marks device secret claimed |
+| POST | /desktop/hard-sync/request | Creates/returns Hard Sync request; auto-approves single-member workspaces |
+| GET | /desktop/hard-sync/status | ?requestId |
+| POST | /desktop/backup/sessions | Presign/local upload authorization |
+| POST | /desktop/backup/sessions/:id/complete | Finalize; latest-3 retention |
+| GET | /desktop/backup/list | Latest 3 |
+| POST | /desktop/restore/request | Short restore code |
+| GET | /desktop/restore/status | Poll approval + download URL |
+| POST | /desktop/restore/complete | Activate new device / revoke old |
+| PUT | /desktop/backup/objects/:token | Local object-store PUT when S3 is not configured |
 
 ## Company
 | Method | Path | Notes |

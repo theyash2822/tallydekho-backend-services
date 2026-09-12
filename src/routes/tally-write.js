@@ -151,11 +151,22 @@ const escapeXml = (value = '') => String(value)
 
 // ── Helper: forward to Tally via device ──────────────────────────────────────
 const forwardToTally = async (companyGuid, userId, xmlBody) => {
-  const { rows } = await query(
-    'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-    [userId]
-  );
-  const device = rows[0];
+  let device = null;
+  const { rows: byWs } = await query(
+    `SELECT d.* FROM devices d
+     JOIN companies c ON c.workspace_id = d.workspace_id
+     WHERE c.guid = $1 AND d.paired = TRUE AND d.binding_status IN ('ACTIVE','RESTORE_PENDING')
+     ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
+    [companyGuid]
+  ).catch(() => ({ rows: [] }));
+  device = byWs[0] || null;
+  if (!device) {
+    const { rows } = await query(
+      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
+      [userId]
+    );
+    device = rows[0];
+  }
   // No device paired — queue it anyway; will push when device pairs
   if (!device) return { status: 'desktop_offline', message: 'No paired desktop. Entry saved — will push when desktop connects.' };
 

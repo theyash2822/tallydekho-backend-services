@@ -1,6 +1,7 @@
 // Database — PostgreSQL via pg pool
 import pg from 'pg';
 import { REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
+import { applyWorkspaceSchema } from './workspaceSchema.js';
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -1085,6 +1086,15 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_kpi_loans_snap_lookup
         ON kpi_loans_snapshots(company_guid, as_of DESC);
     `);
+
+    await applyWorkspaceSchema(client);
+    try {
+      const { backfillPersonalWorkspaces } = await import('../services/workspaceService.js');
+      await backfillPersonalWorkspaces();
+      console.log('✅ workspace bootstrap/backfill complete');
+    } catch (e) {
+      console.warn('[workspace] backfill skipped:', e.message);
+    }
 
     // Backfill historical master writes into app_masters + mark posted when synced.
     try {

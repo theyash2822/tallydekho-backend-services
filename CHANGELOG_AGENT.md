@@ -1,4 +1,26 @@
-## 2026-09-11 — Voucher list party resolve + bank master write fields
+## 2026-09-12 — Workspace binding + cloud backup/restore
+
+### Why
+Desktop program: Device → Workspace, cloud backups (latest 3), Owner/Admin Hard Sync + restore approval. Tally XML freeze.
+
+### Change
+- Workspace bootstrap/backfill; devices.workspace_id + device_secret_hash
+- Pairing no longer steals another workspace’s desktop (`DEVICE_ALREADY_PAIRED`)
+- Lineage check on normal sync; Hard Sync approval (auto if one member)
+- Backup upload sessions + retention; restore sessions
+- Writeback prefers workspace-bound desktop
+
+### How to test
+```bash
+node --test src/__tests__/workspace-lineage.test.js
+node --check src/routes/pairing.js src/routes/desktopWorkspace.js src/services/backupService.js
+```
+Pair from Web (must not steal a paired desktop). Backup Now from Desktop. Settings → Tally Sync approvals.
+
+### Risks
+Local object store under `data/workspace-backups` until `AWS_S3_BACKUP_BUCKET` is set. Full RBAS/billing/GST not in this batch.
+
+---
 
 ### Why
 Journal/SO/Proforma list tiles often blank party; Bank Feeds create missing branch/holder/account type on write-back and local upsert; sales/purchase combined lists needed receipt/journal/payment/contra alignment.

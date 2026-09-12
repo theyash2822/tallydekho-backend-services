@@ -60,24 +60,23 @@ export function setupSocket(io) {
     console.log(`[WS] client connected: ${socket.id}`);
 
     // Mobile/Web registers with token
-    socket.on('register', ({ token, type, deviceId }) => {
-      // Desktop sends: { type: 'desktop', deviceId } (no token)
+    socket.on('register', ({ token, type, deviceId, deviceSecret }) => {
+      // Desktop sends: { type: 'desktop', deviceId, deviceSecret? }
       if (type === 'desktop' && deviceId) {
         socket.deviceId = deviceId;
         socket.clientType = 'desktop';
         connectedClients.set(`desktop_${deviceId}`, socket);
         console.log(`[WS] registered desktop via register event: ${deviceId}`);
         socket.emit('registered', { status: true });
-        // Auto-retry offline entries
-        query('SELECT user_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
+        query('SELECT user_id, workspace_id, device_secret_hash, paired FROM devices WHERE device_id=$1 LIMIT 1', [deviceId])
           .then(async ({ rows }) => {
-            if (!rows[0]) return;
+            if (!rows[0] || !rows[0].paired) return;
+            if (rows[0].workspace_id) socket.join(`workspace:${rows[0].workspace_id}`);
             const userId = rows[0].user_id;
             if (_retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
               _retryOfflineEntries(userId, null);
             }
-            // Phase C: emit lightweight wake-up if pending offline entries exist
             const { rows: pendingRows } = await query(
               `SELECT company_guid, COUNT(*) AS cnt FROM write_queue
                WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
@@ -170,12 +169,18 @@ export function setupSocket(io) {
           console.log(`[WS] notified ${type} client: paired for user ${userId}`);
         }
       });
-      // Also notify the desktop so it refreshes its state
-      for (const [key, s] of connectedClients.entries()) {
-        if (key.startsWith('desktop_') && s?.connected) {
-          s.emit('pairing_confirmed', { userId, pairedAt: new Date().toISOString() });
-        }
-      }
+    },
+
+    notifyDesktop: (deviceId, event, payload) => {
+      const s = connectedClients.get(`desktop_${deviceId}`);
+      if (s?.connected) s.emit(event, payload);
+    },
+
+    notifyWorkspace: (userId, event, payload) => {
+      ['mobile', 'web'].forEach(type => {
+        const client = connectedClients.get(`${type}_${userId}`);
+        if (client?.connected) client.emit(event, payload);
+      });
     },
 
     // Called when device is unpaired

@@ -4,6 +4,9 @@ import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
 import { processIngestedData } from '../controllers/ingestProcessor.js';
 import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
+import { consumeApprovedHardSync } from '../services/hardSyncService.js';
+import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
+import { evaluateLineage } from '../utils/tallyLineage.js';
 
 let _socketService = null;
 export function setSocketService(s) { _socketService = s; }
@@ -42,16 +45,33 @@ router.post('/desktop/init-sync', async (req, res) => {
 
     if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
 
-    // Hard sync only: wipe cloud Tally data for selected companies before re-ingest
-    // Strict === true so string "false" / "0" cannot accidentally purge
+    const workspaceId = device.workspace_id;
+    const incomingGuids = (companies || []).map((c) => c.guid).filter(Boolean);
+    if (workspaceId && incomingGuids.length && isHardSync !== true) {
+      const known = await getKnownLineageGuids(workspaceId);
+      const verdict = evaluateLineage(known, incomingGuids);
+      if (!verdict.ok) {
+        return res.status(409).json({
+          status: false,
+          code: verdict.code || 'TALLY_DATA_MISMATCH',
+          message: verdict.reason === 'guid_replacement_candidate'
+            ? 'Company GUID changed. Owner/Admin must approve a GUID Replacement Hard Sync.'
+            : 'This Tally data does not match the workspace. Restore the workspace backup or reset from Web.',
+          data: { extra: verdict.extra, missing: verdict.missing, reason: verdict.reason },
+        });
+      }
+    }
+
     if (isHardSync === true && companies?.length > 0) {
-      const guids = companies.map(c => c.guid).filter(Boolean);
-      console.log(`[SYNC] Hard sync rebuild — purging ${guids.length} company GUID(s)`);
       try {
-        await purgeCompaniesForHardSync(guids);
+        await consumeApprovedHardSync(workspaceId, deviceId, companies, req.body?.guidReplacement);
       } catch (purgeErr) {
         console.error('[SYNC] Hard sync purge failed:', purgeErr.message);
-        return res.status(500).json({ status: false, message: `Hard sync rebuild failed: ${purgeErr.message}` });
+        return res.status(purgeErr.httpStatus || 500).json({
+          status: false,
+          code: purgeErr.code,
+          message: purgeErr.message || `Hard sync rebuild failed: ${purgeErr.message}`,
+        });
       }
     }
 
@@ -180,6 +200,17 @@ router.post('/desktop/init-sync', async (req, res) => {
           yearIds[c.id || c.guid][y.finYear || y] = `${c.guid}_${y.finYear || y}`;
         });
       });
+    }
+
+    if (workspaceId && companies?.length) {
+      const guids = companies.map((c) => c.guid).filter(Boolean);
+      if (guids.length) {
+        await query(
+          `UPDATE companies SET workspace_id = $1 WHERE guid = ANY($2::text[])`,
+          [workspaceId, guids]
+        ).catch(() => {});
+      }
+      await markFirstSyncConnected(workspaceId, deviceId, companies);
     }
 
     res.json({ status: true, data: { alterIds, yearIds, uploadId: uuid() } });

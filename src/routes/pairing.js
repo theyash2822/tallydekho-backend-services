@@ -3,6 +3,9 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware, desktopAuth, generateToken } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
+import { pairDeviceToWorkspace, unpairDevice, BindingError } from '../services/deviceBinding.js';
+import { generateDeviceSecret, hashSecret } from '../services/deviceCredential.js';
+import { desktopMeHandler } from './desktopWorkspace.js';
 
 // Socket service injected after startup
 let _socket = null;
@@ -11,22 +14,7 @@ export function setPairingSocket(s) { _socket = s; }
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
 
-// GET /me (mounted at /desktop/me) — Desktop fetches user profile via device-id
-router.get('/me', async (req, res) => {
-  const deviceId = req.headers['device-id'];
-  if (!deviceId) return res.status(400).json({ status: false, message: 'device-id required' });
-  try {
-    const { rows } = await query(
-      'SELECT u.id, u.mobile, u.name, u.email, u.language FROM devices d JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
-      [deviceId]
-    );
-    if (!rows[0]) return res.json({ status: false, message: 'Device not paired' });
-    const u = rows[0];
-    res.json({ status: true, data: { id: u.id, mobile: u.mobile, name: u.name || '', email: u.email || '', language: u.language || 'English' } });
-  } catch (err) {
-    res.status(500).json({ status: false, message: 'Failed to fetch profile' });
-  }
-});
+router.get('/me', desktopMeHandler);
 
 // GET /pairing-device — smart handler for BOTH desktop (/desktop) and mobile (/app)
 // Desktop sends device-id header (no JWT). Mobile sends Bearer token (no device-id).
@@ -132,24 +120,25 @@ router.post('/pairing', authMiddleware, async (req, res) => {
       return res.status(400).json({ status: false, message: 'Pairing code expired. Generate a new one.' });
     }
 
-    // Keep pairing_code intact (permanent code stays, just set paired=TRUE)
-    await query(
-      'UPDATE devices SET user_id = $1, paired = TRUE WHERE device_id = $2',
-      [req.user.userId, device.device_id]
-    );
-
-    // Transfer company data: only move companies that belong to this specific device
-    // This prevents taking companies from other users who happened to use the same device
-    await query(
-      'UPDATE companies SET user_id = $1, is_active = TRUE WHERE device_id = $2',
-      [req.user.userId, device.device_id]
-    ).catch(() => {});
-
-    // Notify all connected clients to refresh (web, mobile, desktop)
-    if (_socket) _socket.notifyPaired(req.user.userId, device.name || 'Desktop');
-
-    res.json({ status: true, message: 'Paired successfully', data: { deviceId: device.device_id } });
+    const bound = await pairDeviceToWorkspace({ device, userId: req.user.userId });
+    if (_socket) {
+      _socket.notifyPaired(req.user.userId, device.name || 'Desktop');
+      _socket.notifyDesktop?.(device.device_id, 'pairing_confirmed', {
+        userId: req.user.userId,
+        pairedAt: new Date().toISOString(),
+        deviceSecret: bound.deviceSecret,
+        workspace: { id: bound.workspace.id, name: bound.workspace.name },
+      });
+    }
+    res.json({
+      status: true,
+      message: 'Paired successfully',
+      data: { deviceId: device.device_id, workspaceId: bound.workspace.id },
+    });
   } catch (err) {
+    if (err instanceof BindingError) {
+      return res.status(err.httpStatus).json({ status: false, code: err.code, message: err.message });
+    }
     res.status(500).json({ status: false, message: 'Pairing failed' });
   }
 });
@@ -187,9 +176,9 @@ router.put('/pairing', authMiddleware, async (req, res) => {
 
 // Shared unpair logic - notifies all platforms via WebSocket
 async function performUnpair(deviceId, userId) {
-  await query('UPDATE devices SET paired = FALSE, user_id = NULL WHERE device_id = $1', [deviceId]);
-  // Notify mobile/web clients this user is now unpaired
-  if (_socket && userId) _socket.notifyUnpaired(userId);
+  const result = await unpairDevice(deviceId, userId);
+  if (_socket && (userId || result.userId)) _socket.notifyUnpaired(userId || result.userId, result.newCode);
+  return result;
 }
 
 // DELETE /desktop/paired-device — Unpair from Desktop
@@ -276,6 +265,23 @@ router.post('/register', async (req, res) => {
     const lastSync = device?.last_seen ? new Date(device.last_seen * 1000).toISOString() : null;
     const isPaired = device?.paired === true;
 
+    let issuedSecret = null;
+    if (isPaired && !device.credential_claimed_at) {
+      const secret = generateDeviceSecret();
+      const secretHash = await hashSecret(secret);
+      await query(
+        `UPDATE devices SET device_secret_hash = $2 WHERE device_id = $1`,
+        [resolvedId, secretHash]
+      );
+      issuedSecret = secret;
+    }
+
+    let workspace = null;
+    if (device?.workspace_id) {
+      const { rows: ws } = await query('SELECT id, name, tally_connection FROM workspaces WHERE id = $1', [device.workspace_id]);
+      if (ws[0]) workspace = { id: ws[0].id, name: ws[0].name, tallyConnection: ws[0].tally_connection };
+    }
+
     res.json({
       status: true,
       message: 'Registered',
@@ -283,10 +289,13 @@ router.post('/register', async (req, res) => {
         lastSync,
         forceUpdate: false,
         isPaired,
-        pairingCode: device?.pairing_code || null,  // permanent code returned on every register
+        pairingCode: device?.pairing_code || null,
         versionLevel,
         versionMessage,
         latestVersion: CURRENT_VERSION,
+        workspace,
+        deviceSecret: issuedSecret,
+        bindingStatus: device?.binding_status || (isPaired ? 'ACTIVE' : 'UNBOUND'),
       }
     });
   } catch (err) {

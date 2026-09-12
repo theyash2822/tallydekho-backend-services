@@ -9,6 +9,8 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
+import { pairDeviceToWorkspace, BindingError, unpairDevice } from '../services/deviceBinding.js';
+import workspaceApi from './workspaceApi.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
@@ -53,6 +55,7 @@ const preAuthMiddleware = (req, res, next) => {
 };
 
 const router = Router();
+router.use(workspaceApi);
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -528,35 +531,23 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
     }
 
-    // Auto-unpair any previous user from this device (last paired wins)
-    if (device.user_id && device.user_id !== req.user.userId && device.paired) {
-      const oldUserId = device.user_id;
-      // Deactivate old user's companies from this device
-      await query('UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2', [oldUserId, device.device_id]).catch(() => {});
-      // Notify old user via WebSocket if connected
-      if (_socketService) { try { _socketService.notifyUnpaired(oldUserId); } catch {} }
-      console.log(`[API PAIR] Auto-unpaired previous user ${oldUserId} from device ${device.device_id}`);
+    const bound = await pairDeviceToWorkspace({ device, userId: req.user.userId });
+    if (_socketService) {
+      _socketService.notifyPaired(req.user.userId, device.name || 'Desktop');
+      _socketService.notifyDesktop?.(device.device_id, 'pairing_confirmed', {
+        userId: req.user.userId,
+        pairedAt: new Date().toISOString(),
+        deviceSecret: bound.deviceSecret,
+        workspace: { id: bound.workspace.id, name: bound.workspace.name },
+      });
     }
 
-    await query(
-      // Keep pairing_code intact (permanent code stays for future reference/re-pairing)
-      'UPDATE devices SET user_id = $1, paired = TRUE, code_expires = NULL WHERE device_id = $2',
-      [req.user.userId, device.device_id]
-    );
-
-    // Assign companies from this device to the new user
-    await query('UPDATE companies SET user_id = $1, is_active = TRUE WHERE device_id = $2', [req.user.userId, device.device_id]).catch(() => {});
-
-    // Notify connected clients
-    if (_socketService) _socketService.notifyPaired(req.user.userId, device.name || 'Desktop');
-
-    // Get company info
     const { rows: companies } = await query(
       'SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [req.user.userId]
     );
     const company = companies[0] ? { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null } : null;
 
-    console.log(`[API PAIR] User ${req.user.userId} paired to device ${device.device_id}`);
+    console.log(`[API PAIR] User ${req.user.userId} paired to device ${device.device_id} workspace ${bound.workspace.id}`);
 
     res.json({
       success: true,
@@ -564,10 +555,15 @@ router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
         message: 'Paired successfully',
         device_id: device.device_id,
         is_paired: true,
+        workspace_id: bound.workspace.id,
+        workspace_name: bound.workspace.name,
         company,
       }
     });
   } catch (err) {
+    if (err instanceof BindingError) {
+      return res.status(err.httpStatus).json({ success: false, error: { code: err.code, message: err.message } });
+    }
     console.error('[API PAIR] Error:', err.message);
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Pairing failed' } });
   }
@@ -635,26 +631,17 @@ router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
       [userId]
     );
 
-    // Generate a new permanent pairing code for the device (replaces old one)
-    const newCode = String(Math.floor(100000 + Math.random() * 900000));
     const deviceId = devices[0]?.device_id;
-
-    // Mark device as unpaired + assign fresh pairing code
-    await query(
-      'UPDATE devices SET paired = FALSE, user_id = NULL, pairing_code = $1 WHERE user_id = $2',
-      [newCode, userId]
-    );
-
-    // Mark all companies belonging to this user+device as inactive
+    let newCode = null;
     if (deviceId) {
+      const result = await unpairDevice(deviceId, userId);
+      newCode = result.newCode;
       await query(
         'UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2',
         [userId, deviceId]
       ).catch(e => console.warn('[unpair] companies update failed:', e.message));
     }
 
-    // Notify all connected clients with the new code
-    // Desktop uses newCode to update its display; mobile/web clear their paired state
     const socketSvc = getSocketService?.();
     if (socketSvc?.notifyUnpaired) {
       socketSvc.notifyUnpaired(userId, newCode);

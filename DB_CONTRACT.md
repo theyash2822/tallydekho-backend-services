@@ -12,11 +12,31 @@ Primary user table (mobile/web login)
 ### devices
 Desktop app registrations
 - id, device_id (UNIQUE), user_id→users, name, os, pairing_code, code_expires, paired (bool), last_seen
+- workspace_id, device_secret_hash, binding_status (UNBOUND/ACTIVE/RESTORE_PENDING/REVOKED), credential_claimed_at
+- Backend stores secret hash only. Legacy paired devices without a hash still auth with device-id until next pair/register issues a secret.
 
 ### companies
 Companies synced from Tally
-- id, guid (UNIQUE), user_id→users, device_id→devices, name, formal_name, + address/GST/contact fields
+- id, guid (UNIQUE), user_id→users, device_id→devices, workspace_id, name, formal_name, + address/GST/contact fields
 - logo_url (added for company logo feature)
+
+## Workspace / Backup (2026-09-12)
+### workspaces
+- id, name, owner_user_id, workspace_type, lifecycle_status, commercial_status, tally_connection, setup_generation, is_base
+
+### workspace_memberships
+- workspace_id + user_id unique; OWNER membership on personal workspace bootstrap
+
+### workspace_tally_bindings / workspace_tally_lineage_companies
+- One active desktop per workspace; lineage GUIDs for TALLY_DATA_MISMATCH
+
+### workspace_backups
+- status UPLOADING/AVAILABLE/FAILED/DELETED; latest 3 AVAILABLE kept
+
+### restore_sessions / hard_sync_requests / workspace_audit_log
+- Durable restore codes and Hard Sync approvals
+
+Legacy user_id ownership on companies/devices is kept (expand/contract).
 
 ### company_years
 Financial years per company

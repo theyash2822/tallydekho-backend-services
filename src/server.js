@@ -22,6 +22,7 @@ import { setPairingSocket } from './routes/pairing.js';
 import dataRoutes from './routes/data.js';
 import integrationRoutes from './routes/integrations.js';
 import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
+import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler } from './routes/desktopWorkspace.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -46,6 +47,7 @@ app.use(compression());
 
 // Larger body for ingest chunk uploads only
 app.use('/ingest/chunk', express.raw({ type: '*/*', limit: '50mb' }));
+app.use('/desktop/backup/objects/:token', express.raw({ type: '*/*', limit: '2gb' }));
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting for auth routes
@@ -65,6 +67,9 @@ app.use('/app/integrations', integrationRoutes);
 app.use('/app/ai', aiRoutes);
 app.use('/api/ai', aiRoutes); // also accessible via /api prefix for mobile
 app.use('/desktop', pairingRoutes);
+app.put('/desktop/backup/objects/:token', localObjectPutHandler);
+app.get('/desktop/backup/objects/:token', localObjectGetHandler);
+app.use('/desktop', desktopWorkspaceRoutes);
 app.use('/tally', tallyWriteRoutes);
 app.use('/api', apiV1Routes);
 app.use('/', ingestRoutes);
