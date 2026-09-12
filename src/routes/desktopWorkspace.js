@@ -256,6 +256,7 @@ router.post('/restore/complete', optionalDeviceCredential, async (req, res) => {
       deviceId: req.deviceId || req.headers['device-id'],
       ok: req.body?.ok !== false,
       lineageGuids: req.body?.lineageGuids || [],
+      restoredFolders: req.body?.restoredFolders || [],
     });
     res.json({ status: true, data: result });
   } catch (err) {

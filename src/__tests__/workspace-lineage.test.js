@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateLineage, pickRetentionDeletes, lineageMatchesBackupManifest } from '../utils/tallyLineage.js';
+import { evaluateLineage, pickRetentionDeletes, lineageMatchesBackupManifest, lineageMatchesRestoredFolders } from '../utils/tallyLineage.js';
 import { generateDeviceSecret, hashSecret, verifySecret, hashToken } from '../services/deviceCredential.js';
 import {
   defaultKeysForTemplate,
@@ -43,6 +43,17 @@ test('restore: backup manifest must overlap restored GUIDs', () => {
   assert.equal(hit.ok, true);
   const skip = lineageMatchesBackupManifest([{ guid: 'A' }], []);
   assert.equal(skip.ok, true);
+});
+
+test('restore: restored folders must overlap backup company names', () => {
+  const miss = lineageMatchesRestoredFolders([{ name: 'Acme' }, { name: 'Beta' }], ['OtherCo']);
+  assert.equal(miss.ok, false);
+  const hit = lineageMatchesRestoredFolders([{ name: 'Acme' }, { name: 'Beta' }], ['Beta']);
+  assert.equal(hit.ok, true);
+  const empty = lineageMatchesRestoredFolders([{ name: 'Acme' }], []);
+  assert.equal(empty.ok, false);
+  const byFolder = lineageMatchesRestoredFolders([{ name: 'Acme Ltd', folder: 'AcmeLtd' }], ['AcmeLtd']);
+  assert.equal(byFolder.ok, true);
 });
 
 test('retention: failed backups are not in the successful list; keep latest 3', () => {

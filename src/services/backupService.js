@@ -107,6 +107,23 @@ export async function downloadAuthFor(backup) {
   return createDownloadAuthorization({ objectKey: backup.object_key });
 }
 
+export async function purgeWorkspaceCloudBackups(workspaceId) {
+  const { rows } = await query(
+    `SELECT id, object_key FROM workspace_backups
+     WHERE workspace_id = $1 AND deleted_at IS NULL`,
+    [workspaceId]
+  );
+  const ts = now();
+  for (const b of rows) {
+    await deleteObject(b.object_key).catch(() => {});
+    await query(
+      `UPDATE workspace_backups SET deleted_at = $2, status = 'DELETED' WHERE id = $1`,
+      [b.id, ts]
+    );
+  }
+  return rows.length;
+}
+
 async function enforceRetention(workspaceId) {
   const { rows } = await query(
     `SELECT id, object_key, completed_at, created_at FROM workspace_backups

@@ -46,7 +46,7 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 | GET | /desktop/backup/list | Latest 3 |
 | POST | /desktop/restore/request | Short restore code |
 | GET | /desktop/restore/status | Poll approval + download URL |
-| POST | /desktop/restore/complete | Activate new device / revoke old |
+| POST | /desktop/restore/complete | Body `{ ok, lineageGuids[], restoredFolders[] }`. Folders must overlap backup company names/folder basenames. Activates new device / revokes old |
 | PUT | /desktop/backup/objects/:token | Local object-store PUT when S3 is not configured |
 
 ## Workspace RBAS / billing (workspaceApi.js)
@@ -61,7 +61,7 @@ Header `X-Workspace-Id` preferred; path `:id` binds workspace via `bindWorkspace
 | POST | /api/workspaces/:id/transfer/:transferId/complete | Owner (or system). After grace: flips Owner, assigns outgoing role, deducts 1000 if base |
 | POST | /api/workspaces/:id/reset/request | Owner, base only. PENDING_CONFIRM; phrase `RESET WORKSPACE` |
 | POST | /api/workspaces/:id/reset/confirm | Owner. Body `{ phrase }`. 3 confirms → PENDING_GRACE 24h |
-| POST | /api/workspaces/:id/reset/execute | Owner after grace. Unpair devices, detach companies → Demo, remove non-owners, UNPAIRED |
+| POST | /api/workspaces/:id/reset/execute | Owner after grace. Unpair devices, delete cloud backups, clear lineage, detach companies → Demo, remove non-owners, UNPAIRED |
 | POST | /api/workspaces/:id/close/request | Owner, non-base. PENDING_GRACE 24h |
 | POST | /api/workspaces/:id/close/execute | Owner after grace. Purge memberships, lifecycle CLOSED |
 | GET | /api/billing/usage | Filters: `workspaceId`, `kind`, `limit`. Merges `usage_events` + `wallet_transactions` |

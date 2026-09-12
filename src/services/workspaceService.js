@@ -5,11 +5,12 @@ import { audit } from './auditService.js';
 import { ensureBillingAccount, getServiceRate, deductCredits, getBillingOverview, getWallet } from './billingService.js';
 import { seedBuiltinRoles } from './roleService.js';
 import { getEffectiveAccess, loadMembership } from './authorizationService.js';
-import { ensureDemoCompany } from './demoDataService.js';
+import { ensureDemoCompany, filterCompaniesByPairingStatus } from './demoDataService.js';
 import { sendOwnershipConfirmEmail, sendLifecycleConfirmEmail } from './email.js';
 import { purgeCompanyTallyData } from './companyPurge.js';
 import { unpairDevice } from './deviceBinding.js';
 import { getWorkspaceSocket } from '../socket/workspaceEmit.js';
+import { purgeWorkspaceCloudBackups } from './backupService.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY_SEC = 24 * 60 * 60;
@@ -272,6 +273,8 @@ export async function getWorkspaceContext(userId, workspaceId) {
      WHERE workspace_id = $1 LIMIT 1`,
     [workspaceId]
   );
+  const pairingStatus = binding[0]?.connection_status || workspace.tally_connection || 'UNPAIRED';
+  companies = filterCompaniesByPairingStatus(companies, pairingStatus);
   return {
     workspace: workspacePublicView(workspace),
     access: {
@@ -285,7 +288,7 @@ export async function getWorkspaceContext(userId, workspaceId) {
     },
     companies,
     pairing: {
-      status: binding[0]?.connection_status || workspace.tally_connection || 'UNPAIRED',
+      status: pairingStatus,
       activeDeviceId: binding[0]?.active_device_id || null,
       lineageId: binding[0]?.lineage_id || null,
     },
@@ -1647,6 +1650,20 @@ export async function executeWorkspaceReset(actorUserId, workspaceId, { system =
   }
   sock?.notifyWorkspaceRoom?.(workspaceId, 'workspace_reset', { status: 'COMPLETED', requestId: req.id });
 
+  const deletedBackups = await purgeWorkspaceCloudBackups(workspaceId).catch((e) => {
+    console.warn('[reset] purgeWorkspaceCloudBackups:', e.message);
+    return 0;
+  });
+  await query(
+    `DELETE FROM workspace_tally_lineage_companies WHERE workspace_id = $1`,
+    [workspaceId]
+  ).catch(() => {});
+  await query(
+    `UPDATE restore_sessions SET status = 'FAILED'
+     WHERE workspace_id = $1 AND status IN ('PENDING','APPROVED','DOWNLOADING')`,
+    [workspaceId]
+  ).catch(() => {});
+
   // Detach non-demo companies: purge tally data + clear workspace binding
   const { rows: companies } = await query(
     `SELECT guid, name FROM companies WHERE workspace_id = $1`,
@@ -1734,6 +1751,7 @@ export async function executeWorkspaceReset(actorUserId, workspaceId, { system =
     stub: false,
     devicesUnpaired: devices.length,
     companiesDetached: companies.length,
+    backupsDeleted: deletedBackups,
   });
   return { status: 'COMPLETED', requestId: req.id, stub: false };
 }
@@ -2074,6 +2092,19 @@ export async function executeWorkspaceClose(actorUserId, workspaceId, { system =
     sock?.notifyDesktop?.(d.device_id, 'binding_revoked', { reason: 'WORKSPACE_CLOSED' });
   }
   sock?.notifyWorkspaceRoom?.(workspaceId, 'workspace_closed', { status: 'COMPLETED' });
+
+  await purgeWorkspaceCloudBackups(workspaceId).catch((e) => {
+    console.warn('[close] purgeWorkspaceCloudBackups:', e.message);
+  });
+  await query(
+    `DELETE FROM workspace_tally_lineage_companies WHERE workspace_id = $1`,
+    [workspaceId]
+  ).catch(() => {});
+  await query(
+    `UPDATE restore_sessions SET status = 'FAILED'
+     WHERE workspace_id = $1 AND status IN ('PENDING','APPROVED','DOWNLOADING')`,
+    [workspaceId]
+  ).catch(() => {});
 
   const { rows: companies } = await query(
     `SELECT guid FROM companies WHERE workspace_id = $1`,

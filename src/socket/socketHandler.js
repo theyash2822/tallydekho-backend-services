@@ -89,12 +89,16 @@ export function setupSocket(io) {
             }
             const pendingSql = workspaceId
               ? `SELECT COUNT(*) AS cnt FROM write_queue
-                 WHERE workspace_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
+                 WHERE (workspace_id=$1 OR (workspace_id IS NULL AND user_id=$2))
+                 AND status IN ('desktop_offline','failed') AND attempt_count < 5
                  AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`
               : `SELECT COUNT(*) AS cnt FROM write_queue
                  WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
                  AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`;
-            const { rows: pendingRows } = await query(pendingSql, [workspaceId || userId]).catch(() => ({ rows: [] }));
+            const { rows: pendingRows } = await query(
+              pendingSql,
+              workspaceId ? [workspaceId, userId] : [userId]
+            ).catch(() => ({ rows: [] }));
             const pendingCount = parseInt(pendingRows[0]?.cnt || 0, 10);
             if (pendingCount) {
               socket.emit('pending_tally_writeback_available', {

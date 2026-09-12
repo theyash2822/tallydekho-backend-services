@@ -65,6 +65,31 @@ export function lineageMatchesBackupManifest(backupManifest = [], lineageGuids =
   return { ok: true, reason: 'overlap', overlap };
 }
 
+/** On-disk company folders after restore must overlap backup company names (not a GUID echo). */
+export function lineageMatchesRestoredFolders(backupManifest = [], restoredFolders = []) {
+  let manifest = backupManifest;
+  if (typeof manifest === 'string') {
+    try { manifest = JSON.parse(manifest); } catch { manifest = []; }
+  }
+  const names = [...new Set(
+    (Array.isArray(manifest) ? manifest : [])
+      .flatMap((c) => [c?.name, c.company_name, c.folder, c.folder_name])
+      .map((n) => String(n || '').trim())
+      .filter(Boolean)
+  )];
+  const folders = [...new Set((restoredFolders || []).map((n) => String(n || '').trim()).filter(Boolean))];
+  if (!names.length) return { ok: true, reason: 'skipped' };
+  if (!folders.length) {
+    return { ok: false, code: 'TALLY_DATA_MISMATCH', reason: 'restore_folders_missing', extra: [], missing: names };
+  }
+  const folderSet = new Set(folders.map((n) => n.toLowerCase()));
+  const overlap = names.filter((n) => folderSet.has(n.toLowerCase()));
+  if (overlap.length === 0) {
+    return { ok: false, code: 'TALLY_DATA_MISMATCH', reason: 'restore_folder_mismatch', extra: folders, missing: names };
+  }
+  return { ok: true, reason: 'folder_overlap', overlap };
+}
+
 export function pickRetentionDeletes(successfulBackups, keep = 3) {
   const list = [...(successfulBackups || [])].sort((a, b) => {
     const ta = Number(a.completed_at || a.created_at || 0);

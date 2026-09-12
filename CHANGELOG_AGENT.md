@@ -1,3 +1,36 @@
+## 2026-09-12 — Forensic MD close: restore folders, writeback, Reset backups
+
+### Why
+Restore complete echoed backup GUIDs. Workspace-first writeback skipped legacy NULL `workspace_id` rows. Reset left cloud backups. Writeback pending trusted device-id only.
+
+### Change
+- `lineageMatchesRestoredFolders` — on-disk folders must overlap backup name/folder
+- `POST /desktop/restore/complete` accepts `restoredFolders`
+- write_queue pending/retry/socket count include NULL `workspace_id` for the paired user
+- writeback pending/claim/result use `requireDeviceCredential`
+- Reset/Close: purge cloud backups, clear lineage, fail in-flight restores
+
+### Test
+`npm test` — 131 pass.
+
+---
+
+
+
+### Why
+Forensic/QA: unpaired workspace context still returned live companies; MD requires real data hidden from operational APIs while unpaired.
+
+### Change
+- `filterCompaniesByPairingStatus`: CONNECTED → non-demo only; UNPAIRED/RECONNECTING/other → **Demo companies only** (fail-closed).
+
+### How to test
+```bash
+# Unpaired workspace context companies should be Demo-only
+npm test
+```
+
+---
+
 ## 2026-09-12 — Cost centres list enrichment (Team Access)
 
 ### Why

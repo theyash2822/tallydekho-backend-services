@@ -4,7 +4,7 @@ import { audit } from './auditService.js';
 import { generateShortCode, hashSecret, verifySecret, hashToken, generateDeviceSecret } from './deviceCredential.js';
 import { listAvailableBackups, getBackup, downloadAuthFor } from './backupService.js';
 import { getWorkspaceById, isOwnerOrAdmin } from './workspaceService.js';
-import { lineageMatchesBackupManifest } from '../utils/tallyLineage.js';
+import { lineageMatchesBackupManifest, lineageMatchesRestoredFolders } from '../utils/tallyLineage.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const REQUEST_TTL = 30 * 60;
@@ -155,7 +155,7 @@ export async function restoreStatusForDevice(deviceId) {
   return { status: session.status, restoreRequestId: session.id };
 }
 
-export async function completeRestore({ deviceId, ok, lineageGuids = [] }) {
+export async function completeRestore({ deviceId, ok, lineageGuids = [], restoredFolders = [] }) {
   const session = await getRestoreRequestForDevice(deviceId);
   if (!session || !['APPROVED', 'DOWNLOADING'].includes(session.status)) {
     const err = new Error('No approved restore session');
@@ -171,6 +171,14 @@ export async function completeRestore({ deviceId, ok, lineageGuids = [] }) {
   const backup = session.backup_id && session.workspace_id
     ? await getBackup(session.workspace_id, session.backup_id)
     : null;
+  const folders = lineageMatchesRestoredFolders(backup?.company_manifest_json, restoredFolders);
+  if (!folders.ok) {
+    await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1`, [session.id]);
+    const err = new Error('Restored Tally folders do not match the approved backup.');
+    err.code = folders.code || 'TALLY_DATA_MISMATCH';
+    err.httpStatus = 409;
+    throw err;
+  }
   const match = lineageMatchesBackupManifest(backup?.company_manifest_json, lineageGuids);
   if (!match.ok) {
     await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1`, [session.id]);

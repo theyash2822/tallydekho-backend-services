@@ -3,7 +3,7 @@
 // The desktop app must have the /tally-proxy endpoint running (Phase 3)
 
 import { Router } from 'express';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 import { requireTallyWriteAccess } from '../middleware/companyAccess.js';
 import { generateIRN } from '../utils/irnGenerator.js';
@@ -5616,7 +5616,9 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
     ];
     if (workspaceId) {
       params.push(workspaceId);
-      clauses.unshift(`workspace_id = $${params.length}`);
+      const wsIdx = params.length;
+      params.push(userId);
+      clauses.unshift(`(workspace_id = $${wsIdx} OR (workspace_id IS NULL AND user_id = $${params.length}))`);
     } else {
       params.push(userId);
       clauses.unshift(`user_id = $${params.length}`);
@@ -6071,7 +6073,7 @@ async function resolveDesktopUser(req, res) {
 
 // POST /tally/desktop/writeback/pending — desktop pulls pending offline entries for its Workspace
 // Auth is the paired device. Backend resolves workspace. companyGuid is optional filter only.
-router.post('/desktop/writeback/pending', async (req, res) => {
+router.post('/desktop/writeback/pending', requireDeviceCredential, async (req, res) => {
   try {
     const desktop = await resolveDesktopUser(req, res);
     if (!desktop) return;
@@ -6087,7 +6089,9 @@ router.post('/desktop/writeback/pending', async (req, res) => {
     ];
     if (desktop.workspaceId) {
       params.push(desktop.workspaceId);
-      clauses.unshift(`workspace_id = $${params.length}`);
+      const wsIdx = params.length;
+      params.push(desktop.userId);
+      clauses.unshift(`(workspace_id = $${wsIdx} OR (workspace_id IS NULL AND user_id = $${params.length}))`);
     } else {
       params.push(desktop.userId);
       clauses.unshift(`user_id = $${params.length}`);
@@ -6123,7 +6127,7 @@ router.post('/desktop/writeback/pending', async (req, res) => {
 });
 
 // POST /tally/desktop/writeback/:outboxId/claim — lock entry + return XML for posting
-router.post('/desktop/writeback/:outboxId/claim', async (req, res) => {
+router.post('/desktop/writeback/:outboxId/claim', requireDeviceCredential, async (req, res) => {
   try {
     const desktop = await resolveDesktopUser(req, res);
     if (!desktop) return;
@@ -6167,7 +6171,7 @@ router.post('/desktop/writeback/:outboxId/claim', async (req, res) => {
 });
 
 // POST /tally/desktop/writeback/:outboxId/result — desktop reports Tally result
-router.post('/desktop/writeback/:outboxId/result', async (req, res) => {
+router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, async (req, res) => {
   try {
     const desktop = await resolveDesktopUser(req, res);
     if (!desktop) return;
