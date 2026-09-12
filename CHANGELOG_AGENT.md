@@ -1,4 +1,38 @@
-## 2026-09-12 — Writeback by workspace + thicker already-paired copy
+## 2026-09-12 — Cost centres list enrichment (Team Access)
+
+### Why
+Team Access cost-centre picker often returned empty when `cost_centres` masters were never synced.
+
+### Change
+- New `costCentreListService.js` — shared `listCostCentresForCompany`:
+  1. `cost_centres` table
+  2. allocation tables (`voucher_cost_centre_allocations` / `voucher_cost_allocations`)
+  3. Distinct voucher columns (`cost_centre`, `costcentre`, `cost_centre_name`, …) via information_schema or try/catch
+  4. Ledgers where parent/name ILIKE `%cost centre%` / `%cost center%`
+  5. Best-effort upsert of discovered rows into `cost_centres`
+- Wired into POST `/api/cost-centres`, POST `/app/cost-centres` (`data.js`), GET workspace `.../cost-centres`
+
+### How to test
+```bash
+node --check src/services/costCentreListService.js src/routes/data.js src/routes/api-v1.js src/routes/workspaceApi.js
+```
+
+---
+
+## 2026-09-12 — Desktop can request Reset Workspace; revoke Desktop on execute
+
+### Why
+Desktop had Unpair only. Universal §49 Owner options on mismatch are Restore vs Reset for New Tally. Spec §42.16 needs Reset/Close revocation on Desktop.
+
+### Change
+- `POST /desktop/workspace/reset/request` + `GET .../reset/status` — device starts the same Owner reset workflow
+- `executeWorkspaceReset` / close — notify that Desktop `unpaired` + `binding_revoked`
+
+### Test
+`node --check src/routes/desktopWorkspace.js src/services/workspaceService.js`
+
+---
+
 
 ### Why
 Desktop writeback still keyed pending pulls on companyGuid + device auth. Pairing conflict copy did not tell the user what to do.

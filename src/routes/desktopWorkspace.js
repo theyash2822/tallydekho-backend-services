@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { requireDeviceCredential, optionalDeviceCredential } from '../middleware/auth.js';
-import { getWorkspaceById, workspacePublicView } from '../services/workspaceService.js';
+import { getWorkspaceById, workspacePublicView, requestWorkspaceReset } from '../services/workspaceService.js';
 import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
 import { evaluateLineage } from '../utils/tallyLineage.js';
 import { createHardSyncRequest, getHardSyncRequest } from '../services/hardSyncService.js';
@@ -120,6 +120,67 @@ router.get('/hard-sync/status', requireDeviceCredential, async (req, res) => {
       return res.status(404).json({ status: false, code: 'NOT_FOUND' });
     }
     res.json({ status: true, data: { requestId: row.id, requestStatus: row.status } });
+  } catch (err) {
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// Desktop starts Owner Reset for New Tally (same 3-confirm + 24h grace as Web).
+router.post('/workspace/reset/request', requireDeviceCredential, async (req, res) => {
+  try {
+    if (!req.workspaceId) {
+      return res.status(403).json({ status: false, code: 'DEVICE_NOT_PAIRED', message: 'Device is not paired to a workspace.' });
+    }
+    const actorUserId = req.device?.user_id;
+    if (!actorUserId) {
+      return res.status(403).json({ status: false, code: 'OWNER_ONLY', message: 'Only the Workspace Owner can reset from this Desktop.' });
+    }
+    const data = await requestWorkspaceReset(actorUserId, req.workspaceId);
+    _socket?.notifyWorkspaceRoom?.(req.workspaceId, 'workspace_reset_requested', {
+      requestId: data.requestId,
+      deviceId: req.deviceId,
+    });
+    res.json({
+      status: true,
+      data: {
+        requestId: data.requestId,
+        requestStatus: data.status,
+        confirmPhrase: data.confirmPhrase,
+        confirmsRequired: data.confirmsRequired,
+        hours: data.hours,
+        emailsSent: data.emailsSent,
+      },
+    });
+  } catch (err) {
+    res.status(err.httpStatus || 500).json({ status: false, code: err.code, message: err.message });
+  }
+});
+
+router.get('/workspace/reset/status', requireDeviceCredential, async (req, res) => {
+  try {
+    if (!req.workspaceId) {
+      return res.json({ status: true, data: { requestStatus: null } });
+    }
+    const { rows } = await query(
+      `SELECT id, status, confirm_count, grace_ends_at, created_at
+       FROM workspace_lifecycle_requests
+       WHERE workspace_id = $1 AND kind = 'RESET'
+         AND status IN ('PENDING_CONFIRM','PENDING_GRACE')
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.workspaceId]
+    );
+    const row = rows[0];
+    res.json({
+      status: true,
+      data: row
+        ? {
+            requestId: row.id,
+            requestStatus: row.status,
+            confirmCount: row.confirm_count,
+            graceEndsAt: row.grace_ends_at,
+          }
+        : { requestStatus: null },
+    });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });
   }

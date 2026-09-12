@@ -9,6 +9,7 @@ import { ensureDemoCompany } from './demoDataService.js';
 import { sendOwnershipConfirmEmail, sendLifecycleConfirmEmail } from './email.js';
 import { purgeCompanyTallyData } from './companyPurge.js';
 import { unpairDevice } from './deviceBinding.js';
+import { getWorkspaceSocket } from '../socket/workspaceEmit.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY_SEC = 24 * 60 * 60;
@@ -703,6 +704,28 @@ export async function suspendMember(actorUserId, workspaceId, targetUserId) {
     [target.id, now()]
   );
   await audit(workspaceId, actorUserId, 'member.suspended', { targetUserId });
+  try {
+    const { getWorkspaceSocket } = await import('../socket/workspaceEmit.js');
+    const sock = getWorkspaceSocket?.();
+    sock?.notifyWorkspace?.(targetUserId, 'membership_revoked', {
+      userId: targetUserId,
+      workspaceId,
+      reason: 'SUSPENDED',
+      message: 'Your membership was suspended',
+    });
+    sock?.notifyWorkspace?.(targetUserId, 'access_revoked', {
+      userId: targetUserId,
+      workspaceId,
+      reason: 'SUSPENDED',
+    });
+    sock?.notifyWorkspaceRoom?.(workspaceId, 'membership_changed', {
+      workspaceId,
+      targetUserId,
+      status: 'SUSPENDED',
+    });
+  } catch {
+    /* socket optional */
+  }
   return true;
 }
 
@@ -754,6 +777,28 @@ export async function removeMember(actorUserId, workspaceId, targetUserId) {
     );
   }
   await audit(workspaceId, actorUserId, 'member.removed', { targetUserId });
+  try {
+    const { getWorkspaceSocket } = await import('../socket/workspaceEmit.js');
+    const sock = getWorkspaceSocket?.();
+    sock?.notifyWorkspace?.(targetUserId, 'membership_revoked', {
+      userId: targetUserId,
+      workspaceId,
+      reason: 'REMOVED',
+      message: 'Your membership was removed',
+    });
+    sock?.notifyWorkspace?.(targetUserId, 'access_revoked', {
+      userId: targetUserId,
+      workspaceId,
+      reason: 'REMOVED',
+    });
+    sock?.notifyWorkspaceRoom?.(workspaceId, 'membership_changed', {
+      workspaceId,
+      targetUserId,
+      status: 'REMOVED',
+    });
+  } catch {
+    /* socket optional */
+  }
   return true;
 }
 
@@ -1591,9 +1636,16 @@ export async function executeWorkspaceReset(actorUserId, workspaceId, { system =
     `SELECT device_id FROM devices WHERE workspace_id = $1`,
     [workspaceId]
   );
+  const sock = getWorkspaceSocket();
   for (const d of devices) {
-    await unpairDevice(d.device_id, ownerId).catch(() => {});
+    const unpaired = await unpairDevice(d.device_id, ownerId).catch(() => null);
+    sock?.notifyDesktop?.(d.device_id, 'unpaired', {
+      newCode: unpaired?.newCode || null,
+      reason: 'WORKSPACE_RESET',
+    });
+    sock?.notifyDesktop?.(d.device_id, 'binding_revoked', { reason: 'WORKSPACE_RESET' });
   }
+  sock?.notifyWorkspaceRoom?.(workspaceId, 'workspace_reset', { status: 'COMPLETED', requestId: req.id });
 
   // Detach non-demo companies: purge tally data + clear workspace binding
   const { rows: companies } = await query(
@@ -2012,9 +2064,16 @@ export async function executeWorkspaceClose(actorUserId, workspaceId, { system =
     `SELECT device_id FROM devices WHERE workspace_id = $1`,
     [workspaceId]
   );
+  const sock = getWorkspaceSocket();
   for (const d of devices) {
-    await unpairDevice(d.device_id, ownerId).catch(() => {});
+    const unpaired = await unpairDevice(d.device_id, ownerId).catch(() => null);
+    sock?.notifyDesktop?.(d.device_id, 'unpaired', {
+      newCode: unpaired?.newCode || null,
+      reason: 'WORKSPACE_CLOSED',
+    });
+    sock?.notifyDesktop?.(d.device_id, 'binding_revoked', { reason: 'WORKSPACE_CLOSED' });
   }
+  sock?.notifyWorkspaceRoom?.(workspaceId, 'workspace_closed', { status: 'COMPLETED' });
 
   const { rows: companies } = await query(
     `SELECT guid FROM companies WHERE workspace_id = $1`,
