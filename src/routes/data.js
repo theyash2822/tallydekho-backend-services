@@ -5,6 +5,8 @@ import { authMiddleware, requirePaired, requireCompanySynced } from '../middlewa
 import { resolveFYDates } from './api-v1.js';
 import { buildStockDashboardInsights } from '../utils/stockDashboardInsights.js';
 import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.js';
+import { resolveViewCapability } from '../middleware/viewCapability.js';
+import { listCostCentresForCompany } from '../services/costCentreListService.js';
 
 const router = Router();
 
@@ -24,49 +26,27 @@ router.use((req, res, next) => {
   next();
 });
 
-// Fail-closed workspace + company scope (Universal §45)
-async function verifyCompanyOwnership(req, res, companyGuid) {
+// Fail-closed workspace + company scope + same view caps as /api (Wave 2)
+async function verifyCompanyOwnership(req, res, companyGuid, capabilityOverride = undefined) {
   const fy = req.body?.fy || req.body?.financialYear || null;
+  const mapped = capabilityOverride !== undefined
+    ? capabilityOverride
+    : resolveViewCapability(req);
+  if (capabilityOverride === undefined && mapped == null) {
+    res.status(403).json({
+      status: false,
+      message: 'Capability required for this route',
+      code: 'CAPABILITY_REQUIRED',
+    });
+    return false;
+  }
+  const capability = mapped === '__scope_only__' ? null : mapped;
   const ok = await verifyCompanyAccess(req, res, companyGuid, {
+    capability,
     financialYear: fy,
     responseShape: 'data',
   });
   return ok;
-}
-
-/** List company cost centres (masters table, with optional allocation fallback). */
-async function listCostCentresForCompany(companyGuid) {
-  try {
-    const { rows } = await query(
-      `SELECT guid, name, parent_name FROM cost_centres
-       WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
-       ORDER BY name`,
-      [companyGuid]
-    );
-    if (rows.length) return rows;
-  } catch {
-    /* table may be missing on older DBs */
-  }
-
-  const fallbackSqls = [
-    `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-     FROM voucher_cost_centre_allocations
-     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
-     ORDER BY 2`,
-    `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-     FROM voucher_cost_allocations
-     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
-     ORDER BY 2`,
-  ];
-  for (const sql of fallbackSqls) {
-    try {
-      const { rows } = await query(sql, [companyGuid]);
-      if (rows.length) return rows;
-    } catch {
-      /* allocation table does not exist */
-    }
-  }
-  return [];
 }
 
 // GET /ping — lightweight health check for desktop connectivity detection

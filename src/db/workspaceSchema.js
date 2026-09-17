@@ -460,4 +460,22 @@ export async function applyWorkspaceSchema(client) {
       WHERE display_name IS NULL OR display_name = ''
     `).catch(() => {});
   }
+
+  // Phase 2 D — server-backed sessions (refresh hash only; never store raw refresh)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id                  TEXT PRIMARY KEY,
+      user_id             INTEGER NOT NULL REFERENCES users(id),
+      refresh_token_hash  TEXT NOT NULL,
+      status              TEXT NOT NULL DEFAULT 'ACTIVE',
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      expires_at          BIGINT,
+      revoked_at          BIGINT,
+      rotated_at          BIGINT,
+      client_type         TEXT,
+      device_label        TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_refresh ON auth_sessions(refresh_token_hash);
+  `);
 }

@@ -10,10 +10,14 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { requireIntegrationCompanyAccess } from '../middleware/integrationAccess.js';
 import fetch from 'node-fetch';
 import crypto from 'crypto';
 
 const router = Router();
+const gateConfigure = [authMiddleware, requireIntegrationCompanyAccess('configure')];
+const gateRead = [authMiddleware, requireIntegrationCompanyAccess('read')];
+
 
 /** Fail closed: workspace-scoped generate requires ACTIVE workspace integration. */
 async function assertWorkspaceIntegrationActive(req, domain) {
@@ -109,7 +113,7 @@ const IRP_URLS = {
 const EWAY_BASE = 'https://ewaybillgst.gov.in/api/ewayapirequest.aspx';
 
 // ── Save E-Way Bill credentials ───────────────────────────────────────────────
-router.post('/eway-bill/credentials', authMiddleware, async (req, res) => {
+router.post('/eway-bill/credentials', ...gateConfigure, async (req, res) => {
   const { companyGuid, gstin, username, password, clientId, clientSecret } = req.body;
   if (!companyGuid || !gstin || !username || !password) {
     return res.status(400).json({ status: false, message: 'companyGuid, gstin, username, password required' });
@@ -137,23 +141,21 @@ router.post('/eway-bill/credentials', authMiddleware, async (req, res) => {
 });
 
 // ── Get E-Way Bill status ─────────────────────────────────────────────────────
-router.get('/eway-bill/status', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.query;
-  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+router.get('/eway-bill/status', ...gateRead, async (req, res) => {
+  const companyGuid = req.integrationCompanyGuid || req.query.companyGuid;
   try {
     await ensureTable();
     const { rows } = await query(
-      `SELECT gstin, username, status, last_connected, token_expiry FROM integrations WHERE company_guid=$1 AND type='eway-bill'`,
+      `SELECT status, last_connected, token_expiry FROM integrations WHERE company_guid=$1 AND type='eway-bill'`,
       [companyGuid]
     );
-    if (!rows.length) return res.json({ status: 'disconnected' });
+    if (!rows.length) return res.json({ status: 'disconnected', configured: false });
     const row = rows[0];
-    // Check token validity
     const isTokenValid = row.token_expiry && new Date(row.token_expiry) > new Date();
+    // Never return credentials — configured state only
     res.json({
       status: isTokenValid ? 'connected' : row.status,
-      gstin: row.gstin,
-      username: row.username,
+      configured: true,
       lastConnected: row.last_connected,
     });
   } catch (e) {
@@ -210,7 +212,7 @@ async function getEWayToken(companyGuid) {
 }
 
 // ── Generate E-Way Bill ───────────────────────────────────────────────────────
-router.post('/eway-bill/generate', authMiddleware, async (req, res) => {
+router.post('/eway-bill/generate', ...gateConfigure, async (req, res) => {
   const {
     companyGuid, voucherId, transMode, transDistance,
     transporterName, transporterId, transDocNo, transDocDate,
@@ -291,7 +293,7 @@ router.post('/eway-bill/generate', authMiddleware, async (req, res) => {
 });
 
 // ── Cancel E-Way Bill ─────────────────────────────────────────────────────────
-router.post('/eway-bill/cancel', authMiddleware, async (req, res) => {
+router.post('/eway-bill/cancel', ...gateConfigure, async (req, res) => {
   const { companyGuid, ewbNo, cancelRsnCode, cancelRmrk } = req.body;
   if (!companyGuid || !ewbNo) return res.status(400).json({ status: false, message: 'companyGuid and ewbNo required' });
   try {
@@ -310,7 +312,7 @@ router.post('/eway-bill/cancel', authMiddleware, async (req, res) => {
 });
 
 // ── Extend E-Way Bill validity ────────────────────────────────────────────────
-router.post('/eway-bill/extend', authMiddleware, async (req, res) => {
+router.post('/eway-bill/extend', ...gateConfigure, async (req, res) => {
   const { companyGuid, ewbNo, vehicleNo, fromPlace, fromState, remainingDistance, transMode, extnRsnCode, extnRemarks } = req.body;
   if (!companyGuid || !ewbNo) return res.status(400).json({ status: false, message: 'companyGuid and ewbNo required' });
   try {
@@ -329,7 +331,7 @@ router.post('/eway-bill/extend', authMiddleware, async (req, res) => {
 });
 
 // ── Get E-Way Bill by number ──────────────────────────────────────────────────
-router.get('/eway-bill/get', authMiddleware, async (req, res) => {
+router.get('/eway-bill/get', ...gateRead, async (req, res) => {
   const { companyGuid, ewbNo } = req.query;
   if (!companyGuid || !ewbNo) return res.status(400).json({ status: false, message: 'companyGuid and ewbNo required' });
   try {
@@ -347,7 +349,7 @@ router.get('/eway-bill/get', authMiddleware, async (req, res) => {
 });
 
 // ── Bulk generate E-Way Bills ─────────────────────────────────────────────────
-router.post('/eway-bill/bulk-generate', authMiddleware, async (req, res) => {
+router.post('/eway-bill/bulk-generate', ...gateConfigure, async (req, res) => {
   const { companyGuid, voucherIds } = req.body;
   if (!companyGuid || !voucherIds?.length) return res.status(400).json({ status: false, message: 'companyGuid and voucherIds required' });
   try {
@@ -369,7 +371,7 @@ router.post('/eway-bill/bulk-generate', authMiddleware, async (req, res) => {
 });
 
 // ── Get E-Way Bills list ──────────────────────────────────────────────────────
-router.get('/eway-bill/list', authMiddleware, async (req, res) => {
+router.get('/eway-bill/list', ...gateRead, async (req, res) => {
   const { companyGuid, fy, status: statusFilter } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   try {
@@ -401,7 +403,7 @@ router.get('/eway-bill/list', authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Save E-Invoice credentials ────────────────────────────────────────────────
-router.post('/e-invoice/credentials', authMiddleware, async (req, res) => {
+router.post('/e-invoice/credentials', ...gateConfigure, async (req, res) => {
   const { companyGuid, gstin, username, password, irpProvider = 'NIC', clientId, clientSecret } = req.body;
   if (!companyGuid || !gstin || !username || !password) {
     return res.status(400).json({ status: false, message: 'companyGuid, gstin, username, password required' });
@@ -428,22 +430,20 @@ router.post('/e-invoice/credentials', authMiddleware, async (req, res) => {
 });
 
 // ── Get E-Invoice status ──────────────────────────────────────────────────────
-router.get('/e-invoice/status', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.query;
-  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+router.get('/e-invoice/status', ...gateRead, async (req, res) => {
+  const companyGuid = req.integrationCompanyGuid || req.query.companyGuid;
   try {
     await ensureTable();
     const { rows } = await query(
-      `SELECT gstin, username, irp_provider, status, last_connected, token_expiry FROM integrations WHERE company_guid=$1 AND type='e-invoice'`,
+      `SELECT status, last_connected, token_expiry, irp_provider FROM integrations WHERE company_guid=$1 AND type='e-invoice'`,
       [companyGuid]
     );
-    if (!rows.length) return res.json({ status: 'disconnected' });
+    if (!rows.length) return res.json({ status: 'disconnected', configured: false });
     const row = rows[0];
     const isTokenValid = row.token_expiry && new Date(row.token_expiry) > new Date();
     res.json({
       status: isTokenValid ? 'connected' : row.status,
-      gstin: row.gstin,
-      username: row.username,
+      configured: true,
       irpProvider: row.irp_provider,
       lastConnected: row.last_connected,
     });
@@ -492,7 +492,7 @@ async function getIRPToken(companyGuid) {
 }
 
 // ── Generate IRN ──────────────────────────────────────────────────────────────
-router.post('/e-invoice/generate-irn', authMiddleware, async (req, res) => {
+router.post('/e-invoice/generate-irn', ...gateConfigure, async (req, res) => {
   const { companyGuid, voucherId } = req.body;
   if (!companyGuid || !voucherId) return res.status(400).json({ status: false, message: 'companyGuid and voucherId required' });
   try {
@@ -596,7 +596,7 @@ router.post('/e-invoice/generate-irn', authMiddleware, async (req, res) => {
 });
 
 // ── Cancel IRN ────────────────────────────────────────────────────────────────
-router.post('/e-invoice/cancel-irn', authMiddleware, async (req, res) => {
+router.post('/e-invoice/cancel-irn', ...gateConfigure, async (req, res) => {
   const { companyGuid, irn, cnlRsn, cnlRem } = req.body;
   if (!companyGuid || !irn) return res.status(400).json({ status: false, message: 'companyGuid and irn required' });
   try {
@@ -623,7 +623,7 @@ router.post('/e-invoice/cancel-irn', authMiddleware, async (req, res) => {
 });
 
 // ── Get IRN details ───────────────────────────────────────────────────────────
-router.get('/e-invoice/get-irn', authMiddleware, async (req, res) => {
+router.get('/e-invoice/get-irn', ...gateRead, async (req, res) => {
   const { companyGuid, irn } = req.query;
   if (!companyGuid || !irn) return res.status(400).json({ status: false, message: 'companyGuid and irn required' });
   try {
@@ -642,7 +642,7 @@ router.get('/e-invoice/get-irn', authMiddleware, async (req, res) => {
 });
 
 // ── Get pending IRN (invoices without IRN) ────────────────────────────────────
-router.get('/e-invoice/pending', authMiddleware, async (req, res) => {
+router.get('/e-invoice/pending', ...gateRead, async (req, res) => {
   const { companyGuid } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   try {
@@ -664,7 +664,7 @@ router.get('/e-invoice/pending', authMiddleware, async (req, res) => {
 });
 
 // ── Bulk generate IRN ─────────────────────────────────────────────────────────
-router.post('/e-invoice/bulk-generate-irn', authMiddleware, async (req, res) => {
+router.post('/e-invoice/bulk-generate-irn', ...gateConfigure, async (req, res) => {
   const { companyGuid, voucherIds } = req.body;
   if (!companyGuid || !voucherIds?.length) return res.status(400).json({ status: false, message: 'companyGuid and voucherIds required' });
 

@@ -3,6 +3,7 @@ import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { loadMembership } from '../services/authorizationService.js';
 import { getMemberScopes } from '../services/workspaceService.js';
+import { verifyCompanyAccess } from '../middleware/companyAccess.js';
 
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
@@ -14,43 +15,62 @@ async function filterCompaniesByScope(userId, workspaceId, companies) {
   if (!membership) return [];
   if (membership.membership_type === 'OWNER') return companies;
   const scopes = await getMemberScopes(membership.id);
-  const mode = scopes?.policy?.company_mode || 'ALL';
+  const mode = scopes?.policy?.company_mode || 'NONE';
   if (mode === 'NONE') return [];
   if (mode === 'ALL') return companies;
   const allowed = new Set(scopes.companies || []);
   return companies.filter((c) => allowed.has(c.guid));
 }
 
-// GET /app/companies
+// GET /app/companies — workspace membership required; workspace_id authoritative
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
     const workspaceId = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
-    let companies;
-    if (workspaceId) {
-      // Prefer workspace-bound companies; legacy rows fall back to workspace Owner (not the caller).
-      const { rows: wsRows } = await query(
-        `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
-        [workspaceId]
-      );
-      const ownerId = wsRows[0]?.owner_user_id || req.user.userId;
-      const { rows } = await query(
-        `SELECT c.* FROM companies c
-         WHERE (c.is_active = TRUE OR c.is_active IS NULL)
-           AND (
-             c.workspace_id = $1
-             OR (c.workspace_id IS NULL AND c.user_id = $2)
-           )
-         ORDER BY c.name`,
-        [workspaceId, ownerId]
-      );
-      companies = await filterCompaniesByScope(req.user.userId, workspaceId, rows);
-    } else {
-      const { rows } = await query(
-        'SELECT * FROM companies WHERE user_id = $1 AND (is_active = TRUE OR is_active IS NULL) ORDER BY name',
-        [req.user.userId]
-      );
-      companies = rows;
+    if (!workspaceId) {
+      return res.status(403).json({
+        status: false,
+        message: 'X-Workspace-Id required',
+        code: 'WORKSPACE_ACCESS_DENIED',
+      });
     }
+    const membership = await loadMembership(req.user.userId, workspaceId);
+    if (!membership || membership.status !== 'ACTIVE') {
+      return res.status(403).json({
+        status: false,
+        message: 'Workspace membership required',
+        code: 'WORKSPACE_ACCESS_DENIED',
+      });
+    }
+
+    const { rows: bind } = await query(
+      `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const { rows: ws } = await query(
+      `SELECT tally_connection, owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const pairingStatus = bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
+    const unpaired = String(pairingStatus).toUpperCase() !== 'CONNECTED';
+    const ownerId = ws[0]?.owner_user_id;
+
+    if (unpaired && ownerId) {
+      const { ensureDemoCompany } = await import('../services/demoDataService.js');
+      await ensureDemoCompany(ownerId, workspaceId).catch(() => {});
+    }
+
+    // Authoritative: companies.workspace_id only (no companies.user_id auth)
+    const { rows } = await query(
+      `SELECT c.* FROM companies c
+       WHERE (c.is_active = TRUE OR c.is_active IS NULL)
+         AND c.workspace_id = $1
+       ORDER BY c.name`,
+      [workspaceId]
+    );
+    // Always apply company scope (least privilege — empty/SELECTED/NONE, never skip for unpaired)
+    let companies = await filterCompaniesByScope(req.user.userId, workspaceId, rows);
+    const { filterCompaniesByPairingStatus } = await import('../services/demoDataService.js');
+    companies = filterCompaniesByPairingStatus(companies, pairingStatus);
 
     // Fetch all financial years for all companies in one query
     const guids = companies.map(c => c.guid);
@@ -100,12 +120,20 @@ router.get('/companies', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /app/pairing-device
+// GET /app/pairing-device — Workspace binding (not devices.user_id)
 router.get('/pairing-device', authMiddleware, async (req, res) => {
   try {
+    const { ensureReqWorkspace } = await import('../middleware/companyAccess.js');
+    const workspaceId = await ensureReqWorkspace(req);
+    if (!workspaceId) {
+      return res.json({ status: true, data: { device: null, isPaired: false } });
+    }
     const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
+      `SELECT * FROM devices
+       WHERE workspace_id = $1 AND paired = TRUE
+       ORDER BY last_seen DESC NULLS LAST
+       LIMIT 1`,
+      [workspaceId]
     );
     const device = rows[0];
     if (!device) return res.json({ status: true, data: { device: null, isPaired: false } });
@@ -118,9 +146,17 @@ router.get('/pairing-device', authMiddleware, async (req, res) => {
 // GET /app/paired-device — alias
 router.get('/paired-device', authMiddleware, async (req, res) => {
   try {
+    const { ensureReqWorkspace } = await import('../middleware/companyAccess.js');
+    const workspaceId = await ensureReqWorkspace(req);
+    if (!workspaceId) {
+      return res.json({ status: true, data: { device: null, isPaired: false } });
+    }
     const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
+      `SELECT * FROM devices
+       WHERE workspace_id = $1 AND paired = TRUE
+       ORDER BY last_seen DESC NULLS LAST
+       LIMIT 1`,
+      [workspaceId]
     );
     const device = rows[0];
     if (!device) return res.json({ status: true, data: { device: null, isPaired: false } });
@@ -184,11 +220,17 @@ const DEFAULT_DECLARATION =
 router.get('/companies/:guid/print-profile', authMiddleware, async (req, res) => {
   try {
     const { guid } = req.params;
-    const { rows: owned } = await query(
-      'SELECT guid, gstin, pan, email, phone FROM companies WHERE guid = $1 AND user_id = $2',
-      [guid, req.user.userId]
+    const ok = await verifyCompanyAccess(req, res, guid, {
+      capability: 'workspace.settings.view',
+      responseShape: 'data',
+    });
+    if (!ok) return;
+
+    const { rows: companyRows } = await query(
+      'SELECT guid, gstin, pan, email, phone FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [guid, req.workspaceId]
     );
-    if (!owned[0]) return res.status(404).json({ status: false, message: 'Company not found' });
+    if (!companyRows[0]) return res.status(404).json({ status: false, message: 'Company not found' });
 
     const { rows } = await query('SELECT * FROM company_print_profile WHERE company_guid = $1', [guid]);
     const profile = rows[0] || {};
@@ -197,10 +239,10 @@ router.get('/companies/:guid/print-profile', authMiddleware, async (req, res) =>
       data: {
         companyGuid: guid,
         // Synced value wins; the profile only fills what Tally never sent.
-        gstin: owned[0].gstin || profile.gstin || '',
-        pan: owned[0].pan || profile.pan || '',
-        email: owned[0].email || profile.email || '',
-        phone: owned[0].phone || profile.phone || '',
+        gstin: companyRows[0].gstin || profile.gstin || '',
+        pan: companyRows[0].pan || profile.pan || '',
+        email: companyRows[0].email || profile.email || '',
+        phone: companyRows[0].phone || profile.phone || '',
         jurisdiction: profile.jurisdiction || '',
         declarationText: profile.declaration_text || DEFAULT_DECLARATION,
         bankName: profile.bank_name || '',
@@ -221,9 +263,15 @@ router.get('/companies/:guid/print-profile', authMiddleware, async (req, res) =>
 router.put('/companies/:guid/print-profile', authMiddleware, async (req, res) => {
   try {
     const { guid } = req.params;
+    const ok = await verifyCompanyAccess(req, res, guid, {
+      capability: 'workspace.settings.manage',
+      responseShape: 'data',
+    });
+    if (!ok) return;
+
     const { rows: owned } = await query(
-      'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2',
-      [guid, req.user.userId]
+      'SELECT guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [guid, req.workspaceId]
     );
     if (!owned[0]) return res.status(404).json({ status: false, message: 'Company not found' });
 

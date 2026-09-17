@@ -55,15 +55,35 @@ let _socketService = null;
 export function setTallyWriteSocket(s) { _socketService = s; }
 
 /** Ask desktop to pull newly created voucher(s) via SingleVoucher.xml (REFERENCE + number). */
-async function requestDesktopSyncAfterWrite({ userId, companyGuid, companyName, tdkRef, tallyIds = [], extra = {} }) {
+async function requestDesktopSyncAfterWrite({ userId, workspaceId = null, companyGuid, companyName, tdkRef, tallyIds = [], extra = {} }) {
   if (!_socketService?.connectedClients) return;
   try {
-    const { rows: devRows } = await query(
-      'SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE ORDER BY last_seen DESC LIMIT 1',
-      [userId]
-    );
-    if (!devRows[0]?.device_id) return;
-    const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
+    let deviceId = null;
+    let wsId = workspaceId;
+    if (!wsId && companyGuid) {
+      const { rows: cos } = await query(
+        `SELECT workspace_id FROM companies WHERE guid = $1 LIMIT 1`,
+        [companyGuid]
+      );
+      wsId = cos[0]?.workspace_id || null;
+    }
+    if (wsId) {
+      const { rows: bind } = await query(
+        `SELECT active_device_id FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+        [wsId]
+      );
+      deviceId = bind[0]?.active_device_id || null;
+      if (!deviceId) {
+        const { rows: byWs } = await query(
+          `SELECT device_id FROM devices WHERE workspace_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1`,
+          [wsId]
+        );
+        deviceId = byWs[0]?.device_id || null;
+      }
+    }
+    // No devices.user_id fallback — Workspace binding is sole Desktop routing source
+    if (!deviceId) return;
+    const ds = _socketService.connectedClients.get('desktop_' + deviceId);
     if (!ds?.connected) return;
     const ids = (Array.isArray(tallyIds) ? tallyIds : []).map(String).filter(Boolean);
     ds.emit('sync:request', {
@@ -165,11 +185,15 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
   ).catch(() => ({ rows: [] }));
   device = byWs[0] || null;
   if (!device) {
-    const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [userId]
-    );
-    device = rows[0];
+    // Fallback: company → workspace → active Desktop (never devices.user_id)
+    const { rows: byCompanyWs } = await query(
+      `SELECT d.* FROM devices d
+       JOIN companies c ON c.workspace_id = d.workspace_id
+       WHERE c.guid = $1 AND d.paired = TRUE
+       ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
+      [companyGuid]
+    ).catch(() => ({ rows: [] }));
+    device = byCompanyWs[0] || null;
   }
   // No device paired — queue it anyway; will push when device pairs
   if (!device) return { status: 'desktop_offline', message: 'No paired desktop. Entry saved — will push when desktop connects.' };
@@ -3781,10 +3805,10 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
   let qId = null;
   let creditNoteUuid = null;
   try {
-    // ── Ownership ────────────────────────────────────────────────────────────
+    // ── Ownership (workspace lineage — middleware already gated access) ───────
     const { rows: coRows } = await query(
-      'SELECT guid, name FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      'SELECT guid, name FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [companyGuid, req.workspaceId]
     );
     if (!coRows[0]) return bad('Company not found or access denied', 403);
     const resolvedCompanyName = companyName || coRows[0].name;
@@ -4254,8 +4278,8 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
   let debitNoteUuid = null;
   try {
     const { rows: coRows } = await query(
-      'SELECT guid, name FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      'SELECT guid, name FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [companyGuid, req.workspaceId]
     );
     if (!coRows[0]) return bad('Company not found or access denied', 403);
     const resolvedCompanyName = companyName || coRows[0].name;

@@ -8,7 +8,7 @@ import morgan from 'morgan';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 
-import { initSchema } from './db/schema.js';
+import { initSchema, query } from './db/schema.js';
 import { seedGeoMasters } from './db/seedGeo.js';
 import { startScheduler } from './services/scheduler.js';
 import { setupSocket } from './socket/socketHandler.js';
@@ -24,14 +24,34 @@ import integrationRoutes from './routes/integrations.js';
 import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
 import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler, setDesktopWorkspaceSocket } from './routes/desktopWorkspace.js';
 import { setWorkspaceApiSocket } from './routes/workspaceApi.js';
+import { setWorkspaceSocket } from './socket/workspaceEmit.js';
 
 const app = express();
+app.set('etag', false); // Mobile/web clients mishandle 304 empty bodies on JSON APIs
 const httpServer = createServer(app);
 const PORT = process.env.PORT || 3001;
 
 // ── Socket.io ──────────────────────────────────────────────────────────────
 const io = new SocketIO(httpServer, {
-  cors: { origin: process.env.ALLOWED_ORIGINS?.split(',') || '*', methods: ['GET', 'POST'] },
+  // RN clients often send Origin: null / no Origin — allow those plus ALLOWED_ORIGINS
+  cors: {
+    origin: (origin, cb) => {
+      const allowed = (process.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!origin || origin === 'null' || allowed.includes(origin) || allowed.includes('*')) {
+        return cb(null, true);
+      }
+      // Expo / Metro / native wrappers
+      if (/^exp:\/\//i.test(origin) || /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.)/i.test(origin)) {
+        return cb(null, true);
+      }
+      return cb(null, false);
+    },
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
   transports: ['websocket', 'polling'],
   pingTimeout: 90000,    // 90s — tolerates slow desktop responses during sync
   pingInterval: 30000,   // ping every 30s (default 25s)
@@ -41,7 +61,12 @@ const io = new SocketIO(httpServer, {
 export const socketService = setupSocket(io);
 
 // ── Middleware ─────────────────────────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: false,
+  // API is consumed cross-origin by Web (Vite) / Mobile / Desktop — default
+  // same-origin CORP makes browsers report opaque "Failed to fetch".
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || '*', credentials: true }));
 app.use(morgan('dev'));
 app.use(compression());
@@ -76,13 +101,25 @@ app.use('/api', apiV1Routes);
 app.use('/', ingestRoutes);
 
 // ── Internal notify ────────────────────────────────────────────────────────
-app.post('/ingest/complete-notify', express.json(), (req, res) => {
+app.post('/ingest/complete-notify', express.json(), async (req, res) => {
   const secret = req.headers['x-internal-secret'];
   if (secret !== process.env.INTERNAL_SECRET) {
     return res.status(403).json({ status: false, message: 'Forbidden' });
   }
   const { userId, companyGuid } = req.body;
-  if (userId) socketService.notifySynced(userId, companyGuid);
+  if (userId) {
+    let wsId = null;
+    if (companyGuid) {
+      try {
+        const { rows } = await query(
+          `SELECT workspace_id FROM companies WHERE guid = $1 LIMIT 1`,
+          [companyGuid]
+        );
+        wsId = rows[0]?.workspace_id || null;
+      } catch (_) { /* still notify user clients */ }
+    }
+    socketService.notifySynced(userId, companyGuid, wsId);
+  }
   res.json({ status: true });
 });
 
@@ -102,6 +139,7 @@ setPairingSocket(socketService);
 setApiSocket(socketService);
 setDesktopWorkspaceSocket(socketService);
 setWorkspaceApiSocket(socketService);
+setWorkspaceSocket(socketService);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 initSchema()

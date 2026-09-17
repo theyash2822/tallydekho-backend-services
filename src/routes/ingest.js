@@ -304,23 +304,6 @@ router.post('/ingest/sync-run/complete', requireDeviceCredential, async (req, re
   }
 });
 
-// GET /ingest/sync-run/history?companyGuid= — V2: sync run history + monitoring
-router.get('/ingest/sync-run/history', async (req, res) => {
-  const { companyGuid, limit = 20 } = req.query;
-  if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
-  try {
-    const { rows } = await query(
-      `SELECT id, sync_type, status, record_counts, expected_counts, error_message, started_at, completed_at,
-              EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_seconds
-       FROM sync_runs WHERE company_guid=$1 ORDER BY started_at DESC LIMIT $2`,
-      [companyGuid, parseInt(limit)]
-    );
-    res.json({ status: true, data: rows });
-  } catch (err) {
-    res.status(500).json({ status: false, message: err.message });
-  }
-});
-
 // POST /ingest/chunk
 router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
   const uploadId  = req.headers['upload-id'];
@@ -357,11 +340,30 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
       companyGuid = data[0]?.COMPANY_GUID || data[0]?.company_guid || null;
     }
     if (!companyGuid) {
-      const { rows } = await query('SELECT company_guid FROM ingest_uploads WHERE id = $1', [uploadId]);
+      const { rows } = await query(
+        'SELECT company_guid FROM ingest_uploads WHERE id = $1 AND device_id = $2',
+        [uploadId, deviceId]
+      );
       companyGuid = rows[0]?.company_guid;
     }
+    // Ownership: uploadId must belong to this authenticated device
+    const { rows: owned } = await query(
+      `SELECT id FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
+      [uploadId, deviceId]
+    );
+    if (!owned[0]) {
+      return res.status(403).json({
+        status: false,
+        code: 'UPLOAD_OWNERSHIP_DENIED',
+        message: 'uploadId does not belong to this device',
+      });
+    }
     if (companyGuid) {
-      await query('UPDATE ingest_uploads SET company_guid = $1 WHERE id = $2', [companyGuid, uploadId]);
+      await query('UPDATE ingest_uploads SET company_guid = $1 WHERE id = $2 AND device_id = $3', [
+        companyGuid,
+        uploadId,
+        deviceId,
+      ]);
     }
 
     console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${companyGuid || 'unknown'} | records: ${data.length}`);
@@ -387,12 +389,25 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
   const deviceId = req.headers['device-id'];
 
   try {
-    if (!companyGuid && uploadId) {
-      const { rows } = await query('SELECT company_guid FROM ingest_uploads WHERE id = $1', [uploadId]);
-      companyGuid = rows[0]?.company_guid;
+    if (uploadId) {
+      const { rows: owned } = await query(
+        `SELECT id, company_guid FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
+        [uploadId, deviceId]
+      );
+      if (!owned[0]) {
+        return res.status(403).json({
+          status: false,
+          code: 'UPLOAD_OWNERSHIP_DENIED',
+          message: 'uploadId does not belong to this device',
+        });
+      }
+      if (!companyGuid) companyGuid = owned[0].company_guid;
     }
 
-    await query('UPDATE ingest_uploads SET status = $1, completed_at = $2 WHERE id = $3', ['complete', now(), uploadId || '']);
+    await query(
+      'UPDATE ingest_uploads SET status = $1, completed_at = $2 WHERE id = $3 AND device_id = $4',
+      ['complete', now(), uploadId || '', deviceId]
+    );
     await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
 
     const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);

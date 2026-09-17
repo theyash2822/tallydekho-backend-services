@@ -7,6 +7,7 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { verifyCompanyAccess } from '../middleware/companyAccess.js';
 import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
 import { retrieveKBContext, retrieveKBContextSemantic, buildSystemPrompt } from '../services/helpRetrieval.js';
 import { tryFAQAnswer, tryDirectKBAnswer } from '../services/helpDirectAnswer.js';
@@ -19,6 +20,10 @@ const router = Router();
 router.get('/ai-insights', authMiddleware, async (req, res) => {
   const { companyGuid } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!await verifyCompanyAccess(req, res, companyGuid, {
+    capability: 'ai_insights.view',
+    responseShape: 'data',
+  })) return;
 
   try {
     const now = new Date();

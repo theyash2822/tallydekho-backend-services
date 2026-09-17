@@ -14,6 +14,31 @@ export function demoCompanyGuidForWorkspace(workspaceId) {
   return `dddddddd-dddd-4ddd-8ddd-${hex}`;
 }
 
+/** True for Demo Company rows (name or reserved GUID prefix). */
+export function isDemoCompany(c) {
+  if (!c) return false;
+  const name = String(c.name || '').toLowerCase().trim();
+  const guid = String(c.guid || c.id || '');
+  return (
+    name.startsWith('demo')
+    || guid.startsWith('DEMO')
+    || guid.startsWith('dddddddd-dddd-4ddd-8ddd-')
+  );
+}
+
+/**
+ * Paired (CONNECTED) → hide Demo Company (live books only).
+ * Unpaired / reconnecting / unknown → Demo Company only (fail-closed).
+ * Universal MD §8: real synced data stays stored but hidden from operational APIs/UI.
+ */
+export function filterCompaniesByPairingStatus(companies, pairingStatus) {
+  const list = Array.isArray(companies) ? companies : [];
+  const status = String(pairingStatus || '').toUpperCase();
+  if (status === 'CONNECTED') return list.filter((c) => !isDemoCompany(c));
+  // UNPAIRED | RECONNECTING | anything else → Demo only (never leak live books)
+  return list.filter((c) => isDemoCompany(c));
+}
+
 function currentIndianFy(ref = new Date()) {
   const y = ref.getUTCFullYear();
   const m = ref.getUTCMonth() + 1;
@@ -730,8 +755,9 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
 
 /**
  * Ensures workspace has an active Demo Company with full sample data.
- * - Unpaired: create + full seed
- * - Connected: refresh existing Demo Company only (never overwrite real Tally companies)
+ * - Unpaired: create + full seed (once — skip if vouchers already present)
+ * - Connected: refresh existing Demo Company only when force=true
+ * - force: always reseed (reset / ops)
  */
 export async function ensureDemoCompany(userId, workspaceId, { force = false } = {}) {
   if (!userId || !workspaceId) return null;
@@ -757,6 +783,22 @@ export async function ensureDemoCompany(userId, workspaceId, { force = false } =
   }
 
   const companyGuid = demoRows[0]?.guid || demoCompanyGuidForWorkspace(workspaceId);
+
+  // Already seeded → keep data (avoids wipe/race that blanks home KPI cards)
+  if (demoRows[0] && !force) {
+    const { rows: cnt } = await query(
+      `SELECT COUNT(*)::int AS n FROM vouchers WHERE company_guid = $1`,
+      [companyGuid]
+    );
+    if ((cnt[0]?.n || 0) > 0) {
+      await query(
+        `UPDATE companies SET is_active = TRUE, synced_at = $2 WHERE guid = $1`,
+        [companyGuid, now()]
+      ).catch(() => {});
+      return { guid: companyGuid, name: 'Demo Company', skipped: true };
+    }
+  }
+
   return seedFullDemoCompany(userId, workspaceId, companyGuid);
 }
 

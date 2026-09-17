@@ -3,7 +3,8 @@ import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
 import { generateShortCode, hashSecret, verifySecret, hashToken, generateDeviceSecret } from './deviceCredential.js';
 import { listAvailableBackups, getBackup, downloadAuthFor } from './backupService.js';
-import { getWorkspaceById, isOwnerOrAdmin } from './workspaceService.js';
+import { getWorkspaceById } from './workspaceService.js';
+import { assertCapability } from './authorizationService.js';
 import { lineageMatchesBackupManifest, lineageMatchesRestoredFolders } from '../utils/tallyLineage.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -33,7 +34,12 @@ export async function getRestoreRequestForDevice(deviceId) {
 }
 
 export async function approveRestore({ userId, workspaceId, code, backupId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';
@@ -91,7 +97,12 @@ export async function approveRestore({ userId, workspaceId, code, backupId }) {
 }
 
 export async function rejectRestore({ userId, workspaceId, sessionId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';

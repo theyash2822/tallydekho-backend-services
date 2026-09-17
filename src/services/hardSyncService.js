@@ -1,7 +1,8 @@
 import { v4 as uuid } from 'uuid';
 import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
-import { membershipCount, isOwnerOrAdmin } from './workspaceService.js';
+import { membershipCount } from './workspaceService.js';
+import { assertCapability } from './authorizationService.js';
 import { purgeCompaniesForHardSync } from './companyPurge.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -49,7 +50,12 @@ export async function createHardSyncRequest({
 }
 
 export async function approveHardSync({ requestId, userId, workspaceId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';
@@ -86,7 +92,12 @@ export async function approveHardSync({ requestId, userId, workspaceId }) {
 }
 
 export async function rejectHardSync({ requestId, userId, workspaceId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';

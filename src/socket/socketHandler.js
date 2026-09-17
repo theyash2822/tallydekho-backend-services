@@ -73,12 +73,20 @@ export function setupSocket(io) {
                 socket.emit('error', { code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential invalid' });
                 return;
               }
+            } else {
+              // Pre-claim: no privileged desktop authority
+              socket.deviceId = deviceId;
+              socket.clientType = 'desktop';
+              socket.privilegedDesktop = false;
+              socket.emit('registered', { status: true, privileged: false, reason: 'CREDENTIAL_NOT_CLAIMED' });
+              return;
             }
             socket.deviceId = deviceId;
             socket.clientType = 'desktop';
+            socket.privilegedDesktop = true;
             connectedClients.set(`desktop_${deviceId}`, socket);
             console.log(`[WS] registered desktop via register event: ${deviceId}`);
-            socket.emit('registered', { status: true });
+            socket.emit('registered', { status: true, privileged: true });
             if (!d || !d.paired) return;
             if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
             const userId = d.user_id;
@@ -119,14 +127,8 @@ export function setupSocket(io) {
         connectedClients.set(`${type}_${userId}`, socket);
         console.log(`[WS] registered ${type} client for user ${userId}`);
         socket.emit('registered', { status: true });
-        // Join company room so targeted lifecycle events reach this client
-        query('SELECT guid FROM companies WHERE user_id=$1 AND is_active=TRUE ORDER BY synced_at DESC NULLS LAST LIMIT 1', [userId])
-          .then(({ rows }) => {
-            if (rows[0]?.guid) {
-              socket.join(`company:${rows[0].guid}`);
-              console.log(`[WS] user ${userId} joined company room: ${rows[0].guid}`);
-            }
-          }).catch(() => {});
+        // Do NOT auto-join company rooms via companies.user_id (legacy).
+        // Clients must call workspace:register after selecting a workspace.
       } catch {
         socket.emit('error', { message: 'Invalid token' });
       }
@@ -156,9 +158,7 @@ export function setupSocket(io) {
         console.log(`[WS] user ${socket.userId} joined ${socket.workspaceRoom}`);
         const { rows: cos } = await query(
           `SELECT guid FROM companies
-           WHERE (workspace_id = $1 OR (workspace_id IS NULL AND user_id = (
-             SELECT owner_user_id FROM workspaces WHERE id = $1
-           ))) AND (is_active = TRUE OR is_active IS NULL)`,
+           WHERE workspace_id = $1 AND (is_active = TRUE OR is_active IS NULL)`,
           [workspaceId]
         );
         for (const c of cos) {
@@ -223,20 +223,58 @@ export function setupSocket(io) {
       }
     });
 
-    // Desktop registers with device-id
-    socket.on('register_desktop', ({ deviceId }) => {
-      socket.deviceId = deviceId;
-      socket.clientType = 'desktop';
-      connectedClients.set(`desktop_${deviceId}`, socket);
-      console.log(`[WS] registered desktop: ${deviceId}`);
-      // Auto-retry offline entries for this device
-      query('SELECT user_id, workspace_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1', [deviceId])
-        .then(({ rows }) => {
-          if (rows[0] && _retryOfflineEntries) {
-            console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-            _retryOfflineEntries(rows[0].user_id, null, rows[0].workspace_id || null);
+    // Desktop registers — device-id is NOT a credential. Require secret when hashed;
+    // before claim (no hash): allow socket identity only, ZERO privileged authority.
+    socket.on('register_desktop', async ({ deviceId, deviceSecret } = {}) => {
+      try {
+        if (!deviceId) {
+          socket.emit('error', { code: 'DEVICE_ID_REQUIRED', message: 'deviceId required' });
+          return;
+        }
+        const { rows } = await query(
+          `SELECT user_id, workspace_id, device_secret_hash, paired, binding_status
+           FROM devices WHERE device_id=$1 LIMIT 1`,
+          [deviceId]
+        );
+        const d = rows[0];
+        if (!d) {
+          socket.emit('error', { code: 'DEVICE_NOT_REGISTERED', message: 'Device not registered' });
+          return;
+        }
+        if (d.device_secret_hash) {
+          const { verifySecret } = await import('../services/deviceCredential.js');
+          const ok = deviceSecret ? await verifySecret(deviceSecret, d.device_secret_hash) : false;
+          if (!ok) {
+            socket.emit('error', { code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential invalid' });
+            return;
           }
-        }).catch(() => {});
+        } else {
+          // Pre-claim: identity only — no writeback map, no room, no retry
+          socket.deviceId = deviceId;
+          socket.clientType = 'desktop';
+          socket.privilegedDesktop = false;
+          socket.emit('registered', { status: true, privileged: false, reason: 'CREDENTIAL_NOT_CLAIMED' });
+          return;
+        }
+        if (!d.paired || d.binding_status === 'REVOKED') {
+          socket.emit('error', { code: 'DEVICE_NOT_PAIRED', message: 'Device is not paired' });
+          return;
+        }
+        socket.deviceId = deviceId;
+        socket.clientType = 'desktop';
+        socket.privilegedDesktop = true;
+        connectedClients.set(`desktop_${deviceId}`, socket);
+        if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
+        console.log(`[WS] registered desktop (credentialed): ${deviceId}`);
+        socket.emit('registered', { status: true, privileged: true });
+        if (_retryOfflineEntries) {
+          console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
+          _retryOfflineEntries(d.user_id, null, d.workspace_id || null);
+        }
+      } catch (err) {
+        console.warn('[WS] register_desktop failed', err.message);
+        socket.emit('error', { code: 'REGISTER_FAILED', message: 'Desktop registration failed' });
+      }
     });
 
     // Mobile emits this on manual logout so server cleans up immediately
@@ -302,6 +340,39 @@ export function setupSocket(io) {
       ['mobile', 'web'].forEach(type => {
         const client = connectedClients.get(`${type}_${userId}`);
         if (client?.connected) client.emit(event, payload);
+      });
+    },
+
+    /**
+     * Server-controlled eviction: leave workspace/company rooms and force disconnect
+     * for a user who lost membership (remove/suspend).
+     */
+    revokeUserWorkspaceAccess: (userId, workspaceId, reason = 'ACCESS_REVOKED') => {
+      const payload = { workspaceId, reason };
+      ['mobile', 'web'].forEach((type) => {
+        const client = connectedClients.get(`${type}_${userId}`);
+        if (!client?.connected) return;
+        try {
+          client.emit('workspace_access_revoked', payload);
+          client.emit('membership_revoked', payload);
+          client.emit('access_revoked', payload);
+          if (workspaceId) {
+            client.leave(`workspace:${workspaceId}`);
+            if (Array.isArray(client.companyRooms)) {
+              for (const room of client.companyRooms) client.leave(room);
+              client.companyRooms = [];
+            }
+            // Also leave any company:* rooms we can enumerate from socket adapter
+            if (client.workspaceId === workspaceId) {
+              client.workspaceId = null;
+              client.workspaceRoom = null;
+            }
+          }
+          client.disconnect(true);
+        } catch (err) {
+          console.warn('[WS] revokeUserWorkspaceAccess', err.message);
+        }
+        connectedClients.delete(`${type}_${userId}`);
       });
     },
 

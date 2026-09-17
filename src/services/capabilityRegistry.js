@@ -265,23 +265,22 @@ export function adminProtectedKeys() {
   return CAPABILITIES.filter((c) => c.protected_authority === 'OWNER_ADMIN').map((c) => c.key);
 }
 
-/** Legacy aliases used by early workspaceApi drafts — map to LOCKED keys. */
-export const CAPABILITY_ALIASES = {
-  'workspace.members.view': 'members.view',
-  'workspace.members.invite': 'members.invite',
-  'workspace.members.remove': 'members.remove',
-  'workspace.roles.manage': 'roles.edit',
-  'workspace.scope.manage': 'members.scope_manage',
-  'workspace.settings.manage': 'workspace.settings.manage',
-  'workspace.tally.pair': 'tally.pair',
-  'workspace.tally.unpair': 'tally.unpair',
-  'workspace.restore.approve': 'tally.restore_replace',
-  'workspace.hard_sync.approve': 'tally.restore_replace',
-  'integrations.manage': 'integrations.configure',
-  'integrations.activate': 'integrations.configure',
-  'billing.wallet.view': 'billing.manage',
-};
+/** High-risk caps custom roles must never receive (CTO Phase 3). */
+export function nonDelegableCapabilityKeys() {
+  return [
+    ...ownerOnlyKeys(),
+    ...adminProtectedKeys(),
+    'members.remove',
+    'members.role_assign',
+    'members.suspend',
+    'members.unsuspend',
+    'roles.create',
+    'roles.edit',
+    'roles.delete',
+  ];
+}
 
+/** Capability keys are canonical only — aliases removed in Phase 3. */
 export function resolveCapabilityKey(key) {
-  return CAPABILITY_ALIASES[key] || key;
+  return key;
 }

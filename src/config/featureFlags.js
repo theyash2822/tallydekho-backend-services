@@ -1,11 +1,11 @@
 /**
- * Workspace / RBAS feature flags — ON by product request (2026-09-12).
- * Backend remains fail-closed when enforcement is enabled.
+ * Workspace feature flags.
+ * Known keys below are ON. Unknown keys default OFF (Wave 4 fail-closed).
+ * RBAC is mandatory infrastructure — there is no rbas_enabled kill-switch.
  */
 export const FEATURE_FLAGS = {
   workspace_model_enabled: true,
   workspace_header_required: true,
-  rbas_enabled: true,
   member_invites_enabled: true,
   scope_company_enabled: true,
   scope_fy_enabled: true,
@@ -20,10 +20,10 @@ export const FEATURE_FLAGS = {
 };
 
 export function flag(name) {
-  return FEATURE_FLAGS[name] !== false;
+  return FEATURE_FLAGS[name] === true;
 }
 
-/** Callable map used by authz/scope/invite services: flags.rbas_enabled() */
+/** Callable map used by authz/scope/invite services */
 export const flags = Object.fromEntries(
   Object.keys(FEATURE_FLAGS).map((k) => [k, () => flag(k)])
 );

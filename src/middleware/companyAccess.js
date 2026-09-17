@@ -8,6 +8,7 @@ import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { loadMembership, authorize } from '../services/authorizationService.js';
 import { assertCompanyAccess, assertFyAccess, assertLedgerAccess, assertGodownAccess, assertCostCentreAccess } from '../services/scopeService.js';
 import { applyMask, getPolicies } from '../services/sensitivePolicyService.js';
+import { isDemoCompany } from '../services/demoDataService.js';
 
 function readWorkspaceHeader(req) {
   const h = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
@@ -35,23 +36,15 @@ export async function ensureReqWorkspace(req) {
 }
 
 /**
- * Company must belong to the resolved workspace (or legacy owner-bound).
+ * Company must belong to the resolved workspace (workspace_id authoritative).
+ * Legacy companies.user_id is NOT used for authorization (CTO Phase 2).
  */
-async function companyInWorkspace(companyGuid, workspaceId, userId) {
+async function companyInWorkspace(companyGuid, workspaceId, _userId) {
   const { rows } = await query(
     `SELECT c.guid FROM companies c
-     WHERE c.guid = $1
-       AND (
-         c.workspace_id = $2
-         OR (c.workspace_id IS NULL AND c.user_id = (
-           SELECT owner_user_id FROM workspaces WHERE id = $2
-         ))
-         OR (c.workspace_id IS NULL AND c.user_id = $3 AND EXISTS (
-           SELECT 1 FROM workspaces w WHERE w.id = $2 AND w.owner_user_id = $3 AND w.is_base = TRUE
-         ))
-       )
+     WHERE c.guid = $1 AND c.workspace_id = $2
      LIMIT 1`,
-    [companyGuid, workspaceId, userId]
+    [companyGuid, workspaceId]
   );
   return rows.length > 0;
 }
@@ -86,10 +79,16 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
     if (!companyGuid) return true;
     if (!req.user?.userId) return deny(401, 'UNAUTHORIZED', 'Auth required');
 
-    if (!flag('workspace_model_enabled') && !flag('rbas_enabled')) {
+    if (!flag('workspace_model_enabled')) {
+      // Workspace model is required — never fall back to user_id company ownership.
+      const allowBypass =
+        process.env.ALLOW_RBAS_BYPASS === '1' && process.env.NODE_ENV === 'test';
+      if (!allowBypass) {
+        return deny(403, 'WORKSPACE_REQUIRED', 'Workspace authorization required');
+      }
       const { rows } = await query(
-        'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-        [companyGuid, req.user.userId]
+        'SELECT guid FROM companies WHERE guid = $1 AND workspace_id IS NOT NULL LIMIT 1',
+        [companyGuid]
       );
       if (!rows.length) return deny(403, 'FORBIDDEN', 'Company not found or access denied');
       return true;
@@ -105,8 +104,41 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
       return deny(403, 'COMPANY_SCOPE_DENIED', 'Company not in this workspace');
     }
 
+    // Resolve pairing — Demo never elevates RBAS (product 2A).
+    // CONNECTED: Demo is forbidden. UNPAIRED/RECONNECTING: Demo readable with real caps;
+    // company-scope may exclude Demo GUID so skip scope for Demo only.
+    let pairingStatus = 'UNPAIRED';
+    const demoRow = isDemoCompany({ guid: companyGuid });
+    {
+      const { rows: bindRows } = await query(
+        `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      const { rows: wsRows } = await query(
+        `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      pairingStatus = String(
+        bindRows[0]?.connection_status || wsRows[0]?.tally_connection || 'UNPAIRED'
+      ).toUpperCase();
+    }
+    if (demoRow && pairingStatus === 'CONNECTED') {
+      return deny(403, 'DEMO_HIDDEN', 'Demo Company is not available while Tally is connected');
+    }
+    // Real Company GUID must not bypass Demo gate while Workspace is not CONNECTED
+    if (!demoRow && pairingStatus !== 'CONNECTED') {
+      return deny(
+        403,
+        'TALLY_NOT_CONNECTED',
+        'Live company data is available only after Tally is connected and the first sync succeeds.'
+      );
+    }
+    req.workspacePairingStatus = pairingStatus;
+    if (demoRow) req.authz = { ...(req.authz || {}), demoMode: true };
+
     // Membership company scope (even without a specific capability)
-    if (flag('scope_company_enabled') && req.membership?.membership_type !== 'OWNER') {
+    const skipCompanyScopeForDemo = demoRow && pairingStatus !== 'CONNECTED';
+    if (flag('scope_company_enabled') && !skipCompanyScopeForDemo && req.membership?.membership_type !== 'OWNER') {
       try {
         await assertCompanyAccess(req.membership.id, companyGuid);
       } catch (scopeErr) {
@@ -122,7 +154,7 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
       }
     }
 
-    if (capability && flag('rbas_enabled')) {
+    if (capability) {
       const result = await authorize({
         userId: req.user.userId,
         workspaceId,
@@ -138,7 +170,7 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
         return deny(403, result.reason || 'CAPABILITY_DENIED', 'Not allowed');
       }
       req.authz = result;
-    } else if (flag('rbas_enabled') && req.membership?.membership_type !== 'OWNER') {
+    } else if (req.membership?.membership_type !== 'OWNER') {
       // Extra resource scopes when no capability passed
       try {
         if (ledgerGuid && flag('scope_ledger_enabled')) {
@@ -182,8 +214,10 @@ export function maskIfNeeded(req, payload) {
   if (!masking || typeof masking !== 'object' || !payload) return payload;
   try {
     return applyMask(payload, masking);
-  } catch {
-    return payload;
+  } catch (err) {
+    console.warn('[companyAccess] mask fail-closed:', err?.message);
+    // Fail closed: never return unmasked payload when masking fails
+    return Array.isArray(payload) ? [] : (typeof payload === 'object' ? {} : null);
   }
 }
 
@@ -248,6 +282,31 @@ export async function assertTallyWriteAccess(req, res, companyGuid, pathKey) {
     });
     return false;
   }
+
+  // Product 2A: live Tally writeback only when workspace is CONNECTED
+  const workspaceId = await ensureReqWorkspace(req);
+  if (workspaceId) {
+    const { rows: bindRows } = await query(
+      `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const { rows: wsRows } = await query(
+      `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const status = String(
+      bindRows[0]?.connection_status || wsRows[0]?.tally_connection || 'UNPAIRED'
+    ).toUpperCase();
+    if (status !== 'CONNECTED') {
+      res.status(403).json({
+        status: false,
+        message: 'Connect and sync Tally before creating or writing vouchers',
+        error: { code: 'TALLY_NOT_CONNECTED' },
+      });
+      return false;
+    }
+  }
+
   const capability = map?.capability || null;
   // Sales Invoice/Order: derive Entry Mode from isOptional / entryKind body
   let entryKind = map?.entryKind || req.body?.entryKind || null;

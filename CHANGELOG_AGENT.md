@@ -1,3 +1,35 @@
+## 2026-09-17 — Phase 3 RBAC convergence (delete + harden)
+
+### Why
+End with one authorization system; remove superseded implementations (FIX→MIGRATE→DELETE). Apply Q021 invite NONE + Q022 fail-closed legacy JWT.
+
+### What
+- Deleted: `inviteService.js`, `GET /ingest/sync-run/history`, `isOwnerOrAdmin*`, capability aliases, soft `desktopAuth` / `optionalWorkspaceContext`
+- Pair/unpair/members → `requireCapability` / `assertCapability`; custom-role nonDelegable + actor anti-escalation
+- Invite + scopes default `company_mode=NONE`; Web Team Access company-access step; print-profile / credit-debit company auth via `workspace_id`
+- JWT: sessionless denied unless explicit `ALLOW_LEGACY_JWT=1`; `rbas_enabled=false` → DENY
+- Docs: `RBAC_DELETION_REGISTER.md`, `LEGACY_APP_USAGE_MATRIX.md`, `LEGACY_JWT_USAGE.md`, regenerated route matrix / remediation / migration plans
+- Tests: `rbac-phase3-convergence.test.js` (15 pass with phase2)
+
+### Remaining LEGACY-BLOCKs
+See `RBAC_DELETION_REGISTER.md` (`/app` mount, column writes, JWT flag, membership ADMIN, dual WS register).
+
+## 2026-09-17 — Invitees promoted to OWNER (ensurePersonalWorkspace)
+
+
+### Why
+Accepted invites (Admin / Auditor) later showed as OWNER on the host workspace and could pair/unpair.
+
+### Root cause
+`ensurePersonalWorkspace` matched any `is_base` workspace the user was a member of (including the inviter’s personal WS), then `ensureOwnerSeat` forced OWNER + cleared role_id + stole OWNER seat.
+
+### Fix
+- Personal WS lookup requires `owner_user_id = userId`
+- `ensureOwnerSeat` no-ops unless caller is workspace owner
+- Repaired live data: 9024466791 OWNER, 9078802278 ADMIN, 9928522822 MEMBER+Auditor
+
+---
+
 ## 2026-09-17 — Unpair session cancel + stale pairing-code fix
 
 ### Why

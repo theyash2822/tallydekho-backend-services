@@ -11,24 +11,33 @@ export function authMiddleware(req, res, next) {
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     req.user = payload;
-    next();
+    (async () => {
+      try {
+        const { assertSessionActive } = await import('../services/authSessionService.js');
+        if (payload.sessionId) {
+          const ok = await assertSessionActive(payload.sessionId, payload.userId);
+          if (!ok) {
+            return res.status(401).json({
+              status: false,
+              code: 'SESSION_REVOKED',
+              message: 'Session revoked or expired. Please sign in again.',
+            });
+          }
+        } else if (process.env.ALLOW_LEGACY_JWT !== '1') {
+          return res.status(401).json({
+            status: false,
+            code: 'SESSION_REQUIRED',
+            message: 'Please sign in again to continue.',
+          });
+        }
+        next();
+      } catch (err) {
+        return res.status(401).json({ status: false, message: 'Session validation failed' });
+      }
+    })();
   } catch (err) {
     return res.status(401).json({ status: false, message: 'Invalid or expired token' });
   }
-}
-
-export function desktopAuth(req, res, next) {
-  // Desktop uses device-id header + token
-  const deviceId = req.headers['device-id'] || req.headers['x-device-id'];
-  const token = req.headers.authorization?.slice(7);
-  if (!deviceId) return res.status(401).json({ status: false, message: 'Missing device-id header' });
-  req.deviceId = deviceId;
-  if (token) {
-    try {
-      req.user = jwt.verify(token, process.env.JWT_SECRET);
-    } catch {}
-  }
-  next();
 }
 
 async function attachDevice(req) {

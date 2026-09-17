@@ -364,8 +364,10 @@ router.post('/auth/verify-otp', async (req, res) => {
       });
     }
 
-    // ── No 2FA — issue full token directly ──────────────────────────────
-    const token = generateToken({ userId: user.id, mobile: cleanMobile });
+    // ── No 2FA — issue session-backed access token ──────────────────────────────
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: cleanMobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
 
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
@@ -395,7 +397,9 @@ router.post('/auth/verify-otp', async (req, res) => {
         is_new_user: isNewUser,
         requires_2fa: false,
         access_token: token,
-        expires_in: 3600,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn || '15m',
         user: { id: user.id, name: user.name || null, phone: cleanMobile, language: user.language || 'en' },
         is_paired: isPaired,
         company,
@@ -426,8 +430,10 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
     const { rows } = await query('SELECT id, mobile, name, email, language FROM users WHERE id = $1', [req.user.userId]);
     const user = rows[0];
 
-    // Generate a fresh token
-    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    // Generate a fresh session-backed token
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token = $1 WHERE id = $2', [token, user.id]);
 
     try {
@@ -441,6 +447,8 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
       data: {
         user: { id: user.id, name: user.name, phone: user.mobile, email: user.email || '', language: user.language },
         access_token: token,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
       }
     });
   } catch (err) {
@@ -504,14 +512,49 @@ router.patch('/auth/me', authMiddleware, async (req, res) => {
 router.post('/auth/logout', authMiddleware, async (req, res) => {
   try {
     const { pushToken } = req.body || {};
-    // Remove push token on logout so stale tokens don't accumulate
     if (pushToken) {
       await query('DELETE FROM push_tokens WHERE user_id=$1 AND token=$2', [req.user.userId, pushToken]).catch(() => {});
     }
     await query('UPDATE users SET token = NULL WHERE id = $1', [req.user.userId]);
+    try {
+      const { revokeSession, revokeAllSessionsForUser } = await import('../services/authSessionService.js');
+      if (req.user.sessionId) {
+        await revokeSession(req.user.sessionId, req.user.userId);
+      } else {
+        await revokeAllSessionsForUser(req.user.userId);
+      }
+    } catch {
+      /* session revoke best-effort */
+    }
     res.json({ success: true, data: { message: 'Logged out successfully' } });
   } catch {
     res.json({ success: true, data: { message: 'Logged out' } });
+  }
+});
+
+/** Rotate refresh → new access + refresh */
+router.post('/auth/refresh', async (req, res) => {
+  try {
+    const refreshToken = req.body?.refresh_token || req.body?.refreshToken;
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'refresh_token required' } });
+    }
+    const { refreshAuthSession } = await import('../services/authSessionService.js');
+    const session = await refreshAuthSession(refreshToken);
+    res.json({
+      success: true,
+      data: {
+        access_token: session.accessToken,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
+      },
+    });
+  } catch (err) {
+    res.status(err.httpStatus || 401).json({
+      success: false,
+      error: { code: err.code || 'SESSION_INVALID', message: err.message || 'Refresh failed' },
+    });
   }
 });
 
@@ -6992,7 +7035,9 @@ router.post('/auth/verify-pin', preAuthMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } });
     const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
     if (!match) return res.status(401).json({ success: false, error: { code: 'PIN_INVALID', message: 'Incorrect PIN. Try again.' } });
-    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token=$1, updated_at=$2 WHERE id=$3', [token, now(), user.id]);
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
     const isPaired = devices.length > 0;
@@ -7006,6 +7051,9 @@ router.post('/auth/verify-pin', preAuthMiddleware, async (req, res) => {
       success: true,
       data: {
         access_token: token,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
         is_new_user: !user.name,
         is_paired: isPaired,
         company,
@@ -7038,13 +7086,18 @@ router.post('/auth/reset-pin', preAuthMiddleware, async (req, res) => {
     await query('UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3', [hash, now(), req.user.userId]);
     const { rows } = await query('SELECT mobile, name, language FROM users WHERE id=$1', [req.user.userId]);
     const u = rows[0];
-    const token = generateToken({ userId: req.user.userId, mobile: u.mobile });
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(req.user.userId, { mobile: u.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
     const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
     res.json({
       success: true,
       data: {
         access_token: token,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
         is_paired: devices.length > 0,
         is_new_user: !u.name,
         user: { id: req.user.userId, name: u.name || null, phone: u.mobile, language: u.language || 'en' },

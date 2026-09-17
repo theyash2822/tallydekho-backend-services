@@ -283,16 +283,23 @@ function _collectObjects(obj, keys, results, depth) {
 // Extract name from Tally record — handles plain NAME, NAME.LIST (NATIVEMETHOD), and LANGUAGENAME.LIST multi-lang wrapper
 function tallyName(r) {
   // Guard: xml2js returns arrays when duplicate <Name> tags exist (e.g. item has alias in same field)
-  const pickFirst = (v) => Array.isArray(v) ? (v[0] || '') : v;
+  const pickFirst = (v) => {
+    if (!Array.isArray(v)) return v;
+    const first = v.find((x) => x != null && x !== '') ?? v[0];
+    if (first == null) return '';
+    if (typeof first === 'string' || typeof first === 'number') return String(first);
+    if (typeof first === 'object') return first.NAME || first.Name || first.name || '';
+    return String(first);
+  };
   if (r.NAME) return pickFirst(r.NAME);
   if (r.Name) return pickFirst(r.Name);
   if (r.name) return pickFirst(r.name);
-  if (r.LEDGERNAME) return r.LEDGERNAME;
+  if (r.LEDGERNAME) return pickFirst(r.LEDGERNAME);
   // NATIVEMETHOD format: Name field comes as <NAME.LIST><NAME>...</NAME></NAME.LIST>
   const nl = r['NAME.LIST'];
   if (nl) {
     const nameVal = Array.isArray(nl) ? nl[0]?.NAME : nl?.NAME;
-    if (nameVal) return typeof nameVal === 'string' ? nameVal : String(nameVal);
+    if (nameVal) return typeof nameVal === 'string' ? nameVal : pickFirst(nameVal);
   }
   const ll = r['LANGUAGENAME.LIST'];
   if (ll) {
@@ -300,7 +307,12 @@ function tallyName(r) {
     if (nll) {
       // Guard: always coerce to string — nll or nll[0] could be an object
       const raw = Array.isArray(nll) ? nll[0]?.NAME || nll[0] : nll.NAME || nll;
-      if (raw != null) return typeof raw === 'string' ? raw : (typeof raw === 'object' ? JSON.stringify(raw) : String(raw));
+      if (raw != null) {
+        if (typeof raw === 'string') return raw;
+        if (Array.isArray(raw)) return pickFirst(raw);
+        if (typeof raw === 'object') return raw.NAME || raw.Name || raw.name || '';
+        return String(raw);
+      }
     }
   }
   return '';
@@ -565,7 +577,17 @@ async function processMasters(data, companyGuid) {
     let saved = 0;
 
     for (const r of data) {
-      const name = r.NAME || r.name || r.LEDGERNAME || '';
+      // Must use tallyName — raw NAME can be a string[] from xml2js / multi-lang Tally.
+      // Passing an array into TEXT made one ledger show as '["Motu Halve Wala","…"]' on Mobile.
+      let name = tallyName(r);
+      if (Array.isArray(name)) name = name[0] || '';
+      name = typeof name === 'string' ? name.trim() : String(name || '').trim();
+      if (name.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(name);
+          if (Array.isArray(parsed)) name = String(parsed.find((x) => typeof x === 'string' && x.trim()) || '').trim();
+        } catch (_) { /* keep */ }
+      }
       const guid = r.GUID || r.guid || name + '_' + companyGuid;
       const parent = r.PARENT || r.parent || '';
       if (!name || name.length === 0) continue;

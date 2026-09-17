@@ -72,7 +72,8 @@ async function loadScopes(membershipId) {
   };
 }
 
-function isAdminMembership(membership, role) {
+/** Canonical Admin check — ONLY place authorization may read membership_type ADMIN (Q004/Q015 interim). */
+export function isAdminMembership(membership, role) {
   if (!membership) return false;
   if (membership.membership_type === 'ADMIN') return true;
   if (role?.system_key === 'ADMIN') return true;
@@ -145,9 +146,6 @@ export async function authorize({
   entryKind = null,
 }) {
   try {
-    if (!flag('rbas_enabled')) {
-      return { decision: 'ALLOW', reason: 'RBAS_DISABLED' };
-    }
     const capabilityKey = resolveCapabilityKey(capability);
     const membership = await loadMembership(userId, workspaceId);
     const gate = membershipAuthzGate(membership);
@@ -223,6 +221,19 @@ export async function authorize({
     console.warn('[authz] authorize failed closed:', err.message);
     return { decision: 'DENY', reason: 'AUTHZ_ERROR' };
   }
+}
+
+/** Fail closed throw if capability not granted. Canonical replacement for isOwnerOrAdmin gates. */
+export async function assertCapability(userId, workspaceId, capability) {
+  const result = await authorize({ userId, workspaceId, capability });
+  if (result.decision !== 'ALLOW') {
+    const err = new Error('Capability not granted');
+    err.code = result.reason || 'CAPABILITY_DENIED';
+    err.httpStatus = 403;
+    err.capability = capability;
+    throw err;
+  }
+  return result;
 }
 
 /**

@@ -4,7 +4,7 @@ import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
 import { ensureBillingAccount, getServiceRate, deductCredits, getBillingOverview, getWallet } from './billingService.js';
 import { seedBuiltinRoles } from './roleService.js';
-import { getEffectiveAccess, loadMembership } from './authorizationService.js';
+import { getEffectiveAccess, loadMembership, assertCapability } from './authorizationService.js';
 import { ensureDemoCompany, filterCompaniesByPairingStatus } from './demoDataService.js';
 import { sendOwnershipConfirmEmail, sendLifecycleConfirmEmail } from './email.js';
 import { purgeCompanyTallyData } from './companyPurge.js';
@@ -32,6 +32,18 @@ function personalName(user) {
 }
 
 async function ensureOwnerSeat(workspaceId, userId, membershipId) {
+  // CRITICAL: never promote invitees / members. Only the workspace owner_user_id
+  // may hold membership_type OWNER + the OWNER seat.
+  const { rows: wsRows } = await query(`SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`, [
+    workspaceId,
+  ]);
+  if (!wsRows[0] || Number(wsRows[0].owner_user_id) !== Number(userId)) {
+    console.warn(
+      `[workspace] ensureOwnerSeat skipped — user=${userId} is not owner of workspace=${workspaceId}`
+    );
+    return null;
+  }
+
   const { rows: seats } = await query(
     `SELECT id FROM workspace_seats
      WHERE workspace_id = $1 AND seat_kind = 'OWNER' LIMIT 1`,
@@ -55,8 +67,8 @@ async function ensureOwnerSeat(workspaceId, userId, membershipId) {
   await query(
     `UPDATE workspace_memberships
      SET role_id = NULL, seat_id = $2, membership_type = 'OWNER'
-     WHERE id = $1`,
-    [membershipId, seatId]
+     WHERE id = $1 AND user_id = $3`,
+    [membershipId, seatId, userId]
   );
   await query(
     `INSERT INTO membership_scope_policy
@@ -82,10 +94,17 @@ async function bootstrapWorkspaceExtras(workspaceId, userId, membershipId) {
  * On re-call after register, refreshes workspace name from user.name.
  */
 export async function ensurePersonalWorkspace(userId) {
+  // Must match the caller's OWN base workspace only.
+  // Bug (2026-09-17): joining any is_base workspace where the user is an ACTIVE
+  // member (e.g. invited into Owner's personal WS) then ran ensureOwnerSeat and
+  // promoted invitees to OWNER — clearing role_id and stealing the OWNER seat.
   const { rows: existing } = await query(
     `SELECT w.*, m.id AS membership_id FROM workspaces w
      JOIN workspace_memberships m ON m.workspace_id = w.id
-     WHERE m.user_id = $1 AND m.status = 'ACTIVE' AND w.is_base = TRUE
+     WHERE m.user_id = $1
+       AND m.status = 'ACTIVE'
+       AND w.is_base = TRUE
+       AND w.owner_user_id = $1
      ORDER BY w.created_at ASC LIMIT 1`,
     [userId]
   );
@@ -202,18 +221,19 @@ export async function membershipCount(workspaceId) {
   return rows[0]?.n || 0;
 }
 
-export async function isOwnerOrAdmin(userId, workspaceId) {
-  const m = await loadMembership(userId, workspaceId);
-  if (!m || m.status !== 'ACTIVE') return false;
-  if (m.membership_type === 'OWNER' || m.membership_type === 'ADMIN') return true;
-  if (m.role_id) {
-    const { rows } = await query(
-      `SELECT system_key FROM workspace_roles WHERE id = $1 LIMIT 1`,
-      [m.role_id]
-    );
-    if (rows[0]?.system_key === 'ADMIN') return true;
+
+/** Fail closed if membershipId is not in this workspace (prevents cross-WS scope IDOR). */
+async function assertMembershipInWorkspace(membershipId, workspaceId) {
+  const { rows } = await query(
+    `SELECT id FROM workspace_memberships WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
+    [membershipId, workspaceId]
+  );
+  if (!rows[0]) {
+    const err = new Error('Member not found in this workspace');
+    err.code = 'MEMBER_NOT_FOUND';
+    err.httpStatus = 404;
+    throw err;
   }
-  return false;
 }
 
 export function workspacePublicView(workspace) {
@@ -254,13 +274,13 @@ export async function listWorkspacesForUser(userId) {
 
   // A user can hold BOTH at once:
   //  1) Own workspace(s) — membership OWNER (Personal + any additional they created)
-  //  2) Invited workspace(s) — MEMBER/ADMIN on someone else's business WS
-  // Never hide invites just because the user also owns a workspace.
+  //  2) Invited workspace(s) — MEMBER/ADMIN on someone else's workspace (often is_base=true
+  //     for the host's personal/business WS). Do NOT filter out is_base invites — that hid
+  //     Yash's workspace from Sudhir on Mobile while Web Team Access still listed him.
   return mapped.filter((w) => {
     const mt = String(w.membershipType || '').toUpperCase();
     if (mt === 'OWNER') return true;
-    // Invited access to another owner's business workspace (not their Personal base)
-    return (mt === 'MEMBER' || mt === 'ADMIN') && !w.isBase;
+    return mt === 'MEMBER' || mt === 'ADMIN';
   });
 }
 
@@ -296,12 +316,13 @@ export async function getWorkspaceContext(userId, workspaceId) {
   if (String(pairingStatus).toUpperCase() === 'CONNECTED') {
     // Live books: apply member company scope, then hide Demo
     if (access.membership?.membership_type !== 'OWNER') {
-      const mode = access.scopes?.policy?.company_mode || 'ALL';
+      const mode = access.scopes?.policy?.company_mode || 'NONE';
       if (mode === 'NONE') companies = [];
       else if (mode === 'SELECTED') {
         const allowed = new Set(access.scopes?.companies || []);
         companies = companiesRaw.filter((c) => allowed.has(c.guid));
       }
+      // ALL: keep companiesRaw; never treat undefined/empty as ALL
     }
     companies = filterCompaniesByPairingStatus(companies, pairingStatus);
   } else {
@@ -452,7 +473,10 @@ export async function purchaseSeat(userId, workspaceId) {
   return rows[0];
 }
 
-export async function getMemberScopes(membershipId) {
+export async function getMemberScopes(membershipId, workspaceId = null) {
+  if (workspaceId) {
+    await assertMembershipInWorkspace(membershipId, workspaceId);
+  }
   const { rows: policy } = await query(
     `SELECT * FROM membership_scope_policy WHERE membership_id = $1`,
     [membershipId]
@@ -487,7 +511,10 @@ export async function getMemberScopes(membershipId) {
   };
 }
 
-export async function putMemberScopes(membershipId, scopes = {}) {
+export async function putMemberScopes(membershipId, scopes = {}, workspaceId = null) {
+  if (workspaceId) {
+    await assertMembershipInWorkspace(membershipId, workspaceId);
+  }
   const policy = scopes.policy || scopes;
   await query(
     `INSERT INTO membership_scope_policy
@@ -501,11 +528,11 @@ export async function putMemberScopes(membershipId, scopes = {}) {
        cost_centre_mode = EXCLUDED.cost_centre_mode`,
     [
       membershipId,
-      policy.company_mode || 'ALL',
-      policy.fy_mode || 'ALL',
-      policy.ledger_mode || 'ALL',
-      policy.godown_mode || 'ALL',
-      policy.cost_centre_mode || 'ALL',
+      policy.company_mode || 'NONE',
+      policy.fy_mode || 'NONE',
+      policy.ledger_mode || 'NONE',
+      policy.godown_mode || 'NONE',
+      policy.cost_centre_mode || 'NONE',
     ]
   );
 
@@ -602,6 +629,30 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
     throw err;
   }
 
+  const { rows: existing } = await query(
+    `SELECT id, status, membership_type FROM workspace_memberships
+     WHERE workspace_id = $1 AND user_id = $2 LIMIT 1`,
+    [workspaceId, inviteeUserId]
+  );
+  if (existing[0] && ['ACTIVE', 'SUSPENDED'].includes(existing[0].status)) {
+    const err = new Error('User is already a member of this workspace');
+    err.code = 'ALREADY_MEMBER';
+    err.httpStatus = 409;
+    throw err;
+  }
+  const { rows: pendingInv } = await query(
+    `SELECT id FROM workspace_invitations
+     WHERE workspace_id = $1 AND invitee_user_id = $2 AND status = 'PENDING' AND expires_at > $3
+     LIMIT 1`,
+    [workspaceId, inviteeUserId, now()]
+  );
+  if (pendingInv[0]) {
+    const err = new Error('An invitation is already pending for this user');
+    err.code = 'INVITE_ALREADY_PENDING';
+    err.httpStatus = 409;
+    throw err;
+  }
+
   const { rows: seats } = await query(
     `UPDATE workspace_seats SET status = 'RESERVED'
      WHERE id = (
@@ -620,6 +671,41 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
     throw err;
   }
 
+  // RBAC-Q021: never coerce missing/empty company selection to ALL.
+  // Ordinary invites default to company_mode=NONE; ALL only when explicitly set
+  // and the assigned role is OWNER/ADMIN-style privileged.
+  let scopeSnapshot = scopes || null;
+  if (scopeSnapshot && typeof scopeSnapshot === 'object') {
+    const policy = { ...(scopeSnapshot.policy || {}) };
+    let companyMode = String(policy.company_mode || 'NONE').toUpperCase();
+    if (!['NONE', 'SELECTED', 'ALL'].includes(companyMode)) companyMode = 'NONE';
+    if (companyMode === 'ALL') {
+      let allowAll = false;
+      if (roleId) {
+        const { rows: roleRows } = await query(
+          `SELECT system_key, membership_type FROM workspace_roles WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
+          [roleId, workspaceId]
+        );
+        const sk = String(roleRows[0]?.system_key || '').toUpperCase();
+        allowAll = sk === 'OWNER' || sk === 'ADMIN';
+      }
+      if (!allowAll) companyMode = 'NONE';
+    }
+    if (companyMode === 'SELECTED') {
+      const list = Array.isArray(scopeSnapshot.companies) ? scopeSnapshot.companies.filter(Boolean) : [];
+      if (list.length === 0) companyMode = 'NONE';
+      scopeSnapshot = { ...scopeSnapshot, companies: list, policy: { ...policy, company_mode: companyMode } };
+    } else {
+      scopeSnapshot = {
+        ...scopeSnapshot,
+        companies: companyMode === 'ALL' ? scopeSnapshot.companies : [],
+        policy: { ...policy, company_mode: companyMode },
+      };
+    }
+  } else {
+    scopeSnapshot = { companies: [], policy: { company_mode: 'NONE' } };
+  }
+
   const inviteId = uuid();
   const ts = now();
   const expiresAt = ts + 48 * 60 * 60; // 48h TTL
@@ -630,7 +716,7 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
      VALUES ($1,$2,$3,$4,$5,'PENDING',$6,$7,$8,$9)`,
     [
       inviteId, workspaceId, inviteeUserId, roleId || null, reservedSeatId,
-      expiresAt, invitedByUserId, ts, JSON.stringify(scopes || null),
+      expiresAt, invitedByUserId, ts, JSON.stringify(scopeSnapshot),
     ]
   );
   await audit(workspaceId, invitedByUserId, 'invitation.created', { inviteId, inviteeUserId, roleId });
@@ -698,12 +784,8 @@ export async function listWorkspaceInvitations(workspaceId) {
 }
 
 export async function revokeWorkspaceInvitation(actorUserId, workspaceId, invitationId) {
-  if (!(await isOwnerOrAdmin(actorUserId, workspaceId))) {
-    const err = new Error('Not authorized');
-    err.code = 'WORKSPACE_ACCESS_DENIED';
-    err.httpStatus = 403;
-    throw err;
-  }
+  await assertCapability(actorUserId, workspaceId, 'members.invite');
+
   const { rows } = await query(
     `SELECT * FROM workspace_invitations
      WHERE id = $1 AND workspace_id = $2 AND status = 'PENDING' LIMIT 1`,
@@ -756,6 +838,24 @@ export async function acceptInvitation(userId, invitationId) {
     throw err;
   }
   const ts = now();
+  // Never demote/overwrite an existing OWNER via invite accept
+  const { rows: existingMem } = await query(
+    `SELECT id, membership_type, status, seat_id FROM workspace_memberships
+     WHERE workspace_id = $1 AND user_id = $2 LIMIT 1`,
+    [inv.workspace_id, userId]
+  );
+  if (existingMem[0]?.membership_type === 'OWNER') {
+    const err = new Error('Owner cannot accept an invite into their own workspace as a member');
+    err.code = 'CANNOT_DEMOTE_OWNER';
+    err.httpStatus = 409;
+    throw err;
+  }
+  if (existingMem[0] && ['ACTIVE', 'SUSPENDED'].includes(existingMem[0].status)) {
+    const err = new Error('User is already a member of this workspace');
+    err.code = 'ALREADY_MEMBER';
+    err.httpStatus = 409;
+    throw err;
+  }
   // Admin system role → membership_type ADMIN (protected authority); others stay MEMBER + role_id
   let membershipType = 'MEMBER';
   if (inv.role_id) {
@@ -766,6 +866,13 @@ export async function acceptInvitation(userId, invitationId) {
     if (roleRows[0]?.system_key === 'ADMIN') membershipType = 'ADMIN';
   }
   const membershipId = uuid();
+  // Free prior seat if re-joining after REMOVED with a stale seat pointer
+  if (existingMem[0]?.seat_id && existingMem[0].seat_id !== inv.reserved_seat_id) {
+    await query(
+      `UPDATE workspace_seats SET status = 'AVAILABLE', assigned_user_id = NULL WHERE id = $1`,
+      [existingMem[0].seat_id]
+    );
+  }
   await query(
     `INSERT INTO workspace_memberships
        (id, workspace_id, user_id, membership_type, role_id, status, seat_id, joined_at)
@@ -795,7 +902,7 @@ export async function acceptInvitation(userId, invitationId) {
       : inv.scope_snapshot_json;
     await putMemberScopes(mid, snap);
   } else {
-    await putMemberScopes(mid, { policy: { company_mode: 'ALL', fy_mode: 'ALL', ledger_mode: 'ALL', godown_mode: 'ALL', cost_centre_mode: 'ALL' } });
+    await putMemberScopes(mid, { policy: { company_mode: 'NONE', fy_mode: 'NONE', ledger_mode: 'NONE', godown_mode: 'NONE', cost_centre_mode: 'NONE' } });
   }
   await query(
     `UPDATE workspace_invitations SET status = 'ACCEPTED', accepted_at = $2 WHERE id = $1`,
@@ -833,12 +940,8 @@ export async function declineInvitation(userId, invitationId) {
 }
 
 export async function suspendMember(actorUserId, workspaceId, targetUserId) {
-  if (!(await isOwnerOrAdmin(actorUserId, workspaceId))) {
-    const err = new Error('Not authorized');
-    err.code = 'WORKSPACE_ACCESS_DENIED';
-    err.httpStatus = 403;
-    throw err;
-  }
+  await assertCapability(actorUserId, workspaceId, 'members.suspend');
+
   const target = await loadMembership(targetUserId, workspaceId);
   if (!target) {
     const err = new Error('Member not found');
@@ -876,6 +979,7 @@ export async function suspendMember(actorUserId, workspaceId, targetUserId) {
       targetUserId,
       status: 'SUSPENDED',
     });
+    sock?.revokeUserWorkspaceAccess?.(targetUserId, workspaceId, 'SUSPENDED');
   } catch {
     /* socket optional */
   }
@@ -883,12 +987,8 @@ export async function suspendMember(actorUserId, workspaceId, targetUserId) {
 }
 
 export async function unsuspendMember(actorUserId, workspaceId, targetUserId) {
-  if (!(await isOwnerOrAdmin(actorUserId, workspaceId))) {
-    const err = new Error('Not authorized');
-    err.code = 'WORKSPACE_ACCESS_DENIED';
-    err.httpStatus = 403;
-    throw err;
-  }
+  await assertCapability(actorUserId, workspaceId, 'members.unsuspend');
+
   await query(
     `UPDATE workspace_memberships SET status = 'ACTIVE', suspended_at = NULL
      WHERE workspace_id = $1 AND user_id = $2 AND status = 'SUSPENDED'`,
@@ -899,12 +999,8 @@ export async function unsuspendMember(actorUserId, workspaceId, targetUserId) {
 }
 
 export async function removeMember(actorUserId, workspaceId, targetUserId) {
-  if (!(await isOwnerOrAdmin(actorUserId, workspaceId))) {
-    const err = new Error('Not authorized');
-    err.code = 'WORKSPACE_ACCESS_DENIED';
-    err.httpStatus = 403;
-    throw err;
-  }
+  await assertCapability(actorUserId, workspaceId, 'members.remove');
+
   const target = await loadMembership(targetUserId, workspaceId);
   if (!target) {
     const err = new Error('Member not found');
@@ -949,6 +1045,7 @@ export async function removeMember(actorUserId, workspaceId, targetUserId) {
       targetUserId,
       status: 'REMOVED',
     });
+    sock?.revokeUserWorkspaceAccess?.(targetUserId, workspaceId, 'REMOVED');
   } catch {
     /* socket optional */
   }
@@ -1469,12 +1566,14 @@ export async function completeOwnershipTransfer(actorUserId, workspaceId, transf
     [fromMem.id, outgoingRoleId]
   );
 
-  // Incoming → Owner (protected authority)
-  await ensureOwnerSeat(workspaceId, toId, toMem.id);
+  // Must flip owner_user_id BEFORE ensureOwnerSeat — that helper refuses anyone who is
+  // not the current owner_user_id (guards invitee promotion). Doing seat first left
+  // transfers with no OWNER membership after the 2026-09-17 seat guard.
   await query(
     `UPDATE workspaces SET owner_user_id = $2, updated_at = $3 WHERE id = $1`,
     [workspaceId, toId, ts]
   );
+  await ensureOwnerSeat(workspaceId, toId, toMem.id);
 
   await query(
     `UPDATE workspace_ownership_transfers
