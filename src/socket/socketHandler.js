@@ -258,8 +258,8 @@ export function setupSocket(io) {
 
   return {
     // Called after ingest complete — notifies mobile/web that new data is available
-    notifySynced: (userId, companyGuid) => {
-      const payload = { companyGuid, syncedAt: new Date().toISOString() };
+    notifySynced: (userId, companyGuid, workspaceId = null) => {
+      const payload = { companyGuid, syncedAt: new Date().toISOString(), workspaceId };
       ['mobile', 'web'].forEach(type => {
         const client = connectedClients.get(`${type}_${userId}`);
         if (client?.connected) {
@@ -267,6 +267,14 @@ export function setupSocket(io) {
           console.log(`[WS] notified ${type} client for user ${userId}`);
         }
       });
+      if (workspaceId) {
+        _io?.to(`workspace:${workspaceId}`).emit('synced', payload);
+        _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
+          status: 'CONNECTED',
+          workspaceId,
+          companyGuid,
+        });
+      }
     },
 
     // Called when device is successfully paired - refresh all clients
@@ -299,13 +307,25 @@ export function setupSocket(io) {
 
     // Called when device is unpaired
     // newCode: the freshly generated replacement pairing code (for desktop to display)
-    notifyUnpaired: (userId, newCode) => {
+    notifyUnpaired: (userId, newCode, deviceId = null, workspaceId = null) => {
       // Notify mobile + web: they are now unpaired
       ['mobile', 'web'].forEach(type => {
         const client = connectedClients.get(`${type}_${userId}`);
         if (client?.connected) client.emit('unpaired', {});
       });
-      // Notify desktop: update pairing panel with the new code
+      if (workspaceId) {
+        _io?.to(`workspace:${workspaceId}`).emit('unpaired', {});
+        _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
+          status: 'UNPAIRED',
+          workspaceId,
+        });
+      }
+      // Only the unbound Desktop — never wipe secrets on every LAN Desktop
+      if (deviceId) {
+        const s = connectedClients.get(`desktop_${deviceId}`);
+        if (s?.connected) s.emit('unpaired', { newCode: newCode || null });
+        return;
+      }
       for (const [key, s] of connectedClients.entries()) {
         if (key.startsWith('desktop_') && s?.connected) {
           s.emit('unpaired', { newCode: newCode || null });

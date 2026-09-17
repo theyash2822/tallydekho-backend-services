@@ -1,7 +1,7 @@
 // Pairing routes
 import { Router } from 'express';
 import { query } from '../db/schema.js';
-import { authMiddleware, desktopAuth, generateToken } from '../middleware/auth.js';
+import { authMiddleware, desktopAuth, generateToken, requireDeviceCredential } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
 import { pairDeviceToWorkspace, unpairDevice, BindingError } from '../services/deviceBinding.js';
 import { generateDeviceSecret, hashSecret } from '../services/deviceCredential.js';
@@ -46,7 +46,7 @@ router.get('/pairing-device', async (req, res) => {
       });
     }
 
-    // Mobile/Web path: Bearer token required
+    // Mobile/Web path: Bearer + Workspace binding (not devices.user_id)
     if (!bearerToken) return res.status(401).json({ status: false, message: 'Authorization required' });
     let userId;
     try {
@@ -55,9 +55,21 @@ router.get('/pairing-device', async (req, res) => {
       userId = payload.userId;
     } catch { return res.status(401).json({ status: false, message: 'Invalid token' }); }
 
+    const workspaceHeader = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
+    let workspaceId = Array.isArray(workspaceHeader) ? workspaceHeader[0] : workspaceHeader;
+    if (!workspaceId) {
+      const { ensurePersonalWorkspace } = await import('../services/workspaceService.js');
+      const personal = await ensurePersonalWorkspace(userId);
+      workspaceId = personal?.id || null;
+    }
+    if (!workspaceId) return res.json({ status: true, data: null });
+
     const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [userId]
+      `SELECT * FROM devices
+       WHERE workspace_id = $1 AND paired = TRUE
+       ORDER BY last_seen DESC NULLS LAST
+       LIMIT 1`,
+      [workspaceId]
     );
     const device = rows[0];
     if (!device) return res.json({ status: true, data: null });
@@ -70,143 +82,182 @@ router.get('/pairing-device', async (req, res) => {
   }
 });
 
-// GET /desktop/pairing-code — Returns EXISTING permanent pairing code for this device.
-// Code is set on /desktop/register and only changes when device is unpaired.
-// Never generates a new code here — that would break the permanent code design.
+// GET /desktop/pairing-code — short-lived pairing session (10 min default).
+// Bridges to devices.pairing_code so current Web/Mobile approve still works until Phase C claim.
 router.get('/pairing-code', async (req, res) => {
   const deviceId = req.headers['device-id'];
   if (!deviceId) return res.status(400).json({ status: false, message: 'device-id header required' });
 
   try {
-    const { rows } = await query(
-      'SELECT pairing_code FROM devices WHERE device_id = $1',
-      [deviceId]
-    );
-    const device = rows[0];
-
-    if (!device) return res.status(404).json({ status: false, message: 'Device not registered' });
-
-    // If somehow no code exists (old install before this change), generate one now
-    let code = device.pairing_code;
-    if (!code) {
-      code = String(Math.floor(100000 + Math.random() * 900000));
-      await query(
-        'UPDATE devices SET pairing_code = $1 WHERE device_id = $2',
-        [code, deviceId]
-      );
-    }
-
-    console.log(`[PAIRING] Device ${deviceId} → returning permanent code`);
-    // No expiry — code is permanent. generatedAt sent for display purposes only.
-    res.json({ status: true, data: { code, generatedAt: Date.now() } });
+    const { createPairingSession } = await import('../services/workspacePairingService.js');
+    const session = await createPairingSession(deviceId);
+    console.log(`[PAIRING] Device ${deviceId} → session ${session.sessionId} code (TTL)`);
+    res.json({
+      status: true,
+      data: {
+        code: session.pairingCode,
+        pairingCode: session.pairingCode,
+        sessionId: session.sessionId,
+        claimToken: session.claimToken,
+        expiresAt: session.expiresAt,
+        generatedAt: Date.now(),
+      },
+    });
   } catch (err) {
+    if (err?.code) {
+      return res.status(err.httpStatus || 409).json({ status: false, message: err.message, code: err.code });
+    }
+    console.error('[PAIRING] pairing-code failed:', err.message);
     res.status(500).json({ status: false, message: 'Failed to get code' });
   }
 });
 
-// POST /app/pairing — Mobile enters code to pair
-router.post('/pairing', authMiddleware, async (req, res) => {
-  const { pairingCode } = req.body;
-  if (!pairingCode) return res.status(400).json({ status: false, message: 'Pairing code required' });
-
+// POST /desktop/pairing-sessions/:sessionId/claim — HTTP credential claim (Phase C)
+router.post('/pairing-sessions/:sessionId/claim', async (req, res) => {
   try {
-    const { rows } = await query('SELECT * FROM devices WHERE pairing_code = $1', [pairingCode]);
-    const device = rows[0];
-
-    if (!device) return res.status(400).json({ status: false, message: 'Invalid pairing code' });
-    // Permanent codes: code_expires is NULL — skip expiry check.
-    // Legacy timed codes: check expiry only if code_expires is set.
-    if (device.code_expires && Date.now() > device.code_expires) {
-      return res.status(400).json({ status: false, message: 'Pairing code expired. Generate a new one.' });
-    }
-
-    const bound = await pairDeviceToWorkspace({ device, userId: req.user.userId });
+    const claimToken = req.body?.claimToken || req.headers['x-claim-token'];
+    const { claimPairingCredential } = await import('../services/workspacePairingService.js');
+    const result = await claimPairingCredential({
+      sessionId: req.params.sessionId,
+      claimToken,
+    });
     if (_socket) {
-      _socket.notifyPaired(req.user.userId, device.name || 'Desktop');
-      _socket.notifyDesktop?.(device.device_id, 'pairing_confirmed', {
-        userId: req.user.userId,
-        pairedAt: new Date().toISOString(),
-        deviceSecret: bound.deviceSecret,
-        workspace: { id: bound.workspace.id, name: bound.workspace.name },
+      _socket.notifyWorkspaceRoom?.(result.workspace.id, 'tally_connection', {
+        status: 'RECONNECTING',
+        workspaceId: result.workspace.id,
       });
     }
     res.json({
       status: true,
-      message: 'Paired successfully',
-      data: { deviceId: device.device_id, workspaceId: bound.workspace.id },
+      data: {
+        deviceSecret: result.deviceSecret,
+        workspace: result.workspace,
+        deviceId: result.deviceId,
+        connectionStatus: result.connectionStatus,
+      },
     });
   } catch (err) {
-    if (err instanceof BindingError) {
-      return res.status(err.httpStatus).json({ status: false, code: err.code, message: err.message });
+    if (err?.code) {
+      return res.status(err.httpStatus || 409).json({ status: false, code: err.code, message: err.message });
     }
-    res.status(500).json({ status: false, message: 'Pairing failed' });
+    console.error('[PAIRING] claim failed:', err.message);
+    res.status(500).json({ status: false, message: 'Claim failed' });
   }
+});
+
+// POST /desktop/pairing-sessions/:sessionId/ack — Desktop confirms secret stored
+router.post('/pairing-sessions/:sessionId/ack', async (req, res) => {
+  try {
+    const deviceId = req.headers['device-id'] || req.body?.deviceId;
+    const deviceSecret = req.body?.deviceSecret || req.headers['device-secret'];
+    const { acknowledgePairingCredential } = await import('../services/workspacePairingService.js');
+    const result = await acknowledgePairingCredential({
+      sessionId: req.params.sessionId,
+      deviceId,
+      deviceSecret,
+    });
+    res.json({ status: true, data: result });
+  } catch (err) {
+    if (err?.code) {
+      return res.status(err.httpStatus || 409).json({ status: false, code: err.code, message: err.message });
+    }
+    console.error('[PAIRING] ack failed:', err.message);
+    res.status(500).json({ status: false, message: 'Ack failed' });
+  }
+});
+
+// POST /app/pairing — DISABLED (Phase F). Use POST /workspaces/:id/tally/pair
+router.post('/pairing', authMiddleware, async (_req, res) => {
+  console.warn('[LEGACY] POST /app/pairing → 410');
+  return res.status(410).json({
+    status: false,
+    code: 'PAIRING_API_DEPRECATED',
+    message: 'Use POST /api/workspaces/:workspaceId/tally/pair',
+  });
 });
 
 // Note: GET /pairing-device is handled above (smart handler for both desktop + mobile)
 
-// GET /app/paired-device — alias
+// GET /app/paired-device — Workspace binding (not devices.user_id)
 router.get('/paired-device', authMiddleware, async (req, res) => {
   try {
+    const { ensureReqWorkspace } = await import('../middleware/companyAccess.js');
+    const workspaceId = await ensureReqWorkspace(req);
+    if (!workspaceId) {
+      return res.json({ status: true, data: null });
+    }
     const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
+      `SELECT * FROM devices
+       WHERE workspace_id = $1 AND paired = TRUE
+       ORDER BY last_seen DESC NULLS LAST
+       LIMIT 1`,
+      [workspaceId]
     );
     const device = rows[0];
-    res.json({ status: true, data: device ? { device: { code: device.device_id.slice(0, 8), lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null } } : null });
+    res.json({
+      status: true,
+      data: device
+        ? {
+            device: {
+              code: device.device_id.slice(0, 8),
+              lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null,
+            },
+          }
+        : null,
+    });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed' });
   }
 });
 
-// PUT /app/pairing — Update device info
-router.put('/pairing', authMiddleware, async (req, res) => {
-  const { deviceName, os, deviceId } = req.body || {};
-  if (!deviceId) return res.json({ status: true, message: 'No device info' });
-  try {
-    await query(
-      'UPDATE devices SET name = COALESCE($1, name), os = COALESCE($2, os), last_seen = $3 WHERE device_id = $4 AND user_id = $5',
-      [deviceName || null, os || null, now(), deviceId, req.user.userId]
-    );
-    res.json({ status: true, message: 'Pairing updated' });
-  } catch (err) {
-    res.status(500).json({ status: false, message: 'Update failed' });
-  }
+// PUT /app/pairing — DISABLED. Legacy user-owned device metadata update.
+// No Web / Mobile V4 / Desktop callers remain (only obsolete mobile refs).
+router.put('/pairing', authMiddleware, async (_req, res) => {
+  console.warn('[LEGACY] PUT /app/pairing → 410');
+  return res.status(410).json({
+    status: false,
+    code: 'PAIRING_API_DEPRECATED',
+    message: 'Use Workspace pairing APIs. Device metadata is updated via Desktop register/heartbeat.',
+  });
 });
 
 // Shared unpair logic - notifies all platforms via WebSocket
 async function performUnpair(deviceId, userId) {
   const result = await unpairDevice(deviceId, userId);
-  if (_socket && (userId || result.userId)) _socket.notifyUnpaired(userId || result.userId, result.newCode);
+  if (_socket && (userId || result.userId || result.workspaceId)) {
+    _socket.notifyUnpaired(
+      userId || result.userId,
+      result.newCode,
+      deviceId,
+      result.workspaceId || null,
+    );
+  }
   return result;
 }
 
-// DELETE /desktop/paired-device — Unpair from Desktop
-router.delete('/paired-device', async (req, res) => {
-  const deviceId = req.headers['device-id'];
-  if (!deviceId) return res.status(400).json({ status: false });
+// DELETE /desktop/paired-device — Desktop self-disconnect adapter.
+// Requires device credential. Uses canonical unpairDevice (Workspace binding), not user_id lookup.
+router.delete('/paired-device', requireDeviceCredential, async (req, res) => {
   try {
-    const { rows } = await query('SELECT user_id FROM devices WHERE device_id = $1', [deviceId]);
-    await performUnpair(deviceId, rows[0]?.user_id);
+    const deviceId = req.deviceId || req.headers['device-id'];
+    if (!deviceId) return res.status(400).json({ status: false, message: 'device-id required' });
+    console.log(`[PAIRING] Desktop self-unpair device=${deviceId} workspace=${req.workspaceId || 'none'}`);
+    await performUnpair(deviceId, null);
     res.json({ status: true, message: 'Unpaired from all platforms' });
   } catch (err) {
-    res.status(500).json({ status: false });
+    console.error('[PAIRING] Desktop self-unpair failed:', err.message);
+    res.status(500).json({ status: false, message: 'Unpair failed' });
   }
 });
 
-// DELETE /app/pairing — Unpair from Mobile/Web
-router.delete('/pairing', authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await query(
-      'SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
-    );
-    if (!rows[0]) return res.json({ status: true, message: 'No paired device found' });
-    await performUnpair(rows[0].device_id, req.user.userId);
-    res.json({ status: true, message: 'Unpaired from all platforms' });
-  } catch (err) {
-    res.status(500).json({ status: false, message: 'Unpair failed' });
-  }
+// DELETE /app/pairing — DISABLED (legacy user_id → Device). Use Workspace Unpair.
+router.delete('/pairing', authMiddleware, async (_req, res) => {
+  console.warn('[LEGACY] DELETE /app/pairing → 410');
+  return res.status(410).json({
+    status: false,
+    code: 'PAIRING_API_DEPRECATED',
+    message: 'Use POST /api/workspaces/:workspaceId/tally/unpair',
+  });
 });
 
 // POST /desktop/register — Desktop registers on startup
@@ -266,16 +317,23 @@ router.post('/register', async (req, res) => {
     const isPaired = device?.paired === true;
 
     let issuedSecret = null;
-    // Issue a secret only once. Re-register must not rotate the hash or the
-    // Desktop copy from pairing_confirmed becomes invalid (spec §7/§8).
-    if (isPaired && !device.device_secret_hash) {
+    // Issue secret when missing. Also re-issue when hash exists but never claimed
+    // (Desktop missed pairing_confirmed — e.g. Mobile workspace-pair path bug).
+    // Once credential_claimed_at is set, never rotate (spec §7/§8).
+    const needsSecret =
+      isPaired && (!device.device_secret_hash || !device.credential_claimed_at);
+    if (needsSecret) {
       const secret = generateDeviceSecret();
       const secretHash = await hashSecret(secret);
       await query(
-        `UPDATE devices SET device_secret_hash = $2 WHERE device_id = $1`,
+        `UPDATE devices SET device_secret_hash = $2, credential_claimed_at = NULL WHERE device_id = $1`,
         [resolvedId, secretHash]
       );
       issuedSecret = secret;
+      console.log(
+        `[REGISTER] Re-issued device secret for ${resolvedId.slice(0, 12)}… ` +
+          `(hadHash=${!!device.device_secret_hash}, claimed=${!!device.credential_claimed_at})`
+      );
     }
 
     let workspace = null;

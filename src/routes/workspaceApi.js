@@ -15,6 +15,8 @@ import {
   putMemberScopes,
   createInvitation,
   listMyInvitations,
+  listWorkspaceInvitations,
+  revokeWorkspaceInvitation,
   acceptInvitation,
   declineInvitation,
   suspendMember,
@@ -39,6 +41,7 @@ import {
   getPaymentModeMap,
   putPaymentModeMap,
   listAudit,
+  recordWorkspaceEntered,
   getBillingOverview,
 } from '../services/workspaceService.js';
 import {
@@ -67,6 +70,7 @@ import { listPendingHardSync, approveHardSync, rejectHardSync } from '../service
 import { listAvailableBackups } from '../services/backupService.js';
 import { approveRestore, listWorkspaceApprovals } from '../services/restoreService.js';
 import { query } from '../db/schema.js';
+import { listCostCentresForCompany } from '../services/costCentreListService.js';
 
 const router = Router();
 let _socket = null;
@@ -153,6 +157,16 @@ router.get('/workspaces/:id/context', authMiddleware, bindWorkspaceParam, async 
         error: { code: 'MEMBERSHIP_SUSPENDED', message: 'Membership suspended' },
       });
     }
+    const entered = await recordWorkspaceEntered(req.user.userId, req.params.id).catch(() => false);
+    if (entered) {
+      try {
+        _socket?.notifyWorkspaceRoom?.(req.params.id, 'workspace_audit', {
+          workspaceId: req.params.id,
+          event_type: 'workspace.entered',
+          actor_user_id: req.user.userId,
+        });
+      } catch { /* optional */ }
+    }
     res.json({ success: true, data: ctx });
   } catch (err) {
     errJson(res, err);
@@ -228,7 +242,7 @@ router.post(
   '/workspaces/:id/members/:userId/suspend',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.remove'),
+  requireCapability('members.suspend'),
   async (req, res) => {
     try {
       await suspendMember(req.user.userId, req.params.id, Number(req.params.userId));
@@ -243,7 +257,7 @@ router.post(
   '/workspaces/:id/members/:userId/unsuspend',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.remove'),
+  requireCapability('members.unsuspend'),
   async (req, res) => {
     try {
       await unsuspendMember(req.user.userId, req.params.id, Number(req.params.userId));
@@ -258,15 +272,25 @@ router.delete(
   '/workspaces/:id/members/:userId',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.remove'),
+  requireCapability('members.remove'),
   async (req, res) => {
     try {
       const targetUserId = Number(req.params.userId);
+      if (!Number.isFinite(targetUserId)) {
+        const err = new Error('Invalid member user id');
+        err.code = 'VALIDATION_ERROR';
+        err.httpStatus = 400;
+        throw err;
+      }
       await removeMember(req.user.userId, req.params.id, targetUserId);
-      _socket?.notifyWorkspace?.(targetUserId, 'workspace_access_revoked', {
-        workspaceId: req.params.id,
-        reason: 'MEMBER_REMOVED',
-      });
+      try {
+        _socket?.notifyWorkspace?.(targetUserId, 'workspace_access_revoked', {
+          workspaceId: req.params.id,
+          reason: 'MEMBER_REMOVED',
+        });
+      } catch {
+        /* socket notify must not fail the remove */
+      }
       res.json({ success: true });
     } catch (err) {
       errJson(res, err);
@@ -691,6 +715,21 @@ router.delete(
 
 // ── Invitations ──────────────────────────────────────────────────────────────
 
+router.get(
+  '/workspaces/:id/invitations',
+  authMiddleware,
+  bindWorkspaceParam,
+  requireCapability('members.invite'),
+  async (req, res) => {
+    try {
+      const list = await listWorkspaceInvitations(req.params.id);
+      res.json({ success: true, data: list });
+    } catch (err) {
+      errJson(res, err);
+    }
+  }
+);
+
 router.post(
   '/workspaces/:id/invitations',
   authMiddleware,
@@ -712,7 +751,34 @@ router.post(
           workspaceId: req.params.id,
         });
       }
+      try {
+        _socket?.notifyWorkspaceRoom?.(req.params.id, 'workspace_audit', {
+          workspaceId: req.params.id,
+          event_type: 'invitation.created',
+        });
+      } catch { /* optional */ }
       res.status(201).json({ success: true, data: inv });
+    } catch (err) {
+      errJson(res, err);
+    }
+  }
+);
+
+router.post(
+  '/workspaces/:id/invitations/:inviteId/revoke',
+  authMiddleware,
+  bindWorkspaceParam,
+  requireCapability('members.invite'),
+  async (req, res) => {
+    try {
+      await revokeWorkspaceInvitation(req.user.userId, req.params.id, req.params.inviteId);
+      try {
+        _socket?.notifyWorkspaceRoom?.(req.params.id, 'workspace_audit', {
+          workspaceId: req.params.id,
+          event_type: 'invitation.revoked',
+        });
+      } catch { /* optional */ }
+      res.json({ success: true });
     } catch (err) {
       errJson(res, err);
     }
@@ -722,6 +788,18 @@ router.post(
 router.post('/invitations/:id/accept', authMiddleware, async (req, res) => {
   try {
     const result = await acceptInvitation(req.user.userId, req.params.id);
+    try {
+      if (result?.workspaceId) {
+        _socket?.notifyWorkspaceRoom?.(result.workspaceId, 'workspace_audit', {
+          workspaceId: result.workspaceId,
+          event_type: 'invitation.accepted',
+        });
+        _socket?.notifyWorkspaceRoom?.(result.workspaceId, 'membership_changed', {
+          workspaceId: result.workspaceId,
+          status: 'ACTIVE',
+        });
+      }
+    } catch { /* optional */ }
     res.json({ success: true, data: result });
   } catch (err) {
     errJson(res, err);
@@ -754,7 +832,7 @@ router.get(
   }
 );
 
-router.get('/billing/overview', authMiddleware, async (req, res) => {
+router.get('/billing/overview', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const overview = await getBillingOverview(req.user.userId);
     res.json({ success: true, data: overview });
@@ -763,7 +841,7 @@ router.get('/billing/overview', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/billing/rates', authMiddleware, async (req, res) => {
+router.get('/billing/rates', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const rates = await listRates();
     res.json({ success: true, data: rates });
@@ -773,10 +851,10 @@ router.get('/billing/rates', authMiddleware, async (req, res) => {
 });
 
 /** Usage drilldown — usage_events + wallet_transactions; filters: workspaceId, kind, limit */
-router.get('/billing/usage', authMiddleware, async (req, res) => {
+router.get('/billing/usage', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const rows = await listUsageEvents(req.user.userId, {
-      workspaceId: req.query.workspaceId || req.query.workspace_id,
+      workspaceId: req.query.workspaceId || req.query.workspace_id || req.workspaceId,
       kind: req.query.kind,
       limit: req.query.limit,
     });
@@ -786,7 +864,7 @@ router.get('/billing/usage', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/billing/transactions', authMiddleware, async (req, res) => {
+router.get('/billing/transactions', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const rows = await listWalletTransactions(req.user.userId, { limit: req.query.limit });
     res.json({ success: true, data: rows });
@@ -795,7 +873,7 @@ router.get('/billing/transactions', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/billing/payment-orders', authMiddleware, async (req, res) => {
+router.get('/billing/payment-orders', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const rows = await listPaymentOrders(req.user.userId, { limit: req.query.limit });
     res.json({ success: true, data: rows });
@@ -804,7 +882,7 @@ router.get('/billing/payment-orders', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/billing/payment-orders', authMiddleware, async (req, res) => {
+router.post('/billing/payment-orders', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const body = req.body || {};
     const order = await createPaymentOrder({
@@ -820,10 +898,10 @@ router.post('/billing/payment-orders', authMiddleware, async (req, res) => {
 });
 
 /** Owner credit recharge via Razorpay Checkout */
-router.post('/billing/recharge/create', authMiddleware, async (req, res) => {
+router.post('/billing/recharge/create', authMiddleware, resolveWorkspaceMiddleware, requireCapability('credits.recharge'), async (req, res) => {
   try {
     const credits = req.body?.credits;
-    const workspaceId = req.body?.workspaceId || req.headers['x-workspace-id'] || null;
+    const workspaceId = req.body?.workspaceId || req.headers['x-workspace-id'] || req.workspaceId || null;
     const data = await createRechargeOrder(req.user.userId, { credits, workspaceId });
     res.status(201).json({ success: true, data });
   } catch (err) {
@@ -831,7 +909,7 @@ router.post('/billing/recharge/create', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/billing/recharge/status', authMiddleware, async (req, res) => {
+router.get('/billing/recharge/status', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   res.json({
     success: true,
     data: {
@@ -843,7 +921,7 @@ router.get('/billing/recharge/status', authMiddleware, async (req, res) => {
 });
 
 /** Client-side Checkout success verify + fulfill */
-router.post('/billing/recharge/verify', authMiddleware, async (req, res) => {
+router.post('/billing/recharge/verify', authMiddleware, resolveWorkspaceMiddleware, requireCapability('credits.recharge'), async (req, res) => {
   try {
     const {
       razorpay_order_id: orderId,
@@ -895,10 +973,22 @@ router.post('/billing/webhooks/razorpay', async (req, res) => {
 
 /**
  * Manual/dev complete — credits wallet without Razorpay.
- * Dependency: production should verify Razorpay payment then call the same service path.
+ * Production: blocked (product 5.1 / 5.2). Enable only with ALLOW_DEV_BILLING_COMPLETE=true outside production.
  */
-router.post('/billing/payment-orders/:id/complete', authMiddleware, async (req, res) => {
+router.post('/billing/payment-orders/:id/complete', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
+    const allowDev =
+      process.env.NODE_ENV !== 'production' &&
+      String(process.env.ALLOW_DEV_BILLING_COMPLETE || '').toLowerCase() === 'true';
+    if (!allowDev) {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'DEV_COMPLETE_DISABLED',
+          message: 'Manual payment completion is not available',
+        },
+      });
+    }
     const data = await completePaymentOrder(req.user.userId, req.params.id);
     res.json({ success: true, data });
   } catch (err) {
@@ -906,7 +996,7 @@ router.post('/billing/payment-orders/:id/complete', authMiddleware, async (req, 
   }
 });
 
-router.get('/billing/invoices', authMiddleware, async (req, res) => {
+router.get('/billing/invoices', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
     const rows = await listInvoices(req.user.userId, { limit: req.query.limit });
     res.json({ success: true, data: rows });
@@ -934,7 +1024,7 @@ router.post(
   '/workspaces/:id/seats',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.invite'),
+  requireCapability('seats.purchase'),
   async (req, res) => {
     try {
       const seat = await purchaseSeat(req.user.userId, req.params.id);
@@ -971,7 +1061,7 @@ router.get('/workspace/approvals', authMiddleware, resolveWorkspaceMiddleware, a
   }
 });
 
-router.post('/workspace/hard-sync/:id/approve', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/workspace/hard-sync/:id/approve', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     const row = await approveHardSync({
       requestId: req.params.id,
@@ -985,7 +1075,7 @@ router.post('/workspace/hard-sync/:id/approve', authMiddleware, resolveWorkspace
   }
 });
 
-router.post('/workspace/hard-sync/:id/reject', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/workspace/hard-sync/:id/reject', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     await rejectHardSync({
       requestId: req.params.id,
@@ -1002,6 +1092,10 @@ router.post('/workspace/hard-sync/:id/reject', authMiddleware, resolveWorkspaceM
 
 router.get('/workspace/backups', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
   try {
+    const allowed = await isOwnerOrAdmin(req.user.userId, req.workspaceId);
+    if (!allowed) {
+      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not authorized' } });
+    }
     const backups = await listAvailableBackups(req.workspaceId, 3);
     res.json({ success: true, data: backups });
   } catch (err) {
@@ -1070,41 +1164,7 @@ router.get(
       const companyGuid = req.params.companyGuid;
       if (!(await verifyCompanyAccess(req, res, companyGuid, { responseShape: 'api-v1' }))) return;
 
-      let rows = [];
-      try {
-        const result = await query(
-          `SELECT guid, name, parent_name FROM cost_centres
-           WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
-           ORDER BY name`,
-          [companyGuid]
-        );
-        rows = result.rows;
-      } catch {
-        rows = [];
-      }
-
-      if (!rows.length) {
-        const fallbackSqls = [
-          `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-           FROM voucher_cost_centre_allocations
-           WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
-          `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-           FROM voucher_cost_allocations
-           WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
-        ];
-        for (const sql of fallbackSqls) {
-          try {
-            const result = await query(sql, [companyGuid]);
-            if (result.rows.length) {
-              rows = result.rows;
-              break;
-            }
-          } catch {
-            /* table missing */
-          }
-        }
-      }
-
+      const rows = await listCostCentresForCompany(companyGuid);
       res.json({ success: true, data: rows });
     } catch (err) {
       errJson(res, err);
@@ -1166,40 +1226,9 @@ router.get('/workspaces/:id/company-years', authMiddleware, bindWorkspaceParam, 
 
 router.get('/workspaces/:id/tally/status', authMiddleware, bindWorkspaceParam, async (req, res) => {
   try {
-    const { rows: binding } = await query(
-      `SELECT connection_status, active_device_id, lineage_id FROM workspace_tally_bindings
-       WHERE workspace_id = $1 LIMIT 1`,
-      [req.params.id]
-    );
-    const { rows: ws } = await query(
-      `SELECT tally_connection, lifecycle_status, commercial_status FROM workspaces WHERE id = $1`,
-      [req.params.id]
-    );
-    const deviceId = binding[0]?.active_device_id;
-    let desktopOnline = false;
-    if (deviceId) {
-      const { rows: d } = await query(
-        `SELECT last_seen FROM devices WHERE device_id = $1 AND paired = TRUE LIMIT 1`,
-        [deviceId]
-      );
-      if (d[0]?.last_seen) {
-        const last = Number(d[0].last_seen);
-        const nowSec = Math.floor(Date.now() / 1000);
-        desktopOnline = nowSec - last < 5 * 60;
-      }
-    }
-    const status = binding[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
-    res.json({
-      success: true,
-      data: {
-        status,
-        demoMode: status === 'UNPAIRED' || status === 'RECONNECTING',
-        activeDeviceId: deviceId || null,
-        desktopOnline,
-        lifecycleStatus: ws[0]?.lifecycle_status,
-        commercialStatus: ws[0]?.commercial_status,
-      },
-    });
+    const { buildTallyStatusPayload } = await import('../services/workspacePairingService.js');
+    const data = await buildTallyStatusPayload(req.params.id, req.user.userId);
+    res.json({ success: true, data });
   } catch (err) {
     errJson(res, err);
   }
@@ -1207,39 +1236,66 @@ router.get('/workspaces/:id/tally/status', authMiddleware, bindWorkspaceParam, a
 
 router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.params.id);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Owner/Admin only' } });
-    }
-    const pairing_code = req.body?.pairing_code || req.body?.pairCode || req.body?.code;
+    const pairing_code = req.body?.pairing_code || req.body?.pairingCode || req.body?.pairCode || req.body?.code;
     if (!pairing_code) {
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Pairing code required' } });
     }
-    const { rows } = await query('SELECT * FROM devices WHERE pairing_code = $1', [pairing_code]);
-    const device = rows[0];
-    if (!device) {
-      return res.status(400).json({ success: false, error: { code: 'INVALID_CODE', message: 'Invalid pairing code' } });
-    }
-    if (device.code_expires && Date.now() > device.code_expires) {
-      return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired' } });
-    }
-    const { pairDeviceToWorkspace, BindingError } = await import('../services/deviceBinding.js');
-    const bound = await pairDeviceToWorkspace({
-      device,
-      userId: req.user.userId,
+    const { approvePairing } = await import('../services/workspacePairingService.js');
+    const bound = await approvePairing({
       workspaceId: req.params.id,
+      actorUserId: req.user.userId,
+      pairingCode: pairing_code,
     });
+
+    if (_socket) {
+      _socket.notifyPaired?.(req.user.userId, 'Desktop');
+      // Wake-up only — secret comes from HTTP claim (except legacy_immediate bridge)
+      if (bound.mode === 'session_approved' && bound.deviceId) {
+        _socket.notifyDesktop?.(bound.deviceId, 'pairing_approved', {
+          sessionId: bound.sessionId,
+          workspaceId: bound.workspace.id,
+          workspace: { id: bound.workspace.id, name: bound.workspace.name },
+        });
+      }
+      if (bound.mode === 'legacy_immediate' && bound.deviceSecret && bound.deviceId) {
+        _socket.notifyDesktop?.(bound.deviceId, 'pairing_confirmed', {
+          userId: req.user.userId,
+          pairedAt: new Date().toISOString(),
+          deviceSecret: bound.deviceSecret,
+          workspace: { id: bound.workspace.id, name: bound.workspace.name },
+        });
+        _socket.notifyWorkspaceRoom?.(bound.workspace.id, 'tally_connection', {
+          status: bound.connectionStatus || 'RECONNECTING',
+          workspaceId: bound.workspace.id,
+        });
+      }
+      // Session path: clients stay Demo until claim → RECONNECTING event from claim route
+    }
+
+    console.log(
+      `[WS PAIR] User ${req.user.userId} approved device ${bound.deviceId} → workspace ${bound.workspace.id}` +
+        ` mode=${bound.mode}` +
+        (bound.alreadyBound ? ' (idempotent)' : '')
+    );
     res.json({
       success: true,
       data: {
-        device_id: device.device_id,
+        device_id: bound.deviceId,
         workspace_id: bound.workspace.id,
         workspace_name: bound.workspace.name,
-        is_paired: true,
+        is_paired: bound.mode === 'legacy_immediate' || bound.alreadyBound,
+        connection_status: bound.connectionStatus,
+        already_bound: !!bound.alreadyBound,
+        session_id: bound.sessionId || null,
+        awaiting_desktop_claim: bound.mode === 'session_approved' && !bound.alreadyBound,
+        message:
+          bound.mode === 'session_approved' && !bound.alreadyBound
+            ? 'Desktop connected. Waiting for the first successful Tally sync before showing live data.'
+            : undefined,
       },
     });
   } catch (err) {
-    if (err?.code === 'DEVICE_ALREADY_PAIRED' || err?.code === 'WORKSPACE_ALREADY_HAS_DESKTOP') {
+    if (err?.code) {
       return res.status(err.httpStatus || 409).json({
         success: false,
         error: { code: err.code, message: err.message },
@@ -1251,21 +1307,41 @@ router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, as
 
 router.post('/workspaces/:id/tally/unpair', authMiddleware, bindWorkspaceParam, async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.params.id);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Owner/Admin only' } });
+    const { unpairWorkspace } = await import('../services/workspacePairingService.js');
+    const result = await unpairWorkspace({
+      workspaceId: req.params.id,
+      actorUserId: req.user.userId,
+    });
+    if (result.alreadyUnpaired) {
+      return res.json({
+        success: true,
+        data: { message: 'Already unpaired', code: 'ALREADY_UNPAIRED' },
+      });
     }
-    const { rows } = await query(
-      `SELECT device_id FROM devices WHERE workspace_id = $1 AND paired = TRUE LIMIT 1`,
-      [req.params.id]
-    );
-    if (!rows[0]) {
-      return res.json({ success: true, data: { message: 'Already unpaired' } });
+    // Non-destructive: do NOT deactivate companies or clear companies.workspace_id.
+    if (_socket?.notifyUnpaired) {
+      _socket.notifyUnpaired(
+        req.user.userId,
+        result?.newCode || null,
+        result.deviceId,
+        req.params.id,
+      );
+    } else if (result.deviceId) {
+      // newCode is intentionally null after unpair — Desktop must mint a fresh session.
+      _socket?.notifyDesktop?.(result.deviceId, 'unpaired', { newCode: null });
+      _socket?.notifyWorkspaceRoom?.(req.params.id, 'tally_connection', {
+        status: 'UNPAIRED',
+        workspaceId: req.params.id,
+      });
     }
-    const { unpairDevice } = await import('../services/deviceBinding.js');
-    await unpairDevice(rows[0].device_id, req.user.userId);
     res.json({ success: true, data: { message: 'Unpaired' } });
   } catch (err) {
+    if (err?.code) {
+      return res.status(err.httpStatus || 403).json({
+        success: false,
+        error: { code: err.code, message: err.message },
+      });
+    }
     errJson(res, err);
   }
 });
@@ -1293,7 +1369,7 @@ router.get('/workspaces/:id/approvals', authMiddleware, bindWorkspaceParam, asyn
   }
 });
 
-router.post('/hard-sync-requests/:id/approve', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/hard-sync-requests/:id/approve', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     const row = await approveHardSync({
       requestId: req.params.id,
@@ -1307,7 +1383,7 @@ router.post('/hard-sync-requests/:id/approve', authMiddleware, resolveWorkspaceM
   }
 });
 
-router.post('/hard-sync-requests/:id/reject', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/hard-sync-requests/:id/reject', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     await rejectHardSync({
       requestId: req.params.id,
@@ -1322,7 +1398,7 @@ router.post('/hard-sync-requests/:id/reject', authMiddleware, resolveWorkspaceMi
   }
 });
 
-router.post('/restore-sessions/:id/approve', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/restore-sessions/:id/approve', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     const { code, backupId } = req.body || {};
     if (!code || !backupId) {
@@ -1344,7 +1420,7 @@ router.post('/restore-sessions/:id/approve', authMiddleware, resolveWorkspaceMid
   }
 });
 
-router.post('/restore-sessions/:id/reject', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.post('/restore-sessions/:id/reject', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     const { rejectRestore } = await import('../services/restoreService.js');
     const result = await rejectRestore({

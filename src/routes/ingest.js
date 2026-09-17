@@ -37,20 +37,35 @@ function normalizeGstType(raw) {
 router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
   const deviceId = req.deviceId || req.headers['device-id'];
   const { companies, isHardSync = false } = req.body || {};
-  console.log(`[SYNC] init-sync from device ${deviceId}, companies: ${companies?.length}, hard=${!!isHardSync}`);
 
   try {
     const device = req.device || (await query('SELECT * FROM devices WHERE device_id = $1', [deviceId])).rows[0];
-    const userId = device?.user_id;
+    const workspaceId = device?.workspace_id || null;
+    console.log(`[SYNC] init-sync start device=${deviceId} workspace=${workspaceId || 'none'} companies=${companies?.length || 0} hard=${!!isHardSync}`);
+    // Prefer Workspace owner for legacy company.user_id columns; never treat device.user_id as pairing authority
+    let userId = null;
+    if (workspaceId) {
+      const { rows: wsOwner } = await query(
+        `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      userId = wsOwner[0]?.owner_user_id || device?.user_id || null;
+    } else {
+      userId = device?.user_id || null;
+    }
 
-    if (!userId) return res.status(403).json({ status: false, message: 'Device not paired' });
-
-    const workspaceId = device.workspace_id;
+    if (!workspaceId && !userId) {
+      return res.status(403).json({ status: false, message: 'Device not paired to a Workspace' });
+    }
+    if (!userId) {
+      return res.status(403).json({ status: false, message: 'Device not paired' });
+    }
     const incomingGuids = (companies || []).map((c) => c.guid).filter(Boolean);
     if (workspaceId && incomingGuids.length && isHardSync !== true) {
       const known = await getKnownLineageGuids(workspaceId);
       const verdict = evaluateLineage(known, incomingGuids);
       if (!verdict.ok) {
+        console.warn(`[PAIRING] lineage_mismatch workspace=${workspaceId} device=${deviceId} code=${verdict.code || 'TALLY_DATA_MISMATCH'} reason=${verdict.reason || ''}`);
         return res.status(409).json({
           status: false,
           code: verdict.code || 'TALLY_DATA_MISMATCH',
@@ -211,6 +226,21 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
         ).catch(() => {});
       }
       await markFirstSyncConnected(workspaceId, deviceId, companies);
+      // Flip clients off Demo immediately (don't wait for sync-complete)
+      try {
+        _socketService?.notifyWorkspaceRoom?.(workspaceId, 'tally_connection', {
+          status: 'CONNECTED',
+          workspaceId,
+        });
+        if (userId) {
+          _socketService?.notifyWorkspace?.(userId, 'tally_connection', {
+            status: 'CONNECTED',
+            workspaceId,
+          });
+        }
+      } catch (e) {
+        console.warn('[SYNC] tally_connection notify failed:', e.message);
+      }
     }
 
     res.json({ status: true, data: { alterIds, yearIds, uploadId: uuid() } });
@@ -221,7 +251,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
 });
 
 // POST /ingest/init
-router.post('/ingest/init', async (req, res) => {
+router.post('/ingest/init', requireDeviceCredential, async (req, res) => {
   const deviceId = req.headers['device-id'];
   const uploadId = uuid();
   try {
@@ -234,7 +264,7 @@ router.post('/ingest/init', async (req, res) => {
 });
 
 // POST /ingest/sync-run/start — V2: create a sync_run record before sync starts
-router.post('/ingest/sync-run/start', async (req, res) => {
+router.post('/ingest/sync-run/start', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
   const { companyGuid, syncType = 'normal', expectedCounts } = body || {};
@@ -255,7 +285,7 @@ router.post('/ingest/sync-run/start', async (req, res) => {
 });
 
 // POST /ingest/sync-run/complete — V2: mark sync_run as completed with record counts
-router.post('/ingest/sync-run/complete', async (req, res) => {
+router.post('/ingest/sync-run/complete', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
   const { syncRunId, uploadId, recordCounts, status = 'completed', errorMessage } = body || {};
@@ -292,7 +322,7 @@ router.get('/ingest/sync-run/history', async (req, res) => {
 });
 
 // POST /ingest/chunk
-router.post('/ingest/chunk', async (req, res) => {
+router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
   const uploadId  = req.headers['upload-id'];
   const streamName = req.headers['stream-name'];
   const chunkIndex = parseInt(req.headers['chunk-index'] || '0');
@@ -349,7 +379,7 @@ router.post('/ingest/chunk', async (req, res) => {
 });
 
 // POST /ingest/complete
-router.post('/ingest/complete', async (req, res) => {
+router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
   const { uploadId, isHardSync, voucherCount, ledgerCount, stockCount, recordCount } = body || {};
@@ -501,7 +531,17 @@ router.post('/ingest/complete', async (req, res) => {
     } catch (e) { console.warn('[INGEST] Tax backfill failed (non-fatal):', e.message); }
 
     if (userId) {
-      try { socketService.notifySynced(userId, companyGuid); } catch (e) { console.warn('[WS] emit failed:', e.message); }
+      try {
+        let wsId = null;
+        try {
+          const { rows: wr } = await query(
+            `SELECT workspace_id FROM workspace_devices WHERE device_id = $1 AND status = 'active' LIMIT 1`,
+            [deviceId]
+          );
+          wsId = wr[0]?.workspace_id || null;
+        } catch (_) {}
+        socketService.notifySynced(userId, companyGuid, wsId);
+      } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }
 
     res.json({ status: true, message: 'Sync complete', data: { recordCounts } });

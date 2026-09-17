@@ -230,20 +230,38 @@ export function workspacePublicView(workspace) {
 
 export async function listWorkspacesForUser(userId) {
   const { rows } = await query(
-    `SELECT w.*, m.membership_type, m.status AS membership_status, m.role_id
+    `SELECT w.*, m.membership_type, m.status AS membership_status, m.role_id,
+            b.connection_status AS binding_status
      FROM workspaces w
      JOIN workspace_memberships m ON m.workspace_id = w.id
+     LEFT JOIN workspace_tally_bindings b ON b.workspace_id = w.id
      WHERE m.user_id = $1 AND m.status IN ('ACTIVE','SUSPENDED')
        AND w.lifecycle_status = 'ACTIVE'
      ORDER BY w.is_base DESC, w.created_at ASC`,
     [userId]
   );
-  return rows.map((w) => ({
-    ...workspacePublicView(w),
-    membershipType: w.membership_type,
-    membershipStatus: w.membership_status,
-    roleId: w.role_id,
-  }));
+  const mapped = rows.map((w) => {
+    const view = workspacePublicView(w);
+    const tallyConnection = w.binding_status || w.tally_connection || view.tallyConnection;
+    return {
+      ...view,
+      tallyConnection,
+      membershipType: w.membership_type,
+      membershipStatus: w.membership_status,
+      roleId: w.role_id,
+    };
+  });
+
+  // A user can hold BOTH at once:
+  //  1) Own workspace(s) — membership OWNER (Personal + any additional they created)
+  //  2) Invited workspace(s) — MEMBER/ADMIN on someone else's business WS
+  // Never hide invites just because the user also owns a workspace.
+  return mapped.filter((w) => {
+    const mt = String(w.membershipType || '').toUpperCase();
+    if (mt === 'OWNER') return true;
+    // Invited access to another owner's business workspace (not their Personal base)
+    return (mt === 'MEMBER' || mt === 'ADMIN') && !w.isBase;
+  });
 }
 
 export async function getWorkspaceContext(userId, workspaceId) {
@@ -253,6 +271,20 @@ export async function getWorkspaceContext(userId, workspaceId) {
   if (!access.membership || access.membership.status === 'SUSPENDED') {
     return { workspace: workspacePublicView(workspace), access, denied: true };
   }
+  const { rows: binding } = await query(
+    `SELECT connection_status, active_device_id, lineage_id FROM workspace_tally_bindings
+     WHERE workspace_id = $1 LIMIT 1`,
+    [workspaceId]
+  );
+  const pairingStatus = binding[0]?.connection_status || workspace.tally_connection || 'UNPAIRED';
+
+  // Unpaired → ensure one Demo Company with full sample data (owner-bound seed)
+  if (String(pairingStatus).toUpperCase() !== 'CONNECTED') {
+    await ensureDemoCompany(workspace.owner_user_id || userId, workspaceId).catch((e) =>
+      console.warn('[context] ensureDemoCompany:', e.message)
+    );
+  }
+
   const { rows: companiesRaw } = await query(
     `SELECT guid, name, gstin, is_active FROM companies
      WHERE workspace_id = $1 OR (workspace_id IS NULL AND user_id = $2)
@@ -260,21 +292,23 @@ export async function getWorkspaceContext(userId, workspaceId) {
     [workspaceId, workspace.owner_user_id]
   );
   let companies = companiesRaw;
-  if (access.membership?.membership_type !== 'OWNER') {
-    const mode = access.scopes?.policy?.company_mode || 'ALL';
-    if (mode === 'NONE') companies = [];
-    else if (mode === 'SELECTED') {
-      const allowed = new Set(access.scopes?.companies || []);
-      companies = companiesRaw.filter((c) => allowed.has(c.guid));
+
+  if (String(pairingStatus).toUpperCase() === 'CONNECTED') {
+    // Live books: apply member company scope, then hide Demo
+    if (access.membership?.membership_type !== 'OWNER') {
+      const mode = access.scopes?.policy?.company_mode || 'ALL';
+      if (mode === 'NONE') companies = [];
+      else if (mode === 'SELECTED') {
+        const allowed = new Set(access.scopes?.companies || []);
+        companies = companiesRaw.filter((c) => allowed.has(c.guid));
+      }
     }
+    companies = filterCompaniesByPairingStatus(companies, pairingStatus);
+  } else {
+    // UNPAIRED / RECONNECTING: Demo only — ignore company scope so every member sees it
+    companies = filterCompaniesByPairingStatus(companiesRaw, pairingStatus);
   }
-  const { rows: binding } = await query(
-    `SELECT connection_status, active_device_id, lineage_id FROM workspace_tally_bindings
-     WHERE workspace_id = $1 LIMIT 1`,
-    [workspaceId]
-  );
-  const pairingStatus = binding[0]?.connection_status || workspace.tally_connection || 'UNPAIRED';
-  companies = filterCompaniesByPairingStatus(companies, pairingStatus);
+
   return {
     workspace: workspacePublicView(workspace),
     access: {
@@ -287,11 +321,17 @@ export async function getWorkspaceContext(userId, workspaceId) {
       scopes: access.scopes,
     },
     companies,
-    pairing: {
-      status: pairingStatus,
-      activeDeviceId: binding[0]?.active_device_id || null,
-      lineageId: binding[0]?.lineage_id || null,
-    },
+    pairing: await (async () => {
+      const { buildTallyStatusPayload } = await import('./workspacePairingService.js');
+      const payload = await buildTallyStatusPayload(workspaceId, userId);
+      return {
+        ...payload,
+        // aliases used by older clients
+        status: payload.status,
+        activeDeviceId: payload.activeDeviceId,
+        lineageId: binding[0]?.lineage_id || payload.lineageId || null,
+      };
+    })(),
   };
 }
 
@@ -382,10 +422,10 @@ export async function listSeats(workspaceId) {
 }
 
 export async function purchaseSeat(userId, workspaceId) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
-  if (!allowed) {
-    const err = new Error('Not authorized to purchase seats');
-    err.code = 'WORKSPACE_ACCESS_DENIED';
+  const mem = await loadMembership(userId, workspaceId);
+  if (!mem || mem.status !== 'ACTIVE' || mem.membership_type !== 'OWNER') {
+    const err = new Error('Only Owner can purchase seats');
+    err.code = 'OWNER_ONLY';
     err.httpStatus = 403;
     throw err;
   }
@@ -527,6 +567,17 @@ export async function putMemberScopes(membershipId, scopes = {}) {
 }
 
 export async function createInvitation({ workspaceId, invitedByUserId, mobile, roleId, scopes }) {
+  const { getConnectionStatus } = await import('./workspacePairingService.js');
+  const conn = await getConnectionStatus(workspaceId);
+  if (conn !== 'CONNECTED') {
+    const err = new Error(
+      'Connect Tally and complete the first sync before inviting new members.'
+    );
+    err.code = 'TALLY_CONNECTION_REQUIRED_FOR_INVITE';
+    err.httpStatus = 403;
+    throw err;
+  }
+
   const digits = String(mobile || '').replace(/\D/g, '');
   const cleanMobile = digits.length > 10 ? digits.slice(-10) : digits;
   if (cleanMobile.length < 10) {
@@ -535,8 +586,14 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
     err.httpStatus = 400;
     throw err;
   }
-  // Existing users only — never auto-create invitees
-  const { rows: users } = await query(`SELECT id FROM users WHERE mobile = $1 LIMIT 1`, [cleanMobile]);
+  // Existing users only — match 10-digit or E.164 (+91…) stored mobiles
+  const { rows: users } = await query(
+    `SELECT id FROM users
+     WHERE regexp_replace(COALESCE(mobile,''), '\\D', '', 'g') = $1
+        OR RIGHT(regexp_replace(COALESCE(mobile,''), '\\D', '', 'g'), 10) = $1
+     LIMIT 1`,
+    [cleanMobile]
+  );
   const inviteeUserId = users[0]?.id;
   if (!inviteeUserId) {
     const err = new Error('Invitee must already have a TallyDekho account (request OTP / sign in first)');
@@ -546,14 +603,21 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
   }
 
   const { rows: seats } = await query(
-    `SELECT id FROM workspace_seats
-     WHERE workspace_id = $1 AND status = 'AVAILABLE' AND seat_kind = 'PAID'
-     ORDER BY created_at ASC LIMIT 1`,
+    `UPDATE workspace_seats SET status = 'RESERVED'
+     WHERE id = (
+       SELECT id FROM workspace_seats
+       WHERE workspace_id = $1 AND status = 'AVAILABLE' AND seat_kind = 'PAID'
+       ORDER BY created_at ASC LIMIT 1
+     )
+     RETURNING id`,
     [workspaceId]
   );
-  let reservedSeatId = seats[0]?.id || null;
-  if (reservedSeatId) {
-    await query(`UPDATE workspace_seats SET status = 'RESERVED' WHERE id = $1`, [reservedSeatId]);
+  const reservedSeatId = seats[0]?.id || null;
+  if (!reservedSeatId) {
+    const err = new Error('No available seat — purchase a seat before inviting');
+    err.code = 'NO_SEAT_AVAILABLE';
+    err.httpStatus = 409;
+    throw err;
   }
 
   const inviteId = uuid();
@@ -576,7 +640,9 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
 
 export async function listMyInvitations(userId) {
   const { rows } = await query(
-    `SELECT i.*, w.name AS workspace_name, r.display_name AS role_display_name
+    `SELECT i.id, i.workspace_id, i.invitee_user_id, i.role_id, i.status,
+            i.expires_at, i.created_at, i.invited_by_user_id,
+            w.name AS workspace_name, r.display_name AS role_display_name
      FROM workspace_invitations i
      JOIN workspaces w ON w.id = i.workspace_id
      LEFT JOIN workspace_roles r ON r.id = i.role_id
@@ -584,7 +650,85 @@ export async function listMyInvitations(userId) {
      ORDER BY i.created_at DESC`,
     [userId, now()]
   );
-  return rows;
+  // Never ship scope_snapshot_json to clients — nested objects have caused RN
+  // "Objects are not valid as a React child" crashes if accidentally rendered.
+  return rows.map((r) => ({
+    id: r.id,
+    workspace_id: r.workspace_id,
+    workspace_name: r.workspace_name || 'Workspace',
+    role_id: r.role_id,
+    role_display_name: r.role_display_name || 'Member',
+    status: r.status,
+    expires_at: r.expires_at,
+    created_at: r.created_at,
+    invited_by_user_id: r.invited_by_user_id,
+  }));
+}
+
+/** Pending invitations sent for a workspace (Owner/Admin Team Access). */
+export async function listWorkspaceInvitations(workspaceId) {
+  const { rows } = await query(
+    `SELECT i.id, i.workspace_id, i.invitee_user_id, i.role_id, i.status,
+            i.expires_at, i.created_at, i.invited_by_user_id, i.reserved_seat_id,
+            r.display_name AS role_display_name,
+            u.name AS invitee_name, u.mobile AS invitee_mobile,
+            inviter.name AS invited_by_name
+     FROM workspace_invitations i
+     LEFT JOIN workspace_roles r ON r.id = i.role_id
+     LEFT JOIN users u ON u.id = i.invitee_user_id
+     LEFT JOIN users inviter ON inviter.id = i.invited_by_user_id
+     WHERE i.workspace_id = $1 AND i.status = 'PENDING' AND i.expires_at > $2
+     ORDER BY i.created_at DESC`,
+    [workspaceId, now()]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    workspace_id: r.workspace_id,
+    invitee_user_id: r.invitee_user_id,
+    invitee_name: r.invitee_name || null,
+    invitee_mobile: r.invitee_mobile || null,
+    role_id: r.role_id,
+    role_display_name: r.role_display_name || 'Member',
+    status: r.status,
+    expires_at: r.expires_at,
+    created_at: r.created_at,
+    invited_by_user_id: r.invited_by_user_id,
+    invited_by_name: r.invited_by_name || null,
+  }));
+}
+
+export async function revokeWorkspaceInvitation(actorUserId, workspaceId, invitationId) {
+  if (!(await isOwnerOrAdmin(actorUserId, workspaceId))) {
+    const err = new Error('Not authorized');
+    err.code = 'WORKSPACE_ACCESS_DENIED';
+    err.httpStatus = 403;
+    throw err;
+  }
+  const { rows } = await query(
+    `SELECT * FROM workspace_invitations
+     WHERE id = $1 AND workspace_id = $2 AND status = 'PENDING' LIMIT 1`,
+    [invitationId, workspaceId]
+  );
+  const inv = rows[0];
+  if (!inv) {
+    const err = new Error('Invitation not found or not pending');
+    err.code = 'INVITATION_INVALID';
+    err.httpStatus = 404;
+    throw err;
+  }
+  const ts = now();
+  await query(
+    `UPDATE workspace_invitations SET status = 'REVOKED', revoked_at = $2 WHERE id = $1`,
+    [invitationId, ts]
+  );
+  if (inv.reserved_seat_id) {
+    await query(
+      `UPDATE workspace_seats SET status = 'AVAILABLE', assigned_user_id = NULL WHERE id = $1`,
+      [inv.reserved_seat_id]
+    );
+  }
+  await audit(workspaceId, actorUserId, 'invitation.revoked', { invitationId });
+  return true;
 }
 
 export async function acceptInvitation(userId, invitationId) {
@@ -603,6 +747,12 @@ export async function acceptInvitation(userId, invitationId) {
     const err = new Error('Invitation expired');
     err.code = 'INVITATION_EXPIRED';
     err.httpStatus = 410;
+    throw err;
+  }
+  if (!inv.reserved_seat_id) {
+    const err = new Error('Invitation has no reserved seat');
+    err.code = 'NO_SEAT_AVAILABLE';
+    err.httpStatus = 409;
     throw err;
   }
   const ts = now();
@@ -806,7 +956,8 @@ export async function removeMember(actorUserId, workspaceId, targetUserId) {
 }
 
 /**
- * Assign/change a member's role_id. Never changes Owner membership_type.
+ * Assign/change a member's role_id and derive membership_type from role system_key.
+ * OWNER is never changed via this endpoint. Client must not set membership_type.
  * Capability checked at route (members.role_assign).
  */
 export async function changeMemberRole(actorUserId, workspaceId, targetUserId, roleId) {
@@ -830,7 +981,7 @@ export async function changeMemberRole(actorUserId, workspaceId, targetUserId, r
     throw err;
   }
   const { rows: roleRows } = await query(
-    `SELECT id FROM workspace_roles WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
+    `SELECT id, system_key FROM workspace_roles WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
     [roleId, workspaceId]
   );
   if (!roleRows[0]) {
@@ -839,17 +990,25 @@ export async function changeMemberRole(actorUserId, workspaceId, targetUserId, r
     err.httpStatus = 404;
     throw err;
   }
+  const membershipType = roleRows[0].system_key === 'ADMIN' ? 'ADMIN' : 'MEMBER';
   const previousRoleId = target.role_id;
   await query(
-    `UPDATE workspace_memberships SET role_id = $2 WHERE id = $1`,
-    [target.id, roleId]
+    `UPDATE workspace_memberships SET role_id = $2, membership_type = $3 WHERE id = $1`,
+    [target.id, roleId, membershipType]
   );
   await audit(workspaceId, actorUserId, 'member.role_changed', {
     targetUserId,
     previousRoleId,
     roleId,
+    membershipType,
   });
-  return { membershipId: target.id, userId: targetUserId, roleId, previousRoleId };
+  return {
+    membershipId: target.id,
+    userId: targetUserId,
+    roleId,
+    previousRoleId,
+    membershipType,
+  };
 }
 
 /**
@@ -2219,11 +2378,31 @@ export async function putPaymentModeMap(workspaceId, companyGuid, userId, mappin
 
 export async function listAudit(workspaceId, limit = 50) {
   const { rows } = await query(
-    `SELECT * FROM workspace_audit_log WHERE workspace_id = $1
-     ORDER BY created_at DESC LIMIT $2`,
+    `SELECT a.*, u.name AS actor_name, u.mobile AS actor_mobile
+     FROM workspace_audit_log a
+     LEFT JOIN users u ON u.id = a.actor_user_id
+     WHERE a.workspace_id = $1
+     ORDER BY a.created_at DESC LIMIT $2`,
     [workspaceId, Math.min(Number(limit) || 50, 200)]
   );
   return rows;
+}
+
+/** Record that a user opened/switched into a workspace (Activity log). Rate-limited per hour. */
+export async function recordWorkspaceEntered(userId, workspaceId) {
+  if (!userId || !workspaceId) return false;
+  const ts = now();
+  const hourAgo = ts - 3600;
+  const { rows: recent } = await query(
+    `SELECT id FROM workspace_audit_log
+     WHERE workspace_id = $1 AND actor_user_id = $2 AND event_type = 'workspace.entered'
+       AND created_at >= $3
+     LIMIT 1`,
+    [workspaceId, userId, hourAgo]
+  );
+  if (recent[0]) return false;
+  await audit(workspaceId, userId, 'workspace.entered', {});
+  return true;
 }
 
 /**

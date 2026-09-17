@@ -1,3 +1,128 @@
+## 2026-09-17 — Unpair session cancel + stale pairing-code fix
+
+### Why
+Admin unpair returned 200 but Desktop could still claim a leftover APPROVED session and silently re-bind (RECONNECTING → next pair 409). Desktop also kept showing CLAIMED codes (e.g. 207185) → “Invalid pairing code”.
+
+### Change
+- `unpairDevice`: CANCEL PENDING/APPROVED/CLAIM_PENDING_ACK sessions; clear `pairing_code` (no fake claimable code)
+- `claimPairingCredential`: lock session → CLAIM_PENDING_ACK before binding (unpair race)
+- `approvePairing`: used/CLAIMED codes → message to Refresh on Desktop
+- Desktop: `unpairedAlert` clears code + auto GET `/desktop/pairing-code`; PairingPanel auto-refresh when unpaired
+- Unpair socket fallback notifies Desktop even when `newCode` is null
+
+### How to test
+1. Pair → Admin unpair (do not Refresh yet) → Desktop must show new code, must not re-bind
+2. Approve new code → claim OK
+3. Enter old CLAIMED code on Web → “no longer valid… Refresh code”
+
+### QA
+YELLOW (pairing-stabilization 11/11; unpair regression PASS; no live Electron E2E this run)
+
+---
+
+## 2026-09-14 — Workspace invites list/revoke + activity enter + audit enrich
+
+### Why
+Web Settings Invitations showed only inbound inbox (empty for Owners who sent invites). Activity log ignored `event_type`.
+
+### Change
+- `listWorkspaceInvitations` / `revokeWorkspaceInvitation`; E.164 mobile match on create invite
+- `GET /workspaces/:id/invitations`, `POST .../invitations/:inviteId/revoke`
+- `listAudit` joins actor name/mobile; `recordWorkspaceEntered` (1/hour) on context; socket `workspace_audit`
+
+### How to test
+```bash
+npm test
+# GET /api/workspaces/:id/invitations as Owner → PENDING sent
+# Open workspace → audit shows workspace.entered
+```
+
+---
+
+## 2026-09-14 — Phase C Desktop credential claim (cursor)
+
+### Why
+Device secret must not depend on a single `pairing_confirmed` WebSocket event.
+
+### Change
+- `approvePairing` → session APPROVED + `pairing_approved` wake-up (no secret in socket for session path)
+- `POST /desktop/pairing-sessions/:id/claim` + `/ack`
+- Desktop `claimPairing.js`: HTTP claim + ACK; stores sessionId/claimToken from pairing-code
+- Credential hygiene on `cursor` (safeStorage + encrypted fallback)
+
+### How to test
+Desktop refresh code → Web/Mobile approve → Desktop claims → RECONNECTING → sync → CONNECTED. Kill socket during approve → Desktop poll/claim still works.
+
+---
+
+## 2026-09-14 — Phase B pairing canonicalization (v1.1)
+
+### Why
+Stabilize Workspace↔Desktop pairing per remediation plan: one binding authority, non-destructive Unpair, status contract, invite/read gates.
+
+### Change
+- `workspacePairingService` — sole pair/unpair/status authority; evolve `workspace_tally_bindings`
+- Unpair no longer deactivates companies or clears `companies.workspace_id`
+- Same Device+Workspace Pair is idempotent (no secret rotation)
+- `WORKSPACE_ALREADY_HAS_DESKTOP` → Restore/Replace message (no dead CTA)
+- Workspace context + `/tally/status` return `canPair` / `canUnpair` / firstSyncPending
+- Invites require `CONNECTED` (`TALLY_CONNECTION_REQUIRED_FOR_INVITE`)
+- Real Company GUID reads blocked while not CONNECTED
+- `desktop_pairing_sessions` table + short-lived `/desktop/pairing-code` sessions (claim/ACK in Phase C)
+- Legacy pair routes require `WORKSPACE_REQUIRED`; log deprecation hits
+- `deviceBinding.js` re-exports the new service
+
+### How to test
+Owner/Admin workspace Pair → RECONNECTING; first sync → CONNECTED. Unpair → Demo without company deactivate. Invite while UNPAIRED → 403. Duplicate Pair same Desktop → idempotent.
+
+---
+
+## 2026-09-14 — Workspace pair/unpair + first-sync live books
+
+### Why
+Owner stayed on Demo after pair+sync: clients ignored `tally_connection` CONNECTED, and Web poll skipped live hydrate because `isPaired` was already true. Web pair/unpair used user-scoped `/tally-sync/*` instead of workspace APIs.
+
+### Change
+- Pair emits `tally_connection` RECONNECTING; init-sync CONNECTED; unpair notifies one Desktop + workspace room UNPAIRED
+- Workspace unpair deactivates live companies; `notifyUnpaired` takes workspaceId
+- Internal `/ingest/complete-notify` passes workspaceId into `notifySynced`
+
+### How to test
+Pair from Web or Mobile → Desktop gets secret and syncs → Owner sees live company (not Demo). Unpair → Demo only.
+
+---
+
+
+
+### Why
+Enforce same view caps on `/app` as `/api`; sync `membership_type` on role change; seat-reserve invites; Owner-only billing; Owner+Admin backups list; unknown feature flags OFF.
+
+### Change
+- Shared `resolveViewCapability` — `/app` data routes require view caps (fail closed)
+- `changeMemberRole` derives ADMIN/MEMBER; OWNER immutable
+- `createInvitation` requires AVAILABLE seat → RESERVED; accept requires reserved seat
+- Billing routes: `billing.manage` / `credits.recharge`; seats: `seats.purchase` + Owner-only purchase
+- Hard Sync/Restore approve: `tally.restore_replace`; backups list Owner+Admin
+- `featureFlags.flag`: unknown → false
+- AI insights gated with `ai_insights.view`
+
+### How to test
+`npm test` (131); Member without `sales.view` → 403 on `/app` sales-like paths; invite with 0 seats → `NO_SEAT_AVAILABLE`.
+
+---
+
+
+### Why
+Web Remove looked broken when the Vite proxy dropped DELETE calls, and socket notify after soft-delete could turn a success into a 500.
+
+### Change
+- DELETE `/workspaces/:id/members/:userId` — reject non-finite userId; wrap `_socket.notifyWorkspace` in try/catch.
+
+### How to test
+Owner DELETE member → `200 { success: true }`; membership `status=REMOVED`.
+
+---
+
 ## 2026-09-12 — Forensic MD close: restore folders, writeback, Reset backups
 
 ### Why
@@ -15,7 +140,7 @@ Restore complete echoed backup GUIDs. Workspace-first writeback skipped legacy N
 
 ---
 
-
+## 2026-09-12 — Demo Mode API fail-closed (Universal §8)
 
 ### Why
 Forensic/QA: unpaired workspace context still returned live companies; MD requires real data hidden from operational APIs while unpaired.

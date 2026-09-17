@@ -26,6 +26,7 @@ import { buildArApPayload } from '../modules/ar-ap/arApService.js';
 import { buildPaymentReceiptPayload } from '../modules/kpi/paymentReceiptService.js';
 import { buildCashInHandPayload, buildBankBalancePayload } from '../modules/kpi/cashBankService.js';
 import { computeTrendPct, addDays } from '../modules/kpi/trendUtil.js';
+import { listCostCentresForCompany } from '../services/costCentreListService.js';
 import {
   resolveVoucherListParty,
 } from '../utils/resolveVoucherListParty.js';
@@ -38,6 +39,7 @@ import {
   parseReadNotificationIds,
 } from '../utils/notificationAlerts.js';
 import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.js';
+import { resolveViewCapability } from '../middleware/viewCapability.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -161,58 +163,19 @@ function computeDisplayName(item, field) {
 }
 
 // Fail-closed company access (workspace + membership + company/FY scope + view capability).
-function resolveViewCapability(req) {
-  const u = String(req.originalUrl || `${req.baseUrl || ''}${req.path || ''}`)
-    .toLowerCase()
-    .split('?')[0];
-  if (u.includes('/dashboard') || u.includes('/kpi/')) return 'dashboard.view';
-  if (u.includes('/sales')) return 'sales.view';
-  if (u.includes('/purchase')) return 'purchase.view';
-  if (u.includes('/expenses')) return 'expenses.view';
-  if (u.includes('/daybook')) return 'daybook.view';
-  if (u.includes('/my-entries') || u.includes('/my_entries')) return 'my_entries.view';
-  if (u.includes('/audit')) return 'audit_trail.view';
-  if (u.includes('/ai-insights') || u.includes('/ai_insights') || u.includes('/insights')) return 'ai_insights.view';
-  if (u.includes('/ledgers') || u.includes('/parties') || u.includes('/party')) return 'ledgers.view';
-  if (u.includes('/stocks') || u.includes('/inventory')) {
-    if (u.includes('negative')) return 'inventory.negative_stock.view';
-    if (u.includes('aged')) return 'inventory.aged_items.view';
-    if (u.includes('expiry')) return 'inventory.expiry.view';
-    if (u.includes('warehouse') || u.includes('godown')) return 'inventory.warehouses.view';
-    if (u.includes('barcode')) return 'inventory.barcodes.view';
-    if (u.includes('reorder')) return 'inventory.reorder.view';
-    if (u.includes('ledger')) return 'inventory.stock_ledger.view';
-    return 'inventory.view';
-  }
-  if (
-    u.includes('/financial') || u.includes('/receivable') || u.includes('/payable')
-    || u.includes('/cash-in-hand') || u.includes('/bank-balance') || u.includes('/loans')
-    || u.includes('/profit') || u.includes('/balance-sheet') || u.includes('/trial-balance')
-  ) {
-    if (u.includes('receivable')) return 'financials.receivables.view';
-    if (u.includes('payable')) return 'financials.payables.view';
-    if (u.includes('bank')) return 'financials.bank_balance.view';
-    if (u.includes('loan')) return 'financials.loans_od.view';
-    if (u.includes('profit')) return 'financials.profit_loss.view';
-    if (u.includes('balance-sheet')) return 'financials.balance_sheet.view';
-    if (u.includes('trial')) return 'financials.trial_balance.view';
-    if (u.includes('cash')) return 'financials.cash_register.view';
-    return 'financials.view';
-  }
-  if (u.includes('/eway') || u.includes('/einvoice') || u.includes('/e-invoice') || u.includes('/gst')) {
-    if (u.includes('eway') || u.includes('e-way')) return 'eway.view';
-    if (u.includes('einvoice') || u.includes('e-invoice')) return 'einvoice.view';
-    return 'gst.view';
-  }
-  if (u.includes('/voucher')) return 'vouchers.view';
-  return null;
-}
-
 async function verifyCompanyOwnership(req, res, companyGuid, capabilityOverride = undefined) {
   const fy = req.body?.fy || req.body?.financialYear || req.query?.fy || null;
-  const capability = capabilityOverride !== undefined
+  const mapped = capabilityOverride !== undefined
     ? capabilityOverride
     : resolveViewCapability(req);
+  if (capabilityOverride === undefined && mapped == null) {
+    res.status(403).json({
+      success: false,
+      error: { code: 'CAPABILITY_REQUIRED', message: 'Capability required for this route' },
+    });
+    return false;
+  }
+  const capability = mapped === '__scope_only__' ? null : mapped;
   return verifyCompanyAccess(req, res, companyGuid, {
     capability,
     financialYear: fy,
@@ -333,7 +296,7 @@ router.post('/auth/send-otp', async (req, res) => {
   // Detect country code from phone string
   const countryCode = phone.startsWith('+') ? phone.match(/^\+\d+/)?.[0]?.replace(cleanMobile, '') || '+91' : '+91';
 
-  const BYPASS_NUMBERS = ['9078802278'];
+  const BYPASS_NUMBERS = [];
   const otp = BYPASS_NUMBERS.includes(cleanMobile) ? '1234' : makeOtp();
   const expires = Date.now() + (otp === '1234' ? 365 * 24 * 60 * 60 * 1000 : 5 * 60 * 1000);
 
@@ -589,63 +552,16 @@ router.delete('/push-token', authMiddleware, async (req, res) => {
 
 // Socket service — use the shared ref declared at top of file
 
-// POST /api/tally-sync/pair
-// Frontend sends: { pairing_code: "123456" }
-router.post('/tally-sync/pair', authMiddleware, async (req, res) => {
-  const { pairing_code } = req.body;
-  if (!pairing_code) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Pairing code required' } });
-
-  try {
-    const { rows } = await query('SELECT * FROM devices WHERE pairing_code = $1', [pairing_code]);
-    const device = rows[0];
-
-    if (!device) return res.status(400).json({ success: false, error: { code: 'INVALID_CODE', message: 'Invalid pairing code' } });
-    // Permanent codes have code_expires=NULL — only check expiry for legacy timed codes
-    if (device.code_expires && Date.now() > device.code_expires) {
-      return res.status(400).json({ success: false, error: { code: 'CODE_EXPIRED', message: 'Code expired. Generate a new one on your desktop.' } });
-    }
-
-    const workspaceId = req.headers['x-workspace-id'] || req.body?.workspaceId || null;
-    const bound = await pairDeviceToWorkspace({
-      device,
-      userId: req.user.userId,
-      workspaceId: workspaceId ? String(workspaceId) : null,
-    });
-    if (_socketService) {
-      _socketService.notifyPaired(req.user.userId, device.name || 'Desktop');
-      _socketService.notifyDesktop?.(device.device_id, 'pairing_confirmed', {
-        userId: req.user.userId,
-        pairedAt: new Date().toISOString(),
-        deviceSecret: bound.deviceSecret,
-        workspace: { id: bound.workspace.id, name: bound.workspace.name },
-      });
-    }
-
-    const { rows: companies } = await query(
-      'SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [req.user.userId]
-    );
-    const company = companies[0] ? { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null } : null;
-
-    console.log(`[API PAIR] User ${req.user.userId} paired to device ${device.device_id} workspace ${bound.workspace.id}`);
-
-    res.json({
-      success: true,
-      data: {
-        message: 'Paired successfully',
-        device_id: device.device_id,
-        is_paired: true,
-        workspace_id: bound.workspace.id,
-        workspace_name: bound.workspace.name,
-        company,
-      }
-    });
-  } catch (err) {
-    if (err instanceof BindingError) {
-      return res.status(err.httpStatus).json({ success: false, error: { code: err.code, message: err.message } });
-    }
-    console.error('[API PAIR] Error:', err.message);
-    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Pairing failed' } });
-  }
+// POST /api/tally-sync/pair — DISABLED (Phase F). Use POST /workspaces/:id/tally/pair
+router.post('/tally-sync/pair', authMiddleware, async (_req, res) => {
+  console.warn('[LEGACY] POST /api/tally-sync/pair → 410');
+  return res.status(410).json({
+    success: false,
+    error: {
+      code: 'PAIRING_API_DEPRECATED',
+      message: 'Use POST /api/workspaces/:workspaceId/tally/pair',
+    },
+  });
 });
 
 // GET /api/tally-sync/status
@@ -694,25 +610,32 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
             && (nowSecs - lastSeenSecs) < ONLINE_THRESHOLD_SECS);
         }
         let company = null;
-        if (isPaired) {
+        if (status === 'CONNECTED') {
+          // CONNECTED: never return Demo Company (Mobile must not flicker Demo ↔ empty)
           const { rows: companies } = await query(
             `SELECT guid, name, gstin FROM companies
              WHERE workspace_id = $1 AND is_active = TRUE
                AND LOWER(COALESCE(name,'')) NOT LIKE 'demo%'
+               AND guid NOT LIKE 'dddddddd-dddd-4ddd-8ddd-%'
              ORDER BY synced_at DESC NULLS LAST, name ASC
              LIMIT 1`,
             [workspaceId]
           );
           if (companies[0]) {
             company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-          } else {
-            const { rows: anyCo } = await query(
-              `SELECT guid, name, gstin FROM companies
-               WHERE workspace_id = $1 AND is_active = TRUE
-               ORDER BY synced_at DESC NULLS LAST, name ASC LIMIT 1`,
-              [workspaceId]
-            );
-            if (anyCo[0]) company = { guid: anyCo[0].guid, name: anyCo[0].name, gstin: anyCo[0].gstin || null };
+          }
+          // If only Demo exists while CONNECTED, leave company=null (paired empty state)
+        } else {
+          // UNPAIRED + RECONNECTING: Demo only (same as companies list)
+          const { rows: demoCos } = await query(
+            `SELECT guid, name, gstin FROM companies
+             WHERE workspace_id = $1 AND is_active = TRUE
+               AND (LOWER(COALESCE(name,'')) LIKE 'demo%' OR guid LIKE 'dddddddd-dddd-4ddd-8ddd-%')
+             ORDER BY name ASC LIMIT 1`,
+            [workspaceId]
+          );
+          if (demoCos[0]) {
+            company = { guid: demoCos[0].guid, name: demoCos[0].name, gstin: demoCos[0].gstin || null };
           }
         }
         const lastSeenSecs = Number(device?.last_seen);
@@ -733,84 +656,85 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
       }
     }
 
-    const { rows: devices } = await query(
-      'SELECT d.device_id, d.name, d.last_seen FROM devices d WHERE d.user_id = $1 AND d.paired = TRUE LIMIT 1',
-      [req.user.userId]
-    );
-    const isPaired = devices.length > 0;
-    const device = devices[0] || null;
-
-    // Desktop online = last_seen within 5 minutes
-    // pg bigint serializes as string — coerce before compare
-    const lastSeenSecs = Number(device?.last_seen);
-    const desktopOnline = isPaired && device &&
-      Number.isFinite(lastSeenSecs) && lastSeenSecs > 0 &&
-      (nowSecs - lastSeenSecs) < ONLINE_THRESHOLD_SECS;
-
-    let company = null;
-    if (isPaired) {
-      // Prefer most recently synced active company (desktop may switch which Tally co is open)
-      const { rows: companies } = await query(
-        `SELECT guid, name, gstin FROM companies
-         WHERE user_id = $1 AND is_active = TRUE
-         ORDER BY synced_at DESC NULLS LAST, name ASC
-         LIMIT 1`,
-        [req.user.userId]
-      );
-      if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
+    // No workspace header: resolve Personal Workspace binding (not devices.user_id authority)
+    try {
+      const { ensurePersonalWorkspace } = await import('../services/workspaceService.js');
+      const { getConnectionStatus, buildTallyStatusPayload } = await import('../services/workspacePairingService.js');
+      const personal = await ensurePersonalWorkspace(req.user.userId);
+      if (personal?.id) {
+        const status = await getConnectionStatus(personal.id);
+        const payload = await buildTallyStatusPayload(personal.id, req.user.userId);
+        const isPaired = status === 'CONNECTED' || status === 'RECONNECTING';
+        let company = null;
+        if (status === 'CONNECTED') {
+          const { rows: companies } = await query(
+            `SELECT guid, name, gstin FROM companies
+             WHERE workspace_id = $1 AND is_active = TRUE
+               AND LOWER(COALESCE(name,'')) NOT LIKE 'demo%'
+               AND guid NOT LIKE 'dddddddd-dddd-4ddd-8ddd-%'
+             ORDER BY synced_at DESC NULLS LAST, name ASC
+             LIMIT 1`,
+            [personal.id]
+          );
+          if (companies[0]) {
+            company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
+          }
+        } else {
+          const { rows: demoCos } = await query(
+            `SELECT guid, name, gstin FROM companies
+             WHERE workspace_id = $1 AND is_active = TRUE
+               AND (LOWER(COALESCE(name,'')) LIKE 'demo%' OR guid LIKE 'dddddddd-dddd-4ddd-8ddd-%')
+             ORDER BY name ASC LIMIT 1`,
+            [personal.id]
+          );
+          if (demoCos[0]) {
+            company = { guid: demoCos[0].guid, name: demoCos[0].name, gstin: demoCos[0].gstin || null };
+          }
+        }
+        return res.json({
+          success: true,
+          data: {
+            is_paired: isPaired,
+            desktop_online: !!payload.desktopOnline,
+            workspace_status: status,
+            device: payload.activeDeviceId
+              ? { id: payload.activeDeviceId, name: 'Desktop', last_seen: payload.lastHeartbeatAt || null }
+              : null,
+            company,
+            canPair: payload.canPair,
+            canUnpair: payload.canUnpair,
+          },
+        });
+      }
+    } catch (fallbackErr) {
+      console.warn('[tally-sync/status] personal workspace fallback failed:', fallbackErr.message);
     }
 
-    res.json({
+    return res.json({
       success: true,
       data: {
-        is_paired: isPaired,
-        desktop_online: !!desktopOnline,
-        device: isPaired ? {
-          id: device.device_id,
-          name: device.name || 'Desktop',
-          // Always emit numeric epoch seconds (pg bigint → string otherwise)
-          last_seen: Number.isFinite(lastSeenSecs) ? lastSeenSecs : null,
-        } : null,
-        company,
-      }
+        is_paired: false,
+        desktop_online: false,
+        workspace_status: 'UNPAIRED',
+        device: null,
+        company: null,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch sync status' } });
   }
 });
 
-// POST /api/tally-sync/unpair — unpair this user from their device (cross-platform)
-router.post('/tally-sync/unpair', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-
-    // Get the device before unpairing (for WS notification)
-    const { rows: devices } = await query(
-      'SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1',
-      [userId]
-    );
-
-    const deviceId = devices[0]?.device_id;
-    let newCode = null;
-    if (deviceId) {
-      const result = await unpairDevice(deviceId, userId);
-      newCode = result.newCode;
-      await query(
-        'UPDATE companies SET is_active = FALSE WHERE user_id = $1 AND device_id = $2',
-        [userId, deviceId]
-      ).catch(e => console.warn('[unpair] companies update failed:', e.message));
-    }
-
-    const socketSvc = getSocketService?.();
-    if (socketSvc?.notifyUnpaired) {
-      socketSvc.notifyUnpaired(userId, newCode);
-    }
-
-    res.json({ success: true, message: 'Unpaired successfully', newCode });
-  } catch (err) {
-    console.error('[unpair]', err.message);
-    res.status(500).json({ success: false, error: { message: err.message } });
-  }
+// POST /api/tally-sync/unpair — DISABLED (Phase F). Use POST /workspaces/:id/tally/unpair
+router.post('/tally-sync/unpair', authMiddleware, async (_req, res) => {
+  console.warn('[LEGACY] POST /api/tally-sync/unpair → 410');
+  return res.status(410).json({
+    success: false,
+    error: {
+      code: 'PAIRING_API_DEPRECATED',
+      message: 'Use POST /api/workspaces/:workspaceId/tally/unpair',
+    },
+  });
 });
 
 // POST /api/cost-centres — company cost centre masters (member scope UI)
@@ -821,39 +745,7 @@ router.post('/cost-centres', authMiddleware, async (req, res) => {
   }
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
-    let rows = [];
-    try {
-      const result = await query(
-        `SELECT guid, name, parent_name FROM cost_centres
-         WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
-         ORDER BY name`,
-        [companyGuid]
-      );
-      rows = result.rows;
-    } catch {
-      rows = [];
-    }
-    if (!rows.length) {
-      const fallbackSqls = [
-        `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-         FROM voucher_cost_centre_allocations
-         WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
-        `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
-         FROM voucher_cost_allocations
-         WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL ORDER BY 2`,
-      ];
-      for (const sql of fallbackSqls) {
-        try {
-          const result = await query(sql, [companyGuid]);
-          if (result.rows.length) {
-            rows = result.rows;
-            break;
-          }
-        } catch {
-          /* table missing */
-        }
-      }
-    }
+    const rows = await listCostCentresForCompany(companyGuid);
     res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -891,6 +783,7 @@ router.get('/companies', authMiddleware, async (req, res) => {
       || req.headers['X-Workspace-Id']
       || null;
     let rows;
+    let pairingStatus = 'UNPAIRED';
     if (workspaceId) {
       // Workspace-scoped: any ACTIVE member can list companies in that workspace
       const { rows: mem } = await query(
@@ -903,6 +796,23 @@ router.get('/companies', authMiddleware, async (req, res) => {
           success: false,
           error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not a member of this workspace' },
         });
+      }
+      const { rows: bind } = await query(
+        `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      const { rows: ws } = await query(
+        `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
+        [workspaceId]
+      );
+      pairingStatus = bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
+      if (String(pairingStatus).toUpperCase() !== 'CONNECTED') {
+        const { rows: ownerRows } = await query(
+          `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+          [workspaceId]
+        );
+        const { ensureDemoCompany } = await import('../services/demoDataService.js');
+        await ensureDemoCompany(ownerRows[0]?.owner_user_id || req.user.userId, workspaceId).catch(() => {});
       }
       ({ rows } = await query(
         `SELECT guid, name, gstin FROM companies
@@ -918,9 +828,11 @@ router.get('/companies', authMiddleware, async (req, res) => {
         [req.user.userId]
       ));
     }
+    const { filterCompaniesByPairingStatus } = await import('../services/demoDataService.js');
+    const filtered = filterCompaniesByPairingStatus(rows, pairingStatus);
     res.json({
       success: true,
-      data: rows.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true })),
+      data: filtered.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true })),
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch companies' } });
@@ -1421,6 +1333,7 @@ router.get('/dashboard/search', authMiddleware, async (req, res) => {
 router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   try {
     const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
     const { rows } = await query(
@@ -2237,6 +2150,7 @@ router.get('/sales/ledger-accounts', authMiddleware, async (req, res) => {
   try {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
     const { rows } = await query(
       `SELECT name, guid FROM ledgers
        WHERE company_guid = $1

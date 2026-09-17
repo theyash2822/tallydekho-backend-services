@@ -100,6 +100,14 @@ export async function requireDeviceCredential(req, res, next) {
         message: 'Device is not paired to a workspace.',
       });
     }
+    // Product 5.3: fail closed — paired devices must have a claimed secret
+    if (!attached.device.device_secret_hash) {
+      return res.status(401).json({
+        status: false,
+        code: 'DEVICE_CREDENTIAL_INVALID',
+        message: 'Device credential required. Re-pair or claim credential.',
+      });
+    }
     const secret = await enforceSecret(req, attached.device, { requiredIfHashed: true });
     if (secret.error) return res.status(secret.error.status).json(secret.error.body);
     next();
@@ -113,21 +121,41 @@ export function generateToken(payload) {
 }
 
 /**
- * requirePaired — enforces that the authenticated user has a paired device.
- * Returns 403 if no paired device found.
- * Use after authMiddleware on any data route that requires an active pairing.
+ * requirePaired — Workspace-binding gate for /app data routes.
+ * Ownership is Workspace ↔ Desktop binding, NEVER devices.user_id.
+ *
+ * UNPAIRED / RECONNECTING → allow (Demo path; verifyCompanyAccess still
+ * blocks real company GUID reads).
+ * CONNECTED → require an active paired Device for this Workspace.
  */
 export async function requirePaired(req, res, next) {
   try {
+    const { ensureReqWorkspace } = await import('./companyAccess.js');
+    const { getConnectionStatus } = await import('../services/workspacePairingService.js');
+    const workspaceId = await ensureReqWorkspace(req);
+    if (!workspaceId) {
+      return res.status(403).json({
+        status: false,
+        code: 'WORKSPACE_REQUIRED',
+        message: 'Workspace context required.',
+      });
+    }
+    const status = await getConnectionStatus(workspaceId);
+    if (status === 'UNPAIRED' || status === 'RECONNECTING') {
+      return next();
+    }
     const { rows } = await query(
-      'SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1',
-      [req.user.userId]
+      `SELECT device_id FROM devices
+       WHERE workspace_id = $1 AND paired = TRUE
+       ORDER BY last_seen DESC NULLS LAST
+       LIMIT 1`,
+      [workspaceId]
     );
     if (rows.length === 0) {
       return res.status(403).json({
         status: false,
         code: 'DEVICE_NOT_PAIRED',
-        message: 'Device not paired. Please pair your Tally desktop app to access data.',
+        message: 'No active Tally Desktop for this Workspace. Pair Desktop to access live data.',
       });
     }
     req.deviceId = rows[0].device_id;
@@ -138,17 +166,27 @@ export async function requirePaired(req, res, next) {
 }
 
 /**
- * requireCompanySynced — enforces that the requested companyGuid has been synced.
- * Returns 409 if company has no synced data.
- * Reads companyGuid from req.query, req.body, or req.params.
+ * requireCompanySynced — company must exist in the caller's Workspace.
+ * Ownership is Workspace lineage, never devices.user_id / companies.user_id alone.
  */
 export async function requireCompanySynced(req, res, next) {
   const companyGuid = req.query.companyGuid || req.body?.companyGuid || req.params?.companyGuid;
   if (!companyGuid) return next(); // no company in request — let route handle it
   try {
+    const { ensureReqWorkspace } = await import('./companyAccess.js');
+    const workspaceId = await ensureReqWorkspace(req);
+    if (!workspaceId) {
+      return res.status(403).json({
+        status: false,
+        code: 'WORKSPACE_REQUIRED',
+        message: 'Workspace context required.',
+      });
+    }
     const { rows } = await query(
-      'SELECT guid FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      `SELECT guid FROM companies
+       WHERE guid = $1 AND workspace_id = $2
+       LIMIT 1`,
+      [companyGuid, workspaceId]
     );
     if (rows.length === 0) {
       return res.status(409).json({

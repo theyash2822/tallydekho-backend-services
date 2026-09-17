@@ -275,6 +275,31 @@ export async function applyWorkspaceSchema(client) {
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS binding_status TEXT DEFAULT 'UNBOUND';
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS credential_claimed_at BIGINT;
 
+    -- One active Desktop per Workspace (paired rows only)
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_paired_per_workspace
+      ON devices (workspace_id)
+      WHERE paired = TRUE AND workspace_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS desktop_pairing_sessions (
+      id                  TEXT PRIMARY KEY,
+      device_id           TEXT NOT NULL,
+      code_lookup_hash    TEXT NOT NULL,
+      claim_token_hash    TEXT NOT NULL,
+      status              TEXT NOT NULL DEFAULT 'PENDING',
+      workspace_id        TEXT,
+      approved_by_user_id INTEGER,
+      created_at          BIGINT NOT NULL,
+      expires_at          BIGINT NOT NULL,
+      approved_at         BIGINT,
+      claimed_at          BIGINT,
+      cancelled_at        BIGINT,
+      pending_secret_hash TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pairing_sessions_device
+      ON desktop_pairing_sessions (device_id, status);
+    CREATE INDEX IF NOT EXISTS idx_pairing_sessions_code
+      ON desktop_pairing_sessions (code_lookup_hash, status);
+
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS workspace_id TEXT;
 
     ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS workspace_id TEXT;
