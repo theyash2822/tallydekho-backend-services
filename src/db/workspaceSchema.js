@@ -460,4 +460,39 @@ export async function applyWorkspaceSchema(client) {
       WHERE display_name IS NULL OR display_name = ''
     `).catch(() => {});
   }
+
+  // Phase 2 D — server-backed sessions (refresh hash only; never store raw refresh)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id                  TEXT PRIMARY KEY,
+      user_id             INTEGER NOT NULL REFERENCES users(id),
+      refresh_token_hash  TEXT NOT NULL,
+      status              TEXT NOT NULL DEFAULT 'ACTIVE',
+      created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      expires_at          BIGINT,
+      revoked_at          BIGINT,
+      rotated_at          BIGINT,
+      client_type         TEXT,
+      device_label        TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_refresh ON auth_sessions(refresh_token_hash);
+  `);
+
+  // RBAC Phase 7 — legacy auth usage counters (aggregate only, no PII/secrets).
+  // Makes "verified clean day" answerable from the database instead of stdout.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS legacy_auth_events (
+      day               DATE NOT NULL,
+      event_type        TEXT NOT NULL,
+      route_class       TEXT NOT NULL,
+      platform          TEXT NOT NULL DEFAULT 'unknown',
+      app_version       TEXT NOT NULL DEFAULT 'unknown',
+      identified_client BOOLEAN NOT NULL DEFAULT FALSE,
+      hits              BIGINT NOT NULL DEFAULT 0,
+      last_seen         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (day, event_type, route_class, platform, app_version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_legacy_auth_events_day ON legacy_auth_events(day DESC);
+  `);
 }

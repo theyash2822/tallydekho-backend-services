@@ -44,6 +44,14 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// LEGACY-BLOCK-APP-AUTH telemetry — every hit on this router is legacy surface
+// usage. Counters answer "did a supported client still use /app auth today?";
+// see RBAC_PHASE7_OBSERVATION.md. Never blocks the request.
+router.use((req, _res, next) => {
+  void recordLegacyAuthEvent(LEGACY_EVENTS.APP_AUTH_HIT, req);
+  next();
+});
+
 // ─── POST /app/send-otp ───────────────────────────────────────────────────────
 router.post('/send-otp', async (req, res) => {
   const { mobileNumber, countryCode = '+91' } = req.body;
