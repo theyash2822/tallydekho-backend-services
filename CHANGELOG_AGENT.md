@@ -1,3 +1,54 @@
+## 2026-09-18 (git hygiene pass) — Telemetry classification fix, operator command pack
+
+### Why
+Splitting the bundled commits for review, then re-verifying the P0/P1 fixes and
+the fact collectors. Two real defects surfaced during that re-verification.
+
+### P1 fixed — the RBAC clean-day gate could never have blocked anything
+`isIdentifiedClient()` required the client to declare `x-client-platform` and
+`x-app-version`. **No shipped Web, Mobile or Desktop client sends either header.**
+Every real legacy request would therefore have been classified `unattributed`,
+`STRICT=1` would have exited 0 every day, and the seven clean days would have been
+certified while genuine legacy usage continued — exactly the false confidence the
+telemetry was built to prevent.
+
+Classification now rests on `carriesOurCredential()`: a token that verifies against
+our own `JWT_SECRET`. Only this server can mint one, so it cannot be forged, and it
+works with clients already in the field rather than requiring a release. Headers
+still count, but only ever upgrade an event to identified, so a client cannot
+escape the gate by sending less. The two JWT call sites sit after `jwt.verify()`
+and now pass `credentialVerified: true` explicitly; `/app/*` hits derive it, so
+scanner traffic stays unattributed.
+
+### P2 fixed — report filed verdicts against the wrong day
+`report-legacy-auth-usage.mjs` read `day` as a JS `Date` and called
+`toISOString()`, rendering local midnight in UTC. In IST this reported
+`2026-09-18` as `2026-09-17`, which would have recorded clean days against the
+wrong date. The day is now formatted in SQL.
+
+### P2 fixed — ADMIN migration applied by default
+`migrate-admin-membership-to-role.mjs` rewrote membership rows unless `DRY_RUN=1`
+was remembered, unlike every other destructive operator script here. It now
+inspects by default and requires `CONFIRM=1` to write. `DRY_RUN=1` still honoured.
+
+### Repo hygiene
+An automated checkpoint commit had added an 11 MB workspace-backup archive of real
+customer data. It was never pushed and is absent from the rewritten branch;
+`data/workspace-backups/` is now ignored, as are the SQLite `-shm`/`-wal`
+sidecars, which were tracked and produced noise in every diff.
+
+`.env.staging.example` in td-web-portal was being swallowed by the `.env.*` ignore
+rule, so the template could never be committed. Ignore list now excepts it.
+
+### Verified, not assumed
+- backup/restore re-run end to end: 12 MB in 2.9s, restore 35.8s, 90/90 archive
+  tables present, `vector` pre-created, 8/8 checks pass
+- both fact collectors executed; confirmed no secret values in output
+- report exit codes exercised: 0 clean, 1 identified under STRICT, 2 table missing
+- 195 backend unit (was 192), 43 RBAC, 20 web, mobile and desktop config checks
+
+---
+
 ## 2026-09-18 (later) — Staging provisioning prep, RBAC telemetry, operator script coverage
 
 ### Why

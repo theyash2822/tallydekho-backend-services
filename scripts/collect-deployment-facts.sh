@@ -39,14 +39,16 @@ echo "-- exec mode / instances (names + mode only) --"
 try node -e '
   const { execSync } = require("child_process");
   try {
-    const list = JSON.parse(execSync("pm2 jlist", { encoding: "utf8" }));
+    const list = JSON.parse(
+      execSync("pm2 jlist", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+    );
     for (const p of list) {
       const e = p.pm2_env || {};
       console.log([p.name, e.exec_mode, `instances=${e.instances ?? 1}`,
         `node_args=${e.node_args || ""}`, `max_memory_restart=${e.max_memory_restart || ""}`,
         `cwd=${e.pm_cwd || ""}`].join("  "));
     }
-  } catch (e) { console.log("(unavailable)", e.message); }
+  } catch (e) { console.log("(unavailable):", String(e.message).split("\n")[0]); }
 '
 
 hr "Nginx"
@@ -85,13 +87,15 @@ if command -v pm2 >/dev/null 2>&1; then
   try node -e '
     const { execSync } = require("child_process");
     try {
-      const list = JSON.parse(execSync("pm2 jlist", { encoding: "utf8" }));
+      const list = JSON.parse(
+        execSync("pm2 jlist", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      );
       for (const p of list) {
         console.log(`-- ${p.name} --`);
         const env = (p.pm2_env && p.pm2_env.env) || {};
         console.log(Object.keys(env).sort().join("\n"));
       }
-    } catch (e) { console.log("(unavailable)", e.message); }
+    } catch (e) { console.log("(unavailable):", String(e.message).split("\n")[0]); }
   '
 fi
 echo "-- .env keys (names only) --"

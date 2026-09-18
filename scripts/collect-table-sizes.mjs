@@ -34,6 +34,11 @@ const MIGRATION_CRITICAL = new Set([
   'stocks',
 ]);
 
+/** Table names come from pg_class, but quote them anyway rather than trusting that. */
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
 function pad(s, n) {
   s = String(s);
   return s.length >= n ? s : s + ' '.repeat(n - s.length);
@@ -74,7 +79,7 @@ try {
   if (exact) {
     for (const t of tables) {
       const { rows } = await client.query(
-        `SELECT count(*)::bigint AS n FROM public.${JSON.stringify(t.table).replace(/"/g, '"')}`
+        `SELECT count(*)::bigint AS n FROM public.${quoteIdent(t.table)}`
       );
       counts.set(t.table, rows[0].n);
     }
