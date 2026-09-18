@@ -2,16 +2,23 @@
  * Phase 6 — convert membership_type=ADMIN → MEMBER + workspace builtin ADMIN role.
  *
  * Usage:
- *   node scripts/migrate-admin-membership-to-role.mjs
- *   DRY_RUN=1 node scripts/migrate-admin-membership-to-role.mjs
+ *   node scripts/migrate-admin-membership-to-role.mjs              # inspect only
+ *   CONFIRM=1 node scripts/migrate-admin-membership-to-role.mjs    # apply
  *
  * Fails if any ADMIN membership's workspace lacks builtin ADMIN role.
+ *
+ * Inspecting is the default. This script rewrites membership rows in place, so
+ * running it bare against production by mistake — while exploring, or from a
+ * half-remembered command — must not be able to mutate anything. Every other
+ * destructive operator script here requires CONFIRM=1, and this one was the
+ * exception: it applied by default and only skipped writes when DRY_RUN=1 was
+ * remembered. DRY_RUN is still accepted so older runbooks keep working.
  */
 import 'dotenv/config';
 import { query } from '../src/db/schema.js';
 import { seedBuiltinRoles } from '../src/services/roleService.js';
 
-const dryRun = process.env.DRY_RUN === '1';
+const dryRun = process.env.CONFIRM !== '1' || process.env.DRY_RUN === '1';
 
 async function main() {
   const { rows: before } = await query(
@@ -86,7 +93,8 @@ async function main() {
   }
 
   if (dryRun) {
-    console.log('DRY_RUN: skipping membership_type UPDATE');
+    console.log('inspect only: skipping membership_type UPDATE');
+    console.log('re-run with CONFIRM=1 to apply');
     process.exit(0);
   }
 
