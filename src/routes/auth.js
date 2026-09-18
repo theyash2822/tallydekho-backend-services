@@ -48,9 +48,9 @@ const now = () => Math.floor(Date.now() / 1000);
 // usage. Counters answer "did a supported client still use /app auth today?";
 // see RBAC_PHASE7_OBSERVATION.md. Never blocks the request.
 //
-// Unlike the JWT events, this router is open to unauthenticated traffic, so
-// credentialVerified is left to be derived from the request: a scanner probing
-// /app/auth stays unattributed, while a real client carrying our token counts.
+// This is attempt volume, not evidence. The router is open to the internet, so a
+// hit here only becomes blocking when the request carries a token our own secret
+// validates. A completed login is recorded separately as LOGIN_SUCCESS.
 router.use((req, _res, next) => {
   void recordLegacyAuthEvent(LEGACY_EVENTS.APP_AUTH_HIT, req);
   next();
@@ -124,6 +124,10 @@ router.post('/verify-otp', async (req, res) => {
       // Clear OTP but DO NOT issue a full token yet — issue a scoped pre-auth token instead
       await query('UPDATE users SET otp = NULL, otp_expires = NULL, updated_at = $1 WHERE id = $2', [now(), user.id]);
       const preAuthToken = generatePreAuthToken(user.id, cleanMobile);
+      // The OTP matched and the server is issuing a credential, so a real client
+      // completed a legacy login. Only reachable past the OTP check, which an
+      // outsider cannot pass, which is what makes this evidence rather than noise.
+      void recordLegacyAuthEvent(LEGACY_EVENTS.LOGIN_SUCCESS, req, { serverVerified: true });
       console.log(`[AUTH] 2FA required for user ${user.id}`);
       return res.json({
         status: true,
@@ -137,6 +141,8 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     // ── No 2FA — issue full token ───────────────────────────────────────────
+    // Same reasoning as the 2FA branch: OTP verified, credential being issued.
+    void recordLegacyAuthEvent(LEGACY_EVENTS.LOGIN_SUCCESS, req, { serverVerified: true });
     const token = generateToken({ userId: user.id, mobile: cleanMobile });
 
     await query(`UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3`,
@@ -177,6 +183,11 @@ router.post('/verify', async (req, res) => {
     const { rows } = await query('SELECT * FROM users WHERE id = $1', [payload.userId]);
     const user = rows[0];
     if (!user) return res.json({ status: false, data: { valid: false } });
+
+    // This route takes its token in the BODY, so the generic Authorization-header
+    // check sees nothing and would score a genuine client as unattributable. The
+    // token verified against our own secret here, so record it explicitly.
+    void recordLegacyAuthEvent(LEGACY_EVENTS.LOGIN_SUCCESS, req, { serverVerified: true });
 
     const { isPaired } = await getUserPairingHints(user.id);
 

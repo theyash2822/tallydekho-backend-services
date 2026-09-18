@@ -29,7 +29,7 @@ export function authMiddleware(req, res, next) {
           // Reached only after jwt.verify() passed, so this is provably one of our
           // own clients and counts as identified regardless of client headers.
           void recordLegacyAuthEvent(LEGACY_EVENTS.JWT_REJECTED, req, {
-            credentialVerified: true,
+            serverVerified: true,
           });
           return res.status(401).json({
             status: false,
@@ -38,7 +38,7 @@ export function authMiddleware(req, res, next) {
           });
         } else {
           void recordLegacyAuthEvent(LEGACY_EVENTS.JWT_ACCEPTED, req, {
-            credentialVerified: true,
+            serverVerified: true,
           });
         }
         next();

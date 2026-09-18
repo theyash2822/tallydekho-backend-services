@@ -15,7 +15,7 @@ import {
   LEGACY_EVENTS,
   carriesOurCredential,
   credentialState,
-  isIdentifiedClient,
+  isLegitimateLegacyUse,
   legacyEventFromRequest,
 } from '../services/legacyAuthTelemetry.js';
 
@@ -37,46 +37,92 @@ describe('legacy auth telemetry', () => {
     assert.match(appAuth, /router\.use\(\(req, _res, next\) => \{\s*void recordLegacyAuthEvent\(LEGACY_EVENTS\.APP_AUTH_HIT, req\)/);
   });
 
-  it('pins the full identification truth table', () => {
-    // The gate decides whether a production day counts as clean, so the policy is
-    // pinned exhaustively rather than by example. Any change here changes what
+  it('only server-verified evidence blocks a clean day', () => {
+    // This decides whether a production day counts as clean, so the policy is
+    // pinned exhaustively rather than by example. Changing this table changes what
     // "seven clean days" means.
     const cases = [
-      // credential   platform    version   identified   why
-      ['verified', undefined, undefined, true, 'provably ours even with no headers'],
-      ['verified', 'android', '4.2.0', true, 'provably ours and attributed'],
-      ['verified', 'unknown', 'unknown', true, 'headers cannot downgrade a credential'],
-      ['invalid', undefined, undefined, false, 'forged token is not our client'],
-      ['invalid', 'android', '4.2.0', false, 'headers cannot launder a forged token'],
-      ['absent', 'android', '4.2.0', true, 'unauthenticated legacy use by a real client'],
-      ['absent', undefined, undefined, false, 'unattributable noise'],
-      ['absent', 'android', undefined, false, 'half a declaration is not a declaration'],
-      ['absent', undefined, '4.2.0', false, 'half a declaration is not a declaration'],
+      ['verified', true, 'a token we minted, or a login that actually completed'],
+      ['invalid', false, 'a token was presented and failed — not our client'],
+      ['absent', false, 'nothing the server could verify'],
+      [true, true, 'boolean form used by call sites holding proof'],
+      [false, false, 'boolean form'],
+      [undefined, false, 'default must be non-blocking'],
     ];
 
-    for (const [credential, platform, version, expected, why] of cases) {
+    for (const [evidence, expected, why] of cases) {
       assert.equal(
-        isIdentifiedClient(platform, version, credential),
+        isLegitimateLegacyUse(evidence),
         expected,
-        `${credential} + ${platform}/${version} should be ${expected}: ${why}`
+        `evidence=${evidence} should be ${expected}: ${why}`
       );
     }
   });
 
-  it('a real client cannot escape the gate by sending fewer headers', () => {
-    // The bug this replaces: identification depended on x-client-platform and
-    // x-app-version, and no shipped client sends either. Every genuine legacy
-    // request scored unattributed, STRICT exited 0 daily, and seven "clean" days
-    // would have been certified while legacy auth was still in use.
-    assert.equal(isIdentifiedClient(undefined, undefined, 'verified'), true);
-    assert.equal(isIdentifiedClient(undefined, undefined, true), true, 'boolean form');
+  it('client headers cannot move the gate in either direction', () => {
+    // Two bugs lived here in turn. First headers were the ONLY signal, and since
+    // no shipped client sends them, every genuine legacy request scored
+    // non-blocking — seven clean days would have been certified vacuously. Then
+    // headers became sufficient, which let anyone jam the cutover with two header
+    // lines. isLegitimateLegacyUse now takes no header argument at all, so neither
+    // failure can return: the signature itself forbids it.
+    assert.match(
+      read('services/legacyAuthTelemetry.js'),
+      /export function isLegitimateLegacyUse\(evidence = 'absent'\)/,
+      'evidence is the only input; no platform or version parameter'
+    );
+
+    // A real client withholding everything still blocks, on server evidence alone.
+    assert.equal(isLegitimateLegacyUse('verified'), true);
+    // A stranger sending anything at all still does not.
+    assert.equal(isLegitimateLegacyUse('invalid'), false);
+    assert.equal(isLegitimateLegacyUse('absent'), false);
   });
 
-  it('spoofed headers cannot turn a forged token into legitimate usage', () => {
-    // Otherwise two header lines would hold the cutover open forever — a denial of
-    // progress against our own release that costs an attacker nothing.
-    assert.equal(isIdentifiedClient('android', '4.2.0', 'invalid'), false);
-    assert.equal(isIdentifiedClient('desktop', '1.0.0', 'invalid'), false);
+  it('a completed legacy login is recorded as evidence at every success point', () => {
+    // These are the unauthenticated routes, where no credential exists yet. Without
+    // a hook at the success point, a real client logging in through the legacy
+    // surface would be indistinguishable from a scanner probing it.
+    const appAuth = read('routes/auth.js');
+
+    // /app/verify-otp — both branches issue a credential once the OTP matched.
+    const otpHooks = appAuth.match(
+      /recordLegacyAuthEvent\(LEGACY_EVENTS\.LOGIN_SUCCESS, req, \{ serverVerified: true \}\)/g
+    );
+    assert.ok(
+      otpHooks && otpHooks.length >= 3,
+      'expected success hooks on the 2FA branch, the full-token branch, and /app/verify'
+    );
+
+    // The hook must sit after the OTP check, otherwise a wrong OTP would count.
+    const otpCheck = appAuth.indexOf("user.otp !== String(otp)");
+    const firstHook = appAuth.indexOf('LEGACY_EVENTS.LOGIN_SUCCESS');
+    assert.ok(otpCheck > -1 && firstHook > otpCheck, 'success must follow OTP verification');
+
+    // /app/verify takes its token in the body, so the Authorization-header check
+    // cannot see it and a genuine client would otherwise score unattributable.
+    const verifyRoute = appAuth.slice(appAuth.indexOf("router.post('/verify'"));
+    assert.match(
+      verifyRoute.slice(0, 1200),
+      /jwt\.verify\([\s\S]*LEGACY_EVENTS\.LOGIN_SUCCESS/,
+      '/app/verify must record success after verifying the body token'
+    );
+  });
+
+  it('telemetry cannot break a login', () => {
+    // Every call site is fire-and-forget, and the recorder swallows its own
+    // failures. A telemetry outage must never turn into a failed sign-in.
+    const appAuth = read('routes/auth.js');
+    const mw = read('middleware/auth.js');
+    for (const [name, src] of [['routes/auth.js', appAuth], ['middleware/auth.js', mw]]) {
+      const calls = src.match(/^\s*(void )?recordLegacyAuthEvent\(/gm) || [];
+      assert.ok(calls.length > 0, `${name} should record legacy events`);
+      for (const call of calls) {
+        assert.match(call, /void /, `${name}: every call must be fire-and-forget`);
+      }
+    }
+    const svc = read('services/legacyAuthTelemetry.js');
+    assert.match(svc, /catch \(err\) \{[\s\S]*console\.warn/, 'recorder must swallow failures');
   });
 
   it('only our own signing key can mark a request identified', () => {
@@ -124,8 +170,8 @@ describe('legacy auth telemetry', () => {
     // Both sites sit after jwt.verify(), so they must say so explicitly; deriving
     // it again would be redundant, and omitting it would misclassify the event.
     const mw = read('middleware/auth.js');
-    assert.match(mw, /JWT_REJECTED, req, \{\s*credentialVerified: true,?\s*\}/);
-    assert.match(mw, /JWT_ACCEPTED, req, \{\s*credentialVerified: true,?\s*\}/);
+    assert.match(mw, /JWT_REJECTED, req, \{\s*serverVerified: true,?\s*\}/);
+    assert.match(mw, /JWT_ACCEPTED, req, \{\s*serverVerified: true,?\s*\}/);
   });
 
   it('client labels are bounded — no free-form text reaches the counters', () => {

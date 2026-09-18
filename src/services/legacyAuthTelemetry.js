@@ -21,8 +21,15 @@ export const LEGACY_EVENTS = {
   JWT_REJECTED: 'LEGACY_JWT_REJECTED',
   /** Sessionless JWT accepted because ALLOW_LEGACY_JWT=1. */
   JWT_ACCEPTED: 'LEGACY_JWT_ACCEPTED',
-  /** A legacy /app/* auth route was hit. */
+  /** A legacy /app/* auth route was hit. Attempt only; proves nothing by itself. */
   APP_AUTH_HIT: 'LEGACY_APP_AUTH_HIT',
+  /**
+   * A legacy authentication actually COMPLETED: the server checked the OTP or a
+   * token it minted itself and then issued or confirmed credentials. This is the
+   * evidence that an unauthenticated legacy flow is still in real use, and it
+   * cannot be manufactured from outside.
+   */
+  LOGIN_SUCCESS: 'LEGACY_LOGIN_SUCCESS',
 };
 
 const UNKNOWN = 'unknown';
@@ -46,7 +53,7 @@ function label(value) {
  *   'absent'   — no bearer token at all. Normal for unauthenticated routes such
  *                as login, so it is not suspicious by itself.
  *
- * The distinction between 'invalid' and 'absent' matters: see isIdentifiedClient().
+ * Only 'verified' is treated as evidence; see isLegitimateLegacyUse().
  */
 export function credentialState(req) {
   const header = req?.headers?.authorization;
@@ -66,42 +73,42 @@ export function carriesOurCredential(req) {
 }
 
 /**
- * Whether this event attributes to a real client of ours, which is what blocks
- * the RBAC cutover and resets the clean-day clock.
+ * Does this event count as real legacy usage — the thing that blocks a clean day
+ * and resets the seven-day clock?
  *
- * Header self-declaration alone is NOT sufficient, and relying on it was a bug:
- * no shipped Web, Mobile or Desktop client sends x-client-platform or
- * x-app-version, so an earlier version of this function returned false for every
- * request including genuine legacy usage. STRICT mode would then have exited 0
- * every day and the seven clean days would have been declared vacuously — the
- * precise false confidence this telemetry exists to prevent.
+ * Only the server's own verification counts. Nothing a caller can put in a
+ * request makes an event blocking:
  *
- * A verified credential is therefore what counts, and headers can never downgrade
- * it. Withholding headers cannot hide a real client from the gate.
+ *   evidence     meaning                                            blocking
+ *   --------     -------                                            --------
+ *   verified     a token we minted validated, OR a legacy login     yes
+ *                actually completed against a real OTP/token
+ *   invalid      a token was presented and failed to verify         no
+ *   absent       nothing the server could verify                    no
  *
- * A token that was presented and failed to verify is the one case headers cannot
- * rescue. Otherwise anyone could launder a forged token into "legitimate usage"
- * by adding two header lines, and hold the cutover open indefinitely — a denial
- * of progress against our own release, costing nothing to mount.
+ * Client headers deliberately play no part. They record which platform and
+ * version to chase once a blocking event exists, and nothing more.
  *
- * Headers still decide the case where no token was presented at all, because that
- * is normal for unauthenticated legacy routes such as login. A real client calling
- * /app/auth/send-otp has no token to offer, and once clients send identification
- * headers that is the only signal distinguishing it from a scanner.
+ * Two earlier versions of this function got it wrong in opposite directions,
+ * which is why the rule is now this blunt:
  *
- *   credential     headers      identified
- *   ----------     -------      ----------
- *   verified       any          yes   — provably ours, blocks the clean day
- *   invalid        any          no    — forgery cannot be laundered by headers
- *   absent         present      yes   — unauthenticated legacy use by a real client
- *   absent         missing      no    — unattributable; scanners, abandoned builds
+ * Headers were once the ONLY signal. No shipped client sends x-client-platform
+ * or x-app-version, so every genuine legacy request scored non-blocking, STRICT
+ * exited 0 daily, and seven clean days would have been certified while legacy
+ * auth was still carrying real traffic.
+ *
+ * Headers were then sufficient but not necessary, which fixed the false-clean
+ * hole and opened a false-block one: two header lines from anyone on the
+ * internet counted as a real client, and could hold the cutover open forever at
+ * no cost to the sender.
+ *
+ * Server-verified evidence closes both. It cannot be withheld by a real client
+ * to escape the gate, and it cannot be fabricated by a stranger to jam it.
  */
-export function isIdentifiedClient(platform, appVersion, credential = 'absent') {
-  // Accepts the legacy boolean form as well as the tri-state.
-  const state = credential === true ? 'verified' : credential === false ? 'absent' : credential;
-  if (state === 'verified') return true;
-  if (state === 'invalid') return false;
-  return label(platform) !== UNKNOWN && label(appVersion) !== UNKNOWN;
+export function isLegitimateLegacyUse(evidence = 'absent') {
+  // Accepts the boolean form used by call sites that already know the answer.
+  const state = evidence === true ? 'verified' : evidence === false ? 'absent' : evidence;
+  return state === 'verified';
 }
 
 export function legacyEventFromRequest(req) {
@@ -118,11 +125,12 @@ export function legacyEventFromRequest(req) {
  */
 export async function recordLegacyAuthEvent(eventType, req, opts = {}) {
   const { platform, appVersion, routeClass } = legacyEventFromRequest(req);
-  // JWT_* events are only reachable after the signature already verified, so the
-  // caller states that directly. /app/* hits are open to anyone, so the token is
-  // classified here instead.
-  const credential = opts.credentialVerified === true ? 'verified' : credentialState(req);
-  const identified = isIdentifiedClient(platform, appVersion, credential);
+  // Call sites that already hold server-side proof say so: the JWT_* events sit
+  // after jwt.verify(), and LOGIN_SUCCESS is only reached once a legacy login has
+  // actually completed. Everything else is classified from the request, where the
+  // only thing worth trusting is a token our own secret validates.
+  const evidence = opts.serverVerified === true ? 'verified' : credentialState(req);
+  const identified = isLegitimateLegacyUse(evidence);
 
   // stdout line retained for existing log pipelines / greppability.
   console.warn(

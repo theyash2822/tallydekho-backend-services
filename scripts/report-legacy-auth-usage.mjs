@@ -5,15 +5,28 @@
  * Turns `legacy_auth_events` counters into the daily verdict required by
  * RBAC_PHASE7_OBSERVATION.md. Run against PRODUCTION.
  *
- * A day is CLEAN when zero legacy hits came from an IDENTIFIED client, meaning
- * one that presented a token our own JWT_SECRET validates, or that declared both
- * x-client-platform and x-app-version. The credential is the signal that matters,
- * since no shipped client sends those headers yet; see isIdentifiedClient() in
- * src/services/legacyAuthTelemetry.js for the full rationale.
+ * A day is CLEAN when the server verified zero real uses of a legacy auth path.
  *
- * Unattributed traffic — forged or malformed tokens, scanners, bots — is reported
- * separately and does not by itself reset the clean-day clock; the operator decides
- * using the split.
+ * Two things count as real, and both are established by the server, never by
+ * anything the caller sends:
+ *
+ *   LEGACY_JWT_ACCEPTED / LEGACY_JWT_REJECTED
+ *     a token our own JWT_SECRET validated — only this server can mint one
+ *
+ *   LEGACY_LOGIN_SUCCESS
+ *     a legacy login actually completed: the OTP matched, or a token we issued
+ *     verified, and the server went on to issue or confirm credentials
+ *
+ * Everything else is attempt volume:
+ *
+ *   LEGACY_APP_AUTH_HIT with no verified credential
+ *     anyone can POST to an unauthenticated login route; reported, never blocking
+ *
+ * Client headers (x-client-platform, x-app-version) are attribution only. They
+ * cannot make an event blocking, so a stranger cannot jam the cutover with two
+ * header lines, and they cannot make one non-blocking, so a real client cannot
+ * slip past by withholding them. See isLegitimateLegacyUse() in
+ * src/services/legacyAuthTelemetry.js.
  *
  * Usage:
  *   node scripts/report-legacy-auth-usage.mjs             # last 7 days
@@ -53,7 +66,8 @@ async function main() {
             SUM(hits) FILTER (WHERE NOT identified_client) AS unattributed_hits,
             SUM(hits) FILTER (WHERE event_type = 'LEGACY_JWT_ACCEPTED') AS jwt_accepted,
             SUM(hits) FILTER (WHERE event_type = 'LEGACY_JWT_REJECTED') AS jwt_rejected,
-            SUM(hits) FILTER (WHERE event_type = 'LEGACY_APP_AUTH_HIT') AS app_auth_hits
+            SUM(hits) FILTER (WHERE event_type = 'LEGACY_APP_AUTH_HIT') AS app_auth_hits,
+            SUM(hits) FILTER (WHERE event_type = 'LEGACY_LOGIN_SUCCESS') AS login_success
        FROM legacy_auth_events
       WHERE day >= CURRENT_DATE - ($1::int - 1)
       GROUP BY day
@@ -69,8 +83,8 @@ async function main() {
   }
 
   if (MARKDOWN) {
-    console.log('\n| Date | Legacy JWT accepted | Supported /app/auth hits | Identified clients | Verified clean day |');
-    console.log('| ---- | ------------------- | ------------------------ | ------------------ | ------------------ |');
+    console.log('\n| Date | Verified legacy JWT | Successful legacy login | Unverified attempts | Blocking total | Verified clean day |');
+    console.log('| ---- | ------------------- | ----------------------- | ------------------- | -------------- | ------------------ |');
   }
 
   let identifiedTotal = 0;
@@ -79,14 +93,17 @@ async function main() {
     const identified = n(row.identified_hits);
     identifiedTotal += identified;
     if (MARKDOWN) {
+      const verifiedJwt = n(row.jwt_accepted) + n(row.jwt_rejected);
       console.log(
-        `| ${date} | ${n(row.jwt_accepted)} | ${n(row.app_auth_hits)} | ${identified} | ${identified === 0 ? 'YES' : 'NO'} |`
+        `| ${date} | ${verifiedJwt} | ${n(row.login_success)} | ${n(row.unattributed_hits)} | ${identified} | ${identified === 0 ? 'YES' : 'NO'} |`
       );
     } else {
       console.log(
-        `${date}  identified=${identified}  unattributed=${n(row.unattributed_hits)}  ` +
-          `jwt_accepted=${n(row.jwt_accepted)}  jwt_rejected=${n(row.jwt_rejected)}  ` +
-          `app_auth=${n(row.app_auth_hits)}  → ${identified === 0 ? 'CLEAN' : 'NOT CLEAN'}`
+        `${date}  blocking=${identified}  attempts=${n(row.unattributed_hits)}  ` +
+          `[verified_jwt=${n(row.jwt_accepted) + n(row.jwt_rejected)} ` +
+          `login_success=${n(row.login_success)} ` +
+          `app_auth_hits=${n(row.app_auth_hits)}]  ` +
+          `→ ${identified === 0 ? 'CLEAN' : 'NOT CLEAN'}`
       );
     }
   }
@@ -102,26 +119,30 @@ async function main() {
   );
 
   if (offenders.length) {
-    console.log('\nidentified clients still using legacy auth (migrate these, then restart the clock):');
+    console.log('\nserver-verified legacy usage (migrate these clients, then restart the clock):');
     for (const o of offenders) {
-      // Until clients send the identification headers, most identified events are
-      // attributed by credential alone, so say that rather than printing
-      // "unknown vunknown" and implying the data is missing.
+      // Clients do not send identification headers yet, so most blocking events
+      // are attributed by server evidence alone. Say that, rather than printing
+      // "unknown vunknown" and implying data is missing.
       const who =
         o.platform === 'unknown' && o.app_version === 'unknown'
-          ? 'verified credential (platform/version not declared)'
+          ? 'platform/version not declared'
           : `${o.platform} v${o.app_version}`;
+      const how =
+        o.event_type === 'LEGACY_LOGIN_SUCCESS'
+          ? 'completed a legacy login'
+          : 'presented a token we minted';
       console.log(
-        `  ${who}  ${o.event_type} ${o.route_class} hits=${o.hits} last=${new Date(o.last_seen).toISOString()}`
+        `  ${how} — ${who}  ${o.route_class} hits=${o.hits} last=${new Date(o.last_seen).toISOString()}`
       );
     }
   } else {
-    console.log('\nno identified client used a legacy auth path in the window');
+    console.log('\nno server-verified legacy auth usage in the window');
   }
 
-  console.log(`\nidentified legacy hits in window: ${identifiedTotal}`);
+  console.log(`\nblocking legacy usage in window: ${identifiedTotal}`);
   if (STRICT && identifiedTotal > 0) {
-    console.error('STRICT: identified legacy auth usage present — day is NOT clean');
+    console.error('STRICT: server-verified legacy auth usage present — day is NOT clean');
     process.exit(1);
   }
   process.exit(0);
