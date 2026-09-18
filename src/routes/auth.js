@@ -60,8 +60,8 @@ router.post('/send-otp', async (req, res) => {
   const cleanMobile = mobileNumber.replace(/\D/g, '');
   if (cleanMobile.length < 6) return res.status(400).json({ status: false, message: 'Invalid mobile number' });
 
-  const BYPASS_NUMBERS = ['9078802278'];
-  const otp = BYPASS_NUMBERS.includes(mobileNumber.replace(/\D/g, '')) ? '1234' : makeOtp();
+  const BYPASS_NUMBERS = [];
+  const otp = BYPASS_NUMBERS.includes(cleanMobile) ? '1234' : makeOtp();
   const expires = Date.now() + (otp === '1234' ? 365 * 24 * 60 * 60 * 1000 : 5 * 60 * 1000);
   const region = getRegion(countryCode);
 
@@ -140,9 +140,7 @@ router.post('/verify-otp', async (req, res) => {
 
     await bootstrapWorkspaceSafe(user.id);
 
-    // Check if device is paired
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
 
     // isNewUser = true if name is not set (never completed onboarding)
     const isNewUser = !user.name;
@@ -176,8 +174,7 @@ router.post('/verify', async (req, res) => {
     const user = rows[0];
     if (!user) return res.json({ status: false, data: { valid: false } });
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
 
     res.json({
       status: true,
@@ -195,20 +192,7 @@ router.get('/me', authMiddleware, async (req, res) => {
     const user = rows[0];
     if (!user) return res.status(404).json({ status: false, message: 'User not found' });
 
-    // Also return company + pairing status so the mobile can restore context on fresh install
-    const { rows: devices } = await query(
-      'SELECT paired FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
-    );
-    const isPaired = !!(devices[0]?.paired);
-    let company = null;
-    if (isPaired) {
-      const { rows: cos } = await query(
-        'SELECT guid, name, gstin FROM companies WHERE user_id = $1 ORDER BY synced_at DESC NULLS LAST, id ASC LIMIT 1',
-        [req.user.userId]
-      );
-      if (cos[0]) company = { guid: cos[0].guid, name: cos[0].name, gstin: cos[0].gstin || null };
-    }
+    const { isPaired, company } = await getUserPairingHints(req.user.userId);
 
     res.json({
       status: true,
@@ -380,8 +364,7 @@ router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
 
     await bootstrapWorkspaceSafe(user.id);
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
     const isNewUser = !user.name;
 
     console.log(`[2FA] PIN verified for user ${user.id}`);
@@ -441,14 +424,14 @@ router.post('/reset-pin', preAuthMiddleware, async (req, res) => {
     const token = generateToken({ userId: req.user.userId, mobile: user.mobile });
     await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
+    const { isPaired } = await getUserPairingHints(req.user.userId);
     console.log(`[2FA] PIN reset for user ${req.user.userId}`);
     res.json({
       status: true,
       message: 'PIN reset successfully',
       data: {
         token,
-        isPaired: devices.length > 0,
+        isPaired,
         isNewUser: !user.name,
         user: { id: req.user.userId, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },
       },

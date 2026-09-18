@@ -74,8 +74,8 @@ export async function applyWorkspaceSchema(client) {
 
     CREATE TABLE IF NOT EXISTS member_company_access (
       membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
-      company_guid    TEXT NOT NULL,
-      PRIMARY KEY (membership_id, company_guid)
+      company_id      BIGINT NOT NULL,
+      PRIMARY KEY (membership_id, company_id)
     );
     CREATE TABLE IF NOT EXISTS member_fy_access (
       membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,

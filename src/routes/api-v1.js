@@ -11,7 +11,10 @@ import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { pairDeviceToWorkspace, BindingError, unpairDevice } from '../services/deviceBinding.js';
 import workspaceApi from './workspaceApi.js';
-import { ensurePersonalWorkspace } from '../services/workspaceService.js';
+import { ensurePersonalWorkspace, getMemberScopes } from '../services/workspaceService.js';
+import { loadMembership } from '../services/authorizationService.js';
+import { buildStockDashboardInsights } from '../utils/stockDashboardInsights.js';
+import { getUserPairingHints } from '../services/userPairingHints.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendPaymentReminder } from '../services/notifications.js';
 import { sendOTPEmail } from '../services/email.js';
@@ -131,11 +134,11 @@ router.get('/geo/states', authMiddleware, async (req, res) => {
 // ─── Product Display Name helpers ───────────────────────────────────
 
 // Fetch the company's product_display_field setting. Returns 'name' if not set.
-async function getProductDisplayField(companyGuid) {
+async function getProductDisplayField(companyId) {
   try {
     const { rows } = await query(
-      `SELECT product_display_field FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
-      [companyGuid]
+      `SELECT product_display_field FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
     );
     return rows[0]?.product_display_field || 'name';
   } catch {
@@ -212,23 +215,23 @@ function sqlLfbJoin(alias = 'lfb', fyIdx, prefixIdx) {
   return `(${alias}.financial_year = $${fyIdx} OR ${alias}.financial_year LIKE $${prefixIdx})`;
 }
 
-export async function resolveFYDates(companyGuid, from, to, fyParam) {
+export async function resolveFYDates(companyId, from, to, fyParam) {
   const normalizedFy = normalizeFinYearLabel(fyParam);
   // If explicit financialYear label passed (e.g. "2025-2026"), look up its dates
   // If BOTH fy + from/to are passed: use custom date range but keep FY label for stock/ledger lookups
   if (normalizedFy) {
     try {
       let { rows } = await query(
-        'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND fin_year=$2 LIMIT 1',
-        [companyGuid, normalizedFy]
+        'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_id=$1 AND fin_year=$2 LIMIT 1',
+        [companyId, normalizedFy]
       );
       if (!rows[0]) {
         const startYear = normalizedFy.slice(0, 4);
         ({ rows } = await query(
           `SELECT begin_date, end_date, fin_year FROM company_years
-           WHERE company_guid=$1 AND fin_year LIKE $2
+           WHERE company_id=$1 AND fin_year LIKE $2
            ORDER BY begin_date DESC LIMIT 1`,
-          [companyGuid, `${startYear}-%`]
+          [companyId, `${startYear}-%`]
         ));
       }
       if (rows[0]) {
@@ -245,9 +248,9 @@ export async function resolveFYDates(companyGuid, from, to, fyParam) {
     try {
       const { rows } = await query(
         `SELECT fin_year, begin_date, end_date FROM company_years
-         WHERE company_guid=$1 AND begin_date::date <= $3::date AND end_date::date >= $2::date
+         WHERE company_id=$1 AND begin_date::date <= $3::date AND end_date::date >= $2::date
          ORDER BY begin_date DESC LIMIT 1`,
-        [companyGuid, from, to]
+        [companyId, from, to]
       );
       if (rows[0]) {
         return { from, to, financialYear: rows[0].fin_year };
@@ -258,8 +261,8 @@ export async function resolveFYDates(companyGuid, from, to, fyParam) {
   }
   try {
     const { rows } = await query(
-      'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_guid=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
-      [companyGuid]
+      'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_id=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
+      [companyId]
     );
     const yr = new Date().getFullYear();
     return {
@@ -366,21 +369,13 @@ router.post('/auth/verify-otp', async (req, res) => {
       });
     }
 
-    // ── No 2FA — issue full token directly ──────────────────────────────
-    const token = generateToken({ userId: user.id, mobile: cleanMobile });
+    // ── No 2FA — issue session-backed access token ──────────────────────────────
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: cleanMobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
-
-    // Get company if paired
-    let company = null;
-    if (isPaired) {
-      const { rows: companies } = await query(
-        'SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [user.id]
-      );
-      if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-    }
+    const { isPaired, company } = await getUserPairingHints(user.id);
 
     const isNewUser = !user.name;
     console.log(`[API AUTH] Login: ${cleanMobile} | User: ${user.id} | Paired: ${isPaired} | New: ${isNewUser}`);
@@ -397,7 +392,9 @@ router.post('/auth/verify-otp', async (req, res) => {
         is_new_user: isNewUser,
         requires_2fa: false,
         access_token: token,
-        expires_in: 3600,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn || '15m',
         user: { id: user.id, name: user.name || null, phone: cleanMobile, language: user.language || 'en' },
         is_paired: isPaired,
         company,
@@ -428,8 +425,10 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
     const { rows } = await query('SELECT id, mobile, name, email, language FROM users WHERE id = $1', [req.user.userId]);
     const user = rows[0];
 
-    // Generate a fresh token
-    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    // Generate a fresh session-backed token
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token = $1 WHERE id = $2', [token, user.id]);
 
     try {
@@ -443,6 +442,8 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
       data: {
         user: { id: user.id, name: user.name, phone: user.mobile, email: user.email || '', language: user.language },
         access_token: token,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
       }
     });
   } catch (err) {
@@ -458,14 +459,7 @@ router.get('/auth/me', authMiddleware, async (req, res) => {
     const user = rows[0];
     if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } });
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
-
-    let company = null;
-    if (isPaired) {
-      const { rows: companies } = await query('SELECT guid, name, gstin FROM companies WHERE user_id = $1 AND is_active = TRUE LIMIT 1', [user.id]);
-      if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-    }
+    const { isPaired, company } = await getUserPairingHints(user.id);
 
     res.json({
       success: true,
@@ -506,14 +500,49 @@ router.patch('/auth/me', authMiddleware, async (req, res) => {
 router.post('/auth/logout', authMiddleware, async (req, res) => {
   try {
     const { pushToken } = req.body || {};
-    // Remove push token on logout so stale tokens don't accumulate
     if (pushToken) {
       await query('DELETE FROM push_tokens WHERE user_id=$1 AND token=$2', [req.user.userId, pushToken]).catch(() => {});
     }
     await query('UPDATE users SET token = NULL WHERE id = $1', [req.user.userId]);
+    try {
+      const { revokeSession, revokeAllSessionsForUser } = await import('../services/authSessionService.js');
+      if (req.user.sessionId) {
+        await revokeSession(req.user.sessionId, req.user.userId);
+      } else {
+        await revokeAllSessionsForUser(req.user.userId);
+      }
+    } catch {
+      /* session revoke best-effort */
+    }
     res.json({ success: true, data: { message: 'Logged out successfully' } });
   } catch {
     res.json({ success: true, data: { message: 'Logged out' } });
+  }
+});
+
+/** Rotate refresh → new access + refresh */
+router.post('/auth/refresh', async (req, res) => {
+  try {
+    const refreshToken = req.body?.refresh_token || req.body?.refreshToken;
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'refresh_token required' } });
+    }
+    const { refreshAuthSession } = await import('../services/authSessionService.js');
+    const session = await refreshAuthSession(refreshToken);
+    res.json({
+      success: true,
+      data: {
+        access_token: session.accessToken,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
+      },
+    });
+  } catch (err) {
+    res.status(err.httpStatus || 401).json({
+      success: false,
+      error: { code: err.code || 'SESSION_INVALID', message: err.message || 'Refresh failed' },
+    });
   }
 });
 
@@ -746,8 +775,9 @@ router.post('/cost-centres', authMiddleware, async (req, res) => {
     return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'companyGuid required' } });
   }
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const rows = await listCostCentresForCompany(companyGuid);
+    const rows = await listCostCentresForCompany(companyId);
     res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -759,8 +789,9 @@ router.get('/company/years', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT fin_year, begin_date, end_date FROM company_years WHERE company_guid=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyGuid]);
+    const { rows } = await query('SELECT fin_year, begin_date, end_date FROM company_years WHERE company_id=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyId]);
     const fys = rows.map(r => {
       const start = new Date(r.begin_date);
       const end   = new Date(r.end_date);
@@ -777,67 +808,170 @@ router.get('/company/years', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
-// GET /api/companies
+/** Filter company rows by membership company scope (ALL / SELECTED / NONE). */
+async function filterCompaniesByScope(userId, workspaceId, companies) {
+  if (!workspaceId || !companies?.length) return companies || [];
+  const membership = await loadMembership(userId, workspaceId);
+  if (!membership) return [];
+  if (membership.membership_type === 'OWNER') return companies;
+  const scopes = await getMemberScopes(membership.id);
+  const mode = scopes?.policy?.company_mode || 'NONE';
+  if (mode === 'NONE') return [];
+  if (mode === 'ALL') return companies;
+  const allowed = new Set(scopes.companies || []);
+  return companies.filter((c) => allowed.has(c.guid));
+}
+
+// GET /api/companies — workspace_id + membership + company scope (no companies.user_id)
 router.get('/companies', authMiddleware, async (req, res) => {
   try {
     const workspaceId = req.workspaceId
       || req.headers['x-workspace-id']
       || req.headers['X-Workspace-Id']
       || null;
-    let rows;
-    let pairingStatus = 'UNPAIRED';
-    if (workspaceId) {
-      // Workspace-scoped: any ACTIVE member can list companies in that workspace
-      const { rows: mem } = await query(
-        `SELECT 1 FROM workspace_memberships
-         WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
-        [workspaceId, req.user.userId]
-      );
-      if (!mem[0]) {
-        return res.status(403).json({
-          success: false,
-          error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not a member of this workspace' },
-        });
-      }
-      const { rows: bind } = await query(
-        `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
-        [workspaceId]
-      );
-      const { rows: ws } = await query(
-        `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
-        [workspaceId]
-      );
-      pairingStatus = bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
-      if (String(pairingStatus).toUpperCase() !== 'CONNECTED') {
-        const { rows: ownerRows } = await query(
-          `SELECT owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
-          [workspaceId]
-        );
-        const { ensureDemoCompany } = await import('../services/demoDataService.js');
-        await ensureDemoCompany(ownerRows[0]?.owner_user_id || req.user.userId, workspaceId).catch(() => {});
-      }
-      ({ rows } = await query(
-        `SELECT guid, name, gstin FROM companies
-         WHERE workspace_id = $1 AND is_active = TRUE
-         ORDER BY name ASC`,
-        [workspaceId]
-      ));
-    } else {
-      ({ rows } = await query(
-        `SELECT guid, name, gstin FROM companies
-         WHERE user_id = $1 AND is_active = TRUE
-         ORDER BY name ASC`,
-        [req.user.userId]
-      ));
+    if (!workspaceId) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'X-Workspace-Id required' },
+      });
     }
+    const membership = await loadMembership(req.user.userId, workspaceId);
+    if (!membership || membership.status !== 'ACTIVE') {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not a member of this workspace' },
+      });
+    }
+    const { rows: bind } = await query(
+      `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const { rows: ws } = await query(
+      `SELECT tally_connection, owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
+      [workspaceId]
+    );
+    const pairingStatus = bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
+    if (String(pairingStatus).toUpperCase() !== 'CONNECTED' && ws[0]?.owner_user_id) {
+      const { ensureDemoCompany } = await import('../services/demoDataService.js');
+      await ensureDemoCompany(ws[0].owner_user_id, workspaceId).catch(() => {});
+    }
+    const { rows } = await query(
+      `SELECT guid, name, gstin FROM companies
+       WHERE workspace_id = $1 AND is_active = TRUE
+       ORDER BY name ASC`,
+      [workspaceId]
+    );
+    let scoped = await filterCompaniesByScope(req.user.userId, workspaceId, rows);
     const { filterCompaniesByPairingStatus } = await import('../services/demoDataService.js');
-    const filtered = filterCompaniesByPairingStatus(rows, pairingStatus);
+    scoped = filterCompaniesByPairingStatus(scoped, pairingStatus);
     res.json({
       success: true,
-      data: filtered.map(c => ({ id: c.guid, name: c.name, gstin: c.gstin || null, active: true })),
+      data: scoped.map((c) => ({
+        id: c.guid,
+        guid: c.guid,
+        name: c.name,
+        gstin: c.gstin || null,
+        active: true,
+      })),
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch companies' } });
+  }
+});
+
+const PRINT_PROFILE_FIELDS = [
+  'gstin', 'pan', 'email', 'phone', 'jurisdiction', 'declaration_text',
+  'bank_name', 'bank_account_no', 'bank_ifsc', 'bank_branch', 'pdf_format', 'pdf_format_overrides',
+];
+const DEFAULT_PRINT_DECLARATION =
+  'We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.';
+
+// GET /api/companies/:guid/print-profile
+router.get('/companies/:guid/print-profile', authMiddleware, async (req, res) => {
+  try {
+    const { guid } = req.params;
+    const ok = await verifyCompanyAccess(req, res, guid, {
+      capability: 'workspace.settings.view',
+      responseShape: 'api-v1',
+    });
+    if (!ok) return;
+    const { rows: companyRows } = await query(
+      'SELECT guid, gstin, pan, email, phone FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [guid, req.workspaceId]
+    );
+    if (!companyRows[0]) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
+    }
+    const { rows } = await query('SELECT * FROM company_print_profile WHERE company_id=$1', [guid]);
+    const profile = rows[0] || {};
+    res.json({
+      success: true,
+      data: {
+        companyGuid: guid,
+        gstin: companyRows[0].gstin || profile.gstin || '',
+        pan: companyRows[0].pan || profile.pan || '',
+        email: companyRows[0].email || profile.email || '',
+        phone: companyRows[0].phone || profile.phone || '',
+        jurisdiction: profile.jurisdiction || '',
+        declarationText: profile.declaration_text || DEFAULT_PRINT_DECLARATION,
+        bankName: profile.bank_name || '',
+        bankAccountNo: profile.bank_account_no || '',
+        bankIfsc: profile.bank_ifsc || '',
+        bankBranch: profile.bank_branch || '',
+        pdfFormat: profile.pdf_format || 'tally',
+        pdfFormatOverrides: profile.pdf_format_overrides || {},
+      },
+    });
+  } catch (err) {
+    console.error('[api print-profile:get]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to fetch print profile' } });
+  }
+});
+
+// PUT /api/companies/:guid/print-profile
+router.put('/companies/:guid/print-profile', authMiddleware, async (req, res) => {
+  try {
+    const { guid } = req.params;
+    const ok = await verifyCompanyAccess(req, res, guid, {
+      capability: 'workspace.settings.manage',
+      responseShape: 'api-v1',
+    });
+    if (!ok) return;
+    const companyId = requireResolvedCompanyId(req);
+    const body = req.body || {};
+    const incoming = {
+      gstin: body.gstin,
+      pan: body.pan,
+      email: body.email,
+      phone: body.phone,
+      jurisdiction: body.jurisdiction,
+      declaration_text: body.declarationText ?? body.declaration_text,
+      bank_name: body.bankName ?? body.bank_name,
+      bank_account_no: body.bankAccountNo ?? body.bank_account_no,
+      bank_ifsc: body.bankIfsc ?? body.bank_ifsc,
+      bank_branch: body.bankBranch ?? body.bank_branch,
+      pdf_format: body.pdfFormat ?? body.pdf_format,
+      pdf_format_overrides: body.pdfFormatOverrides ?? body.pdf_format_overrides,
+    };
+    const cols = PRINT_PROFILE_FIELDS.filter((f) => incoming[f] !== undefined);
+    if (!cols.length) {
+      return res.status(400).json({ status: false, error: { code: 'BAD_REQUEST', message: 'No print profile fields supplied' } });
+    }
+    const values = cols.map((c) => (
+      c === 'pdf_format_overrides' ? JSON.stringify(incoming[c] || {}) : incoming[c]
+    ));
+    const placeholders = cols.map((_, i) => `$${i + 3}`).join(', ');
+    const updates = cols.map((c, i) => `${c} = $${i + 3}`).join(', ');
+    await query(
+      `INSERT INTO company_print_profile (company_id, company_guid, ${cols.join(', ')})
+       VALUES ($1, $2, ${placeholders})
+       ON CONFLICT (company_id) DO UPDATE SET ${updates}, updated_at = NOW()`,
+      [companyId, guid, ...values]
+    );
+    res.json({ success: true, message: 'Print profile saved' });
+  } catch (err) {
+    console.error('[api print-profile:put]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to save print profile' } });
   }
 });
 
@@ -914,33 +1048,33 @@ function rowsToBucketMap(rows) {
   return map;
 }
 
-async function voucherSeriesMap(companyGuid, from, to, interval, typeSql) {
+async function voucherSeriesMap(companyId, from, to, interval, typeSql) {
   const trunc = pgDateTrunc(interval);
   const { rows } = await query(
     `SELECT date_trunc('${trunc}', date::timestamp)::date::text AS bucket,
             COALESCE(SUM(amount), 0)::float AS v
      FROM vouchers
-     WHERE company_guid = $1 AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
+     WHERE company_id=$1 AND is_cancelled = FALSE AND date BETWEEN $2 AND $3
        AND (${typeSql})
      GROUP BY 1`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
   return rowsToBucketMap(rows);
 }
 
-async function ledgerEntrySeriesMap(companyGuid, from, to, interval, drCr, parentSql) {
+async function ledgerEntrySeriesMap(companyId, from, to, interval, drCr, parentSql) {
   const trunc = pgDateTrunc(interval);
   const { rows } = await query(
     `SELECT date_trunc('${trunc}', v.date::timestamp)::date::text AS bucket,
             COALESCE(SUM(ABS(vle.amount)), 0)::float AS v
      FROM voucher_ledger_entries vle
-     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1 AND vle.dr_cr = $2
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+     WHERE vle.company_id=$1 AND vle.dr_cr = $2
        AND (${parentSql})
        AND v.is_cancelled = FALSE AND v.date BETWEEN $3 AND $4
      GROUP BY 1`,
-    [companyGuid, drCr, from, to]
+    [companyId, drCr, from, to]
   );
   return rowsToBucketMap(rows);
 }
@@ -964,16 +1098,16 @@ const METRICS_EXPENSE_PARENT = `l.parent ~* '^Indirect Expenses?$'`;
 const CASHFLOW_RECEIPT_SQL = `voucher_type ILIKE '%Receipt%'`;
 const CASHFLOW_PAYMENT_SQL = `voucher_type ILIKE '%Payment%'`;
 
-async function buildDashboardChartSeries(companyGuid, from, to, period) {
+async function buildDashboardChartSeries(companyId, from, to, period) {
   const interval = dashboardSeriesInterval(period, from, to);
   const buckets = enumerateSeriesBuckets(from, to, interval);
   const [salesLed, purchLed, expLed, salesV, purchV, expV] = await Promise.all([
-    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Cr', METRICS_SALES_PARENT),
-    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Dr', METRICS_PURCHASE_PARENT),
-    ledgerEntrySeriesMap(companyGuid, from, to, interval, 'Dr', METRICS_EXPENSE_PARENT),
-    voucherSeriesMap(companyGuid, from, to, interval, METRICS_SALES_SQL),
-    voucherSeriesMap(companyGuid, from, to, interval, METRICS_PURCHASE_SQL),
-    voucherSeriesMap(companyGuid, from, to, interval, METRICS_EXPENSE_SQL),
+    ledgerEntrySeriesMap(companyId, from, to, interval, 'Cr', METRICS_SALES_PARENT),
+    ledgerEntrySeriesMap(companyId, from, to, interval, 'Dr', METRICS_PURCHASE_PARENT),
+    ledgerEntrySeriesMap(companyId, from, to, interval, 'Dr', METRICS_EXPENSE_PARENT),
+    voucherSeriesMap(companyId, from, to, interval, METRICS_SALES_SQL),
+    voucherSeriesMap(companyId, from, to, interval, METRICS_PURCHASE_SQL),
+    voucherSeriesMap(companyId, from, to, interval, METRICS_EXPENSE_SQL),
   ]);
   const salesMap = preferLedgerSeries(salesLed, salesV);
   const purchMap = preferLedgerSeries(purchLed, purchV);
@@ -1001,37 +1135,41 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    // KPI balances are from ledger closing balances (not date-filtered) — consistent regardless of FY
-    // Voucher-based KPIs (payments/receipts) are filtered by FY/period when provided
-    const pmtParams = from && to ? [companyGuid, from, to] : [companyGuid];
+    const companyId = req.company?.id;
+    if (!companyId) {
+      return res.status(403).json({ success: false, error: { code: 'COMPANY_SCOPE_DENIED', message: 'Company not resolved' } });
+    }
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    // Phase 3B: internal ownership filter = company_id
+    const pmtParams = from && to ? [companyId, from, to] : [companyId];
     const pmtDateFilter = from && to ? 'AND date BETWEEN $2 AND $3' : '';
-    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
-    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyGuid]);
-    const { rows: rec }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyGuid]);
-    const { rows: pay }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`, [companyGuid]);
+    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyId]);
+    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyId]);
+    const { rows: rec }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyId]);
+    const { rows: pay }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`, [companyId]);
     const { rows: loans } = await query(
       `SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers
-       WHERE company_guid=$1 AND (
+       WHERE company_id=$1 AND (
          parent ILIKE 'Secured Loans' OR parent ILIKE 'Unsecured Loans'
          OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%'
          OR parent ILIKE '%Cash Credit%' OR parent ILIKE 'Bank OD A/c' OR parent ILIKE 'Bank OD Accounts'
        )`,
-      [companyGuid]
+      [companyId]
     );
-    const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
-    const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
+    const { rows: pmts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
+    const { rows: rcts } = await query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE ${pmtDateFilter}`, pmtParams);
 
     // Soft-fail each builder so one KPI trend failure does not blank the strip
     const settled = await Promise.allSettled([
-      buildCashInHandPayload(companyGuid, { from, to }),
-      buildBankBalancePayload(companyGuid, { from, to }),
-      buildArApPayload(companyGuid, 'AR', {}),
-      buildArApPayload(companyGuid, 'AP', {}),
-      buildLoansOdsPayload(companyGuid),
-      buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Payment' }),
-      buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Receipt' }),
+      buildCashInHandPayload(companyId, { from, to }),
+      buildBankBalancePayload(companyId, { from, to }),
+      buildArApPayload(companyId, 'AR', {}),
+      buildArApPayload(companyId, 'AP', {}),
+      buildLoansOdsPayload(companyId),
+      buildPaymentReceiptPayload(companyId, { from, to, kind: 'Payment' }),
+      buildPaymentReceiptPayload(companyId, { from, to, kind: 'Receipt' }),
     ]);
     const pickTrend = (result) => {
       if (result.status !== 'fulfilled' || !result.value) {
@@ -1085,34 +1223,34 @@ async function dashboardMetricAmounts(companyGuid, from, to) {
   const [sRes, pRes, eRes] = await Promise.all([
     query(`SELECT COALESCE(
       (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-       WHERE vle.company_guid=$1 AND vle.dr_cr='Cr'
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_id=vle.company_id
+       WHERE vle.company_id=$1 AND vle.dr_cr='Cr'
          AND (l.parent ILIKE '%Sales%' OR l.parent ILIKE '%Direct Income%' OR l.parent ILIKE '%Indirect Income%')
          AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Sales%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
       0
-    ) as v`, [companyGuid, from, to]),
+    ) as v`, [companyId, from, to]),
     query(`SELECT COALESCE(
       (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-       WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_id=vle.company_id
+       WHERE vle.company_id=$1 AND vle.dr_cr='Dr'
          AND (l.parent ILIKE '%Purchase%' OR l.parent ILIKE '%Direct Expense%')
          AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Purchase%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3),
       0
-    ) as v`, [companyGuid, from, to]),
+    ) as v`, [companyId, from, to]),
     query(`SELECT COALESCE(
       (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-       WHERE vle.company_guid=$1 AND vle.dr_cr='Dr'
+       JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+       JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_id=vle.company_id
+       WHERE vle.company_id=$1 AND vle.dr_cr='Dr'
          AND l.parent ~* '^Indirect Expenses?$'
          AND v.is_cancelled=FALSE AND v.date BETWEEN $2 AND $3),
-      (SELECT SUM(amount) FROM vouchers WHERE company_guid=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3),
+      (SELECT SUM(amount) FROM vouchers WHERE company_id=$1 AND voucher_type IN ('Journal','Payment','Contra') AND is_cancelled=FALSE AND amount > 0 AND date BETWEEN $2 AND $3),
       0
-    ) as v`, [companyGuid, from, to]),
+    ) as v`, [companyId, from, to]),
   ]);
   return {
     sales: +(sRes.rows?.[0]?.v ?? 0) || 0,
@@ -1138,8 +1276,9 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const periodDays = inclusiveMetricDays(from, to);
     const priorTo = addDays(from, -1);
     const priorFrom = addDays(priorTo, -(periodDays - 1));
@@ -1167,9 +1306,10 @@ router.get('/dashboard/chart', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const { interval, series } = await buildDashboardChartSeries(companyGuid, from, to, req.query.period);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const { interval, series } = await buildDashboardChartSeries(companyId, from, to, req.query.period);
     res.json({ success: true, data: { interval, series, fy_from: from, fy_to: to } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -1183,10 +1323,11 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyGuid]);
-    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND (parent ILIKE '%Bank%')`, [companyGuid]);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyId]);
+    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Bank%')`, [companyId]);
     const salesFilter = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND is_cancelled=FALSE`;
     const purchFilter = `voucher_type ILIKE '%Purchase%' AND voucher_type NOT ILIKE '%Order%' AND is_cancelled=FALSE`;
     // Parent match must use ^Direct / ^Indirect — '%Direct Expense%' also matches "Indirect Expenses"
@@ -1194,26 +1335,26 @@ router.get('/dashboard/cashflow', authMiddleware, async (req, res) => {
       query(
         `SELECT COALESCE(SUM(ABS(vle.amount)),0) as v
          FROM voucher_ledger_entries vle
-         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-         WHERE vle.company_guid=$1 AND vle.dr_cr=$2
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+         JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_id=vle.company_id
+         WHERE vle.company_id=$1 AND vle.dr_cr=$2
            AND l.parent ~* $3
            AND v.is_cancelled=FALSE AND v.date BETWEEN $4 AND $5`,
-        [companyGuid, drCr, parentRegex, from, to]
+        [companyId, drCr, parentRegex, from, to]
       );
     const interval = dashboardSeriesInterval(req.query.period, from, to);
     const buckets = enumerateSeriesBuckets(from, to, interval);
     const [rctRes, pmtRes, salesRes, purchRes, dirExpRes, indExpRes, dirIncRes, indIncRes, rctSeries, pmtSeries] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
-      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${purchFilter} AND date BETWEEN $2 AND $3`, [companyGuid, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Receipt%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyId, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Payment%' AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyId, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND ${salesFilter} AND date BETWEEN $2 AND $3`, [companyId, from, to]),
+      query(`SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND ${purchFilter} AND date BETWEEN $2 AND $3`, [companyId, from, to]),
       plLeg('^Direct Expenses?$', 'Dr'),
       plLeg('^Indirect Expenses?$', 'Dr'),
       plLeg('^Direct Incomes?$', 'Cr'),
       plLeg('^Indirect Incomes?$', 'Cr'),
-      voucherSeriesMap(companyGuid, from, to, interval, CASHFLOW_RECEIPT_SQL),
-      voucherSeriesMap(companyGuid, from, to, interval, CASHFLOW_PAYMENT_SQL),
+      voucherSeriesMap(companyId, from, to, interval, CASHFLOW_RECEIPT_SQL),
+      voucherSeriesMap(companyId, from, to, interval, CASHFLOW_PAYMENT_SQL),
     ]);
     const receipts = +(rctRes.rows?.[0]?.v ?? 0);
     const payments = +(pmtRes.rows?.[0]?.v ?? 0);
@@ -1261,6 +1402,7 @@ router.get('/dashboard/search', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
+  const companyId = requireResolvedCompanyId(req);
   const q = String(req.query.q || '').trim();
   if (q.length < 2) return res.json({ success: true, data: [] });
 
@@ -1269,29 +1411,29 @@ router.get('/dashboard/search', authMiddleware, async (req, res) => {
     const { rows: vouchers } = await query(
       `SELECT guid, voucher_number, party_name, voucher_type, amount, date
        FROM vouchers
-       WHERE company_guid = $1 AND is_cancelled = FALSE
+       WHERE company_id=$1 AND is_cancelled = FALSE
          AND (party_name ILIKE $2 OR voucher_number ILIKE $2 OR voucher_type ILIKE $2)
        ORDER BY date DESC NULLS LAST
        LIMIT 8`,
-      [companyGuid, pattern]
+      [companyId, pattern]
     );
 
     const { rows: ledgers } = await query(
       `SELECT guid, name, parent, closing_balance, balance_type
        FROM ledgers
-       WHERE company_guid = $1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)
+       WHERE company_id=$1 AND (name ILIKE $2 OR alias ILIKE $2 OR gstin ILIKE $2)
        ORDER BY ABS(closing_balance) DESC
        LIMIT 6`,
-      [companyGuid, pattern]
+      [companyId, pattern]
     );
 
     const { rows: stocks } = await query(
       `SELECT name, closing_qty, group_name
        FROM stocks
-       WHERE company_guid = $1 AND (name ILIKE $2 OR alias ILIKE $2)
+       WHERE company_id=$1 AND (name ILIKE $2 OR alias ILIKE $2)
        ORDER BY name ASC
        LIMIT 6`,
-      [companyGuid, pattern]
+      [companyId, pattern]
     );
 
     const results = [
@@ -1336,11 +1478,12 @@ router.get('/dashboard/recent-activity', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const { rows } = await query(
-      `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
-      [companyGuid, from, to]
+      `SELECT id, guid, voucher_number, party_name, voucher_type, amount, date FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 ORDER BY date DESC, id DESC LIMIT 10`,
+      [companyId, from, to]
     );
     const activity = rows.map(r => ({
       id: r.guid || String(r.id),
@@ -1364,15 +1507,16 @@ router.get('/dashboard/top-customers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const limit = Math.min(10, Math.max(1, parseInt(req.query.limit, 10) || 5));
     const { rows } = await query(
       `SELECT party_name AS name,
               COALESCE(SUM(ABS(amount)), 0)::float AS v,
               COUNT(*)::int AS invoices
        FROM vouchers
-       WHERE company_guid = $1 AND is_cancelled = FALSE
+       WHERE company_id=$1 AND is_cancelled = FALSE
          AND voucher_type ILIKE '%Sales%'
          AND voucher_type NOT ILIKE '%Order%'
          AND voucher_type NOT ILIKE '%Delivery%'
@@ -1382,7 +1526,7 @@ router.get('/dashboard/top-customers', authMiddleware, async (req, res) => {
        GROUP BY party_name
        ORDER BY v DESC
        LIMIT $4`,
-      [companyGuid, from, to, limit]
+      [companyId, from, to, limit]
     );
     const total = rows.reduce((s, r) => s + +(r.v || 0), 0);
     const data = rows.map(r => {
@@ -1406,34 +1550,35 @@ router.get('/dashboard/cost-analysis', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     let { rows } = await query(
       `SELECT l.name, l.parent,
               COALESCE(SUM(ABS(vle.amount)), 0)::float AS v
        FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-       WHERE vle.company_guid = $1 AND vle.dr_cr = 'Dr'
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+       WHERE vle.company_id=$1 AND vle.dr_cr = 'Dr'
          AND (l.parent ~* '^Direct Expenses?$' OR l.parent ~* '^Indirect Expenses?$')
          AND v.is_cancelled = FALSE AND v.date BETWEEN $2 AND $3
        GROUP BY l.name, l.parent
        HAVING SUM(ABS(vle.amount)) > 0
        ORDER BY v DESC`,
-      [companyGuid, from, to]
+      [companyId, from, to]
     );
     if (!rows.length) {
       const fallback = await query(
         `SELECT voucher_type AS name, '' AS parent,
                 COALESCE(SUM(amount), 0)::float AS v
          FROM vouchers
-         WHERE company_guid = $1 AND is_cancelled = FALSE
+         WHERE company_id=$1 AND is_cancelled = FALSE
            AND voucher_type IN ('Journal', 'Payment', 'Contra') AND amount > 0
            AND date BETWEEN $2 AND $3
          GROUP BY voucher_type
          HAVING SUM(amount) > 0
          ORDER BY v DESC`,
-        [companyGuid, from, to]
+        [companyId, from, to]
       );
       rows = fallback.rows;
     }
@@ -1470,7 +1615,7 @@ const VOUCHER_LIST_SELECT = `
                SELECT vle.ledger_name
                FROM voucher_ledger_entries vle
                WHERE vle.voucher_guid = v.guid
-                 AND vle.company_guid = v.company_guid
+                 AND vle.company_id = v.company_id
                  AND NULLIF(TRIM(vle.ledger_name), '') IS NOT NULL
                ORDER BY
                  CASE
@@ -1488,7 +1633,7 @@ const VOUCHER_LIST_SELECT = `
       LEFT JOIN LATERAL (
         SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
         FROM app_vouchers av
-        WHERE av.company_guid = v.company_guid
+        WHERE av.company_id = v.company_id
           AND av.tally_voucher_no = v.voucher_number
           AND av.voucher_date::text = v.date
           AND (
@@ -1580,8 +1725,9 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', page = 1, limit = 30 } = req.query;
-  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   // Optional exact (case/whitespace-insensitive) party filter — used by "deliveries for
   // this customer" style screens. Omitted → handler behaves exactly as before.
@@ -1589,10 +1735,10 @@ const voucherListHandler = (voucherType) => async (req, res) => {
   try {
     let q = `
       ${VOUCHER_LIST_SELECT}
-      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE $2
+      WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE $2
         AND (v.party_name ILIKE $3 OR v.voucher_number ILIKE $3)
         AND v.date BETWEEN $4 AND $5`;
-    const params = [companyGuid, `%${voucherType}%`, `%${search}%`, from, to];
+    const params = [companyId, `%${voucherType}%`, `%${search}%`, from, to];
     if (partyName) {
       params.push(partyName);
       q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
@@ -1600,8 +1746,8 @@ const voucherListHandler = (voucherType) => async (req, res) => {
     q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const cntParams = [companyGuid, `%${voucherType}%`, from, to];
-    let cntQ = `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND date BETWEEN $3 AND $4`;
+    const cntParams = [companyId, `%${voucherType}%`, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND voucher_type ILIKE $2 AND date BETWEEN $3 AND $4`;
     if (partyName) {
       cntParams.push(partyName);
       cntQ += ` AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
@@ -1625,8 +1771,9 @@ const strictInvoiceListHandler = (module) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', page = 1, limit = 30 } = req.query;
-  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
   const optRaw = String(req.query.is_optional ?? 'false').toLowerCase();
@@ -1637,11 +1784,11 @@ const strictInvoiceListHandler = (module) => async (req, res) => {
   try {
     let q = `
       ${VOUCHER_LIST_SELECT}
-      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+      WHERE v.company_id=$1 AND v.is_cancelled=FALSE
         AND (${baseSql})${optionalSql}
         AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)
         AND v.date BETWEEN $3 AND $4`;
-    const params = [companyGuid, `%${search}%`, from, to];
+    const params = [companyId, `%${search}%`, from, to];
     if (partyName) {
       params.push(partyName);
       q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
@@ -1649,8 +1796,8 @@ const strictInvoiceListHandler = (module) => async (req, res) => {
     q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const cntParams = [companyGuid, from, to];
-    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND (${baseSql})${optionalSql} AND v.date BETWEEN $2 AND $3`;
+    const cntParams = [companyId, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND (${baseSql})${optionalSql} AND v.date BETWEEN $2 AND $3`;
     if (partyName) {
       cntParams.push(partyName);
       cntQ += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
@@ -1680,7 +1827,7 @@ function parseCsvParam(raw) {
 function partyGroupExistsSql(paramIdx) {
   return `EXISTS (
     SELECT 1 FROM ledgers pl
-    WHERE pl.company_guid = v.company_guid
+    WHERE pl.company_id = v.company_id
       AND (
         (NULLIF(TRIM(COALESCE(v.party_guid, '')), '') IS NOT NULL AND pl.guid = v.party_guid)
         OR LOWER(TRIM(pl.name)) = LOWER(TRIM(COALESCE(v.party_name, '')))
@@ -1696,7 +1843,7 @@ const PARTY_LEDGER_JOIN = `
   JOIN LATERAL (
     SELECT TRIM(COALESCE(l.parent, '')) AS parent
     FROM ledgers l
-    WHERE l.company_guid = v.company_guid
+    WHERE l.company_id = v.company_id
       AND (
         (NULLIF(TRIM(COALESCE(v.party_guid, '')), '') IS NOT NULL AND l.guid = v.party_guid)
         OR LOWER(TRIM(l.name)) = LOWER(TRIM(COALESCE(v.party_name, '')))
@@ -1717,8 +1864,9 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', page = 1, limit = 30 } = req.query;
-  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   const partyName = typeof req.query.partyName === 'string' ? req.query.partyName.trim() : '';
   const partyGroups = parseCsvParam(req.query.partyGroups);
@@ -1740,11 +1888,11 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
   try {
     let q = `
       ${VOUCHER_LIST_SELECT}
-      WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+      WHERE v.company_id=$1 AND v.is_cancelled=FALSE
         AND ${typeOr}
         AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)
         AND v.date BETWEEN $3 AND $4`;
-    const params = [companyGuid, `%${search}%`, from, to];
+    const params = [companyId, `%${search}%`, from, to];
     if (partyName) {
       params.push(partyName);
       q += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${params.length}))`;
@@ -1756,8 +1904,8 @@ const combinedVoucherListHandler = (module) => async (req, res) => {
     q += ` ORDER BY v.date DESC, v.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const cntParams = [companyGuid, from, to];
-    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND ${typeOr} AND v.date BETWEEN $2 AND $3`;
+    const cntParams = [companyId, from, to];
+    let cntQ = `SELECT COUNT(*) as c FROM vouchers v WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND ${typeOr} AND v.date BETWEEN $2 AND $3`;
     if (partyName) {
       cntParams.push(partyName);
       cntQ += ` AND LOWER(TRIM(COALESCE(v.party_name,''))) = LOWER(TRIM($${cntParams.length}))`;
@@ -1798,7 +1946,8 @@ const voucherCountsHandler = (module) => async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const companyId = requireResolvedCompanyId(req);
+  const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to);
   const types = module === 'purchase'
     ? ['invoice', 'order', 'debit_note', 'payment', 'contra']
     : ['invoice', 'order', 'credit_note', 'delivery_note', 'proforma', 'quotation', 'receipt', 'journal'];
@@ -1811,9 +1960,9 @@ const voucherCountsHandler = (module) => async (req, res) => {
       if (!pred) return [docType, 0];
       const { rows } = await query(
         `SELECT COUNT(*)::int AS c FROM vouchers v
-          WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND ${pred}
+          WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND ${pred}
             AND v.date BETWEEN $2 AND $3`,
-        [companyGuid, from, to]
+        [companyId, from, to]
       );
       return [docType, parseInt(rows[0]?.c || 0, 10)];
     }));
@@ -1821,14 +1970,14 @@ const voucherCountsHandler = (module) => async (req, res) => {
       `SELECT pl.parent AS name, COUNT(DISTINCT v.guid)::int AS c
          FROM vouchers v
          ${PARTY_LEDGER_JOIN}
-        WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+        WHERE v.company_id=$1 AND v.is_cancelled=FALSE
           AND ${typeOrAll}
           AND v.date BETWEEN $2 AND $3
           AND pl.parent <> ''
         GROUP BY pl.parent
         ORDER BY c DESC, pl.parent ASC
         LIMIT 50`,
-      [companyGuid, from, to]
+      [companyId, from, to]
     );
     const data = Object.fromEntries(pairs);
     data.all = pairs.reduce((sum, [, n]) => sum + n, 0);
@@ -1876,8 +2025,8 @@ function homeMetricTrend(cur, prior, invert = false) {
 async function sumVoucherAmount(companyGuid, filterSql, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
-    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
-    [companyGuid, from, to]
+    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
+    [companyId, from, to]
   );
   return +(rows?.[0]?.v ?? 0);
 }
@@ -1885,8 +2034,8 @@ async function sumVoucherAmount(companyGuid, filterSql, from, to) {
 async function countVouchers(companyGuid, filterSql, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
-    `SELECT COUNT(*)::int as c FROM vouchers WHERE company_guid=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
-    [companyGuid, from, to]
+    `SELECT COUNT(*)::int as c FROM vouchers WHERE company_id=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
+    [companyId, from, to]
   );
   return +(rows?.[0]?.c ?? 0);
 }
@@ -1894,8 +2043,8 @@ async function countVouchers(companyGuid, filterSql, from, to) {
 async function sumNoteAmount(companyGuid, typePattern, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
-    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE AND date BETWEEN $3 AND $4`,
-    [companyGuid, typePattern, from, to]
+    `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE AND date BETWEEN $3 AND $4`,
+    [companyId, typePattern, from, to]
   );
   return +(rows?.[0]?.v ?? 0);
 }
@@ -1905,19 +2054,19 @@ async function sumLedgerOutstanding(companyGuid, side) {
     ? `(parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`
     : `(parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`;
   const { rows } = await query(
-    `SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_guid=$1 AND ${parentFilter}`,
-    [companyGuid]
+    `SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND ${parentFilter}`,
+    [companyId]
   );
   return +(rows?.[0]?.v ?? 0);
 }
 
-async function buildAvgTicketMetrics(companyGuid, filterSql, fyFrom, fyTo, ytdVal) {
+async function buildAvgTicketMetrics(companyId, filterSql, fyFrom, fyTo, ytdVal) {
   const priorFyFrom = shiftYearIso(fyFrom, -1);
   const priorFyTo = shiftYearIso(fyTo, -1);
   const [count, priorYtd, priorCount] = await Promise.all([
-    countVouchers(companyGuid, filterSql, fyFrom, fyTo),
-    sumVoucherAmount(companyGuid, filterSql, priorFyFrom, priorFyTo),
-    countVouchers(companyGuid, filterSql, priorFyFrom, priorFyTo),
+    countVouchers(companyId, filterSql, fyFrom, fyTo),
+    sumVoucherAmount(companyId, filterSql, priorFyFrom, priorFyTo),
+    countVouchers(companyId, filterSql, priorFyFrom, priorFyTo),
   ]);
   const avg = count > 0 ? ytdVal / count : 0;
   const priorAvg = priorCount > 0 ? priorYtd / priorCount : 0;
@@ -1930,23 +2079,23 @@ async function buildAvgTicketMetrics(companyGuid, filterSql, fyFrom, fyTo, ytdVa
   };
 }
 
-async function buildNoteMetrics(companyGuid, typePattern, fyFrom, fyTo) {
+async function buildNoteMetrics(companyId, typePattern, fyFrom, fyTo) {
   const priorFyFrom = shiftYearIso(fyFrom, -1);
   const priorFyTo = shiftYearIso(fyTo, -1);
   const [cur, prior] = await Promise.all([
-    sumNoteAmount(companyGuid, typePattern, fyFrom, fyTo),
-    sumNoteAmount(companyGuid, typePattern, priorFyFrom, priorFyTo),
+    sumNoteAmount(companyId, typePattern, fyFrom, fyTo),
+    sumNoteAmount(companyId, typePattern, priorFyFrom, priorFyTo),
   ]);
   const trend = homeMetricTrend(cur, prior, false);
   return { amount: cur, trend_pct: trend.trend_pct, trend_positive: trend.trend_positive };
 }
 
-async function buildOutstandingMetrics(companyGuid, side) {
-  const payload = await buildArApPayload(companyGuid, side, {}).catch((e) => {
+async function buildOutstandingMetrics(companyId, side) {
+  const payload = await buildArApPayload(companyId, side, {}).catch((e) => {
     console.warn(`[home-metrics] ${side} trend failed:`, e.message);
     return null;
   });
-  const outstanding = await sumLedgerOutstanding(companyGuid, side);
+  const outstanding = await sumLedgerOutstanding(companyId, side);
   return {
     outstanding,
     outstanding_trend_pct: payload?.trend_pct ?? null,
@@ -1954,7 +2103,7 @@ async function buildOutstandingMetrics(companyGuid, side) {
   };
 }
 
-async function buildVoucherHomeCoreMetrics(companyGuid, filterSql, fyFrom, fyTo, today, invertTrend = false) {
+async function buildVoucherHomeCoreMetrics(companyId, filterSql, fyFrom, fyTo, today, invertTrend = false) {
   const yesterday = addDays(today, -1);
   const mtdWin = priorMtdWindow(today);
   const priorFyFrom = shiftYearIso(fyFrom, -1);
@@ -1964,12 +2113,12 @@ async function buildVoucherHomeCoreMetrics(companyGuid, filterSql, fyFrom, fyTo,
     mtdVal, priorMtdVal,
     ytdVal, priorYtdVal,
   ] = await Promise.all([
-    sumVoucherAmount(companyGuid, filterSql, today, today),
-    sumVoucherAmount(companyGuid, filterSql, yesterday, yesterday),
-    sumVoucherAmount(companyGuid, filterSql, mtdWin.from, mtdWin.to),
-    sumVoucherAmount(companyGuid, filterSql, mtdWin.priorFrom, mtdWin.priorTo),
-    sumVoucherAmount(companyGuid, filterSql, fyFrom, fyTo),
-    sumVoucherAmount(companyGuid, filterSql, priorFyFrom, priorFyTo),
+    sumVoucherAmount(companyId, filterSql, today, today),
+    sumVoucherAmount(companyId, filterSql, yesterday, yesterday),
+    sumVoucherAmount(companyId, filterSql, mtdWin.from, mtdWin.to),
+    sumVoucherAmount(companyId, filterSql, mtdWin.priorFrom, mtdWin.priorTo),
+    sumVoucherAmount(companyId, filterSql, fyFrom, fyTo),
+    sumVoucherAmount(companyId, filterSql, priorFyFrom, priorFyTo),
   ]);
   const todayTrend = homeMetricTrend(todayVal, yesterdayVal, invertTrend);
   const mtdTrend = homeMetricTrend(mtdVal, priorMtdVal, invertTrend);
@@ -1992,14 +2141,15 @@ router.get('/sales/home-metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
-    const core = await buildVoucherHomeCoreMetrics(companyGuid, SALES_HOME_FILTER, fyFrom, fyTo, today, false);
+    const core = await buildVoucherHomeCoreMetrics(companyId, SALES_HOME_FILTER, fyFrom, fyTo, today, false);
     const [avgMetrics, creditNotes, outstanding] = await Promise.all([
-      buildAvgTicketMetrics(companyGuid, SALES_HOME_FILTER, fyFrom, fyTo, core.ytd),
-      buildNoteMetrics(companyGuid, '%Credit Note%', fyFrom, fyTo),
-      buildOutstandingMetrics(companyGuid, 'AR'),
+      buildAvgTicketMetrics(companyId, SALES_HOME_FILTER, fyFrom, fyTo, core.ytd),
+      buildNoteMetrics(companyId, '%Credit Note%', fyFrom, fyTo),
+      buildOutstandingMetrics(companyId, 'AR'),
     ]);
     res.json({
       success: true,
@@ -2031,8 +2181,9 @@ router.get('/sales/invoices/:id/credit-note-context', authMiddleware, async (req
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const resolved = await resolveCreditNoteContext(companyGuid, req.params.id);
+    const resolved = await resolveCreditNoteContext(companyId, req.params.id);
     if (!resolved.ok) {
       return res.status(resolved.status).json({ success: false, error: { code: resolved.code, message: resolved.message } });
     }
@@ -2095,8 +2246,9 @@ router.get('/company/:guid/compliance-config', authMiddleware, async (req, res) 
   try {
     const { guid } = req.params;
     if (!await verifyCompanyOwnership(req, res, guid)) return;
+    const companyId = requireResolvedCompanyId(req);
     const { rows } = await query(
-      `SELECT * FROM company_compliance_config WHERE company_guid = $1`,
+      `SELECT * FROM company_compliance_config WHERE company_id=$1`,
       [guid]
     );
     // Return defaults if not yet configured
@@ -2120,6 +2272,7 @@ router.post('/company/:guid/compliance-config', authMiddleware, async (req, res)
   try {
     const { guid } = req.params;
     if (!await verifyCompanyOwnership(req, res, guid)) return;
+    const companyId = requireResolvedCompanyId(req);
     const {
       numbering_policy = 'tally_prime_series',
       numbering_overrides = {},
@@ -2130,9 +2283,9 @@ router.post('/company/:guid/compliance-config', authMiddleware, async (req, res)
     } = req.body;
     await query(`
       INSERT INTO company_compliance_config
-        (company_guid, numbering_policy, numbering_overrides, e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7, EXTRACT(EPOCH FROM NOW())::BIGINT)
-      ON CONFLICT (company_guid) DO UPDATE SET
+        (company_id, company_guid, numbering_policy, numbering_overrides, e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8, EXTRACT(EPOCH FROM NOW())::BIGINT)
+      ON CONFLICT (company_id) DO UPDATE SET
         numbering_policy      = EXCLUDED.numbering_policy,
         numbering_overrides   = EXCLUDED.numbering_overrides,
         e_invoice_applicable  = EXCLUDED.e_invoice_applicable,
@@ -2140,7 +2293,7 @@ router.post('/company/:guid/compliance-config', authMiddleware, async (req, res)
         e_way_bill_applicable = EXCLUDED.e_way_bill_applicable,
         e_way_bill_mode       = EXCLUDED.e_way_bill_mode,
         updated_at            = EXCLUDED.updated_at
-    `, [guid, numbering_policy, JSON.stringify(numbering_overrides), e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode]);
+    `, [companyId, guid, numbering_policy, JSON.stringify(numbering_overrides), e_invoice_applicable, e_invoice_mode, e_way_bill_applicable, e_way_bill_mode]);
     res.json({ status: true, message: 'Compliance config saved' });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
@@ -2153,12 +2306,13 @@ router.get('/sales/ledger-accounts', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const companyId = requireResolvedCompanyId(req);
     const { rows } = await query(
       `SELECT name, guid FROM ledgers
-       WHERE company_guid = $1
+       WHERE company_id=$1
          AND (parent = 'Sales Accounts' OR parent ILIKE '%Sales Account%' OR parent ILIKE 'Sales Accounts')
        ORDER BY name ASC`,
-      [companyGuid]
+      [companyId]
     );
     res.json({ status: true, data: rows });
   } catch (e) {
@@ -2172,21 +2326,22 @@ router.get('/purchase/ledger-accounts', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const companyId = requireResolvedCompanyId(req);
     const { rows } = await query(
       `WITH RECURSIVE purchase_groups AS (
          SELECT name FROM groups
-          WHERE company_guid = $1 AND name ILIKE 'Purchase Account%'
+          WHERE company_id=$1 AND name ILIKE 'Purchase Account%'
          UNION ALL
          SELECT g.name FROM groups g
            JOIN purchase_groups pg ON g.parent = pg.name
-          WHERE g.company_guid = $1
+          WHERE g.company_id=$1
        )
        SELECT DISTINCT l.name, l.guid, l.parent
          FROM ledgers l
-        WHERE l.company_guid = $1
+        WHERE l.company_id=$1
           AND (l.parent IN (SELECT name FROM purchase_groups) OR l.parent ILIKE '%Purchase Account%')
         ORDER BY l.name ASC`,
-      [companyGuid]
+      [companyId]
     );
     res.json({ status: true, data: rows });
   } catch (e) {
@@ -2200,18 +2355,19 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const companyId = requireResolvedCompanyId(req);
     const { rows } = await query(
       `WITH RECURSIVE tax_groups AS (
          SELECT name FROM groups
-         WHERE company_guid = $1
+         WHERE company_id=$1
            AND (name ILIKE '%Duties%' OR name ILIKE '%Tax%' OR name ILIKE '%GST%')
          UNION ALL
          SELECT g.name FROM groups g
          JOIN tax_groups tg ON g.parent = tg.name
-         WHERE g.company_guid = $1
+         WHERE g.company_id=$1
        )
        SELECT DISTINCT l.name, l.guid, COALESCE(l.tax_rate, 0)::float AS "taxRate" FROM ledgers l
-       WHERE l.company_guid = $1
+       WHERE l.company_id=$1
          AND (
            l.parent IN (SELECT name FROM tax_groups)
            OR l.parent ILIKE '%GST%' OR l.parent ILIKE '%Tax%' OR l.parent ILIKE '%Duty%' OR l.parent ILIKE '%Duties%'
@@ -2220,7 +2376,7 @@ router.get('/tax/ledgers', authMiddleware, async (req, res) => {
            OR l.name ILIKE '%TDS%' OR l.name ILIKE '%TCS%'
          )
        ORDER BY l.name ASC`,
-      [companyGuid]
+      [companyId]
     );
     res.json({ status: true, data: rows });
   } catch (e) {
@@ -2235,6 +2391,7 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
     const companyGuid = req.query.companyGuid || req.user?.defaultCompanyGuid;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+    const companyId = requireResolvedCompanyId(req);
     // Recursive CTE: walk ALL descendant groups of the 4 root expense/income categories.
     // Simple parent ILIKE was wrong — it only matched ledgers DIRECTLY under the root
     // groups, missing any ledger under a sub-group (e.g. parent='Freight & Forwarding'
@@ -2243,7 +2400,7 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
       `WITH RECURSIVE expense_income_groups AS (
          -- Anchor: root group names are carried forward so we know the origin of each ledger
          SELECT name, name AS root_name FROM groups
-         WHERE company_guid = $1
+         WHERE company_id=$1
            AND (
              name ILIKE 'Direct Expenses'
              OR name ILIKE 'Indirect Expenses'
@@ -2257,14 +2414,14 @@ router.get('/charge-ledgers', authMiddleware, async (req, res) => {
          UNION ALL
          SELECT g.name, eig.root_name FROM groups g
          JOIN expense_income_groups eig ON g.parent = eig.name
-         WHERE g.company_guid = $1
+         WHERE g.company_id=$1
        )
        SELECT DISTINCT l.name, l.guid, l.parent, eig.root_name
        FROM ledgers l
        JOIN expense_income_groups eig ON l.parent = eig.name
-       WHERE l.company_guid = $1
+       WHERE l.company_id=$1
        ORDER BY l.name ASC`,
-      [companyGuid]
+      [companyId]
     );
     const normalize = (s) => String(s || '').trim().toLowerCase();
     const LOGISTICS_KW = ['freight','transport','delivery','courier','loading','unloading','handling','cartage','hamali','logistics','forwarding','shipping','dispatch'];
@@ -2300,14 +2457,15 @@ router.get('/purchase/home-metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
-    const core = await buildVoucherHomeCoreMetrics(companyGuid, PURCHASE_HOME_FILTER, fyFrom, fyTo, today, false);
+    const core = await buildVoucherHomeCoreMetrics(companyId, PURCHASE_HOME_FILTER, fyFrom, fyTo, today, false);
     const [avgMetrics, debitNotes, outstanding] = await Promise.all([
-      buildAvgTicketMetrics(companyGuid, PURCHASE_HOME_FILTER, fyFrom, fyTo, core.ytd),
-      buildNoteMetrics(companyGuid, '%Debit Note%', fyFrom, fyTo),
-      buildOutstandingMetrics(companyGuid, 'AP'),
+      buildAvgTicketMetrics(companyId, PURCHASE_HOME_FILTER, fyFrom, fyTo, core.ytd),
+      buildNoteMetrics(companyId, '%Debit Note%', fyFrom, fyTo),
+      buildOutstandingMetrics(companyId, 'AP'),
     ]);
     res.json({
       success: true,
@@ -2339,8 +2497,9 @@ router.get('/purchase/invoices/:id/debit-note-context', authMiddleware, async (r
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const resolved = await resolveDebitNoteContext(companyGuid, req.params.id);
+    const resolved = await resolveDebitNoteContext(companyId, req.params.id);
     if (!resolved.ok) {
       return res.status(resolved.status).json({ success: false, error: { code: resolved.code, message: resolved.message } });
     }
@@ -2403,13 +2562,14 @@ router.get('/vouchers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { type, search = '', page = 1, limit = 30, from, to } = req.query;
   const typeMap = { payment: 'Payment', receipt: 'Receipt', journal: 'Journal', contra: 'Contra', sales: 'Sales', purchase: 'Purchase' };
   const vType = typeMap[type] || null;
   const offset = (parseInt(page) - 1) * parseInt(limit);
   try {
-    let q = `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND NOT (voucher_type='Voucher' AND (amount=0 OR amount IS NULL)) AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
-    const params = [companyGuid, `%${search}%`];
+    let q = `SELECT * FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND NOT (voucher_type='Voucher' AND (amount=0 OR amount IS NULL)) AND (party_name ILIKE $2 OR voucher_number ILIKE $2)`;
+    const params = [companyId, `%${search}%`];
     let idx = 3;
     if (vType) { q += ` AND voucher_type ILIKE $${idx++}`; params.push(`%${vType}%`); }
     if (from)  { q += ` AND date >= $${idx++}`; params.push(from); }
@@ -2417,7 +2577,7 @@ router.get('/vouchers', authMiddleware, async (req, res) => {
     q += ` ORDER BY date DESC, id DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE`, [companyGuid]);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE`, [companyId]);
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -2429,6 +2589,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { from, to, type, page = 1, limit = 50 } = req.query;
   const userId = req.user.userId;
   const offset = (parseInt(page)-1)*parseInt(limit);
@@ -2465,7 +2626,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       -- Tally rows across the years (Cartesian collision). The extra JOIN predicates collapse
       -- the fanout to exactly 1 Tally row per app_voucher.
       JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
-        AND av.company_guid = v.company_guid
+        AND av.company_id = v.company_id
         AND av.voucher_date::text = v.date
         -- When TDK reference exists, use it as the primary identity guard.
         -- This prevents fan-out when Tally allows duplicate voucher numbers
@@ -2494,9 +2655,9 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         )
       JOIN write_queue wq ON wq.id = av.write_queue_id
       LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
-      WHERE v.company_guid = $1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
+      WHERE v.company_id=$1 AND wq.user_id = $2 AND v.is_cancelled = FALSE
     `;
-    const params = [companyGuid, userId];
+    const params = [companyId, userId];
     let idx = 3;
     if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
@@ -2541,14 +2702,14 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         TRUE as _is_master
       FROM app_masters am
       JOIN write_queue wq ON wq.id = am.write_queue_id
-      WHERE am.company_guid = $1
+      WHERE am.company_id=$1
         AND am.user_id = $2
         AND am.books_impact_status = 'posted'
         AND ($3::text IS NULL OR TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') >= $3)
         AND ($4::text IS NULL OR TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') <= $4)
       ORDER BY wq.created_at DESC
       LIMIT 100
-    `, [companyGuid, userId, from || null, to || null]);
+    `, [companyId, userId, from || null, to || null]);
 
     // 2. Pending/failed write_queue entries not yet in vouchers
     // Also include 'success' entries for non-standard voucher types (stock_transfer, stock_adjustment)
@@ -2585,7 +2746,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
       LEFT JOIN app_vouchers parent_av ON parent_av.invoice_uuid = av.parent_invoice_uuid
       LEFT JOIN app_masters am ON am.write_queue_id = wq.id
-      WHERE wq.company_guid = $1
+      WHERE wq.company_id=$1
         AND wq.user_id = $2
         AND wq.entry_type IS DISTINCT FROM 'proforma_convert'
         AND (
@@ -2600,7 +2761,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         AND COALESCE(am.books_impact_status, 'not_posted') <> 'posted'
       ORDER BY wq.created_at DESC
       LIMIT 50
-    `, [companyGuid, userId]);
+    `, [companyId, userId]);
 
     const { lifecycleFilter } = req.query;
 
@@ -2673,41 +2834,42 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { id } = req.params;
   try {
     // Prefer GUID match; fall back to voucher_number (most recent when number repeats across FYs)
     const { rows: vRows } = await query(
-      'SELECT * FROM vouchers WHERE company_guid=$2 AND (guid=$1 OR voucher_number=$1) ORDER BY (guid=$1)::int DESC, date DESC LIMIT 1',
-      [id, companyGuid]
+      'SELECT * FROM vouchers WHERE company_id=$2 AND (guid=$1 OR voucher_number=$1) ORDER BY (guid=$1)::int DESC, date DESC LIMIT 1',
+      [id, companyId]
     );
     if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
     const v = vRows[0];
     // Inventory items (for Sales/Purchase vouchers)
-    const { rows: items } = await query('SELECT * FROM voucher_inventory_items WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY id', [v.guid, companyGuid]);
+    const { rows: items } = await query('SELECT * FROM voucher_inventory_items WHERE voucher_guid=$1 AND company_id=$2 ORDER BY id', [v.guid, companyId]);
     // GST details
-    const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]);
+    const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_id=$2 LIMIT 1', [v.guid, companyId]);
     // Company info — full profile
-    const { rows: co } = await query('SELECT name, formal_name, gstin, pan, phone, mobile, email, website, address, state, pincode, country FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    const { rows: co } = await query('SELECT name, formal_name, gstin, pan, phone, mobile, email, website, address, state, pincode, country FROM companies WHERE id=$1 LIMIT 1', [companyId]);
     // Party ledger details (GSTIN, address etc) — state_name feeds Place of Supply on the print
-    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1', [companyGuid, v.party_name || '']);
+    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode FROM ledgers WHERE company_id=$1 AND name=$2 LIMIT 1', [companyId, v.party_name || '']);
     // Ledger entries — used to compute the TRUE party amount (not v.amount which may be wrong)
     const { rows: ledgerEntries } = await query(
-      'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2 ORDER BY ABS(amount) DESC',
-      [v.guid, companyGuid]
+      'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_id=$2 ORDER BY ABS(amount) DESC',
+      [v.guid, companyId]
     );
     // Party amount = the Dr entry for the party ledger (what party owes / paid)
     const partyEntry = ledgerEntries.find(e => e.ledger_name === v.party_name);
     const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(v.amount||'0');
     // App voucher payload — dispatch_details, collect_payment, narration (from app, not Tally)
     const { rows: avRows } = await query(
-      `SELECT payload FROM app_vouchers WHERE tally_voucher_no=$1 AND company_guid=$2 LIMIT 1`,
-      [v.voucher_number, companyGuid]
+      `SELECT payload FROM app_vouchers WHERE tally_voucher_no=$1 AND company_id=$2 LIMIT 1`,
+      [v.voucher_number, companyId]
     ).catch(() => ({ rows: [] }));
     const avPayload = avRows[0]?.payload || null;
     // Compliance acknowledgements — the IRN band and e-Way Bill line on the print.
     const [{ rows: eInv }, { rows: eWb }] = await Promise.all([
-      query('SELECT irn, ack_no, ack_date, qr_code, status FROM e_invoice_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]).catch(() => ({ rows: [] })),
-      query('SELECT ewb_no, ewb_date, valid_till, vehicle_no, transporter_id, status FROM e_way_bill_details WHERE voucher_guid=$1 AND company_guid=$2 LIMIT 1', [v.guid, companyGuid]).catch(() => ({ rows: [] })),
+      query('SELECT irn, ack_no, ack_date, qr_code, status FROM e_invoice_details WHERE voucher_guid=$1 AND company_id=$2 LIMIT 1', [v.guid, companyId]).catch(() => ({ rows: [] })),
+      query('SELECT ewb_no, ewb_date, valid_till, vehicle_no, transporter_id, status FROM e_way_bill_details WHERE voucher_guid=$1 AND company_id=$2 LIMIT 1', [v.guid, companyId]).catch(() => ({ rows: [] })),
     ]);
     res.json({
       success: true,
@@ -2741,10 +2903,11 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', nature, group, page = 1, limit = 200 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
   // If FY params provided, compute FY-specific closing balance (opening + net movement)
-  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
   const fyPrefix = fyLikePrefix(financialYear);
   try {
     let q = `
@@ -2756,8 +2919,8 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
         COALESCE((
           SELECT SUM(vle.amount)
           FROM voucher_ledger_entries vle
-          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-          WHERE vle.company_guid = l.company_guid AND vle.ledger_name = l.name
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+          WHERE vle.company_id = l.company_id AND vle.ledger_name = l.name
             AND v.date >= $4 AND v.date <= $5
             AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
         ), 0) as fy_movement,
@@ -2765,7 +2928,7 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
         COALESCE(NULLIF(TRIM(l.nature), ''), NULLIF(TRIM(g.nature), '')) as stored_nature
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 3, 6)}
+        ON lfb.company_id = l.company_id AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 3, 6)}
       -- DISTINCT ON: Tally can sync duplicate group rows with the same name; a plain
       -- JOIN fans out every ledger under that parent (same guid twice → React key crash).
       LEFT JOIN (
@@ -2773,10 +2936,10 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
         FROM groups
         ORDER BY company_guid, name
       ) g
-        ON g.company_guid = l.company_guid AND g.name = TRIM(l.parent)
-      WHERE l.company_guid=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
+        ON g.company_id = l.company_id AND g.name = TRIM(l.parent)
+      WHERE l.company_id=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
     `;
-    const params = [companyGuid, `%${search}%`, financialYear, fyFrom, fyTo, fyPrefix];
+    const params = [companyId, `%${search}%`, financialYear, fyFrom, fyTo, fyPrefix];
     let idx = 7;
     // Group filter (supports comma-separated multi)
     const groupList = String(group || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -2799,8 +2962,8 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
 
     const [{ rows }, { rows: groupRows }, { rows: cnt }] = await Promise.all([
       query(q, params),
-      query('SELECT name, parent, nature FROM groups WHERE company_guid=$1', [companyGuid]),
-      query('SELECT COUNT(*) as c FROM ledgers WHERE company_guid=$1', [companyGuid]),
+      query('SELECT name, parent, nature FROM groups WHERE company_id=$1', [companyId]),
+      query('SELECT COUNT(*) as c FROM ledgers WHERE company_id=$1', [companyId]),
     ]);
     const parentByName = buildGroupParentMap(groupRows);
 
@@ -2847,7 +3010,8 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
 router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+  const companyId = requireResolvedCompanyId(req);
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
   const fyPrefix = fyLikePrefix(financialYear);
   try {
     // V2: Use financial_year column directly + ledger_fy_balances for opening
@@ -2861,19 +3025,19 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
         COALESCE((
           SELECT SUM(vle.amount)
           FROM voucher_ledger_entries vle
-          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-          WHERE vle.company_guid = l.company_guid
+          JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+          WHERE vle.company_id = l.company_id
             AND vle.ledger_name  = l.name
             AND v.date >= $3 AND v.date <= $4
             AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
         ), 0) as fy_movement
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid
+        ON lfb.company_id = l.company_id
         AND lfb.ledger_name  = l.name
         AND ${sqlLfbJoin('lfb', 2, 5)}
-      WHERE l.company_guid = $1
-    `, [companyGuid, financialYear, fyFrom, fyTo, fyPrefix]);
+      WHERE l.company_id=$1
+    `, [companyId, financialYear, fyFrom, fyTo, fyPrefix]);
 
     const data = rows.map(l => {
       const bt             = l.fy_balance_type || 'Dr';
@@ -2904,10 +3068,11 @@ router.get('/ledgers/fy-balances', authMiddleware, async (req, res) => {
 router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { id } = req.params;
-  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+  const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
   try {
-    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_guid=$1 AND guid=$2', [companyGuid, id]);
+    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_id=$1 AND guid=$2', [companyId, id]);
     if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
     const ledger = lr[0];
     const ledgerName = ledger.name;
@@ -2917,21 +3082,21 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
       SELECT v.guid, v.voucher_number, v.voucher_type, v.date, v.narration, v.party_name,
              vle.amount as entry_amount, vle.dr_cr
       FROM voucher_ledger_entries vle
-      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-      WHERE vle.company_guid = $1
+      JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+      WHERE vle.company_id=$1
         AND vle.ledger_name = $2
         AND v.is_cancelled = FALSE
         AND v.date IS NOT NULL AND v.date != ''
         AND v.date BETWEEN $3 AND $4
       ORDER BY v.date ASC, v.id ASC
-    `, [companyGuid, ledgerName, fyFrom, fyTo]);
+    `, [companyId, ledgerName, fyFrom, fyTo]);
 
     // V2: FY-specific opening balance from ledger_fy_balances table
     // Source: LedgerOpeningBalance.xml per FY — Tally's authoritative opening per year
     // Fallback: use ledger.opening_balance from LedgerFull.xml (current FY opening)
     const { rows: fyBalRows } = await query(
-      'SELECT opening_balance, balance_type FROM ledger_fy_balances WHERE company_guid=$1 AND ledger_name=$2 AND financial_year=$3 LIMIT 1',
-      [companyGuid, ledgerName, financialYear]
+      'SELECT opening_balance, balance_type FROM ledger_fy_balances WHERE company_id=$1 AND ledger_name=$2 AND financial_year=$3 LIMIT 1',
+      [companyId, ledgerName, financialYear]
     );
 
     const balType = fyBalRows[0]?.balance_type || ledger.balance_type || 'Dr';
@@ -2988,9 +3153,10 @@ router.get('/ledgers/:id/statement', authMiddleware, async (req, res) => {
 router.get('/ledgers/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { id } = req.params;
   try {
-    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_guid=$1 AND guid=$2', [companyGuid, id]);
+    const { rows: lr } = await query('SELECT * FROM ledgers WHERE company_id=$1 AND guid=$2', [companyId, id]);
     if (!lr[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ledger not found' } });
     const { from, to, page = 1, limit = 30 } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
@@ -3000,10 +3166,10 @@ router.get('/ledgers/:id', authMiddleware, async (req, res) => {
         ABS(vle.amount) as entry_amount, vle.dr_cr as entry_dr_cr
       FROM vouchers v
       LEFT JOIN voucher_ledger_entries vle 
-        ON vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid AND vle.ledger_name = $3
-      WHERE v.company_guid=$1 AND (v.party_guid=$2 OR v.party_name=$3) AND v.is_cancelled=FALSE
+        ON vle.voucher_guid = v.guid AND vle.company_id = v.company_id AND vle.ledger_name = $3
+      WHERE v.company_id=$1 AND (v.party_guid=$2 OR v.party_name=$3) AND v.is_cancelled=FALSE
     `;
-    const tp = [companyGuid, id, lr[0].name];
+    const tp = [companyId, id, lr[0].name];
     let idx = 4;
     if (from) { tq += ` AND v.date >= $${idx++}`; tp.push(from); }
     if (to)   { tq += ` AND v.date <= $${idx++}`; tp.push(to); }
@@ -3047,7 +3213,7 @@ async function applyMultiWarehouseStockFilter(companyGuid, rows, warehouseList, 
                 COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
                 SUM(CASE WHEN type = 'inward' THEN ABS(qty) ELSE -ABS(qty) END) AS net_qty
          FROM stock_transactions
-         WHERE company_guid = $1
+         WHERE company_id=$1
            AND date <= $2
            AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = ANY($3)
            AND voucher_type != 'Physical Stock'
@@ -3056,11 +3222,11 @@ async function applyMultiWarehouseStockFilter(companyGuid, rows, warehouseList, 
                 COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
                 SUM(CASE WHEN type = 'inward' THEN ABS(qty) ELSE -ABS(qty) END) AS net_qty
          FROM stock_transactions
-         WHERE company_guid = $1
+         WHERE company_id=$1
            AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = ANY($2)
            AND voucher_type != 'Physical Stock'
          GROUP BY stock_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')`,
-    fyTo ? [companyGuid, fyTo, whNormList] : [companyGuid, whNormList]
+    fyTo ? [companyId, fyTo, whNormList] : [companyId, whNormList]
   );
 
   const qtyByStock = {};
@@ -3088,6 +3254,23 @@ async function applyMultiWarehouseStockFilter(companyGuid, rows, warehouseList, 
     });
 }
 
+// GET /api/stocks/dashboard — canonical replacement for POST /app/stock-dashboard
+router.get('/stocks/dashboard', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) {
+    return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  }
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  try {
+    const data = await buildStockDashboardInsights(query, companyId);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('[stocks/dashboard]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed' } });
+  }
+});
+
 // GET /api/stocks/items
 // Per Tally FY guide §3.4: Stock qty is NEVER static. It's always derived from transactions.
 // When fy= param is passed: compute FY-specific closing qty from stock_transactions
@@ -3096,14 +3279,15 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', category, warehouse, group, page = 1, limit = 500 } = req.query; // Default 500
   const warehouseList = parseCsvQueryParam(warehouse);
   const groupList = parseCsvQueryParam(group);
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
-    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
 
     let q, params, idx;
     if (fyRequested) {
@@ -3112,7 +3296,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         SELECT s.guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                s.reorder_level, s.closing_rate,
                (SELECT st2.warehouse FROM stock_transactions st2
-                WHERE st2.company_guid = s.company_guid AND st2.stock_guid = s.name
+                WHERE st2.company_id = s.company_id AND st2.stock_guid = s.name
                 ORDER BY st2.date DESC LIMIT 1) AS primary_warehouse,
                (
                  SELECT ROUND(
@@ -3120,7 +3304,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                    GREATEST((NOW()::date - MIN(stc.date::date)), 1)
                  , 4)
                  FROM stock_transactions stc
-                 WHERE stc.company_guid = s.company_guid
+                 WHERE stc.company_id = s.company_id
                    AND stc.stock_guid = s.name
                    AND stc.type = 'outward'
                    AND stc.date::date >= (NOW() - INTERVAL '90 days')::date
@@ -3137,17 +3321,17 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         -- Physical Stock vouchers are Tally stock-count/audit entries (absolute qty, not a movement).
         -- Exclude from FY running qty calc to prevent cumulative inflation.
         -- TODO: future — model Physical Stock as absolute stock count event (last count wins, movements apply on top)
-        LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_guid = s.company_guid
+        LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_id = s.company_id
           AND st.date <= $3
           AND st.voucher_type != 'Physical Stock'
           AND COALESCE(st.voucher_type, '') != 'Opening Balance'
-        WHERE s.company_guid = $1
+        WHERE s.company_id=$1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
-        GROUP BY s.guid, s.company_guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
+        GROUP BY s.guid, s.company_id, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                  s.reorder_level, s.closing_rate, s.opening_qty
         ORDER BY fy_closing_value DESC NULLS LAST, s.name
       `;
-      params = [companyGuid, `%${search}%`, fyTo];
+      params = [companyId, `%${search}%`, fyTo];
       if (category) { q = q.replace('GROUP BY', `AND s.category = $4 GROUP BY`); params.push(category); }
       if (groupList.length === 1) {
         q = q.replace('GROUP BY', `AND TRIM(s.group_name) = $${params.length + 1} GROUP BY`);
@@ -3184,7 +3368,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     // No FY param: serve stored closing_qty (current stock as of last sync)
     q = `SELECT s.*,
       (SELECT st.warehouse FROM stock_transactions st
-       WHERE st.company_guid = s.company_guid AND st.stock_guid = s.name
+       WHERE st.company_id = s.company_id AND st.stock_guid = s.name
        ORDER BY st.date DESC LIMIT 1) AS primary_warehouse,
       (
         SELECT ROUND(
@@ -3192,14 +3376,14 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
           GREATEST((NOW()::date - MIN(stc.date::date)), 1)
         , 4)
         FROM stock_transactions stc
-        WHERE stc.company_guid = s.company_guid
+        WHERE stc.company_id = s.company_id
           AND stc.stock_guid = s.name
           AND stc.type = 'outward'
           AND stc.date::date >= (NOW() - INTERVAL '90 days')::date
       ) AS avg_daily_consumption
     FROM stocks s
-    WHERE s.company_guid=$1 AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)`;
-    params = [companyGuid, `%${search}%`];
+    WHERE s.company_id=$1 AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)`;
+    params = [companyId, `%${search}%`];
     idx = 3;
     if (category) { q += ` AND category = $${idx++}`; params.push(category); }
     if (groupList.length === 1) {
@@ -3239,15 +3423,16 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
+  const companyId = requireResolvedCompanyId(req);
   const page      = Math.max(1, parseInt(req.query.page     || 1));
   const pageSize  = Math.min(500, Math.max(1, parseInt(req.query.pageSize || 25)));
   const offset    = (page - 1) * pageSize;
   const warehouse = req.query.warehouse || null;
 
   try {
-    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
 
     let allRows;
 
@@ -3266,12 +3451,12 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
           sfv.closing_qty                              AS "fyClosingQty"
         FROM stock_fy_valuation sfv
         JOIN stocks s
-          ON s.name = sfv.stock_name AND s.company_guid = sfv.company_guid
-        WHERE sfv.company_guid = $1
+          ON s.name = sfv.stock_name AND s.company_id = sfv.company_id
+        WHERE sfv.company_id=$1
           AND sfv.financial_year = $2
           AND sfv.closing_qty < 0
         ORDER BY sfv.closing_qty ASC
-      `, [companyGuid, financialYear]);
+      `, [companyId, financialYear]);
 
       // Per-warehouse breakdown for FY — filtered to same FY date range
       const stockNames = itemRows.map(r => r.itemName);
@@ -3283,13 +3468,13 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
             COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
             SUM(CASE WHEN type = 'inward' THEN ABS(qty) ELSE -ABS(qty) END) AS net_qty
           FROM stock_transactions
-          WHERE company_guid = $1
+          WHERE company_id=$1
             AND qty IS NOT NULL
             AND date <= $2
             AND stock_guid = ANY($3)
             AND voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse movement totals
           GROUP BY stock_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
-        `, [companyGuid, fyTo, stockNames]);
+        `, [companyId, fyTo, stockNames]);
         whRows = whResult.rows;
       }
 
@@ -3313,7 +3498,7 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
     } else {
       // ── Current stock path: use stored closing_qty (no FY filter) ──
       let whFilter = '';
-      const params = [companyGuid];
+      const params = [companyId];
       if (warehouse) {
         params.push(warehouse);
         whFilter = `AND COALESCE(NULLIF(warehouse, ''), 'Main Location') = $${params.length}`;
@@ -3343,12 +3528,12 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
                  COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
                  SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS net_qty
           FROM stock_transactions
-          WHERE company_guid = $1 AND qty IS NOT NULL
+          WHERE company_id=$1 AND qty IS NOT NULL
             AND voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse movement totals
           GROUP BY stock_guid, company_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
           ${whFilter}
-        ) wh ON wh.stock_guid = s.name AND wh.company_guid = s.company_guid
-        WHERE s.company_guid = $1 AND s.closing_qty < 0
+        ) wh ON wh.stock_guid = s.name AND wh.company_id = s.company_id
+        WHERE s.company_id=$1 AND s.closing_qty < 0
         GROUP BY s.guid, s.name, s.group_name, s.category, s.unit, s.closing_rate, s.closing_qty
         ORDER BY s.closing_qty ASC
       `, params);
@@ -3427,9 +3612,10 @@ router.get('/stocks/expiry-schedule', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { fy } = req.query;
   try {
-    const { financialYear } = await resolveFYDates(companyGuid, null, null, fy);
+    const { financialYear } = await resolveFYDates(companyId, null, null, fy);
     const fyParam = fy ? financialYear : null;
 
     const { rows } = await query(`
@@ -3445,8 +3631,8 @@ router.get('/stocks/expiry-schedule', authMiddleware, async (req, res) => {
         MAX(ba.rate)                                    AS rate,
         SUM(ba.qty * ba.rate)                           AS value
       FROM batch_allocations ba
-      LEFT JOIN stocks s ON s.name = ba.stock_item_name AND s.company_guid = ba.company_guid
-      WHERE ba.company_guid = $1
+      LEFT JOIN stocks s ON s.name = ba.stock_item_name AND s.company_id = ba.company_id
+      WHERE ba.company_id=$1
         AND ($2::text IS NULL OR ba.financial_year = $2)
       GROUP BY
         ba.stock_item_name, COALESCE(NULLIF(s.sku,''), NULLIF(s.alias,''), ''),
@@ -3455,7 +3641,7 @@ router.get('/stocks/expiry-schedule', authMiddleware, async (req, res) => {
         ba.expiry_date, ba.mfg_date
       HAVING SUM(ba.qty) != 0
       ORDER BY ba.expiry_date ASC NULLS LAST, ba.stock_item_name ASC
-    `, [companyGuid, fyParam]);
+    `, [companyId, fyParam]);
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -3510,8 +3696,9 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
 
     // Fetch all stocks + their FY movement stats
     const { rows } = await query(`
@@ -3532,14 +3719,14 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
       FROM stocks s
       LEFT JOIN stock_transactions st
         ON st.stock_guid = s.name
-       AND st.company_guid = s.company_guid
+       AND st.company_id = s.company_id
        AND st.date::date >= $2::date
        AND st.date::date <= $3::date
        AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from velocity calculation
-      WHERE s.company_guid = $1
+      WHERE s.company_id=$1
       GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty, s.sku, s.alias
       ORDER BY total_outward_qty DESC, s.name ASC
-    `, [companyGuid, fyFrom, fyTo]);
+    `, [companyId, fyFrom, fyTo]);
 
     if (!rows.length) {
       return res.json({ success: true, data: { fast: [], slow: [], financial_year: financialYear } });
@@ -3553,8 +3740,8 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     // Use company's fast_moving_top_pct setting (default 20%); fall back to 50% if not set
     const { rows: fsSettings } = await query(
       `SELECT fast_moving_top_pct, slow_moving_no_movement_days, dead_stock_no_movement_days
-       FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
-      [companyGuid]
+       FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
     );
     const fastPct    = parseInt(fsSettings[0]?.fast_moving_top_pct)  || 20;  // top X% by outward qty
     const slowDays   = parseInt(fsSettings[0]?.slow_moving_no_movement_days) || 90;
@@ -3566,7 +3753,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
     const slowActive = active.slice(fastCount);
     const slowRaw    = [...slowActive, ...inactive];
 
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
     const mapItem = (r, idx, tab) => ({
       id:                 r.guid,
       name:               r.name,
@@ -3613,6 +3800,7 @@ router.get('/stocks/aged-items', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { mode = 'sold', days: daysParam = '30' } = req.query;
     const bucketStart = parseInt(daysParam);
@@ -3632,15 +3820,15 @@ router.get('/stocks/aged-items', authMiddleware, async (req, res) => {
         FROM stocks s
         LEFT JOIN stock_transactions st_out
           ON  st_out.stock_guid    = s.name
-          AND st_out.company_guid  = s.company_guid
+          AND st_out.company_id  = s.company_id
           AND st_out.type          = 'outward'
           AND st_out.voucher_type NOT IN ('Stock Journal','Physical Stock')
         LEFT JOIN stock_transactions st_in
           ON  st_in.stock_guid    = s.name
-          AND st_in.company_guid  = s.company_guid
+          AND st_in.company_id  = s.company_id
           AND st_in.type          = 'inward'
           AND st_in.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-        WHERE s.company_guid = $1
+        WHERE s.company_id=$1
           AND COALESCE(s.closing_qty, 0) > 0
         GROUP BY s.name, s.sku, s.alias, s.group_name, s.closing_qty, s.closing_rate
       ),
@@ -3672,9 +3860,9 @@ router.get('/stocks/aged-items', authMiddleware, async (req, res) => {
           WHEN 'received' THEN days_since_received::float
           ELSE total_value
         END DESC
-    `, [companyGuid, mode, bucketStart, bucketEnd]);
+    `, [companyId, mode, bucketStart, bucketEnd]);
 
-    const displayField  = await getProductDisplayField(companyGuid);
+    const displayField  = await getProductDisplayField(companyId);
     const totalValue    = rows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
     const mappedRows    = rows.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
     res.json({
@@ -3695,9 +3883,10 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { fy } = req.query;
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, null, null, fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, null, null, fy);
 
     // Wrap in subquery so we can reference column aliases in ORDER BY
     // Include sold-out items (closing_qty=0) if they had outward movement in the FY
@@ -3718,9 +3907,9 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
         FROM stocks s
         LEFT JOIN stock_transactions st
           ON  st.stock_guid   = s.name
-          AND st.company_guid = s.company_guid
+          AND st.company_id = s.company_id
           AND st.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-        WHERE s.company_guid = $1
+        WHERE s.company_id=$1
           AND (
             -- Items currently in stock
             COALESCE(s.closing_qty, 0) > 0
@@ -3728,7 +3917,7 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
             OR EXISTS (
               SELECT 1 FROM stock_transactions st2
               WHERE st2.stock_guid   = s.name
-                AND st2.company_guid = s.company_guid
+                AND st2.company_id = s.company_id
                 AND st2.type         = 'outward'
                 AND st2.date::date  >= $2::date
                 AND st2.date::date  <= $3::date
@@ -3744,7 +3933,7 @@ router.get('/stocks/movement-analytics', authMiddleware, async (req, res) => {
           outward_qty * 999.0
         ) DESC NULLS LAST,
         name ASC
-    `, [companyGuid, fyFrom, fyTo]);
+    `, [companyId, fyFrom, fyTo]);
 
     const items = rows.map(r => {
       const outwardQty   = parseFloat(r.outward_qty   || 0);
@@ -3780,6 +3969,7 @@ router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) 
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { item } = req.query;
     if (!item) return res.status(400).json({ success: false, error: { code: 'MISSING_ITEM', message: 'item param required' } });
@@ -3797,7 +3987,7 @@ router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) 
           ROUND(SUM(CASE WHEN type='inward'  THEN value ELSE 0 END)::numeric, 2) AS inward_value,
           ROUND(SUM(CASE WHEN type='inward'  THEN qty   ELSE 0 END)::numeric, 2) AS inward_qty
         FROM stock_transactions
-        WHERE company_guid = $1
+        WHERE company_id=$1
           AND stock_guid   = $2
           AND type IN ('outward', 'inward')
           AND voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
@@ -3806,7 +3996,7 @@ router.get('/stocks/movement-analytics/chart', authMiddleware, async (req, res) 
         LIMIT 30
       ) sub
       ORDER BY date ASC
-    `, [companyGuid, item]);
+    `, [companyId, item]);
 
     // Return actual entry dates with separate inward/outward values
     const filledData = rows.map(r => ({
@@ -3827,14 +4017,15 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { fy } = req.query;
     let financialYear = fy || null;
 
     // ── 1. All registered warehouses — always included even if empty ─────────────────────
     const { rows: allWarehouses } = await query(
-      'SELECT name FROM warehouses WHERE company_guid=$1 ORDER BY name',
-      [companyGuid]
+      'SELECT name FROM warehouses WHERE company_id=$1 ORDER BY name',
+      [companyId]
     );
 
     // ── 2. Per-godown per-item net positive qty from batch_allocations ──────────────
@@ -3847,10 +4038,10 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
         ba.stock_item_name AS stock_name,
         GREATEST(SUM(COALESCE(ba.qty, 0)), 0) AS net_qty
       FROM batch_allocations ba
-      WHERE ba.company_guid = $1
+      WHERE ba.company_id=$1
       GROUP BY ba.godown_name, ba.stock_item_name
       HAVING GREATEST(SUM(COALESCE(ba.qty, 0)), 0) > 0
-    `, [companyGuid]);
+    `, [companyId]);
 
     // ── 3. Authoritative closing + opening rates from stocks table ─────────────────
     // stocks.closing_rate is the most accurate rate per item (from Tally current valuation).
@@ -3862,8 +4053,8 @@ router.get('/stocks/snapshot', authMiddleware, async (req, res) => {
         COALESCE(closing_rate, 0)  AS closing_rate,
         COALESCE(opening_rate, 0)  AS opening_rate
       FROM stocks
-      WHERE company_guid = $1
-    `, [companyGuid]);
+      WHERE company_id=$1
+    `, [companyId]);
 
     // Build rate lookup map {stock_name -> {closing_rate, opening_rate}}
     const rateMap = {};
@@ -3928,6 +4119,7 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { fy, from: qFrom, to: qTo, page = 1, limit = 30 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -3937,7 +4129,7 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
       fyFrom = qFrom;
       fyTo   = qTo;
     } else if (fy) {
-      const resolved = await resolveFYDates(companyGuid, null, null, fy);
+      const resolved = await resolveFYDates(companyId, null, null, fy);
       fyFrom = resolved.from;
       fyTo   = resolved.to;
     }
@@ -3948,7 +4140,7 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
       WITH transfer_voucher_guids AS (
         SELECT st.voucher_guid
         FROM stock_transactions st
-        WHERE st.company_guid = $1
+        WHERE st.company_id=$1
           AND ($2::date IS NULL OR st.date::date >= $2::date)
           AND ($3::date IS NULL OR st.date::date <= $3::date)
         GROUP BY st.voucher_guid
@@ -3971,12 +4163,12 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
         FROM stock_transactions st_out
         JOIN stock_transactions st_in
           ON  st_out.voucher_guid = st_in.voucher_guid
-          AND st_out.company_guid = st_in.company_guid
+          AND st_out.company_id = st_in.company_id
           AND st_out.stock_guid   = st_in.stock_guid
           AND st_out.type         = 'outward'
           AND st_in.type          = 'inward'
         JOIN transfer_voucher_guids tvg ON tvg.voucher_guid = st_out.voucher_guid
-        WHERE st_out.company_guid = $1
+        WHERE st_out.company_id=$1
         ORDER BY st_out.voucher_guid, st_out.stock_guid, st_out.warehouse, st_in.warehouse
       ),
       grouped AS (
@@ -3997,20 +4189,20 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
           SUM(ti.value)  AS total_value,
           COALESCE(MAX(v.voucher_number), '') AS voucher_number
         FROM transfer_items ti
-        LEFT JOIN vouchers v ON v.guid = ti.voucher_guid AND v.company_guid = $1
+        LEFT JOIN vouchers v ON v.guid = ti.voucher_guid AND v.company_id=$1
         GROUP BY ti.voucher_guid
       )
       SELECT * FROM grouped
       ORDER BY date DESC
       LIMIT $4 OFFSET $5
-    `, [companyGuid, fyFrom, fyTo, parseInt(limit), offset]);
+    `, [companyId, fyFrom, fyTo, parseInt(limit), offset]);
 
     const { rows: countRow } = await query(`
       SELECT COUNT(*) AS total
       FROM (
         SELECT st.voucher_guid
         FROM stock_transactions st
-        WHERE st.company_guid = $1
+        WHERE st.company_id=$1
           AND ($2::date IS NULL OR st.date::date >= $2::date)
           AND ($3::date IS NULL OR st.date::date <= $3::date)
         GROUP BY st.voucher_guid
@@ -4018,7 +4210,7 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
           COUNT(CASE WHEN st.type = 'outward' THEN 1 END) > 0
           AND COUNT(CASE WHEN st.type = 'inward'  THEN 1 END) > 0
       ) t
-    `, [companyGuid, fyFrom, fyTo]);
+    `, [companyId, fyFrom, fyTo]);
 
     res.json({
       success: true,
@@ -4035,8 +4227,9 @@ router.get('/stocks/transfer-history', authMiddleware, async (req, res) => {
 router.get('/stocks/items/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT * FROM stocks WHERE company_guid=$1 AND guid=$2', [companyGuid, req.params.id]);
+    const { rows } = await query('SELECT * FROM stocks WHERE company_id=$1 AND guid=$2', [companyId, req.params.id]);
     if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
     res.json({ success: true, data: rows[0] });
   } catch (err) {
@@ -4051,34 +4244,35 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Load saved settings (may be null for new company)
     const { rows: [saved] } = await query(
-      `SELECT * FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
-      [companyGuid]
+      `SELECT * FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
     );
 
     // Tally-derived: all distinct UoMs
     const { rows: uomRows } = await query(
       `SELECT DISTINCT TRIM(unit) AS name FROM stocks
-       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
        ORDER BY TRIM(unit) ASC`,
-      [companyGuid]
+      [companyId]
     );
 
     // Tally-derived: most common unit (for default)
     const { rows: commonUnitRows } = await query(
       `SELECT TRIM(unit) AS name, COUNT(*) AS cnt FROM stocks
-       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
        GROUP BY TRIM(unit) ORDER BY cnt DESC LIMIT 1`,
-      [companyGuid]
+      [companyId]
     );
 
     // Tally-derived: warehouses (godowns)
     const { rows: warehouseRows } = await query(
       `SELECT guid, name, parent, address FROM warehouses
-       WHERE company_guid=$1 ORDER BY name`,
-      [companyGuid]
+       WHERE company_id=$1 ORDER BY name`,
+      [companyId]
     );
 
     const uoms = uomRows.map(r => r.name).filter(Boolean);
@@ -4090,8 +4284,8 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
          COUNT(*) FILTER (WHERE batch_enabled  = TRUE) AS batch_count,
          COUNT(*) FILTER (WHERE expiry_enabled = TRUE) AS expiry_count,
          COUNT(*) AS total
-       FROM stocks WHERE company_guid=$1`,
-      [companyGuid]
+       FROM stocks WHERE company_id=$1`,
+      [companyId]
     );
     const tallyBatchStats = {
       batch_enabled_count:  parseInt(tallyBatchRows[0]?.batch_count  || 0),
@@ -4163,11 +4357,12 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid || req.body.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const b = req.body;
     await query(`
       INSERT INTO company_inventory_settings (
-        company_guid, product_display_field, default_unit_for_new_items,
+        company_id, company_guid, product_display_field, default_unit_for_new_items,
         purchase_buffer_days, reorder_calc_mode, low_stock_threshold_mode,
         archive_old_stock_months, warehouse_code_map, cycle_count_frequency_map,
         archive_stock_layers_map, default_low_stock_level, inventory_aging_rules,
@@ -4176,8 +4371,8 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
         expiry_alerts, fast_slow_moving_alerts,
         batch_tracking_app_enabled, expiry_tracking_app_enabled, allow_negative_stock_app,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW())
-      ON CONFLICT (company_guid) DO UPDATE SET
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW())
+      ON CONFLICT (company_id) DO UPDATE SET
         product_display_field           = EXCLUDED.product_display_field,
         default_unit_for_new_items      = EXCLUDED.default_unit_for_new_items,
         purchase_buffer_days            = EXCLUDED.purchase_buffer_days,
@@ -4202,6 +4397,7 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
         allow_negative_stock_app        = EXCLUDED.allow_negative_stock_app,
         updated_at                      = NOW()
     `, [
+      companyId,
       companyGuid,
       b.product_display_field         || 'auto',
       b.default_unit_for_new_items    || null,
@@ -4238,12 +4434,13 @@ router.get('/stocks/units', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
       `SELECT DISTINCT unit as name FROM stocks
-       WHERE company_guid=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
        ORDER BY unit ASC`,
-      [companyGuid]
+      [companyId]
     );
     res.json({ success: true, data: rows.map(r => r.name.trim()).filter(Boolean) });
   } catch (err) {
@@ -4256,13 +4453,14 @@ router.get('/stocks/groups', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
       `SELECT DISTINCT TRIM(group_name) as name FROM stocks
-       WHERE company_guid=$1 AND group_name IS NOT NULL AND TRIM(group_name) != ''
+       WHERE company_id=$1 AND group_name IS NOT NULL AND TRIM(group_name) != ''
          AND LOWER(TRIM(group_name)) != 'primary'
        ORDER BY TRIM(group_name) ASC`,
-      [companyGuid]
+      [companyId]
     );
     res.json({ success: true, data: rows.map(r => r.name).filter(Boolean) });
   } catch (err) {
@@ -4273,24 +4471,25 @@ router.get('/stocks/groups', authMiddleware, async (req, res) => {
 router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
       `SELECT w.guid, w.name, w.parent, w.address,
         COALESCE(SUM(CASE WHEN st.type='inward' THEN st.qty ELSE -st.qty END), 0) as net_qty,
         COUNT(DISTINCT st.stock_guid) as skus
        FROM warehouses w
-       LEFT JOIN stock_transactions st ON st.warehouse = w.name AND st.company_guid = w.company_guid
+       LEFT JOIN stock_transactions st ON st.warehouse = w.name AND st.company_id = w.company_id
          AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse net qty
-       WHERE w.company_guid=$1
+       WHERE w.company_id=$1
        GROUP BY w.guid, w.name, w.parent, w.address
        ORDER BY w.name`,
-      [companyGuid]
+      [companyId]
     );
     // Merge TallyDekho-only warehouse settings (code, cycle freq, archive months)
     const { rows: settRows } = await query(
       `SELECT warehouse_code_map, cycle_count_frequency_map, archive_stock_layers_map
-       FROM company_inventory_settings WHERE company_guid=$1 LIMIT 1`,
-      [companyGuid]
+       FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
     );
     const codeMap    = settRows[0]?.warehouse_code_map          || {};
     const cycleMap   = settRows[0]?.cycle_count_frequency_map   || {};
@@ -4316,12 +4515,13 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
 router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { id } = req.params;
   try {
     // Warehouse info
     const { rows: wh } = await query(
-      'SELECT guid, name, parent, address FROM warehouses WHERE company_guid=$1 AND guid=$2 LIMIT 1',
-      [companyGuid, id]
+      'SELECT guid, name, parent, address FROM warehouses WHERE company_id=$1 AND guid=$2 LIMIT 1',
+      [companyId, id]
     );
     if (!wh[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Warehouse not found' } });
     const whName = wh[0].name;
@@ -4331,21 +4531,21 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
       `SELECT
         COALESCE(SUM(CASE WHEN type='inward' THEN qty ELSE -qty END), 0) as total_qty,
         COUNT(DISTINCT stock_guid) as skus
-       FROM stock_transactions WHERE company_guid=$1 AND warehouse=$2
+       FROM stock_transactions WHERE company_id=$1 AND warehouse=$2
          AND voucher_type != 'Physical Stock'`,
-      [companyGuid, whName]
+      [companyId, whName]
     );
 
     // Recent stock activity (last 500 transactions)
     const { rows: activity } = await query(
       `SELECT st.type, st.qty, st.warehouse, s.name as stock_name, v.guid as voucher_guid, v.voucher_number, v.date, v.voucher_type
        FROM stock_transactions st
-       LEFT JOIN stocks s ON s.name = st.stock_guid AND s.company_guid = st.company_guid
-       LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
-       WHERE st.company_guid=$1 AND st.warehouse=$2
+       LEFT JOIN stocks s ON s.name = st.stock_guid AND s.company_id = st.company_id
+       LEFT JOIN vouchers v ON v.guid = st.voucher_guid AND v.company_id = st.company_id
+       WHERE st.company_id=$1 AND st.warehouse=$2
          AND st.voucher_type != 'Physical Stock'
        ORDER BY v.date DESC, st.id DESC LIMIT 500`,
-      [companyGuid, whName]
+      [companyId, whName]
     );
 
     res.json({
@@ -4378,12 +4578,13 @@ router.get('/reports/financial', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Use from/to params sent by the frontend (selected FY dates)
     // Fall back to most recent 12 months if no range provided
     const fromDate = req.query.from || null;
     const toDate   = req.query.to   || null;
-    const params   = [companyGuid];
+    const params   = [companyId];
     let dateClause = '';
     if (fromDate && toDate) {
       params.push(fromDate, toDate);
@@ -4397,7 +4598,7 @@ router.get('/reports/financial', authMiddleware, async (req, res) => {
         SUM(CASE WHEN voucher_type ILIKE '%Sales%' OR voucher_type ILIKE '%Sale%' THEN amount ELSE 0 END) as revenue,
         SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as expenses
       FROM vouchers
-      WHERE company_guid=$1 AND is_cancelled=FALSE
+      WHERE company_id=$1 AND is_cancelled=FALSE
         AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
         ${dateClause}
       GROUP BY TO_CHAR(date::date,'Mon'), TO_CHAR(date::date,'Mon YY'),
@@ -4421,8 +4622,9 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyPrefix = fyLikePrefix(financialYear);
 
     // Ledger balance = FY anchor (opening at FY start) + SUM(movements within date range)
@@ -4437,17 +4639,17 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         + COALESCE((
             SELECT SUM(vle.amount)
             FROM voucher_ledger_entries vle
-            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-            WHERE vle.ledger_name = l.name AND vle.company_guid = l.company_guid
+            JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+            WHERE vle.ledger_name = l.name AND vle.company_id = l.company_id
               AND v.date >= $3 AND v.date <= $4
               AND (v.is_cancelled IS NULL OR v.is_cancelled = FALSE)
               AND v.voucher_type NOT ILIKE '%Order%'  -- exclude Sales Orders / Purchase Orders (non-P&L)
           ), 0) as fy_signed
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 2, 5)}
-      WHERE l.company_guid = $1
-    `, [companyGuid, financialYear, fyFrom, fyTo, fyPrefix]);
+        ON lfb.company_id = l.company_id AND lfb.ledger_name = l.name AND ${sqlLfbJoin('lfb', 2, 5)}
+      WHERE l.company_id=$1
+    `, [companyId, financialYear, fyFrom, fyTo, fyPrefix]);
 
     const toAmount = (l) => Math.abs(parseFloat(l.fy_signed || 0));
     const isDr = (l) => parseFloat(l.fy_signed || 0) < 0;
@@ -4552,8 +4754,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         ABS(COALESCE(SUM(opening_value::float), 0)) AS opening_stock,
         ABS(COALESCE(SUM(closing_value::float), 0)) AS closing_stock
       FROM stock_fy_valuation
-      WHERE company_guid = $1 AND financial_year = $2
-    `, [companyGuid, financialYear]);
+      WHERE company_id=$1 AND financial_year = $2
+    `, [companyId, financialYear]);
     const hasFyValData = (parseFloat(fyValRows[0]?.opening_stock || 0) > 0 || parseFloat(fyValRows[0]?.closing_stock || 0) > 0);
 
     let openingStock = 0;
@@ -4573,8 +4775,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
         const { rows: prevRows } = await query(`
           SELECT ABS(COALESCE(SUM(closing_value::float), 0)) AS prev_closing
           FROM stock_fy_valuation
-          WHERE company_guid=$1 AND financial_year=$2
-        `, [companyGuid, prevFY]);
+          WHERE company_id=$1 AND financial_year=$2
+        `, [companyId, prevFY]);
         const prevClosing = parseFloat(prevRows[0]?.prev_closing || 0);
         if (prevClosing > 0) rawOpening = prevClosing;
       }
@@ -4607,7 +4809,7 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     ]);
     // Build group parent map from DB
     const { rows: groupRows } = await query(
-      `SELECT name, parent FROM groups WHERE company_guid=$1`, [companyGuid]
+      `SELECT name, parent FROM groups WHERE company_id=$1`, [companyId]
     );
     const grpParentMap = {}; // name → parent
     for (const g of groupRows) grpParentMap[g.name] = g.parent || null;
@@ -4657,9 +4859,9 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
              COALESCE(lfb.balance_type, l.balance_type, 'Dr') as ob_type
       FROM ledgers l
       LEFT JOIN ledger_fy_balances lfb
-        ON lfb.company_guid = l.company_guid AND lfb.ledger_name = l.name AND lfb.financial_year = $2
-      WHERE l.company_guid = $1
-    `, [companyGuid, financialYear]);
+        ON lfb.company_id = l.company_id AND lfb.ledger_name = l.name AND lfb.financial_year = $2
+      WHERE l.company_id=$1
+    `, [companyId, financialYear]);
     for (const row of openingRows) {
       const topGrp = topBSGroup(row.parent);
       if (!topGrp) continue;
@@ -4748,8 +4950,8 @@ router.get('/reports/pl-bs', authMiddleware, async (req, res) => {
     const { rows: stockValRows } = await query(
       `SELECT ABS(COALESCE(SUM(closing_value), 0)) as closing_stock
        FROM stock_fy_valuation
-       WHERE company_guid=$1 AND financial_year=$2`,
-      [companyGuid, financialYear]
+       WHERE company_id=$1 AND financial_year=$2`,
+      [companyId, financialYear]
     );
     const stockClosingValue = parseFloat(stockValRows[0]?.closing_stock || 0);
     if (stockClosingValue > 0.01) {
@@ -4829,23 +5031,24 @@ router.get('/reports/gst', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const dateFilter = from && to ? ' AND v.date BETWEEN $2 AND $3' : '';
-    const baseParams = from && to ? [companyGuid, from, to] : [companyGuid];
+    const baseParams = from && to ? [companyId, from, to] : [companyId];
 
     const [salesRes, purchaseRes, monthsRes] = await Promise.all([
       query(`SELECT COALESCE(SUM(ABS(g.cgst_amount + g.sgst_amount + g.igst_amount)),0) as tax,
                     COALESCE(SUM(g.taxable_amount),0) as taxable
-             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_guid=v.company_guid
-             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Sales'${dateFilter}`, baseParams),
+             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_id=v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Sales'${dateFilter}`, baseParams),
       query(`SELECT COALESCE(SUM(ABS(g.cgst_amount + g.sgst_amount + g.igst_amount)),0) as tax,
                     COALESCE(SUM(g.taxable_amount),0) as taxable
-             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_guid=v.company_guid
-             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Purchase'${dateFilter}`, baseParams),
+             FROM vouchers v JOIN gst_voucher_details g ON g.voucher_guid=v.guid AND g.company_id=v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type_parent='Purchase'${dateFilter}`, baseParams),
       // Use voucher_type ILIKE '%Sales%' (not strict parent='Sales') — covers Tally types classified as 'Voucher' parent
       query(`SELECT COUNT(DISTINCT TO_CHAR(date::date, 'YYYY-MM')) as filed_months
-             FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE
+             FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE
              AND voucher_type ILIKE '%Sales%'
              AND voucher_type NOT ILIKE '%Order%'
              AND voucher_type NOT ILIKE '%Purchase%'
@@ -4886,17 +5089,17 @@ async function persistReadNotificationIds(userId, ids) {
   );
 }
 
-async function buildDerivedNotifications(companyGuid) {
+async function buildDerivedNotifications(companyId) {
   const raw = [];
-  if (!companyGuid) return raw;
+  if (!companyId) return raw;
 
   const now = new Date();
   const weekAgo = new Date(now);
   weekAgo.setDate(weekAgo.getDate() - 7);
 
   const { rows: lowStock } = await query(
-    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_guid=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3',
-    [companyGuid]
+    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_id=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3',
+    [companyId]
   );
   lowStock.forEach((s, i) => {
     const createdAt = new Date(now.getTime() - i * 3600000);
@@ -4905,9 +5108,9 @@ async function buildDerivedNotifications(companyGuid) {
 
   const { rows: overdue } = await query(
     `SELECT name, ABS(closing_balance) as bal FROM ledgers
-     WHERE company_guid=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000
+     WHERE company_id=$1 AND parent ILIKE '%Sundry Debtor%' AND closing_balance > 50000
      ORDER BY closing_balance DESC LIMIT 3`,
-    [companyGuid]
+    [companyId]
   );
   overdue.forEach((l, i) => {
     const createdAt = new Date(now.getTime() - (i + 1) * 7200000);
@@ -4919,13 +5122,13 @@ async function buildDerivedNotifications(companyGuid) {
 
   const { rows: pendingEwb } = await query(
     `SELECT COUNT(*)::int AS c FROM vouchers
-     WHERE company_guid=$1 AND is_cancelled=FALSE
+     WHERE company_id=$1 AND is_cancelled=FALSE
        AND voucher_type ILIKE '%Sales%'
        AND voucher_type NOT ILIKE '%Order%'
        AND amount >= 50000
        AND (ewb_number IS NULL OR ewb_number='')
        AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`,
-    [companyGuid, fyStart, fyEnd]
+    [companyId, fyStart, fyEnd]
   ).catch(() => ({ rows: [{ c: 0 }] }));
 
   const ewbCount = pendingEwb[0]?.c || 0;
@@ -4943,13 +5146,13 @@ async function buildDerivedNotifications(companyGuid) {
 
   const { rows: pendingIrn } = await query(
     `SELECT COUNT(*)::int AS c FROM vouchers
-     WHERE company_guid=$1 AND is_cancelled=FALSE
+     WHERE company_id=$1 AND is_cancelled=FALSE
        AND voucher_type ILIKE '%Sales%'
        AND amount >= 0
        AND (irn IS NULL OR irn = '')
        AND (irn_cancelled IS NULL OR irn_cancelled = FALSE)
        AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`,
-    [companyGuid, fyStart, fyEnd]
+    [companyId, fyStart, fyEnd]
   ).catch(() => ({ rows: [{ c: 0 }] }));
 
   const irnCount = pendingIrn[0]?.c || 0;
@@ -4966,12 +5169,12 @@ async function buildDerivedNotifications(companyGuid) {
 
   const { rows: recentSales } = await query(
     `SELECT voucher_number, party_name, amount, date FROM vouchers
-     WHERE company_guid=$1 AND is_cancelled=FALSE
+     WHERE company_id=$1 AND is_cancelled=FALSE
        AND voucher_type ILIKE '%Sales%'
        AND voucher_type NOT ILIKE '%Order%'
        AND date >= CURRENT_DATE - INTERVAL '3 days'
      ORDER BY date DESC LIMIT 2`,
-    [companyGuid]
+    [companyId]
   ).catch(() => ({ rows: [] }));
 
   recentSales.forEach((v, i) => {
@@ -4992,9 +5195,10 @@ async function buildDerivedNotifications(companyGuid) {
 router.get('/notifications', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const readIds = await getReadNotificationIds(req.user.userId);
-    const raw = await buildDerivedNotifications(companyGuid);
+    const raw = await buildDerivedNotifications(companyId);
     const data = raw.map(n => enrichNotification(n, readIds));
     res.json({ success: true, data });
   } catch (err) {
@@ -5019,9 +5223,10 @@ router.patch('/notifications/:id/read', authMiddleware, async (req, res) => {
 router.patch('/notifications/read-all', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.body?.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const readIds = await getReadNotificationIds(req.user.userId);
-    const raw = await buildDerivedNotifications(companyGuid);
+    const raw = await buildDerivedNotifications(companyId);
     raw.forEach(n => readIds.add(n.id));
     await persistReadNotificationIds(req.user.userId, readIds);
     res.json({ success: true, data: { read: true, count: readIds.size } });
@@ -5037,10 +5242,11 @@ router.patch('/notifications/read-all', authMiddleware, async (req, res) => {
 router.get('/parties', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { search = '', type } = req.query;
   try {
-    let q = `SELECT guid, name, gstin, gst_registration_type, parent, address, state_name, pincode FROM ledgers WHERE company_guid=$1 AND (name ILIKE $2 OR alias ILIKE $2)`;
-    const params = [companyGuid, `%${search}%`];
+    let q = `SELECT guid, name, gstin, gst_registration_type, parent, address, state_name, pincode FROM ledgers WHERE company_id=$1 AND (name ILIKE $2 OR alias ILIKE $2)`;
+    const params = [companyId, `%${search}%`];
     let idx = 3;
     if (type === 'customer') { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Debtor%'); }
     if (type === 'vendor')   { q += ` AND parent ILIKE $${idx++}`; params.push('%Sundry Creditor%'); }
@@ -5075,8 +5281,9 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!ledger)      return res.status(400).json({ success: false, error: { code: 'MISSING_LEDGER',  message: 'ledger required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const params = [companyGuid, ledger];
+    const params = [companyId, ledger];
     let sideFilter = '';
     if (drOnly) {
       // Receivables for Receipt: Dr type, or negative pending (legacy rows without bill_type)
@@ -5088,7 +5295,7 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
     const { rows } = await query(
       `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
          FROM bill_outstanding
-        WHERE company_guid=$1 AND ledger_name=$2 AND ABS(COALESCE(pending_amount,0)) > 0.005
+        WHERE company_id=$1 AND ledger_name=$2 AND ABS(COALESCE(pending_amount,0)) > 0.005
         ${sideFilter}
         ORDER BY bill_date ASC NULLS LAST, id ASC
         LIMIT 500`,
@@ -5131,9 +5338,10 @@ router.get('/kpi/cash-in-hand', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const data = await buildCashInHandPayload(companyGuid, { from, to });
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const data = await buildCashInHandPayload(companyId, { from, to });
     res.json({ success: true, data });
   } catch (err) {
     console.error('[kpi/cash-in-hand]', err);
@@ -5149,6 +5357,7 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const type = req.query.type || 'all'; // changed default to 'all' so payment forms get both
   try {
     let whereExtra = '';
@@ -5184,18 +5393,18 @@ router.get('/bank-ledgers', authMiddleware, async (req, res) => {
               (
                 SELECT UPPER(COALESCE(am.payload->>'accountType', am.payload->>'account_type', ''))
                 FROM app_masters am
-                WHERE am.company_guid = l.company_guid
+                WHERE am.company_id = l.company_id
                   AND am.master_type = 'bank'
                   AND LOWER(am.master_name) = LOWER(l.name)
                 ORDER BY am.updated_at DESC NULLS LAST
                 LIMIT 1
               ) AS app_account_type
        FROM ledgers l
-       WHERE l.company_guid=$1 ${whereExtra}
+       WHERE l.company_id=$1 ${whereExtra}
        ORDER BY
          CASE WHEN l.parent ILIKE '%Cash%' OR l.name ILIKE 'Cash' THEN 0 ELSE 1 END,
          ABS(l.closing_balance) DESC`,
-      [companyGuid]
+      [companyId]
     );
     const normalizeType = (v) => {
       const t = String(v || '').trim().toUpperCase();
@@ -5230,9 +5439,10 @@ router.get('/kpi/bank-balance', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const data = await buildBankBalancePayload(companyGuid, { from, to });
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const data = await buildBankBalancePayload(companyId, { from, to });
     res.json({ success: true, data });
   } catch (err) {
     console.error('[kpi/bank-balance]', err);
@@ -5244,8 +5454,9 @@ router.get('/kpi/receivables', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const data = await buildArApPayload(companyGuid, 'AR', {
+    const data = await buildArApPayload(companyId, 'AR', {
       from: req.query.from,
       to: req.query.to,
       overdue: req.query.overdue,
@@ -5259,8 +5470,9 @@ router.get('/kpi/payables', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const data = await buildArApPayload(companyGuid, 'AP', {
+    const data = await buildArApPayload(companyId, 'AP', {
       from: req.query.from,
       to: req.query.to,
       overdue: req.query.overdue,
@@ -5274,9 +5486,10 @@ router.get('/kpi/payments', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const data = await buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Payment' });
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const data = await buildPaymentReceiptPayload(companyId, { from, to, kind: 'Payment' });
     res.json({ success: true, data });
   } catch (err) {
     console.error('[kpi/payments]', err);
@@ -5288,9 +5501,10 @@ router.get('/kpi/receipts', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const data = await buildPaymentReceiptPayload(companyGuid, { from, to, kind: 'Receipt' });
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const data = await buildPaymentReceiptPayload(companyId, { from, to, kind: 'Receipt' });
     res.json({ success: true, data });
   } catch (err) {
     console.error('[kpi/receipts]', err);
@@ -5302,8 +5516,9 @@ router.get('/kpi/loans-ods', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const data = await buildLoansOdsPayload(companyGuid);
+    const data = await buildLoansOdsPayload(companyId);
     // Flat compat list (loans + ODs) lives on `all` — enriched arrays stay on loans/overdrafts
     const compatLoans = [
       ...(data.loans || []).map((l) => ({
@@ -5345,30 +5560,31 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const [integRow, generatedRow, pendingRow, expiringRow, errorRow, transportRow, dailyRow] = await Promise.all([
       // Integration status
-      query(`SELECT status FROM integrations WHERE company_guid=$1 AND type='ewb' LIMIT 1`, [companyGuid])
+      query(`SELECT status FROM integrations WHERE company_id=$1 AND type='ewb' LIMIT 1`, [companyId])
         .catch(() => ({ rows: [] })),
       // Generated: vouchers with ewb_number from Tally
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Pending: Sales >= 50K without EWB
       // EWB applicable from Apr 2018 only
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Expiring within 24h
-      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_guid=$1 AND valid_till BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`, [companyGuid])
+      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_id=$1 AND valid_till BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`, [companyId])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Errors
-      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_guid=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyGuid])
+      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_id=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyId])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Transport mode breakdown
-      query(`SELECT COALESCE(sub_supply_type, 'Road') as mode, COUNT(*) as cnt FROM e_way_bill_details WHERE company_guid=$1 GROUP BY sub_supply_type`, [companyGuid])
+      query(`SELECT COALESCE(sub_supply_type, 'Road') as mode, COUNT(*) as cnt FROM e_way_bill_details WHERE company_id=$1 GROUP BY sub_supply_type`, [companyId])
         .catch(() => ({ rows: [] })),
       // Daily counts for bar chart (last 30 days within FY)
-      query(`SELECT date as day, COUNT(*) as cnt FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3 GROUP BY date ORDER BY date`, [companyGuid, from, to])
+      query(`SELECT date as day, COUNT(*) as cnt FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3 GROUP BY date ORDER BY date`, [companyId, from, to])
         .catch(() => ({ rows: [] })),
     ]);
     const dailyMap = new Map(dailyRow.rows.map(r => [r.day, parseInt(r.cnt)]));
@@ -5400,13 +5616,14 @@ router.get('/ewaybills/pending', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const { search = '', page = 1, limit = 100 } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
     const { rows } = await query(
       // EWB applicable from Apr 2018 only — earlier invoices never need EWB
-    `SELECT * FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE
+    `SELECT * FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE
          AND voucher_type ILIKE '%Sales%'
          AND voucher_type NOT ILIKE '%Order%'
          AND voucher_type NOT ILIKE '%Delivery%'
@@ -5417,11 +5634,11 @@ router.get('/ewaybills/pending', authMiddleware, async (req, res) => {
          AND date >= '2018-04-01'
          AND (party_name ILIKE $4 OR voucher_number ILIKE $4)
        ORDER BY date DESC LIMIT $5 OFFSET $6`,
-      [companyGuid, from, to, `%${search}%`, parseInt(limit), offset]
+      [companyId, from, to, `%${search}%`, parseInt(limit), offset]
     );
     const { rows: cnt } = await query(
-      `SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`,
-      [companyGuid, from, to]
+      `SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`,
+      [companyId, from, to]
     );
     res.json({ success: true, data: rows.map(r => ({ ...r, ewb_status: 'pending' })), meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
@@ -5431,10 +5648,11 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Check if company has GSTIN (India-specific)
     const { rows: userRows } = await query('SELECT country FROM users WHERE id=$1', [req.user.userId]);
-    const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE id=$1', [companyId]);
     const isIndia = (userRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.gstin)
       || (coRows[0]?.country || '').toLowerCase().includes('india')
@@ -5454,18 +5672,18 @@ router.get('/ewaybills', authMiddleware, async (req, res) => {
                     d.distance_km, d.supply_type, d.sub_supply_type
                FROM vouchers v
                LEFT JOIN e_way_bill_details d
-                 ON d.voucher_guid = v.guid AND d.company_guid = v.company_guid
-              WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+                 ON d.voucher_guid = v.guid AND d.company_id = v.company_id
+              WHERE v.company_id=$1 AND v.is_cancelled=FALSE
                 AND v.ewb_number IS NOT NULL AND v.ewb_number != ''
                 AND (v.party_name ILIKE $2 OR v.voucher_number ILIKE $2)`;
-    const params = [companyGuid, `%${search}%`];
+    const params = [companyId, `%${search}%`];
     let idx = 3;
     if (from) { q += ` AND v.date >= $${idx++}`; params.push(from); }
     if (to)   { q += ` AND v.date <= $${idx++}`; params.push(to); }
     q += ` ORDER BY v.date DESC LIMIT $${idx++} OFFSET $${idx}`;
     params.push(parseInt(limit), offset);
     const { rows } = await query(q, params);
-    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != ''`, [companyGuid]);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != ''`, [companyId]);
     res.json({
       success: true, country_applicable: true,
       data: rows.map(r => ({ ...r, ewb_status: 'generated' })),
@@ -5479,17 +5697,18 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
   const companyGuid = req.body.companyGuid || req.user?.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { voucherGuid, dispatchDetails, force = false } = req.body;
   if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER', message: 'voucherGuid required' } });
 
   try {
     // 1. Load voucher
-    const { rows: vRows } = await query(`SELECT * FROM vouchers WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    const { rows: vRows } = await query(`SELECT * FROM vouchers WHERE guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND' } });
     const voucher = vRows[0];
 
     // 2. Check compliance config
-    const { rows: cfgRows } = await query(`SELECT * FROM company_compliance_config WHERE company_guid=$1`, [companyGuid]);
+    const { rows: cfgRows } = await query(`SELECT * FROM company_compliance_config WHERE company_id=$1`, [companyId]);
     const cfg = cfgRows[0];
     if (!cfg || cfg.e_way_bill_applicable !== 'applicable_configured') {
       return res.status(400).json({ success: false, locked: true, error: { code: 'NOT_CONFIGURED', message: 'E-Way Bill not configured. Go to Settings → Voucher Config.' } });
@@ -5511,13 +5730,13 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     }
 
     // 6. Check existing EWB
-    const { rows: existingEWB } = await query(`SELECT ewb_no FROM e_way_bill_details WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]).catch(() => ({ rows: [] }));
+    const { rows: existingEWB } = await query(`SELECT ewb_no FROM e_way_bill_details WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]).catch(() => ({ rows: [] }));
     if (existingEWB[0]?.ewb_no && !force) {
       return res.status(400).json({ success: false, error: { code: 'EWB_EXISTS', message: 'E-Way Bill already generated', ewbNo: existingEWB[0].ewb_no } });
     }
 
     // 7. Company GSTIN
-    const { rows: coRows } = await query(`SELECT gstin, name, address, state, pincode, state_code FROM companies WHERE guid=$1`, [companyGuid]);
+    const { rows: coRows } = await query(`SELECT gstin, name, address, state, pincode, state_code FROM companies WHERE id=$1`, [companyId]);
     if (!coRows[0]?.gstin) {
       return res.status(400).json({ success: false, locked: true, error: { code: 'NO_GSTIN', message: 'Company GSTIN not set. Add in Settings → Company Profile.' } });
     }
@@ -5525,7 +5744,7 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     // 8. Dispatch details (from request or from app_vouchers payload)
     let details = dispatchDetails;
     if (!details) {
-      const { rows: avRows } = await query(`SELECT payload FROM app_vouchers WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => ({ rows: [] }));
+      const { rows: avRows } = await query(`SELECT payload FROM app_vouchers WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => ({ rows: [] }));
       details = avRows[0]?.payload?.dispatch_details;
     }
     if (!details?.dispatch_from || !details?.ship_to) {
@@ -5537,13 +5756,13 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     const ewbCreds = userRows[0]?.integration_settings?.ewaybill || userRows[0]?.integration_settings?.ewb || {};
 
     // Mark as generating
-    await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => {});
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     // Call EWB generator
     const ewbResult = await generateEWB(companyGuid, voucher, coRows[0], ewbCreds, details).catch(e => ({ _error: e.message }));
 
     if (ewbResult._error) {
-      await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$2 AND tally_voucher_no=$3`, [ewbResult._error, companyGuid, voucher.voucher_number]).catch(() => {});
+      await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no=$3`, [ewbResult._error, companyId, voucher.voucher_number]).catch(() => {});
       return res.status(500).json({ success: false, error: { code: 'EWB_FAILED', message: ewbResult._error } });
     }
 
@@ -5553,9 +5772,9 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
       `INSERT INTO e_way_bill_details (voucher_guid, company_guid, ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET ewb_no=$3, ewb_date=$4, valid_till=$5`,
-      [voucherGuid, companyGuid, ewbNo, ewbDate, validUpto, details.transporter_id || null, details.vehicle_number || null, 'Road']
+      [voucherGuid, companyId, ewbNo, ewbDate, validUpto, details.transporter_id || null, details.vehicle_number || null, 'Road']
     ).catch(() => {});
-    await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`, [companyGuid, voucher.voucher_number]).catch(() => {});
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     res.json({ success: true, data: { ewbNo, ewbDate, validUpto } });
   } catch (err) {
@@ -5568,14 +5787,15 @@ router.post('/ewaybills/cancel', authMiddleware, async (req, res) => {
   const companyGuid = req.body.companyGuid || req.user?.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { voucherGuid, cancelReason = 1 } = req.body;
   if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER' } });
   try {
-    await query(`UPDATE e_way_bill_details SET status='cancelled' WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]).catch(() => {});
+    await query(`UPDATE e_way_bill_details SET status='cancelled' WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]).catch(() => {});
     await query(
       `UPDATE app_vouchers SET e_way_bill_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-       WHERE company_guid=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_guid=$1)`,
-      [companyGuid, voucherGuid]
+       WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
+      [companyId, voucherGuid]
     ).catch(() => {});
     res.json({ success: true, message: 'E-Way Bill cancelled' });
   } catch (err) {
@@ -5592,17 +5812,18 @@ router.get('/einvoice/status', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const [generatedRow, pendingRow, cancelledRow, errorRow] = await Promise.all([
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // IRN applicable from Oct 2020 only
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
-      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE AND irn_cancelled=TRUE AND date BETWEEN $2 AND $3`, [companyGuid, from, to])
+      query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND irn_cancelled=TRUE AND date BETWEEN $2 AND $3`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
-      query(`SELECT COUNT(*) as c FROM e_invoice_details WHERE company_guid=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyGuid])
+      query(`SELECT COUNT(*) as c FROM e_invoice_details WHERE company_id=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyId])
         .catch(() => ({ rows: [{ c: 0 }] })),
     ]);
     res.json({
@@ -5621,17 +5842,18 @@ router.get('/einvoice/pending', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows: userRows } = await query('SELECT country FROM users WHERE id=$1', [req.user.userId]);
-    const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: coRows } = await query('SELECT gstin, state, country FROM companies WHERE id=$1', [companyId]);
     const isIndia = (userRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.gstin)
       || (coRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.state);
     if (!isIndia) return res.json({ success: true, data: [], meta: { country_applicable: false, message: 'E-Invoice (IRN) is applicable only for India (GST-registered companies)' } });
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     // IRN applicable from Oct 2020 only — earlier invoices never need IRN
-    const { rows } = await query(`SELECT * FROM vouchers WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01' ORDER BY date DESC LIMIT 100`, [companyGuid, from, to]);
+    const { rows } = await query(`SELECT * FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01' ORDER BY date DESC LIMIT 100`, [companyId, from, to]);
     res.json({ success: true, country_applicable: true, data: rows, meta: { total: rows.length, pending_irn: rows.length } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
@@ -5640,8 +5862,9 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const { page = 1, limit = 50, search = '' } = req.query;
     const offset = (parseInt(page)-1)*parseInt(limit);
     // Ack No / Ack date / QR live in e_invoice_details and are what the IRP
@@ -5652,15 +5875,15 @@ router.get('/einvoice/generated', authMiddleware, async (req, res) => {
               d.status AS einvoice_status
          FROM vouchers v
          LEFT JOIN e_invoice_details d
-           ON d.voucher_guid = v.guid AND d.company_guid = v.company_guid
-        WHERE v.company_guid=$1 AND v.irn IS NOT NULL AND v.irn != ''
+           ON d.voucher_guid = v.guid AND d.company_id = v.company_id
+        WHERE v.company_id=$1 AND v.irn IS NOT NULL AND v.irn != ''
           AND v.irn_cancelled=FALSE AND v.is_cancelled=FALSE
           AND v.date BETWEEN $2 AND $3
           AND (v.party_name ILIKE $4 OR v.voucher_number ILIKE $4)
         ORDER BY v.date DESC LIMIT $5 OFFSET $6`,
-      [companyGuid, from, to, `%${search}%`, parseInt(limit), offset]
+      [companyId, from, to, `%${search}%`, parseInt(limit), offset]
     );
-    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyGuid, from, to]);
+    const { rows: cnt } = await query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyId, from, to]);
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
@@ -5671,21 +5894,22 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
+  const companyId = requireResolvedCompanyId(req);
   const { voucherGuid, voucherNumber, force = false } = req.body;
   if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER', message: 'voucherGuid required' } });
 
   try {
     // -- 1. Prerequisite checks -----------------------------------------------
     const { rows: vRows } = await query(
-      `SELECT * FROM vouchers WHERE guid = $1 AND company_guid = $2`,
-      [voucherGuid, companyGuid]
+      `SELECT * FROM vouchers WHERE guid = $1 AND company_id=$2`,
+      [voucherGuid, companyId]
     );
     if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
     const voucher = vRows[0];
 
     // Check compliance config
     const { rows: cfgRows } = await query(
-      `SELECT * FROM company_compliance_config WHERE company_guid = $1`, [companyGuid]
+      `SELECT * FROM company_compliance_config WHERE company_id=$1`, [companyId]
     );
     const cfg = cfgRows[0];
     if (!cfg || cfg.e_invoice_applicable !== 'applicable_configured') {
@@ -5708,7 +5932,7 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
     }
 
     // Check company GSTIN
-    const { rows: coRows } = await query(`SELECT gstin, name FROM companies WHERE guid = $1`, [companyGuid]);
+    const { rows: coRows } = await query(`SELECT gstin, name FROM companies WHERE id = $1`, [companyId]);
     const company = coRows[0];
     if (!company?.gstin) {
       return res.status(400).json({ success: false, locked: true, error: { code: 'NO_GSTIN', message: 'Company GSTIN not configured. Add GSTIN in Settings > Company Profile.' } });
@@ -5723,8 +5947,8 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
 
     // -- 2. Mark as generating ------------------------------------------------
     await query(
-      `UPDATE app_vouchers SET e_invoice_status = 'generating', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $1 AND tally_voucher_no = $2`,
-      [companyGuid, voucher.voucher_number]
+      `UPDATE app_vouchers SET e_invoice_status = 'generating', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no = $2`,
+      [companyId, voucher.voucher_number]
     ).catch(() => {});
 
     // -- 3. IRP API call (wire real GSP/NIC API in irnGenerator.js) -----------
@@ -5736,11 +5960,11 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
         `INSERT INTO e_invoice_details (voucher_guid, company_guid, status, error_message, synced_at)
          VALUES ($1, $2, 'failed', $3, NOW())
          ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET status='failed', error_message=$3, synced_at=NOW()`,
-        [voucherGuid, companyGuid, irnResult.error]
+        [voucherGuid, companyId, irnResult.error]
       );
       await query(
-        `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $2 AND tally_voucher_no = $3`,
-        [irnResult.error, companyGuid, voucher.voucher_number]
+        `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no = $3`,
+        [irnResult.error, companyId, voucher.voucher_number]
       ).catch(() => {});
       return res.status(500).json({ success: false, error: { code: 'IRN_FAILED', message: irnResult.error } });
     }
@@ -5752,17 +5976,17 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,'generated',NOW())
        ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
          irn=$3, ack_no=$4, ack_date=$5, signed_invoice=$6, qr_code=$7, status='generated', synced_at=NOW()`,
-      [voucherGuid, companyGuid, irn, ackNo, ackDate, signedInvoice, qrCode]
+      [voucherGuid, companyId, irn, ackNo, ackDate, signedInvoice, qrCode]
     );
     // Update vouchers table
     await query(
-      `UPDATE vouchers SET irn=$1, irn_date=$2 WHERE guid=$3 AND company_guid=$4`,
-      [irn, ackDate, voucherGuid, companyGuid]
+      `UPDATE vouchers SET irn=$1, irn_date=$2 WHERE guid=$3 AND company_id=$4`,
+      [irn, ackDate, voucherGuid, companyId]
     );
     // Update app_vouchers
     await query(
-      `UPDATE app_vouchers SET e_invoice_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=$2`,
-      [companyGuid, voucher.voucher_number]
+      `UPDATE app_vouchers SET e_invoice_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`,
+      [companyId, voucher.voucher_number]
     ).catch(() => {});
 
     res.json({ success: true, data: { irn, ackNo, ackDate, qrCode } });
@@ -5776,17 +6000,18 @@ router.post('/einvoice/cancel', authMiddleware, async (req, res) => {
   const companyGuid = req.body.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { voucherGuid, cancelReason = 1, cancelRemarks = '' } = req.body;
   if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER' } });
   try {
-    const { rows } = await query(`SELECT irn FROM vouchers WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    const { rows } = await query(`SELECT irn FROM vouchers WHERE guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     if (!rows[0]?.irn) return res.status(404).json({ success: false, error: { code: 'NO_IRN', message: 'No IRN found for this voucher' } });
     // Placeholder: call IRP cancel API in production
-    await query(`UPDATE vouchers SET irn_cancelled=TRUE WHERE guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
-    await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_guid=$2`, [voucherGuid, companyGuid]);
+    await query(`UPDATE vouchers SET irn_cancelled=TRUE WHERE guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
+    await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     await query(
-      `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2)`,
-      [companyGuid, voucherGuid]
+      `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2)`,
+      [companyId, voucherGuid]
     ).catch(() => {});
     res.json({ success: true, message: 'IRN cancelled successfully' });
   } catch (err) {
@@ -5803,10 +6028,11 @@ router.get('/reports/gst-summary', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user?.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
 
-    const baseParams = [companyGuid];
+    const baseParams = [companyId];
     let dateWhere = ''; let dIdx = 2;
     if (fyFrom) { dateWhere += ` AND v.date >= $${dIdx++}`; baseParams.push(fyFrom); }
     if (fyTo)   { dateWhere += ` AND v.date <= $${dIdx++}`; baseParams.push(fyTo); }
@@ -5821,8 +6047,8 @@ router.get('/reports/gst-summary', authMiddleware, async (req, res) => {
                COALESCE(SUM(g.igst_amount),0) as igst,
                COALESCE(SUM(g.taxable_amount),0) as taxable
              FROM vouchers v
-             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled = FALSE
              AND v.voucher_type != ALL(${NON_SALES_LIT})${dateWhere}`, baseParams),
       // ITC = sum of (cgst+sgst+igst) on inward purchases
       query(`SELECT
@@ -5831,14 +6057,14 @@ router.get('/reports/gst-summary', authMiddleware, async (req, res) => {
                COALESCE(SUM(g.igst_amount),0) as igst,
                COALESCE(SUM(g.taxable_amount),0) as taxable
              FROM vouchers v
-             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled = FALSE
              AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
       // Unmatched = GSTR-2A eligible purchases (from registered suppliers) without IRN
       query(`SELECT COUNT(*) as cnt
              FROM vouchers v
-             INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
-             WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+             INNER JOIN ledgers l ON l.name = v.party_name AND l.company_id = v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled = FALSE
              AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])
              AND l.gstin IS NOT NULL AND l.gstin != ''
              AND (v.irn IS NULL OR v.irn = '')${dateWhere}`, baseParams),
@@ -5864,11 +6090,12 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { from, to, type = 'GSTR-1', fy } = req.query;
   try {
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to, fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, from, to, fy);
     const { rows: userRows } = await query('SELECT country FROM users WHERE id=$1', [req.user.userId]);
-    const { rows: coRows } = await query('SELECT gstin, state, country, gst_taxpayer_type FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: coRows } = await query('SELECT gstin, state, country, gst_taxpayer_type FROM companies WHERE id=$1', [companyId]);
     const isIndia = (userRows[0]?.country || '').toLowerCase().includes('india')
       || !!(coRows[0]?.gstin)
       || (coRows[0]?.country || '').toLowerCase().includes('india')
@@ -5968,12 +6195,12 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                          ), ''
                        ) as gst_ledger_names
                FROM vouchers v
-               INNER JOIN ledgers l ON l.name = v.party_name AND l.company_guid = v.company_guid
-               LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-               WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+               INNER JOIN ledgers l ON l.name = v.party_name AND l.company_id = v.company_id
+               LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id
+               WHERE v.company_id=$1 AND v.is_cancelled = FALSE
                AND v.voucher_type = ANY($2)
                AND l.gstin IS NOT NULL AND l.gstin != ''`;
-      let q2Params = [companyGuid, PURCHASE];
+      let q2Params = [companyId, PURCHASE];
       let q2Idx = 3;
       if (fyFrom) { q2 += ` AND v.date >= $${q2Idx++}`; q2Params.push(fyFrom); }
       if (fyTo)   { q2 += ` AND v.date <= $${q2Idx++}`; q2Params.push(fyTo); }
@@ -5996,7 +6223,7 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
 
     // ── GSTR-3B: summary card + full voucher list (outward + inward) ───────────
     if (gstrTypeStr === 'GSTR-3B') {
-      const baseParams = [companyGuid];
+      const baseParams = [companyId];
       let dateWhere = ''; let dIdx = 2;
       if (fyFrom) { dateWhere += ` AND v.date >= $${dIdx++}`; baseParams.push(fyFrom); }
       if (fyTo)   { dateWhere += ` AND v.date <= $${dIdx++}`; baseParams.push(fyTo); }
@@ -6026,11 +6253,11 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       // GST relevance filter: only include vouchers that have GST details OR are explicitly flagged.
       // This removes pre-GST era vouchers (e.g. 2017-18 before July 2017) that have no gst_voucher_details.
       const gstRelevanceFilter = `AND (v.is_gst_relevant = TRUE OR g.voucher_guid IS NOT NULL)`;
-      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL}) ${gstRelevanceFilter}`;
-      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase']) ${gstRelevanceFilter}`;
+      const outQ = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_id = v.company_id WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL}) ${gstRelevanceFilter}`;
+      const inQ  = `SELECT ${voucherCols} FROM vouchers v LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_id = v.company_id WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase']) ${gstRelevanceFilter}`;
       const [outSumR, inSumR, outVouR, inVouR] = await Promise.all([
-        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
-        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type != ALL(${NON_SALES_LITERAL})${dateWhere}`, baseParams),
+        query(`SELECT ROUND(COALESCE(SUM(ABS(v.amount)),0)::numeric,2) as total FROM vouchers v WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type = ANY(ARRAY['Purchase GST','Purchase'])${dateWhere}`, baseParams),
         query(`${outQ}${dateWhere} ORDER BY v.date DESC LIMIT 500`, baseParams),
         query(`${inQ}${dateWhere} ORDER BY v.date DESC LIMIT 500`, baseParams),
       ]);
@@ -6066,11 +6293,11 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
     //   null types  → no type filter (GSTR-10 final return = all vouchers)
     let qParams, typeFilter, qIdx;
     if (cfg.useExclude) {
-      qParams    = [companyGuid, NON_SALES];
+      qParams    = [companyId, NON_SALES];
       typeFilter = 'AND v.voucher_type != ALL($2)';
       qIdx       = 3;
     } else if (cfg.types && cfg.types.length > 0) {
-      qParams    = [companyGuid, cfg.types];
+      qParams    = [companyId, cfg.types];
       typeFilter = 'AND v.voucher_type = ANY($2)';
       qIdx       = 3;
     } else if (cfg.types && cfg.types.length === 0) {
@@ -6078,7 +6305,7 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
       return res.json({ success: true, country_applicable: true, data: [], meta: { total: 0, gstr_type: gstrTypeStr, empty: true,
         label: cfg.label, message: `${cfg.label} (${gstrTypeStr}) requires specific Tally TDL setup. No data available.` } });
     } else {
-      qParams    = [companyGuid];
+      qParams    = [companyId];
       typeFilter = '';
       qIdx       = 2;
     }
@@ -6105,9 +6332,9 @@ router.get('/reports/gst-detail', authMiddleware, async (req, res) => {
                       ), ''
                     ) as gst_ledger_names
              FROM vouchers v
-             LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-             LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_guid = v.company_guid
-             WHERE v.company_guid=$1 AND v.is_cancelled=FALSE ${typeFilter}
+             LEFT JOIN gst_voucher_details g ON g.voucher_guid = v.guid AND g.company_id = v.company_id
+             LEFT JOIN ledgers l2 ON l2.name = v.party_name AND l2.company_id = v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled=FALSE ${typeFilter}
              AND (v.is_gst_relevant = TRUE OR g.voucher_guid IS NOT NULL)`;
     if (fyFrom) { q += ` AND v.date >= $${qIdx++}`; qParams.push(fyFrom); }
     if (fyTo)   { q += ` AND v.date <= $${qIdx++}`; qParams.push(fyTo); }
@@ -6138,8 +6365,9 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { from, to, page = 1, limit = 50 } = req.query;
-  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, from, to);
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
     // Unmatched = sales/purchase vouchers where GST details are missing or 0
@@ -6154,8 +6382,8 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
         END as issue,
         v.guid
       FROM vouchers v
-      LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_guid = v.company_guid
-      WHERE v.company_guid = $1
+      LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_id = v.company_id
+      WHERE v.company_id=$1
         AND v.is_cancelled = FALSE
         AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
         AND v.date BETWEEN $2 AND $3
@@ -6166,15 +6394,15 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
         AND ABS(v.amount) > 0
       ORDER BY v.date DESC
       LIMIT $4 OFFSET $5
-    `, [companyGuid, fyFrom, fyTo, parseInt(limit), offset]);
+    `, [companyId, fyFrom, fyTo, parseInt(limit), offset]);
     const { rows: cnt } = await query(
       `SELECT COUNT(*) as c FROM vouchers v
-       LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_guid = v.company_guid
-       WHERE v.company_guid=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
+       LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_id = v.company_id
+       WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
          AND v.date BETWEEN $2 AND $3
          AND (gst.id IS NULL OR COALESCE(gst.cgst_amount,0)+COALESCE(gst.sgst_amount,0)+COALESCE(gst.igst_amount,0)=0)
          AND ABS(v.amount)>0`,
-      [companyGuid, fyFrom, fyTo]
+      [companyId, fyFrom, fyTo]
     );
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), page: parseInt(page) } });
   } catch (err) {
@@ -6197,14 +6425,14 @@ WITH RECURSIVE expense_groups AS (
   SELECT g.name,
          CASE WHEN g.name ~* '^Direct Expenses?$' THEN 'Direct' ELSE 'Indirect' END AS root_type
     FROM groups g
-   WHERE g.company_guid = $1
+   WHERE g.company_id=$1
      AND (g.name ~* '^Direct Expenses?$' OR g.name ~* '^Indirect Expenses?$')
   UNION ALL
   SELECT child.name, eg.root_type
     FROM groups child
     JOIN expense_groups eg
       ON LOWER(TRIM(COALESCE(child.parent, ''))) = LOWER(TRIM(eg.name))
-   WHERE child.company_guid = $1
+   WHERE child.company_id=$1
 )`;
 
 async function sumExpenseAmount(companyGuid, from, to) {
@@ -6213,20 +6441,20 @@ async function sumExpenseAmount(companyGuid, from, to) {
     `${EXPENSE_GROUPS_CTE}
      SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS v
      FROM voucher_ledger_entries vle
-     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
      JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.is_cancelled = FALSE
        AND vle.dr_cr = 'Dr'
        AND v.date IS NOT NULL AND v.date != ''
        AND v.date BETWEEN $2 AND $3`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
   return +(rows?.[0]?.v ?? 0);
 }
 
-async function buildExpenseHomeCoreMetrics(companyGuid, fyFrom, fyTo, today) {
+async function buildExpenseHomeCoreMetrics(companyId, fyFrom, fyTo, today) {
   const yesterday = addDays(today, -1);
   const mtdWin = priorMtdWindow(today);
   const priorFyFrom = shiftYearIso(fyFrom, -1);
@@ -6236,12 +6464,12 @@ async function buildExpenseHomeCoreMetrics(companyGuid, fyFrom, fyTo, today) {
     mtdVal, priorMtdVal,
     ytdVal, priorYtdVal,
   ] = await Promise.all([
-    sumExpenseAmount(companyGuid, today, today),
-    sumExpenseAmount(companyGuid, yesterday, yesterday),
-    sumExpenseAmount(companyGuid, mtdWin.from, mtdWin.to),
-    sumExpenseAmount(companyGuid, mtdWin.priorFrom, mtdWin.priorTo),
-    sumExpenseAmount(companyGuid, fyFrom, fyTo),
-    sumExpenseAmount(companyGuid, priorFyFrom, priorFyTo),
+    sumExpenseAmount(companyId, today, today),
+    sumExpenseAmount(companyId, yesterday, yesterday),
+    sumExpenseAmount(companyId, mtdWin.from, mtdWin.to),
+    sumExpenseAmount(companyId, mtdWin.priorFrom, mtdWin.priorTo),
+    sumExpenseAmount(companyId, fyFrom, fyTo),
+    sumExpenseAmount(companyId, priorFyFrom, priorFyTo),
   ]);
   const todayTrend = homeMetricTrend(todayVal, yesterdayVal, true);
   const mtdTrend = homeMetricTrend(mtdVal, priorMtdVal, true);
@@ -6264,10 +6492,11 @@ router.get('/expenses/home-metrics', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const today = new Date().toISOString().slice(0, 10);
-    const core = await buildExpenseHomeCoreMetrics(companyGuid, fyFrom, fyTo, today);
+    const core = await buildExpenseHomeCoreMetrics(companyId, fyFrom, fyTo, today);
     res.json({
       success: true,
       data: {
@@ -6286,32 +6515,33 @@ router.get('/expenses/counts', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to);
+  const companyId = requireResolvedCompanyId(req);
+  const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to);
   try {
     const baseFrom = `
       ${EXPENSE_GROUPS_CTE}
       SELECT COUNT(DISTINCT v.guid)::int AS c
       FROM vouchers v
-      JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+      JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
       JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-      WHERE v.company_guid = $1
+      WHERE v.company_id=$1
         AND v.is_cancelled = FALSE
         AND vle.dr_cr = 'Dr'
         AND v.date IS NOT NULL AND v.date != ''
         AND v.date BETWEEN $2 AND $3`;
     const [allRes, directRes, indirectRes, catRes] = await Promise.all([
-      query(baseFrom, [companyGuid, from, to]),
-      query(`${baseFrom} AND eg.root_type = 'Direct'`, [companyGuid, from, to]),
-      query(`${baseFrom} AND eg.root_type = 'Indirect'`, [companyGuid, from, to]),
+      query(baseFrom, [companyId, from, to]),
+      query(`${baseFrom} AND eg.root_type = 'Direct'`, [companyId, from, to]),
+      query(`${baseFrom} AND eg.root_type = 'Indirect'`, [companyId, from, to]),
       query(
         `${EXPENSE_GROUPS_CTE}
          SELECT l.parent AS name, COUNT(DISTINCT v.guid)::int AS c
          FROM vouchers v
-         JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-         JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+         JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+         JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
          JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-         WHERE v.company_guid = $1
+         WHERE v.company_id=$1
            AND v.is_cancelled = FALSE
            AND vle.dr_cr = 'Dr'
            AND v.date IS NOT NULL AND v.date != ''
@@ -6319,7 +6549,7 @@ router.get('/expenses/counts', authMiddleware, async (req, res) => {
          GROUP BY l.parent
          ORDER BY c DESC
          LIMIT 50`,
-        [companyGuid, from, to]
+        [companyId, from, to]
       ),
     ]);
     res.json({
@@ -6344,8 +6574,9 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { from, to, page = 1, limit = 30, type, category } = req.query;
-  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyGuid, from, to);
+  const { from: fyFrom, to: fyTo } = await resolveFYDates(companyId, from, to);
   const offset = (parseInt(page) - 1) * parseInt(limit);
   // Multi-select: types=Direct,Indirect (or legacy type=Direct). Empty / All → both.
   const typesRaw = parseCsvParam(req.query.types).length
@@ -6367,7 +6598,7 @@ router.get('/expenses', authMiddleware, async (req, res) => {
 
   try {
     const buildFilters = () => {
-      const params = [companyGuid, fyFrom, fyTo];
+      const params = [companyId, fyFrom, fyTo];
       let idx = 4;
       let catSql = '';
       if (categoryNames.length === 1) {
@@ -6392,10 +6623,10 @@ router.get('/expenses', authMiddleware, async (req, res) => {
               eg.root_type AS expense_type,
               ABS(vle.amount) AS expense_amount
        FROM vouchers v
-       JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
+       JOIN voucher_ledger_entries vle ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
        JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-       WHERE v.company_guid = $1
+       WHERE v.company_id=$1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
          ${rootTypeSql}
@@ -6417,10 +6648,10 @@ router.get('/expenses', authMiddleware, async (req, res) => {
       `${EXPENSE_GROUPS_CTE}
        SELECT COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
        JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-       WHERE v.company_guid = $1
+       WHERE v.company_id=$1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
          ${rootTypeSql}
@@ -6436,10 +6667,10 @@ router.get('/expenses', authMiddleware, async (req, res) => {
       `${EXPENSE_GROUPS_CTE}
        SELECT l.parent AS name, COALESCE(SUM(ABS(vle.amount)), 0) AS total
        FROM voucher_ledger_entries vle
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+       JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
        JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-       WHERE v.company_guid = $1
+       WHERE v.company_id=$1
          AND v.is_cancelled = FALSE
          AND vle.dr_cr = 'Dr'
          AND v.date IS NOT NULL AND v.date != ''
@@ -6447,7 +6678,7 @@ router.get('/expenses', authMiddleware, async (req, res) => {
        GROUP BY l.parent
        ORDER BY total DESC
        LIMIT 50`,
-      [companyGuid, fyFrom, fyTo]
+      [companyId, fyFrom, fyTo]
     );
 
     // Master fill: all ledger parents that sit under the expense tree (even if 0 in range).
@@ -6456,11 +6687,11 @@ router.get('/expenses', authMiddleware, async (req, res) => {
        SELECT DISTINCT l.parent AS name
          FROM ledgers l
          JOIN expense_groups eg ON LOWER(TRIM(l.parent)) = LOWER(TRIM(eg.name))
-        WHERE l.company_guid = $1
+        WHERE l.company_id=$1
           AND COALESCE(TRIM(l.parent), '') <> ''
         ORDER BY name
         LIMIT 50`,
-      [companyGuid]
+      [companyId]
     );
     const amountByParent = new Map(catRows.map((r) => [r.name, parseFloat(r.total) || 0]));
     const categoryList = [];
@@ -6516,15 +6747,16 @@ router.get('/daybook', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { date, page = 1, limit = 50 } = req.query;
   const targetDate = date || new Date().toISOString().split('T')[0];
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
     const { rows } = await query(
-      `SELECT * FROM vouchers WHERE company_guid=$1 AND date=$2 AND is_cancelled=FALSE ORDER BY id DESC LIMIT $3 OFFSET $4`,
-      [companyGuid, targetDate, parseInt(limit), offset]
+      `SELECT * FROM vouchers WHERE company_id=$1 AND date=$2 AND is_cancelled=FALSE ORDER BY id DESC LIMIT $3 OFFSET $4`,
+      [companyId, targetDate, parseInt(limit), offset]
     );
-    const { rows: cnt } = await query('SELECT COUNT(*) as c FROM vouchers WHERE company_guid=$1 AND date=$2 AND is_cancelled=FALSE', [companyGuid, targetDate]);
+    const { rows: cnt } = await query('SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND date=$2 AND is_cancelled=FALSE', [companyId, targetDate]);
     res.json({ success: true, data: rows, meta: { total: parseInt(cnt[0].c), date: targetDate, page: parseInt(page) } });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
@@ -6538,8 +6770,9 @@ router.get('/company/capabilities', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT gstin, name FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows } = await query('SELECT gstin, name FROM companies WHERE id=$1', [companyId]);
     const co = rows[0];
     const isIndia = !!(co?.gstin);
     // Detect country from GSTIN format (India: 15-char alphanumeric starting with 2 digits)
@@ -6575,10 +6808,10 @@ router.get('/sync-history', authMiddleware, async (req, res) => {
     const { rows } = await query(
       `SELECT id, device_id, mode, synced_at, voucher_count, ledger_count, stock_count, record_count, status, error_message
        FROM sync_log
-       WHERE company_guid = $1 AND user_id = $2
+       WHERE company_id=$1 AND user_id = $2
        ORDER BY synced_at DESC
        LIMIT $3`,
-      [companyGuid, req.user.userId, parseInt(limit)]
+      [companyId, req.user.userId, parseInt(limit)]
     );
     res.json({ success: true, data: { entries: rows } });
   } catch (err) {
@@ -6601,21 +6834,22 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const isCurrentFY = (financialYear === currentFYLabel());
     const monthKey    = currentMonthKey();
 
     // ── Step 1: Check cache (current FY only, monthly TTL) ────────────────────
     if (isCurrentFY) {
-      const cached = await getCachedInsights(companyGuid, monthKey);
+      const cached = await getCachedInsights(companyId, monthKey);
       if (cached) {
         return res.json({ success: true, data: { ...cached, fromCache: true, isCurrentFY } });
       }
     }
 
     // ── Step 2: Compute SQL analytics ─────────────────────────────────────────
-    const metrics = await computeInsightMetrics(companyGuid, from, to, financialYear);
+    const metrics = await computeInsightMetrics(companyId, from, to, financialYear);
     const { forecastData, expenseWithSpike, receivablesAging,
             topSuppliers, topCustomers, stockout, summary, llmPayload } = metrics;
 
@@ -6644,7 +6878,7 @@ router.get('/ai/insights', authMiddleware, async (req, res) => {
 
     // ── Step 4: Cache result (current FY only) ─────────────────────────────────
     if (isCurrentFY) {
-      await setCachedInsights(companyGuid, monthKey, llmPayload, responseData);
+      await setCachedInsights(companyId, monthKey, llmPayload, responseData);
     }
 
     // Add cache timestamps for UI disclaimer
@@ -6664,6 +6898,7 @@ router.get('/ai/insights/history/:fy', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const financialYear = req.params.fy; // e.g. '2025-2026'
   if (!financialYear || !/^\d{4}-\d{4}$/.test(financialYear)) {
     return res.status(400).json({ success: false, error: { code: 'INVALID_FY', message: 'fy must be like 2025-2026' } });
@@ -6673,8 +6908,8 @@ router.get('/ai/insights/history/:fy', authMiddleware, async (req, res) => {
     return res.status(400).json({ success: false, error: { code: 'USE_CURRENT_ENDPOINT', message: 'Use /ai/insights for current FY' } });
   }
   try {
-    const { from, to } = await resolveFYDates(companyGuid, null, null, financialYear);
-    const summary = await computeHistoricalSummary(companyGuid, financialYear, from, to);
+    const { from, to } = await resolveFYDates(companyId, null, null, financialYear);
+    const summary = await computeHistoricalSummary(companyId, financialYear, from, to);
     return res.json({ success: true, data: summary });
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
@@ -6685,17 +6920,18 @@ router.post('/admin/backfill-stock-voucher-types', authMiddleware, async (req, r
   const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rowCount } = await query(`
       UPDATE stock_transactions st
       SET voucher_type = v.voucher_type
       FROM vouchers v
       WHERE st.voucher_guid = v.guid
-        AND st.company_guid = v.company_guid
-        AND st.company_guid = $1
+        AND st.company_id = v.company_id
+        AND st.company_id=$1
         AND (st.voucher_type IS NULL OR st.voucher_type = '')
         AND v.voucher_type IS NOT NULL AND v.voucher_type != ''
-    `, [companyGuid]);
+    `, [companyId]);
     res.json({ success: true, data: { updated: rowCount, message: `Backfilled voucher_type for ${rowCount} stock_transactions` } });
   } catch (e) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: e.message } });
@@ -6707,25 +6943,26 @@ router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
   const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rowCount } = await query(`
       UPDATE gst_voucher_details gvd
       SET cgst_amount=sub.cgst, sgst_amount=sub.sgst, igst_amount=sub.igst, taxable_amount=sub.taxable
       FROM (
-        SELECT v.guid as voucher_guid, v.company_guid,
+        SELECT v.guid as voucher_guid, v.company_id,
           COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' THEN ABS(vle.amount) ELSE 0 END),0) as cgst,
           COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%UTGST%' THEN ABS(vle.amount) ELSE 0 END),0) as sgst,
           COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0) as igst,
           GREATEST(0, COALESCE(SUM(CASE WHEN vle.dr_cr='Dr' THEN ABS(vle.amount) ELSE 0 END),0) -
             COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0)) as taxable
         FROM vouchers v
-        JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
-        WHERE v.company_guid=$1
-        GROUP BY v.guid, v.company_guid
+        JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_id = v.company_id
+        WHERE v.company_id=$1
+        GROUP BY v.guid, v.company_id
         HAVING SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END) > 0
       ) sub
-      WHERE gvd.voucher_guid = sub.voucher_guid AND gvd.company_guid = sub.company_guid`,
-      [companyGuid]
+      WHERE gvd.voucher_guid = sub.voucher_guid AND gvd.company_id = sub.company_id`,
+      [companyId]
     );
     res.json({ success: true, data: { updated: rowCount } });
   } catch (err) {
@@ -6738,8 +6975,9 @@ router.get('/company/profile', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT * FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    const { rows } = await query('SELECT * FROM companies WHERE id=$1 LIMIT 1', [companyId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
     res.json({ success: true, data: rows[0] });
   } catch (err) {
@@ -6752,6 +6990,7 @@ const _companyProfileUpdate = async (req, res) => {
   const companyGuid = req.query.companyGuid || req.body?.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { gstin, address, state, email, formal_name } = req.body || {};
   try {
     await query(`
@@ -6761,7 +7000,7 @@ const _companyProfileUpdate = async (req, res) => {
         state = COALESCE($3, state),
         formal_name = COALESCE($5, formal_name)
       WHERE guid = $4
-    `, [gstin || null, address || null, state || null, companyGuid, formal_name || null]);
+    `, [gstin || null, address || null, state || null, companyId, formal_name || null]);
     res.json({ success: true, message: 'Company profile updated' });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -6774,6 +7013,7 @@ router.patch('/company/profile', authMiddleware, _companyProfileUpdate);
 router.post('/company/:guid/logo', authMiddleware, async (req, res) => {
   const { guid } = req.params;
   if (!await verifyCompanyOwnership(req, res, guid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { logo } = req.body || {}; // expects base64 data URI: data:image/jpeg;base64,...
   if (!logo) return res.status(400).json({ success: false, error: { code: 'MISSING_LOGO', message: 'logo field required (base64 data URI)' } });
   // Validate it's a data URI image
@@ -6792,8 +7032,9 @@ router.post('/company/:guid/logo', authMiddleware, async (req, res) => {
 router.get('/company/:guid/logo', authMiddleware, async (req, res) => {
   const { guid } = req.params;
   if (!await verifyCompanyOwnership(req, res, guid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT logo_url FROM companies WHERE guid=$1 LIMIT 1', [guid]);
+    const { rows } = await query('SELECT logo_url FROM companies WHERE guid=$1 AND workspace_id=$2 LIMIT 1', [guid, req.workspaceId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
     res.json({ success: true, data: { logo_url: rows[0].logo_url || null } });
   } catch (err) {
@@ -6852,9 +7093,10 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
   if (!companyGuid || !mobile) return res.status(400).json({ success: false, error: { code: 'MISSING_FIELDS', message: 'companyGuid and mobile required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Get company name for the message
-    const { rows: co } = await query('SELECT name FROM companies WHERE guid=$1 LIMIT 1', [companyGuid]);
+    const { rows: co } = await query('SELECT name, guid FROM companies WHERE id=$1 LIMIT 1', [companyId]);
     const companyName = co[0]?.name || 'Company';
     
     // Clean mobile number
@@ -6877,8 +7119,8 @@ router.post('/reminders/send', authMiddleware, async (req, res) => {
     let partyEmail = null;
     if (channels.email) {
       const { rows: party } = await query(
-        'SELECT email FROM ledgers WHERE company_guid=$1 AND name=$2 LIMIT 1',
-        [companyGuid, ledgerName]
+        'SELECT email FROM ledgers WHERE company_id=$1 AND name=$2 LIMIT 1',
+        [companyId, ledgerName]
       ).catch(() => ({ rows: [] }));
       partyEmail = party[0]?.email || null;
     }
@@ -6994,20 +7236,19 @@ router.post('/auth/verify-pin', preAuthMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } });
     const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
     if (!match) return res.status(401).json({ success: false, error: { code: 'PIN_INVALID', message: 'Incorrect PIN. Try again.' } });
-    const token = generateToken({ userId: user.id, mobile: user.mobile });
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token=$1, updated_at=$2 WHERE id=$3', [token, now(), user.id]);
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
-    let company = null;
-    if (isPaired) {
-      const { rows: companies } = await query('SELECT guid, name, gstin FROM companies WHERE user_id=$1 AND is_active=TRUE LIMIT 1', [user.id]);
-      if (companies[0]) company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-    }
+    const { isPaired, company } = await getUserPairingHints(user.id);
     console.log(`[API 2FA] PIN verified for user ${user.id}`);
     res.json({
       success: true,
       data: {
         access_token: token,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
         is_new_user: !user.name,
         is_paired: isPaired,
         company,
@@ -7040,14 +7281,19 @@ router.post('/auth/reset-pin', preAuthMiddleware, async (req, res) => {
     await query('UPDATE users SET two_fa_pin_hash=$1, two_fa_enabled=TRUE, updated_at=$2 WHERE id=$3', [hash, now(), req.user.userId]);
     const { rows } = await query('SELECT mobile, name, language FROM users WHERE id=$1', [req.user.userId]);
     const u = rows[0];
-    const token = generateToken({ userId: req.user.userId, mobile: u.mobile });
+    const { createAuthSession } = await import('../services/authSessionService.js');
+    const session = await createAuthSession(req.user.userId, { mobile: u.mobile, clientType: 'app' });
+    const token = session.accessToken;
     await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
+    const { isPaired } = await getUserPairingHints(req.user.userId);
     res.json({
       success: true,
       data: {
         access_token: token,
-        is_paired: devices.length > 0,
+        refresh_token: session.refreshToken,
+        session_id: session.sessionId,
+        expires_in: session.accessExpiresIn,
+        is_paired: isPaired,
         is_new_user: !u.name,
         user: { id: req.user.userId, name: u.name || null, phone: u.mobile, language: u.language || 'en' },
       },
@@ -7247,12 +7493,13 @@ router.get('/reports/other-taxes/summary', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyPrefix = fyLikePrefix(financialYear);
     // Lazy backfill for companies synced before tax extraction existed
     try {
-      const { rows: tc } = await query('SELECT COUNT(*)::int AS c FROM tax_transactions WHERE company_guid=$1', [companyGuid]);
+      const { rows: tc } = await query('SELECT COUNT(*)::int AS c FROM tax_transactions WHERE company_id=$1', [companyId]);
       if ((tc[0]?.c || 0) === 0) {
         const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
         await backfillTaxTransactions(companyGuid);
@@ -7268,10 +7515,10 @@ router.get('/reports/other-taxes/summary', authMiddleware, async (req, res) => {
              SUM(tax_amount)              AS total_tax_amount,
              MAX(COALESCE(NULLIF(voucher_date,''), financial_year)) AS last_transaction_date
       FROM tax_transactions
-      WHERE company_guid=$1 AND ${taxDateFilter}
+      WHERE company_id=$1 AND ${taxDateFilter}
       GROUP BY tax_type
       ORDER BY total_tax_amount DESC
-    `, [companyGuid, from, to, financialYear, fyPrefix]);
+    `, [companyId, from, to, financialYear, fyPrefix]);
     res.json({
       success: true,
       data: rows.map(r => ({
@@ -7291,12 +7538,13 @@ router.get('/reports/other-taxes/transactions', authMiddleware, async (req, res)
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { taxType, page = 1, limit = 50 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
   try {
-    const { from, to, financialYear } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
+    const { from, to, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyPrefix = fyLikePrefix(financialYear);
-    const params = [companyGuid, from, to];
+    const params = [companyId, from, to];
     // typeFilter is TOP-LEVEL — must apply to ALL rows (including null-date FY fallback)
     let typeFilter = '';
     if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
@@ -7310,13 +7558,13 @@ router.get('/reports/other-taxes/transactions', authMiddleware, async (req, res)
     )`;
     const { rows } = await query(`
       SELECT * FROM tax_transactions
-      WHERE company_guid=$1${typeFilter} AND ${dateFilter}
+      WHERE company_id=$1${typeFilter} AND ${dateFilter}
       ORDER BY COALESCE(NULLIF(voucher_date,''), financial_year) DESC
       LIMIT ${parseInt(limit)} OFFSET ${offset}
     `, fyParams);
     const { rows: cnt } = await query(`
       SELECT COUNT(*) AS c FROM tax_transactions
-      WHERE company_guid=$1${typeFilter} AND ${dateFilter}
+      WHERE company_id=$1${typeFilter} AND ${dateFilter}
     `, fyParams);
     res.json({
       success: true,
@@ -7333,10 +7581,11 @@ router.get('/reports/other-taxes/late-challans', authMiddleware, async (req, res
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { taxType } = req.query;
   try {
-    const { from, to } = await resolveFYDates(companyGuid, req.query.from, req.query.to, req.query.fy);
-    const params = [companyGuid, from, to];
+    const { from, to } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const params = [companyId, from, to];
     let typeFilter = '';
     if (taxType) { typeFilter = ` AND tax_type = $4`; params.push(taxType); }
     const { rows } = await query(`
@@ -7344,7 +7593,7 @@ router.get('/reports/other-taxes/late-challans', authMiddleware, async (req, res
              SUM(tax_amount) AS tax_amount,
              (COALESCE(paid_date::date, NOW()::date) - due_date::date) AS late_days
       FROM tax_transactions
-      WHERE company_guid=$1 AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date${typeFilter}
+      WHERE company_id=$1 AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date${typeFilter}
         AND due_date IS NOT NULL
         AND COALESCE(paid_date::date, NOW()::date) > due_date::date
       GROUP BY tax_type, return_period, challan_no, due_date, paid_date
@@ -7362,6 +7611,7 @@ router.get('/reports/other-taxes/backfill', authMiddleware, async (req, res) => 
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
     const count = await backfillTaxTransactions(companyGuid);
@@ -7378,6 +7628,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
+  const companyId = requireResolvedCompanyId(req);
   const {
     mode = 'chronological',  // chronological | by_item | by_document
     fy, from, to,
@@ -7401,8 +7652,8 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
 
   try {
     // ── Build shared WHERE conditions on stock_transactions (aliased st)
-    const stCond = [`st.company_guid = $1`];
-    const params = [companyGuid];
+    const stCond = [`st.company_id=$1`];
+    const params = [companyId];
     let idx = 2;
 
     // Date / FY
@@ -7452,7 +7703,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
         params.push(`%${v}%`);
         return `(st.voucher_type ILIKE $${likeIdx} OR EXISTS (
           SELECT 1 FROM vouchers vf
-          WHERE vf.guid = st.voucher_guid AND vf.company_guid = $1
+          WHERE vf.guid = st.voucher_guid AND vf.company_id=$1
           AND vf.voucher_type ILIKE $${likeIdx}
         ))`;
       });
@@ -7465,7 +7716,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
         st.stock_guid ILIKE $${idx}
         OR EXISTS (
           SELECT 1 FROM vouchers sv WHERE sv.guid = st.voucher_guid
-            AND sv.company_guid = $1 AND sv.voucher_number ILIKE $${idx}
+            AND sv.company_id=$1 AND sv.voucher_number ILIKE $${idx}
         )
       )`);
       params.push(`%${search}%`); idx++;
@@ -7495,15 +7746,15 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
     // ── Distinct warehouses for filter
     const { rows: whRows } = await query(
       `SELECT DISTINCT warehouse FROM stock_transactions
-       WHERE company_guid=$1 AND warehouse IS NOT NULL AND warehouse <> ''
-       ORDER BY warehouse`, [companyGuid]);
+       WHERE company_id=$1 AND warehouse IS NOT NULL AND warehouse <> ''
+       ORDER BY warehouse`, [companyId]);
     const warehouses = whRows.map(r => r.warehouse);
 
     // ── Distinct voucher types for filter (dynamic — Tally companies use custom names like 'Sales GST')
     const { rows: vtRows } = await query(
       `SELECT DISTINCT voucher_type FROM stock_transactions
-       WHERE company_guid=$1 AND voucher_type IS NOT NULL AND voucher_type <> ''
-       ORDER BY voucher_type`, [companyGuid]);
+       WHERE company_id=$1 AND voucher_type IS NOT NULL AND voucher_type <> ''
+       ORDER BY voucher_type`, [companyId]);
     const voucherTypes = vtRows.map(r => r.voucher_type);
 
     // ════════════════════════════════════════════════════════
@@ -7534,14 +7785,14 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
           vi.batch_name      AS "batchSerial"
         FROM stock_transactions st
         LEFT JOIN stocks s
-          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+          ON s.name = st.stock_guid AND s.company_id = st.company_id
         LEFT JOIN vouchers v
-          ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+          ON v.guid = st.voucher_guid AND v.company_id = st.company_id
           AND v.is_cancelled = FALSE
         LEFT JOIN LATERAL (
           SELECT batch_name FROM voucher_inventory_items
           WHERE voucher_guid = st.voucher_guid
-            AND company_guid = st.company_guid
+            AND company_id = st.company_id
             AND stock_item_name = st.stock_guid
           LIMIT 1
         ) vi ON true
@@ -7585,7 +7836,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
           MAX(st.rate)       AS latest_rate
         FROM stock_transactions st
         LEFT JOIN stocks s
-          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+          ON s.name = st.stock_guid AND s.company_id = st.company_id
         WHERE ${stWhere}
         GROUP BY st.stock_guid, s.guid, s.alias, s.group_name, s.category, s.unit, s.closing_qty
         ORDER BY st.stock_guid
@@ -7620,11 +7871,11 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
             v.voucher_number   AS "docRef"
           FROM stock_transactions st
           LEFT JOIN vouchers v
-            ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+            ON v.guid = st.voucher_guid AND v.company_id = st.company_id
             AND v.is_cancelled = FALSE
-          WHERE st.company_guid = $1 AND st.stock_guid IN (${placeholders})
+          WHERE st.company_id=$1 AND st.stock_guid IN (${placeholders})
           ORDER BY st.date DESC, st.id DESC
-        `, [companyGuid, ...itemNames]);
+        `, [companyId, ...itemNames]);
 
         txnsByItem = txnRows.reduce((acc, t) => {
           const key = t.item_name_key;
@@ -7684,7 +7935,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
         MIN(st.warehouse) AS warehouse
       FROM stock_transactions st
       INNER JOIN vouchers v
-        ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+        ON v.guid = st.voucher_guid AND v.company_id = st.company_id
         AND v.is_cancelled = FALSE
       WHERE ${stWhere}
       GROUP BY v.guid, v.voucher_number, v.voucher_type, v.date, v.party_name, v.narration, v.reference, v.amount
@@ -7696,7 +7947,7 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
       SELECT COUNT(DISTINCT v.guid) AS total
       FROM stock_transactions st
       INNER JOIN vouchers v
-        ON v.guid = st.voucher_guid AND v.company_guid = st.company_guid
+        ON v.guid = st.voucher_guid AND v.company_id = st.company_id
         AND v.is_cancelled = FALSE
       WHERE ${stWhere}
     `, params);
@@ -7722,17 +7973,17 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
           vi.batch_name   AS "batchSerial"
         FROM stock_transactions st
         LEFT JOIN stocks s
-          ON s.name = st.stock_guid AND s.company_guid = st.company_guid
+          ON s.name = st.stock_guid AND s.company_id = st.company_id
         LEFT JOIN LATERAL (
           SELECT batch_name FROM voucher_inventory_items
           WHERE voucher_guid = st.voucher_guid
-            AND company_guid = st.company_guid
+            AND company_id = st.company_id
             AND stock_item_name = st.stock_guid
           LIMIT 1
         ) vi ON true
-        WHERE st.company_guid = $1 AND st.voucher_guid IN (${phs})
+        WHERE st.company_id=$1 AND st.voucher_guid IN (${phs})
         ORDER BY st.id
-      `, [companyGuid, ...vGuids]);
+      `, [companyId, ...vGuids]);
 
       linesByVoucher = lineRows.reduce((acc, l) => {
         if (!acc[l.voucher_guid]) acc[l.voucher_guid] = [];
@@ -7782,10 +8033,11 @@ router.get('/stocks/ledger', authMiddleware, async (req, res) => {
 router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const { limit = 20 } = req.query;
   try {
     // Get stock name from guid
-    const { rows: sRows } = await query('SELECT name, closing_rate FROM stocks WHERE guid=$1 AND company_guid=$2', [req.params.id, companyGuid]);
+    const { rows: sRows } = await query('SELECT name, closing_rate FROM stocks WHERE guid=$1 AND company_id=$2', [req.params.id, companyId]);
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
     const stockName = sRows[0].name;
 
@@ -7808,8 +8060,8 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
             NULL::text AS from_warehouse,
             NULL::text AS to_warehouse
           FROM voucher_inventory_items vi
-          JOIN vouchers v ON v.guid = vi.voucher_guid AND v.company_guid = vi.company_guid
-          WHERE vi.stock_item_name = $1 AND vi.company_guid = $2
+          JOIN vouchers v ON v.guid = vi.voucher_guid AND v.company_id = vi.company_id
+          WHERE vi.stock_item_name = $1 AND vi.company_id=$2
             AND v.is_cancelled = FALSE
             AND COALESCE(v.voucher_type, '') NOT IN ('Physical Stock', 'Stock Journal')
           GROUP BY v.id, v.voucher_number, v.voucher_type, v.date, v.reference
@@ -7830,13 +8082,13 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
           FROM stock_transactions st_out
           JOIN stock_transactions st_in
             ON  st_out.voucher_guid = st_in.voucher_guid
-            AND st_out.company_guid = st_in.company_guid
+            AND st_out.company_id = st_in.company_id
             AND st_out.stock_guid   = st_in.stock_guid
             AND st_out.type         = 'outward'
             AND st_in.type          = 'inward'
-          JOIN vouchers v ON v.guid = st_out.voucher_guid AND v.company_guid = st_out.company_guid
+          JOIN vouchers v ON v.guid = st_out.voucher_guid AND v.company_id = st_out.company_id
           WHERE st_out.stock_guid = $1
-            AND st_out.company_guid = $2
+            AND st_out.company_id=$2
             AND v.is_cancelled = FALSE
             AND COALESCE(v.voucher_type, st_out.voucher_type, '') = 'Stock Journal'
           ORDER BY st_out.voucher_guid, st_out.warehouse, st_in.warehouse, v.date DESC
@@ -7844,26 +8096,26 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
       ) movements
       ORDER BY date DESC, voucher_number DESC
       LIMIT $3
-    `, [stockName, companyGuid, parseInt(limit)]);
+    `, [stockName, companyId, parseInt(limit)]);
 
     // Avg purchase rate from inward transactions
     const { rows: avgRows } = await query(`
       SELECT AVG(rate) as avg_purchase_rate,
-             (SELECT rate FROM stock_transactions WHERE stock_guid=$1 AND company_guid=$2 AND type='inward' AND rate>0 ORDER BY date DESC, id DESC LIMIT 1) as last_purchase_rate
+             (SELECT rate FROM stock_transactions WHERE stock_guid=$1 AND company_id=$2 AND type='inward' AND rate>0 ORDER BY date DESC, id DESC LIMIT 1) as last_purchase_rate
       FROM stock_transactions
-      WHERE stock_guid=$1 AND company_guid=$2 AND type='inward' AND rate>0
-    `, [stockName, companyGuid]);
+      WHERE stock_guid=$1 AND company_id=$2 AND type='inward' AND rate>0
+    `, [stockName, companyId]);
 
     // Last selling rate from sales vouchers
     const { rows: sellRows } = await query(`
       SELECT vi.rate as last_sell_rate
       FROM voucher_inventory_items vi
       JOIN vouchers v ON v.guid = vi.voucher_guid
-      WHERE vi.stock_item_name=$1 AND vi.company_guid=$2
+      WHERE vi.stock_item_name=$1 AND vi.company_id=$2
         AND v.voucher_type ILIKE '%sales%' AND vi.rate > 0
         AND v.is_cancelled = FALSE
       ORDER BY v.date DESC LIMIT 1
-    `, [stockName, companyGuid]);
+    `, [stockName, companyId]);
 
     res.json({
       success: true,
@@ -7883,14 +8135,15 @@ router.get('/stocks/items/:id/movements', authMiddleware, async (req, res) => {
 router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Resolve by Tally GUID or stock name (mobile sometimes only has name).
     const { rows: sRows } = await query(
       `SELECT name, closing_qty, unit, guid FROM stocks
-        WHERE company_guid = $2 AND (guid = $1 OR name = $1)
+        WHERE company_id=$2 AND (guid = $1 OR name = $1)
         ORDER BY (guid = $1)::int DESC
         LIMIT 1`,
-      [req.params.id, companyGuid]
+      [req.params.id, companyId]
     );
     if (!sRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Item not found' } });
     const stockName = sRows[0].name;
@@ -7903,7 +8156,7 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
         SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
                SUM(qty) AS qty
         FROM stock_transactions
-        WHERE stock_guid = $1 AND company_guid = $2
+        WHERE stock_guid = $1 AND company_id=$2
           AND voucher_type = 'Opening Balance'
         GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
       ),
@@ -7911,21 +8164,21 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
         SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
                SUM(qty) AS qty
         FROM stock_transactions
-        WHERE stock_guid = $1 AND company_guid = $2
+        WHERE stock_guid = $1 AND company_id=$2
           AND voucher_type = 'Physical Stock'
         GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
       ),
       has_ob AS (
         SELECT COUNT(*)::int AS cnt
         FROM stock_transactions
-        WHERE stock_guid = $1 AND company_guid = $2
+        WHERE stock_guid = $1 AND company_id=$2
           AND voucher_type = 'Opening Balance'
       ),
       mov AS (
         SELECT COALESCE(NULLIF(warehouse, ''), 'Main Location') AS wh,
                SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS qty
         FROM stock_transactions
-        WHERE stock_guid = $1 AND company_guid = $2
+        WHERE stock_guid = $1 AND company_id=$2
           AND COALESCE(voucher_type, '') NOT IN ('Physical Stock', 'Opening Balance')
         GROUP BY COALESCE(NULLIF(warehouse, ''), 'Main Location')
       ),
@@ -7956,7 +8209,7 @@ router.get('/stocks/items/:id/godowns', authMiddleware, async (req, res) => {
       FROM combined
       WHERE qty > 0.0001
       ORDER BY qty DESC
-    `, [stockName, companyGuid]);
+    `, [stockName, companyId]);
 
     let warehouses = rows.map(r => ({
       name: r.name,
@@ -8008,7 +8261,7 @@ function _ean13Check(d12) {
   for (let i = 0; i < 12; i++) s += parseInt(d12[i]) * (i % 2 === 0 ? 1 : 3);
   return ((10 - (s % 10)) % 10).toString();
 }
-function generateBarcodeValue(type, companyGuid, seq) {
+function generateBarcodeValue(type, companyId, seq) {
   if (type === 'EAN13') {
     const p  = '890';
     const ch = _hashCode32(companyGuid).toString().padStart(4,'0').slice(0,4);
@@ -8094,9 +8347,9 @@ function applyBarcodeListFilters({ period, group, status, search }, params) {
 }
 
 /** Build WHERE for unlinked barcode generation targets (requires sb LEFT JOIN). */
-function buildBarcodeTargetWhere(companyGuid, { all, stockGuids, period, group, status, search }, params) {
-  const whereParts = ['s.company_guid = $1'];
-  params.push(companyGuid);
+function buildBarcodeTargetWhere(companyId, { all, stockGuids, period, group, status, search }, params) {
+  const whereParts = ['s.company_id=$1'];
+  params.push(companyId);
   const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
   if (filterSql) whereParts.push(filterSql);
   if (!all && Array.isArray(stockGuids) && stockGuids.length) {
@@ -8106,42 +8359,42 @@ function buildBarcodeTargetWhere(companyGuid, { all, stockGuids, period, group, 
   return whereParts.join(' AND ');
 }
 
-async function fetchBarcodeGenerateTargets(companyGuid, opts) {
+async function fetchBarcodeGenerateTargets(companyId, opts) {
   const params = [];
-  const where = buildBarcodeTargetWhere(companyGuid, opts, params);
+  const where = buildBarcodeTargetWhere(companyId, opts, params);
   const { rows } = await query(`
     SELECT s.guid, s.name FROM stocks s
-    LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+    LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_id=s.company_id AND sb.is_primary=TRUE AND sb.status='active'
     WHERE ${where}
     AND NOT EXISTS (
       SELECT 1 FROM stock_barcodes sb2
-      WHERE sb2.stock_guid = s.guid AND sb2.company_guid = $1 AND sb2.is_primary = TRUE AND sb2.status = 'active'
+      WHERE sb2.stock_guid = s.guid AND sb2.company_id=$1 AND sb2.is_primary = TRUE AND sb2.status = 'active'
     )
     ORDER BY s.name`, params);
   return rows.map(r => ({ guid: r.guid, name: r.name }));
 }
 
-async function generateOneBarcodeForStock(companyGuid, item, barcodeType, syncTarget, seqOffset) {
+async function generateOneBarcodeForStock(companyId, companyGuid, item, barcodeType, syncTarget, seqOffset) {
   const { rows: [{ cnt }] } = await query(
-    `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid],
+    `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_id=$1`, [companyId],
   );
   const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
   let barcode;
   let tries = 0;
   do {
-    barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + seqOffset + tries + 1);
+    barcode = generateBarcodeValue(barcodeType, companyId, cnt + seqOffset + tries + 1);
     tries++;
     const { rows: [dup] } = await query(
-      `SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode],
+      `SELECT 1 FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, barcode],
     );
     if (!dup) break;
   } while (tries < 10);
   if (!barcode) throw new Error('Could not allocate unique barcode');
   await query(`
-    INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-    VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
-    ON CONFLICT (company_guid, barcode) DO NOTHING`,
-    [companyGuid, item.guid, item.name, barcode, barcodeType, syncTarget, tallyStatus],
+    INSERT INTO stock_barcodes (company_id, company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+    VALUES ($1,$2,$3,$4,$5,$6,'app_generated','active',TRUE,$7,$8)
+    ON CONFLICT (company_id, barcode) DO NOTHING`,
+    [companyId, companyGuid, item.guid, item.name, barcode, barcodeType, syncTarget, tallyStatus],
   );
   return barcode;
 }
@@ -8172,7 +8425,7 @@ async function processBarcodeGenerateJob(jobId) {
       for (const item of batch) {
         try {
           await generateOneBarcodeForStock(
-            job.company_guid, item, job.barcode_type, job.sync_target, generated,
+            job.company_id, job.company_guid, item, job.barcode_type, job.sync_target, generated,
           );
           generated++;
         } catch {
@@ -8221,11 +8474,12 @@ router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (re
   if (!all && (!Array.isArray(stockGuids) || !stockGuids.length))
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'stockGuids[] or all=true required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows: [running] } = await query(
       `SELECT id, total, processed, generated, errors, status FROM barcode_generate_jobs
-       WHERE company_guid=$1 AND status IN ('pending','running')
-       ORDER BY created_at DESC LIMIT 1`, [companyGuid],
+       WHERE company_id=$1 AND status IN ('pending','running')
+       ORDER BY created_at DESC LIMIT 1`, [companyId],
     );
     if (running) {
       return res.json({
@@ -8242,7 +8496,7 @@ router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (re
       });
     }
 
-    const targets = await fetchBarcodeGenerateTargets(companyGuid, {
+    const targets = await fetchBarcodeGenerateTargets(companyId, {
       all, stockGuids, period, group, status, search,
     });
     if (!targets.length) {
@@ -8255,9 +8509,9 @@ router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (re
 
     await query(`
       INSERT INTO barcode_generate_jobs
-        (id, company_guid, status, total, processed, generated, errors, barcode_type, sync_target, filters_json, target_guids)
-      VALUES ($1,$2,'pending',$3,0,0,0,$4,$5,$6,$7)`,
-      [jobId, companyGuid, targets.length, barcodeType, syncTarget, filtersJson, JSON.stringify(targets)],
+        (id, company_id, company_guid, status, total, processed, generated, errors, barcode_type, sync_target, filters_json, target_guids)
+      VALUES ($1,$2,$3,'pending',$4,0,0,0,$5,$6,$7,$8)`,
+      [jobId, companyId, companyGuid, targets.length, barcodeType, syncTarget, filtersJson, JSON.stringify(targets)],
     );
 
     kickBarcodeGenerateJob(jobId);
@@ -8280,10 +8534,11 @@ router.get('/inventory/barcodes/generate-bulk/status/:jobId', authMiddleware, as
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and jobId required' } });
   }
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows: [job] } = await query(
       `SELECT id, status, total, processed, generated, errors, error_message, created_at, completed_at
-       FROM barcode_generate_jobs WHERE id=$1 AND company_guid=$2`, [jobId, companyGuid],
+       FROM barcode_generate_jobs WHERE id=$1 AND company_id=$2`, [jobId, companyId],
     );
     if (!job) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Job not found' } });
 
@@ -8315,12 +8570,13 @@ router.get('/inventory/barcodes/generate-bulk/active', authMiddleware, async (re
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid required' } });
   }
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows: [job] } = await query(
       `SELECT id, status, total, processed, generated, errors, error_message
        FROM barcode_generate_jobs
-       WHERE company_guid=$1 AND status IN ('pending','running')
-       ORDER BY created_at DESC LIMIT 1`, [companyGuid],
+       WHERE company_id=$1 AND status IN ('pending','running')
+       ORDER BY created_at DESC LIMIT 1`, [companyId],
     );
     if (!job) return res.json({ success: true, data: null });
     const pct = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : 100;
@@ -8355,6 +8611,7 @@ router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'stockGuids[] or all=true required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
 
+  const companyId = requireResolvedCompanyId(req);
   if (all) {
     return res.status(400).json({
       success: false,
@@ -8366,7 +8623,7 @@ router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res
   }
 
   try {
-    const targets = await fetchBarcodeGenerateTargets(companyGuid, {
+    const targets = await fetchBarcodeGenerateTargets(companyId, {
       all: false, stockGuids, period, group, status, search,
     });
 
@@ -8376,7 +8633,7 @@ router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res
     let generated = 0, errors = 0;
     for (const item of targets) {
       try {
-        await generateOneBarcodeForStock(companyGuid, item, barcodeType, syncTarget, generated);
+        await generateOneBarcodeForStock(companyId, companyGuid, item, barcodeType, syncTarget, generated);
         generated++;
       } catch { errors++; }
     }
@@ -8393,17 +8650,18 @@ router.post('/inventory/barcodes/by-guids', authMiddleware, async (req, res) => 
   if (!companyGuid || !Array.isArray(stockGuids) || !stockGuids.length)
     return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and stockGuids[] required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
     const { rows } = await query(`
       SELECT
         s.guid AS stock_guid, s.name, s.alias, s.sku, s.group_name, s.unit,
         s.closing_qty, s.closing_rate,
         sb.barcode, sb.barcode_type, sb.status AS barcode_status, sb.tally_sync_status
       FROM stocks s
-      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
-      WHERE s.company_guid=$1 AND s.guid = ANY($2::text[])
-      ORDER BY s.name ASC`, [companyGuid, stockGuids]);
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_id=s.company_id AND sb.is_primary=TRUE AND sb.status='active'
+      WHERE s.company_id=$1 AND s.guid = ANY($2::text[])
+      ORDER BY s.name ASC`, [companyId, stockGuids]);
     res.json({
       success: true,
       data: {
@@ -8432,12 +8690,13 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
   const { companyGuid, period, group, status, search, page = 1, pageSize = 50 } = req.body;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
     const lim  = Math.min(parseInt(pageSize) || 50, 200);
     const off  = (Math.max(1, parseInt(page)) - 1) * lim;
-    const params = [companyGuid];
-    let where = 's.company_guid = $1';
+    const params = [companyId];
+    let where = 's.company_id=$1';
     const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
     if (filterSql) where += ` AND ${filterSql}`;
 
@@ -8449,8 +8708,8 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
         COUNT(*) FILTER (WHERE sb.status='invalid')::int AS invalid,
         COUNT(*) FILTER (WHERE sb.tally_sync_status IN ('pending_tally','failed'))::int AS pending_tally_sync
       FROM stocks s
-      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE
-      WHERE s.company_guid=$1`, [companyGuid]);
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_id=s.company_id AND sb.is_primary=TRUE
+      WHERE s.company_id=$1`, [companyId]);
     const sr = sumRes.rows[0] || {};
 
     const { rows } = await query(`
@@ -8461,7 +8720,7 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
         sb.status AS barcode_status, sb.source, sb.sync_target, sb.tally_sync_status, sb.is_primary,
         COUNT(*) OVER() AS _total
       FROM stocks s
-      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_id=s.company_id AND sb.is_primary=TRUE AND sb.status='active'
       WHERE ${where}
       ORDER BY s.name ASC
       LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, lim, off]);
@@ -8472,7 +8731,7 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
     const unlinkedFilterRes = await query(`
       SELECT COUNT(DISTINCT s.guid)::int AS unlinked_in_filter
       FROM stocks s
-      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_guid=s.company_guid AND sb.is_primary=TRUE AND sb.status='active'
+      LEFT JOIN stock_barcodes sb ON sb.stock_guid=s.guid AND sb.company_id=s.company_id AND sb.is_primary=TRUE AND sb.status='active'
       WHERE ${where} AND sb.barcode IS NULL`, params);
     const unlinkedInFilter = parseInt(unlinkedFilterRes.rows[0]?.unlinked_in_filter ?? 0);
 
@@ -8496,7 +8755,7 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
       unit:            r.unit || 'Pcs',
     }));
 
-    const groupsRes = await query(`SELECT DISTINCT TRIM(group_name) AS group_name FROM stocks WHERE company_guid=$1 AND group_name IS NOT NULL AND TRIM(group_name) != '' ORDER BY 1`, [companyGuid]);
+    const groupsRes = await query(`SELECT DISTINCT TRIM(group_name) AS group_name FROM stocks WHERE company_id=$1 AND group_name IS NOT NULL AND TRIM(group_name) != '' ORDER BY 1`, [companyId]);
     const groups = ['All', ...groupsRes.rows.map(r => r.group_name)];
 
     res.json({
@@ -8522,13 +8781,13 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
 
 // POST /api/inventory/barcodes/generate — generate barcode for a stock item
 // ── Helper: push barcode to Tally if auto-sync is enabled ─────────────────────
-async function autoSyncBarcodeToTally(userId, companyGuid, stockGuid, stockName, barcode, syncTarget) {
+async function autoSyncBarcodeToTally(userId, companyId, stockGuid, stockName, barcode, syncTarget) {
   if (!syncTarget || syncTarget === 'app_only') return;
   try {
     const { rows: [settings] } = await query(
-      'SELECT auto_sync_to_tally FROM inventory_barcode_settings WHERE company_guid=$1', [companyGuid]);
+      'SELECT auto_sync_to_tally FROM inventory_barcode_settings WHERE company_id=$1', [companyId]);
     if (!settings?.auto_sync_to_tally) return; // toggle is OFF — do not push
-    const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: [co] } = await query('SELECT name, guid FROM companies WHERE id=$1', [companyId]);
     if (!co?.name) return;
     const { pushBarcodeToTally } = await import('./tally-write.js');
     const result = await pushBarcodeToTally({
@@ -8541,8 +8800,8 @@ async function autoSyncBarcodeToTally(userId, companyGuid, stockGuid, stockName,
       result.status === 'success'           ? 'synced'        :
       (result.altered > 0 && !result.errors)? 'synced'        : 'failed';
     await query(
-      'UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
-      [newStatus, companyGuid, stockGuid, barcode]
+      'UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_id=$2 AND stock_guid=$3 AND barcode=$4',
+      [newStatus, companyId, stockGuid, barcode]
     );
   } catch (err) {
     console.error('[autoSyncBarcodeToTally]', err.message); // non-fatal — barcode already saved
@@ -8553,17 +8812,18 @@ router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => 
   const { companyGuid, stockGuid, barcodeType = 'CODE128', syncTarget = 'app_only' } = req.body;
   if (!companyGuid || !stockGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and stockGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows: [stock] } = await query('SELECT name, guid FROM stocks WHERE guid=$1 AND company_guid=$2', [stockGuid, companyGuid]);
+    const { rows: [stock] } = await query('SELECT name, guid FROM stocks WHERE guid=$1 AND company_id=$2', [stockGuid, companyId]);
     if (!stock) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Stock item not found' } });
-    const { rows: [existing] } = await query(`SELECT barcode, barcode_type FROM stock_barcodes WHERE stock_guid=$1 AND company_guid=$2 AND is_primary=TRUE AND status='active' LIMIT 1`, [stockGuid, companyGuid]);
+    const { rows: [existing] } = await query(`SELECT barcode, barcode_type FROM stock_barcodes WHERE stock_guid=$1 AND company_id=$2 AND is_primary=TRUE AND status='active' LIMIT 1`, [stockGuid, companyId]);
     if (existing) return res.json({ success: true, data: { barcode: existing.barcode, barcodeType: existing.barcode_type, status: 'active', alreadyExisted: true } });
-    const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid=$1`, [companyGuid]);
+    const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_id=$1`, [companyId]);
     let barcode, tries = 0;
     do {
-      barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + tries + 1);
+      barcode = generateBarcodeValue(barcodeType, companyId, cnt + tries + 1);
       tries++;
-      const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode]);
+      const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, barcode]);
       if (!dup) break;
     } while (tries < 10);
     const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
@@ -8571,9 +8831,9 @@ router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => 
       INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
       VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
       RETURNING barcode, barcode_type, status, tally_sync_status`,
-      [companyGuid, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
+      [companyId, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
     // Auto-push to Tally if toggle is ON (fire-and-forget, non-blocking)
-    autoSyncBarcodeToTally(req.user.userId, companyGuid, stockGuid, stock.name, ins.barcode, syncTarget).catch(() => {});
+    autoSyncBarcodeToTally(req.user.userId, companyId, stockGuid, stock.name, ins.barcode, syncTarget).catch(() => {});
     res.json({ success: true, data: { barcode: ins.barcode, barcodeType: ins.barcode_type, status: ins.status, tallySyncStatus: ins.tally_sync_status } });
   } catch (err) {
     console.error('[inventory/barcodes GENERATE]', err.message);
@@ -8586,21 +8846,22 @@ router.post('/inventory/barcodes/link', authMiddleware, async (req, res) => {
   const { companyGuid, stockGuid, barcode, barcodeType = 'CODE128', source = 'manual', syncTarget = 'app_only', isPrimary = true } = req.body;
   if (!companyGuid || !stockGuid || !barcode) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid, stockGuid, barcode required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const vErr = validateBarcode(barcode, barcodeType);
   if (vErr) return res.status(400).json({ success: false, error: { code: 'INVALID_BARCODE', message: vErr } });
   try {
-    const { rows: [stock] } = await query('SELECT name FROM stocks WHERE guid=$1 AND company_guid=$2', [stockGuid, companyGuid]);
+    const { rows: [stock] } = await query('SELECT name FROM stocks WHERE guid=$1 AND company_id=$2', [stockGuid, companyId]);
     if (!stock) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Stock item not found' } });
-    const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, barcode.trim()]);
+    const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, barcode.trim()]);
     if (dup) return res.status(409).json({ success: false, error: { code: 'DUPLICATE_BARCODE', message: `Barcode already linked to "${dup.stock_name}"` } });
-    if (isPrimary) await query(`UPDATE stock_barcodes SET is_primary=FALSE WHERE stock_guid=$1 AND company_guid=$2 AND is_primary=TRUE`, [stockGuid, companyGuid]);
+    if (isPrimary) await query(`UPDATE stock_barcodes SET is_primary=FALSE WHERE stock_guid=$1 AND company_id=$2 AND is_primary=TRUE`, [stockGuid, companyId]);
     const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
     await query(`
       INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
       VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9)`,
-      [companyGuid, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
+      [companyId, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
     // Auto-push to Tally if toggle is ON
-    autoSyncBarcodeToTally(req.user.userId, companyGuid, stockGuid, stock.name, barcode.trim(), syncTarget).catch(() => {});
+    autoSyncBarcodeToTally(req.user.userId, companyId, stockGuid, stock.name, barcode.trim(), syncTarget).catch(() => {});
     res.json({ success: true, data: { status: 'active', tallySyncStatus: tallyStatus } });
   } catch (err) {
     console.error('[inventory/barcodes LINK]', err.message);
@@ -8613,15 +8874,16 @@ router.post('/inventory/barcodes/lookup', authMiddleware, async (req, res) => {
   const { companyGuid, barcode } = req.body;
   if (!companyGuid || !barcode) return res.status(400).json({ success: false, error: { code: 'MISSING_PARAMS', message: 'companyGuid and barcode required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const displayField = await getProductDisplayField(companyGuid);
+    const displayField = await getProductDisplayField(companyId);
     const { rows: [row] } = await query(`
       SELECT s.guid AS stock_guid, s.name, s.sku, s.alias, s.group_name, s.unit, s.closing_qty,
              sb.barcode, sb.barcode_type
       FROM stock_barcodes sb
-      JOIN stocks s ON s.guid=sb.stock_guid AND s.company_guid=sb.company_guid
-      WHERE sb.company_guid=$1 AND sb.barcode=$2 AND sb.status='active'
-      LIMIT 1`, [companyGuid, barcode.trim()]);
+      JOIN stocks s ON s.guid=sb.stock_guid AND s.company_id=sb.company_id
+      WHERE sb.company_id=$1 AND sb.barcode=$2 AND sb.status='active'
+      LIMIT 1`, [companyId, barcode.trim()]);
     if (!row) return res.json({ success: true, data: { found: false, barcode, actions: ['link_existing_item','create_new_item'] } });
     res.json({ success: true, data: { found: true, item: { stockGuid: row.stock_guid, displayName: computeDisplayName(row, displayField), name: row.name, sku: row.sku || row.alias, barcode: row.barcode, currentQty: parseFloat(row.closing_qty||0), groupName: row.group_name, unit: row.unit } } });
   } catch (err) {
@@ -8635,13 +8897,14 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
   const { companyGuid, text, lines, fileName = 'import.csv' } = req.body;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const rawLines = lines || (text ? String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean) : []);
   if (!rawLines.length) return res.status(400).json({ success: false, error: { code: 'NO_DATA', message: 'No data to import' } });
   try {
     // Read company's current sync settings so imported barcodes respect them
     const { rows: [companySettings] } = await query(
-      'SELECT barcode_storage_mode, auto_sync_to_tally FROM inventory_barcode_settings WHERE company_guid=$1',
-      [companyGuid]
+      'SELECT barcode_storage_mode, auto_sync_to_tally FROM inventory_barcode_settings WHERE company_id=$1',
+      [companyId]
     ).catch(() => ({ rows: [{}] }));
     const companySyncTarget   = companySettings?.barcode_storage_mode || 'app_only';
     const companyAutoSync     = companySettings?.auto_sync_to_tally   || false;
@@ -8668,14 +8931,14 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
       }
       let stockGuid=null, stockName=null;
       if (row.rawItemName) {
-        const { rows: [found] } = await query(`SELECT guid,name FROM stocks WHERE company_guid=$1 AND (LOWER(name)=LOWER($2) OR LOWER(sku)=LOWER($2) OR LOWER(alias)=LOWER($2)) LIMIT 1`, [companyGuid, row.rawItemName]);
+        const { rows: [found] } = await query(`SELECT guid,name FROM stocks WHERE company_id=$1 AND (LOWER(name)=LOWER($2) OR LOWER(sku)=LOWER($2) OR LOWER(alias)=LOWER($2)) LIMIT 1`, [companyId, row.rawItemName]);
         if (found) { stockGuid=found.guid; stockName=found.name; }
         else { needsReview++; errors.push({ job_id: jobId, row_number: row.rowNumber, item_identifier: row.rawItemName, barcode: b, error_type: 'needs_review', error_message: `No stock item matched "${row.rawItemName}"`, raw_data: row.raw }); continue; }
       }
-      const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_guid=$1 AND barcode=$2`, [companyGuid, b]);
+      const { rows: [dup] } = await query(`SELECT stock_name FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, b]);
       if (dup) { duplicates++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'duplicate', error_message: `Barcode already linked to "${dup.stock_name}"`, raw_data: row.raw }); continue; }
       try {
-        await query(`INSERT INTO stock_barcodes (company_guid,stock_guid,stock_name,barcode,barcode_type,source,status,is_primary,sync_target,tally_sync_status) VALUES ($1,$2,$3,$4,'CODE128','import','active',TRUE,$5,$6) ON CONFLICT (company_guid,barcode) DO NOTHING`, [companyGuid, stockGuid, stockName, b, companySyncTarget, companyTallyStatus]);
+        await query(`INSERT INTO stock_barcodes (company_id,company_guid,stock_guid,stock_name,barcode,barcode_type,source,status,is_primary,sync_target,tally_sync_status) VALUES ($1,$2,$3,$4,$5,'CODE128','import','active',TRUE,$6,$7) ON CONFLICT (company_id,barcode) DO NOTHING`, [companyId, companyGuid, stockGuid, stockName, b, companySyncTarget, companyTallyStatus]);
         imported++;
       } catch(e) { invalid++; errors.push({ job_id: jobId, row_number: row.rowNumber, barcode: b, error_type: 'error', error_message: e.message, raw_data: row.raw }); }
     }
@@ -8687,12 +8950,12 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
       setImmediate(async () => {
         try {
           const { pushBarcodeToTally } = await import('./tally-write.js');
-          const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+          const { rows: [co] } = await query('SELECT name, guid FROM companies WHERE id=$1', [companyId]);
           if (!co?.name) return;
           const { rows: newBarcodes } = await query(
             `SELECT stock_guid, stock_name, barcode, sync_target FROM stock_barcodes
-             WHERE company_guid=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
-            [companyGuid]);
+             WHERE company_id=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
+            [companyId]);
           for (const row of newBarcodes) {
             const result = await pushBarcodeToTally({
               companyGuid, userId: req.user.userId,
@@ -8702,8 +8965,8 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
             const s = !result ? 'pending_tally'
               : result.status === 'desktop_offline' ? 'pending_tally'
               : (result.status === 'success' || (result.altered > 0 && !result.errors)) ? 'synced' : 'failed';
-            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
-              [s, companyGuid, row.stock_guid, row.barcode]);
+            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_id=$2 AND stock_guid=$3 AND barcode=$4',
+              [s, companyId, row.stock_guid, row.barcode]);
             if (s === 'pending_tally') break;
           }
         } catch (e) { console.error('[bulk-import auto-sync]', e.message); }
@@ -8723,16 +8986,17 @@ router.get('/inventory/barcodes/template', authMiddleware, async (req, res) => {
   const { companyGuid } = req.query;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     // Fetch all stocks + their primary barcode (if already linked)
     const { rows } = await query(`
       SELECT s.name AS item_name, sb.barcode
       FROM stocks s
       LEFT JOIN stock_barcodes sb
-        ON sb.stock_guid = s.guid AND sb.company_guid = s.company_guid
+        ON sb.stock_guid = s.guid AND sb.company_id = s.company_id
            AND sb.is_primary = TRUE AND sb.status = 'active'
-      WHERE s.company_guid = $1
-      ORDER BY s.name ASC`, [companyGuid]);
+      WHERE s.company_id=$1
+      ORDER BY s.name ASC`, [companyId]);
 
     // Build CSV: header + one row per stock
     const lines = ['item_name,barcode'];
@@ -8758,8 +9022,9 @@ router.get('/inventory/barcodes/settings', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows: [row] } = await query(`SELECT * FROM inventory_barcode_settings WHERE company_guid=$1`, [companyGuid]);
+    const { rows: [row] } = await query(`SELECT * FROM inventory_barcode_settings WHERE company_id=$1`, [companyId]);
     res.json({ success: true, data: { barcodeStorageMode: row?.barcode_storage_mode || 'app_only', defaultBarcodeType: row?.default_barcode_type || 'CODE128', autoSyncToTally: row?.auto_sync_to_tally || false } });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
@@ -8770,15 +9035,16 @@ router.post('/inventory/barcodes/push-pending', authMiddleware, async (req, res)
   const { companyGuid } = req.body;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+    const { rows: [co] } = await query('SELECT name, guid FROM companies WHERE id=$1', [companyId]);
     if (!co?.name) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
 
     const { rows: pending } = await query(`
       SELECT sb.stock_guid, sb.stock_name, sb.barcode, sb.sync_target
       FROM stock_barcodes sb
-      WHERE sb.company_guid=$1 AND sb.tally_sync_status='pending_tally' AND sb.status='active'
-      ORDER BY sb.created_at ASC LIMIT 100`, [companyGuid]);
+      WHERE sb.company_id=$1 AND sb.tally_sync_status='pending_tally' AND sb.status='active'
+      ORDER BY sb.created_at ASC LIMIT 100`, [companyId]);
 
     if (!pending.length) return res.json({ success: true, data: { pushed: 0, message: 'No pending barcodes to sync' } });
 
@@ -8799,8 +9065,8 @@ router.post('/inventory/barcodes/push-pending', authMiddleware, async (req, res)
           result.status === 'success'            ? 'synced'        :
           (result.altered > 0 && !result.errors) ? 'synced'        : 'failed';
 
-        await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
-          [newStatus, companyGuid, row.stock_guid, row.barcode]);
+        await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_id=$2 AND stock_guid=$3 AND barcode=$4',
+          [newStatus, companyId, row.stock_guid, row.barcode]);
 
         if (newStatus === 'synced') synced++;
         else if (newStatus === 'pending_tally') { offline++; break; } // desktop offline — stop batching
@@ -8823,34 +9089,35 @@ router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => 
   const { companyGuid, barcodeStorageMode = 'app_only', defaultBarcodeType = 'CODE128', autoSyncToTally = false } = req.body;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   const VALID_MODES = ['app_only','tally_alias','tally_part_number','tally_udf'];
   const VALID_TYPES = ['CODE128','EAN13','EAN8','UPC','QR','INTERNAL'];
   if (!VALID_MODES.includes(barcodeStorageMode)) return res.status(400).json({ success: false, error: { code: 'INVALID_MODE', message: 'Invalid storage mode' } });
   if (!VALID_TYPES.includes(defaultBarcodeType))  return res.status(400).json({ success: false, error: { code: 'INVALID_TYPE', message: 'Invalid barcode type' } });
   try {
     await query(`
-      INSERT INTO inventory_barcode_settings (company_guid,barcode_storage_mode,default_barcode_type,auto_sync_to_tally,updated_at)
-      VALUES ($1,$2,$3,$4,NOW())
-      ON CONFLICT (company_guid) DO UPDATE SET barcode_storage_mode=EXCLUDED.barcode_storage_mode, default_barcode_type=EXCLUDED.default_barcode_type, auto_sync_to_tally=EXCLUDED.auto_sync_to_tally, updated_at=NOW()`,
-      [companyGuid, barcodeStorageMode, defaultBarcodeType, autoSyncToTally]);
+      INSERT INTO inventory_barcode_settings (company_id, company_guid, barcode_storage_mode, default_barcode_type, auto_sync_to_tally, updated_at)
+      VALUES ($1,$2,$3,$4,$5,NOW())
+      ON CONFLICT (company_id) DO UPDATE SET barcode_storage_mode=EXCLUDED.barcode_storage_mode, default_barcode_type=EXCLUDED.default_barcode_type, auto_sync_to_tally=EXCLUDED.auto_sync_to_tally, updated_at=NOW()`,
+      [companyId, companyGuid, barcodeStorageMode, defaultBarcodeType, autoSyncToTally]);
 
     // When user enables auto-sync AND selects a Tally target, update any existing
     // 'app_only' barcodes for this company to the new sync_target so they get queued,
     // then trigger push-pending (fire-and-forget)
     if (autoSyncToTally && barcodeStorageMode !== 'app_only') {
       await query(`UPDATE stock_barcodes SET sync_target=$1, tally_sync_status='pending_tally'
-        WHERE company_guid=$2 AND status='active' AND tally_sync_status='not_required'`,
-        [barcodeStorageMode, companyGuid]);
+        WHERE company_id=$2 AND status='active' AND tally_sync_status='not_required'`,
+        [barcodeStorageMode, companyId]);
       // Kick off push in background — response does not wait for it
       setImmediate(async () => {
         try {
           const { pushBarcodeToTally } = await import('./tally-write.js');
-          const { rows: [co] } = await query('SELECT name FROM companies WHERE guid=$1', [companyGuid]);
+          const { rows: [co] } = await query('SELECT name, guid FROM companies WHERE id=$1', [companyId]);
           if (!co?.name) return;
           const { rows: pending } = await query(`
             SELECT stock_guid, stock_name, barcode, sync_target FROM stock_barcodes
-            WHERE company_guid=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
-            [companyGuid]);
+            WHERE company_id=$1 AND tally_sync_status='pending_tally' AND status='active' LIMIT 100`,
+            [companyId]);
           for (const row of pending) {
             const result = await pushBarcodeToTally({
               companyGuid, userId: req.user.userId,
@@ -8860,8 +9127,8 @@ router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => 
             const s = !result ? 'pending_tally'
               : result.status === 'desktop_offline' ? 'pending_tally'
               : (result.status === 'success' || (result.altered > 0 && !result.errors)) ? 'synced' : 'failed';
-            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_guid=$2 AND stock_guid=$3 AND barcode=$4',
-              [s, companyGuid, row.stock_guid, row.barcode]);
+            await query('UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_id=$2 AND stock_guid=$3 AND barcode=$4',
+              [s, companyId, row.stock_guid, row.barcode]);
             if (s === 'pending_tally') break; // desktop offline — stop
           }
         } catch (e) { console.error('[settings auto-sync]', e.message); }
