@@ -115,6 +115,34 @@ describe('Company Identity destructive migration gate', () => {
     }
   });
 
+  it('the ADMIN membership migration inspects unless CONFIRM=1', () => {
+    const src = fs.readFileSync(
+      path.join(root, '..', 'scripts', 'migrate-admin-membership-to-role.mjs'),
+      'utf8'
+    );
+
+    // This script rewrites membership rows and installs a CHECK constraint. It
+    // used to apply by default and hold back only on DRY_RUN=1, so forgetting the
+    // flag migrated production. Safety must come from the default, not recall.
+    assert.match(
+      src,
+      /const dryRun\s*=\s*process\.env\.CONFIRM\s*!==\s*'1'/,
+      'absence of CONFIRM=1 must mean inspect-only'
+    );
+
+    // The membership rewrite has to sit after the early exit, or the guard is
+    // decorative.
+    const exitAt = src.indexOf('skipping membership_type UPDATE');
+    const updateAt = src.search(/UPDATE workspace_memberships\s+SET membership_type\s*=\s*'MEMBER'/);
+    assert.ok(exitAt > -1, 'inspect-only path must exit before mutating');
+    assert.ok(updateAt > -1, 'expected the membership_type rewrite');
+    assert.ok(exitAt < updateAt, 'the mutation must be unreachable in inspect-only mode');
+
+    // Same for the constraint that makes the change hard to walk back.
+    const checkAt = src.indexOf("CHECK (membership_type IN ('OWNER', 'MEMBER'))");
+    assert.ok(checkAt > exitAt, 'the CHECK constraint must also be gated');
+  });
+
   it('the staging template never enables the destructive boot flag', () => {
     const template = fs.readFileSync(path.join(root, '..', '.env.staging.example'), 'utf8');
     const active = template

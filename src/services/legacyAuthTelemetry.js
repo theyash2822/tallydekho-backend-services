@@ -35,21 +35,34 @@ function label(value) {
 }
 
 /**
- * Does the request carry a token that our own JWT_SECRET validates?
+ * Classify the bearer token on a request as one of three states.
  *
- * This is the load-bearing signal, because it cannot be forged: only this server
- * can mint a token that verifies. Expiry is ignored on purpose — an expired token
- * still proves the sender is one of our clients, which is the question being asked.
+ *   'verified' — validates against our own JWT_SECRET, so the sender is provably
+ *                one of our clients. Cannot be forged; only this server can mint
+ *                such a token. Expiry is ignored on purpose, since an expired
+ *                token still proves origin, which is the question being asked.
+ *   'invalid'  — a token was presented and did not validate. Forged, corrupted,
+ *                or signed with a key that is not ours.
+ *   'absent'   — no bearer token at all. Normal for unauthenticated routes such
+ *                as login, so it is not suspicious by itself.
+ *
+ * The distinction between 'invalid' and 'absent' matters: see isIdentifiedClient().
  */
-export function carriesOurCredential(req) {
+export function credentialState(req) {
   const header = req?.headers?.authorization;
-  if (!header?.startsWith('Bearer ') || !process.env.JWT_SECRET) return false;
+  if (!header?.startsWith('Bearer ')) return 'absent';
+  if (!process.env.JWT_SECRET) return 'invalid';
   try {
     jwt.verify(header.slice(7), process.env.JWT_SECRET, { ignoreExpiration: true });
-    return true;
+    return 'verified';
   } catch {
-    return false;
+    return 'invalid';
   }
+}
+
+/** Convenience boolean: did this request prove it came from one of our clients? */
+export function carriesOurCredential(req) {
+  return credentialState(req) === 'verified';
 }
 
 /**
@@ -63,18 +76,31 @@ export function carriesOurCredential(req) {
  * every day and the seven clean days would have been declared vacuously — the
  * precise false confidence this telemetry exists to prevent.
  *
- * A verified credential is therefore what counts. Headers only refine attribution
- * to a platform and version once clients start sending them, and they can only
- * ever move an event toward "identified", never away from it, so a client cannot
- * hide from the gate by withholding them.
+ * A verified credential is therefore what counts, and headers can never downgrade
+ * it. Withholding headers cannot hide a real client from the gate.
  *
- * Spoofing runs one way: anything may *claim* headers and be counted as
- * identified. That direction is safe, since it delays a destructive migration
- * rather than permitting one. The unsafe direction, a real client being scored
- * unattributed, is what the credential check closes.
+ * A token that was presented and failed to verify is the one case headers cannot
+ * rescue. Otherwise anyone could launder a forged token into "legitimate usage"
+ * by adding two header lines, and hold the cutover open indefinitely — a denial
+ * of progress against our own release, costing nothing to mount.
+ *
+ * Headers still decide the case where no token was presented at all, because that
+ * is normal for unauthenticated legacy routes such as login. A real client calling
+ * /app/auth/send-otp has no token to offer, and once clients send identification
+ * headers that is the only signal distinguishing it from a scanner.
+ *
+ *   credential     headers      identified
+ *   ----------     -------      ----------
+ *   verified       any          yes   — provably ours, blocks the clean day
+ *   invalid        any          no    — forgery cannot be laundered by headers
+ *   absent         present      yes   — unauthenticated legacy use by a real client
+ *   absent         missing      no    — unattributable; scanners, abandoned builds
  */
-export function isIdentifiedClient(platform, appVersion, credentialVerified = false) {
-  if (credentialVerified) return true;
+export function isIdentifiedClient(platform, appVersion, credential = 'absent') {
+  // Accepts the legacy boolean form as well as the tri-state.
+  const state = credential === true ? 'verified' : credential === false ? 'absent' : credential;
+  if (state === 'verified') return true;
+  if (state === 'invalid') return false;
   return label(platform) !== UNKNOWN && label(appVersion) !== UNKNOWN;
 }
 
@@ -94,9 +120,9 @@ export async function recordLegacyAuthEvent(eventType, req, opts = {}) {
   const { platform, appVersion, routeClass } = legacyEventFromRequest(req);
   // JWT_* events are only reachable after the signature already verified, so the
   // caller states that directly. /app/* hits are open to anyone, so the token is
-  // checked here instead.
-  const credentialVerified = opts.credentialVerified ?? carriesOurCredential(req);
-  const identified = isIdentifiedClient(platform, appVersion, credentialVerified);
+  // classified here instead.
+  const credential = opts.credentialVerified === true ? 'verified' : credentialState(req);
+  const identified = isIdentifiedClient(platform, appVersion, credential);
 
   // stdout line retained for existing log pipelines / greppability.
   console.warn(

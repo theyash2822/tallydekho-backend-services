@@ -14,6 +14,7 @@ import jwt from 'jsonwebtoken';
 import {
   LEGACY_EVENTS,
   carriesOurCredential,
+  credentialState,
   isIdentifiedClient,
   legacyEventFromRequest,
 } from '../services/legacyAuthTelemetry.js';
@@ -36,24 +37,46 @@ describe('legacy auth telemetry', () => {
     assert.match(appAuth, /router\.use\(\(req, _res, next\) => \{\s*void recordLegacyAuthEvent\(LEGACY_EVENTS\.APP_AUTH_HIT, req\)/);
   });
 
-  it('a verified credential identifies a client even with no headers at all', () => {
-    // The reason this matters: no shipped client sends x-client-platform or
-    // x-app-version. If headers were the only signal, every real legacy request
-    // would score unattributed, STRICT would exit 0 daily, and seven "clean" days
-    // would be declared while genuine legacy usage continued.
-    assert.equal(isIdentifiedClient(undefined, undefined, true), true);
-    assert.equal(isIdentifiedClient('unknown', 'unknown', true), true);
+  it('pins the full identification truth table', () => {
+    // The gate decides whether a production day counts as clean, so the policy is
+    // pinned exhaustively rather than by example. Any change here changes what
+    // "seven clean days" means.
+    const cases = [
+      // credential   platform    version   identified   why
+      ['verified', undefined, undefined, true, 'provably ours even with no headers'],
+      ['verified', 'android', '4.2.0', true, 'provably ours and attributed'],
+      ['verified', 'unknown', 'unknown', true, 'headers cannot downgrade a credential'],
+      ['invalid', undefined, undefined, false, 'forged token is not our client'],
+      ['invalid', 'android', '4.2.0', false, 'headers cannot launder a forged token'],
+      ['absent', 'android', '4.2.0', true, 'unauthenticated legacy use by a real client'],
+      ['absent', undefined, undefined, false, 'unattributable noise'],
+      ['absent', 'android', undefined, false, 'half a declaration is not a declaration'],
+      ['absent', undefined, '4.2.0', false, 'half a declaration is not a declaration'],
+    ];
+
+    for (const [credential, platform, version, expected, why] of cases) {
+      assert.equal(
+        isIdentifiedClient(platform, version, credential),
+        expected,
+        `${credential} + ${platform}/${version} should be ${expected}: ${why}`
+      );
+    }
   });
 
-  it('headers alone still identify a client, and their absence does not clear it', () => {
-    assert.equal(isIdentifiedClient('android', '4.2.0'), true);
-    assert.equal(isIdentifiedClient('android', undefined), false);
-    assert.equal(isIdentifiedClient(undefined, '4.2.0'), false);
-    assert.equal(isIdentifiedClient(undefined, undefined), false);
+  it('a real client cannot escape the gate by sending fewer headers', () => {
+    // The bug this replaces: identification depended on x-client-platform and
+    // x-app-version, and no shipped client sends either. Every genuine legacy
+    // request scored unattributed, STRICT exited 0 daily, and seven "clean" days
+    // would have been certified while legacy auth was still in use.
+    assert.equal(isIdentifiedClient(undefined, undefined, 'verified'), true);
+    assert.equal(isIdentifiedClient(undefined, undefined, true), true, 'boolean form');
+  });
 
-    // Withholding headers must never downgrade a verified credential, or a client
-    // could hide from the cutover gate simply by sending less.
-    assert.equal(isIdentifiedClient(undefined, undefined, true), true);
+  it('spoofed headers cannot turn a forged token into legitimate usage', () => {
+    // Otherwise two header lines would hold the cutover open forever — a denial of
+    // progress against our own release that costs an attacker nothing.
+    assert.equal(isIdentifiedClient('android', '4.2.0', 'invalid'), false);
+    assert.equal(isIdentifiedClient('desktop', '1.0.0', 'invalid'), false);
   });
 
   it('only our own signing key can mark a request identified', () => {
@@ -68,6 +91,22 @@ describe('legacy auth telemetry', () => {
       assert.equal(carriesOurCredential({ headers: { authorization: 'Bearer garbage' } }), false);
       assert.equal(carriesOurCredential({ headers: {} }), false);
       assert.equal(carriesOurCredential({}), false);
+
+      // "Presented and failed" must be distinguishable from "never presented":
+      // the first is a forgery signal, the second is normal on a login route.
+      assert.equal(credentialState({ headers: { authorization: `Bearer ${ours}` } }), 'verified');
+      assert.equal(credentialState({ headers: { authorization: `Bearer ${forged}` } }), 'invalid');
+      assert.equal(credentialState({ headers: { authorization: 'Bearer garbage' } }), 'invalid');
+      assert.equal(credentialState({ headers: {} }), 'absent');
+      assert.equal(credentialState({}), 'absent');
+
+      // An attacker choosing the "none" algorithm must not verify.
+      const none = [
+        Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+        Buffer.from(JSON.stringify({ userId: 1 })).toString('base64url'),
+        '',
+      ].join('.');
+      assert.equal(credentialState({ headers: { authorization: `Bearer ${none}` } }), 'invalid');
 
       // An expired token still proves origin: the client is ours either way, and
       // that is the question the observation window asks.
@@ -194,5 +233,39 @@ describe('OTP secrecy', () => {
     } finally {
       process.env.NODE_ENV = prev;
     }
+  });
+});
+
+describe('observation report date handling', () => {
+  const reporter = fs.readFileSync(
+    path.join(root, '..', 'scripts', 'report-legacy-auth-usage.mjs'),
+    'utf8'
+  );
+
+  it('the hazard being guarded against is real', () => {
+    // A DATE column arrives as local midnight. Rendering that through UTC moves it
+    // backwards for any positive offset, so in IST the row for the 18th prints as
+    // the 17th. Constructed with an explicit offset so the result does not depend
+    // on the machine running the test.
+    const localMidnightIST = new Date('2026-09-18T00:00:00+05:30');
+    assert.equal(
+      localMidnightIST.toISOString().slice(0, 10),
+      '2026-09-17',
+      'toISOString shifts the calendar day backwards in IST'
+    );
+  });
+
+  it('the report formats the observation day in SQL, not through a JS Date', () => {
+    // A clean day recorded against the wrong date is worse than no record: the
+    // seven-day window would be certified from rows that describe other days.
+    assert.match(
+      reporter,
+      /to_char\(\s*day\s*,\s*'YYYY-MM-DD'\s*\)\s+AS day/,
+      'the day must be formatted by Postgres, which knows it is a calendar date'
+    );
+    assert.ok(
+      !/new Date\(\s*row\.day\s*\)/.test(reporter),
+      'reading row.day into a JS Date reintroduces the timezone shift'
+    );
   });
 });
