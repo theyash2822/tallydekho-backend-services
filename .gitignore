@@ -3,3 +3,16 @@ data/*.db
 *.log
 .DS_Store
 .env
+
+# SQLite runtime sidecars — regenerated on every open, never source.
+data/*.db-shm
+data/*.db-wal
+
+# Workspace backup archives are runtime output containing real customer data.
+# An 11 MB archive was committed by an automated checkpoint on 2026-09-18 and
+# removed before the branch was ever pushed. Keep it out.
+data/workspace-backups/
+
+# Backup/restore artefacts produced by scripts/db-backup.mjs
+*.dump
+backups/
