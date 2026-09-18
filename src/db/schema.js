@@ -2,18 +2,48 @@
 import pg from 'pg';
 import { REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 import { applyWorkspaceSchema } from './workspaceSchema.js';
+import { ensureDeploymentIdentity } from './deploymentIdentity.js';
+import { assertAppEnvConsistency } from '../config/appEnv.js';
 const { Pool } = pg;
 
-const pool = new Pool({
+const POOL_OPTS = {
   connectionString: process.env.DATABASE_URL,
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
-});
+};
+
+let pool = new Pool(POOL_OPTS);
 
 pool.on('error', (err) => {
   console.error('[DB] Unexpected pool error:', err.message);
 });
+
+/** Test harness: pin every new connection to an isolated schema. */
+export function configureTestSearchPath(schemaName) {
+  if (!schemaName || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schemaName)) {
+    throw new Error('Invalid test schema name');
+  }
+  pool.on('connect', (client) => {
+    client.query(`SET search_path TO ${schemaName}`).catch(() => {});
+  });
+}
+
+export function getPool() {
+  return pool;
+}
+
+/** After pool.end() in multi-file tests — recreate so the next file can run. */
+export async function recreatePool() {
+  try {
+    if (pool && !pool.ended) await pool.end();
+  } catch (_) { /* ignore */ }
+  pool = new Pool(POOL_OPTS);
+  pool.on('error', (err) => {
+    console.error('[DB] Unexpected pool error:', err.message);
+  });
+  return pool;
+}
 
 // Helper: run a query with params
 export async function query(text, params) {
@@ -39,10 +69,28 @@ export function getDb() {
   return pool;
 }
 
+/**
+ * Destructive Company Identity constraint migrations must never run as an
+ * implicit side effect of a production deploy/restart. Outside production they
+ * run on boot so dev/CI schemas track the code.
+ */
+export function cidDestructiveMigrationsAllowed() {
+  return (
+    process.env.NODE_ENV !== 'production' ||
+    process.env.CID_ALLOW_DESTRUCTIVE_MIGRATION === '1'
+  );
+}
+
 // Initialize schema — create all tables if they don't exist
 export async function initSchema() {
   const client = await pool.connect();
   try {
+    assertAppEnvConsistency();
+    // Fail closed before any DDL if this app is pointed at another
+    // environment's database (e.g. a staging deploy still holding the
+    // production DATABASE_URL).
+    await ensureDeploymentIdentity(client);
+
     await client.query(`
       -- Users (mobile/web login)
       CREATE TABLE IF NOT EXISTS users (
