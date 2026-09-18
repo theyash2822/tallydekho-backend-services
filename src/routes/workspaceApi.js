@@ -951,11 +951,22 @@ router.post('/billing/recharge/verify', authMiddleware, resolveWorkspaceMiddlewa
 router.post('/billing/webhooks/razorpay', async (req, res) => {
   try {
     const signature = req.headers['x-razorpay-signature'];
-    const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {});
+    // The body arrives as a Buffer: this path is mounted with express.raw ahead
+    // of express.json precisely so the signed bytes survive intact. Re-encoding
+    // a parsed object here would reintroduce the mismatch.
+    const raw = Buffer.isBuffer(req.body)
+      ? req.body
+      : typeof req.body === 'string'
+        ? req.body
+        : JSON.stringify(req.body || {});
     if (!verifyRazorpayWebhookSignature(raw, signature)) {
       return res.status(400).json({ success: false, error: { code: 'INVALID_SIGNATURE' } });
     }
-    const event = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const event = Buffer.isBuffer(req.body)
+      ? JSON.parse(req.body.toString('utf8'))
+      : typeof req.body === 'string'
+        ? JSON.parse(req.body)
+        : req.body;
     const payment = event?.payload?.payment?.entity;
     const orderId = payment?.order_id;
     const paymentId = payment?.id;
@@ -1518,22 +1529,33 @@ router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bin
         error: { code: 'INTEGRATION_NOT_CONFIGURED', message: 'Configure provider settings before activation' },
       });
     }
-    // Billing stub — deduct activation credits from Owner wallet when billing service present
+    // Already active: succeed without charging again. Only NOT_CONFIGURED was
+    // rejected before, so re-activating an active integration deducted the fee
+    // a second time — and the button is reachable by anyone holding
+    // integrations.configure, spending the Owner's credits each press.
+    if (rows[0].status === 'ACTIVE') {
+      return res.json({ success: true, data: { domain, status: 'ACTIVE', alreadyActive: true } });
+    }
+    // Deduct activation credits from the Owner wallet when billing is present.
     try {
-      const { deductCredits, ensureBillingAccount } = await import('../services/billingService.js');
+      const { deductCredits, ensureBillingAccount, getServiceRate } = await import('../services/billingService.js');
       const { rows: ws } = await query(`SELECT owner_user_id FROM workspaces WHERE id = $1`, [req.params.id]);
       const ownerId = ws[0]?.owner_user_id;
       if (ownerId) {
         await ensureBillingAccount(ownerId);
         const rateKey = domain === 'gst' ? 'GST_ACTIVATION'
           : domain === 'einvoice' ? 'EINVOICE_ACTIVATION' : 'EWAY_ACTIVATION';
+        // Price comes from service_rates; the amount was hardcoded at 100, so
+        // repricing in the rates table had no effect on what was charged.
+        const rate = await getServiceRate(rateKey);
+        const amount = Number(rate?.credits ?? 100);
         await deductCredits({
           userId: ownerId,
-          amount: 100,
+          amount,
           kind: rateKey,
           reference: `${req.params.id}:${domain}`,
           workspaceId: req.params.id,
-          meta: { domain },
+          meta: { domain, rateVersion: rate?.version ?? null },
         });
       }
     } catch (billErr) {

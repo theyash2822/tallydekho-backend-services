@@ -71,6 +71,10 @@ app.use(compression());
 // Larger body for ingest chunk uploads only
 app.use('/ingest/chunk', express.raw({ type: '*/*', limit: '50mb' }));
 app.use('/desktop/backup/objects/:token', express.raw({ type: '*/*', limit: '2gb' }));
+// Razorpay signs the exact bytes it sent. Parsing to an object and
+// re-serialising changes key order and escaping, so the HMAC never matched and
+// every webhook was rejected as an invalid signature.
+app.use('/api/billing/webhooks/razorpay', express.raw({ type: '*/*', limit: '1mb' }));
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting for auth routes

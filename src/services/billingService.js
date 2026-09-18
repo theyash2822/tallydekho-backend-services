@@ -642,23 +642,45 @@ export async function fulfillRechargePayment({
   }
 
   const credits = Number(order.credits);
-  await creditWallet({
-    userId: order.owner_user_id,
-    amount: credits,
-    kind: 'TOPUP',
-    reference: order.id,
-    meta: { source: 'RAZORPAY', providerOrderId, providerPaymentId, signature },
-    source: 'RECHARGE',
-  });
   const ts = now();
-  const invoice = await createInvoiceFromOrder(order.owner_user_id, order.id);
-  await query(
+
+  // Claim the order before granting anything. A successful payment arrives twice
+  // by design — once from the browser's verify call and once from Razorpay's
+  // webhook — and the status check above is not a lock, so both could pass it
+  // and both credit the wallet. Only the caller whose UPDATE matches a row may
+  // proceed; the loser reports the payment as already fulfilled.
+  const claim = await query(
     `UPDATE billing_payment_orders
      SET status = 'COMPLETED', completed_at = $2,
          meta_json = COALESCE(meta_json, '{}'::jsonb) || $3::jsonb
-     WHERE id = $1`,
+     WHERE id = $1 AND status IN ('PENDING', 'CREATED')
+     RETURNING id`,
     [order.id, ts, JSON.stringify({ providerPaymentId, fulfilledAt: ts, signature: signature || null })]
   );
+  if (!claim.rowCount) {
+    return { orderId: order.id, status: 'COMPLETED', alreadyFulfilled: true };
+  }
+
+  let invoice;
+  try {
+    await creditWallet({
+      userId: order.owner_user_id,
+      amount: credits,
+      kind: 'TOPUP',
+      reference: order.id,
+      meta: { source: 'RAZORPAY', providerOrderId, providerPaymentId, signature },
+      source: 'RECHARGE',
+    });
+    invoice = await createInvoiceFromOrder(order.owner_user_id, order.id);
+  } catch (err) {
+    // Release the claim so the webhook retry can fulfil it. Leaving it COMPLETED
+    // would mean money taken and credits never granted, with no path to recover.
+    await query(
+      `UPDATE billing_payment_orders SET status = $2, completed_at = NULL WHERE id = $1`,
+      [order.id, order.status]
+    ).catch(() => {});
+    throw err;
+  }
   const wallet = await getWallet(order.owner_user_id);
   await audit(null, order.owner_user_id, 'billing.recharge_fulfilled', {
     orderId: order.id, credits, providerPaymentId, invoiceId: invoice?.id,
