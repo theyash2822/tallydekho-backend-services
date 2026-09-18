@@ -3,65 +3,38 @@
 ## src/routes/
 | File | Purpose |
 |------|---------|
-| api-v1.js | All /api/* endpoints (~3500 lines). Primary route file for mobile V4 and web portal |
-| auth.js | Legacy /app/auth/* routes |
-| companies.js | Legacy /app/companies/* routes |
-| data.js | Legacy /app/data/* routes |
-| ingest.js | /ingest/* — Tally sync ingest (chunk upload, full sync) |
-| pairing.js | /app/pairing/* — device pairing handshake |
-| tally-write.js | /tally/* — write-back vouchers to Tally via desktop socket |
-| ai.js | /ai/* — AI chat/help routes |
-| integrations.js | /integrations/* — external integration hooks |
+| api-v1.js | Canonical `/api/*` (mobile V4 + web). Includes workspaceApi mount |
+| auth.js | Legacy `/app` auth only (OTP/me/PIN) — LEGACY-BLOCK-APP-AUTH |
+| ingest.js | `/ingest/*` — Tally sync ingest (chunk upload, full sync) |
+| pairing.js | Mounted at `/desktop` — device pairing handshake |
+| tally-write.js | `/tally/*` — write-back vouchers to Tally via desktop socket |
+| ai.js | Mounted at `/api/ai` — AI insights / help |
+| desktopWorkspace.js | Desktop backup/restore/workspace routes |
+| workspaceApi.js | `/api/workspaces/*` team, roles, pairing, billing |
 
-## src/controllers/
+**Deleted (Phase 4–5):** `data.js`, `companies.js`, `integrations.js`, `/app` pairing+ai mounts.
+
+## Membership model (Phase 6)
+
+```text
+OWNER | MEMBER
+MEMBER → role_id → capabilities / scopes
+Admin-equivalent = MEMBER + builtin role system_key=ADMIN
+```
+
+## Authorization
+
 | File | Purpose |
 |------|---------|
-| ingestProcessor.js | Parses Tally XML payloads → upserts to PostgreSQL. Core sync logic |
+| services/authorizationService.js | Single resolver (`authorize`, `getEffectiveAccess`, `isAdminRole`) |
+| middleware/companyAccess.js | Company/FY/scope gate |
+| services/capabilityRegistry.js | Capability catalogue (`OWNER` / `OWNER_OR_ADMIN_ROLE`) |
+| services/roleService.js | Builtin + custom roles |
+| services/workspaceService.js | Invites, members, context |
 
-## src/db/
+## Controllers / sync
+
 | File | Purpose |
 |------|---------|
-| schema.js | pg Pool, query(), getClient(), initSchema() — all CREATE TABLE IF NOT EXISTS |
-
-## src/middleware/
-| File | Purpose |
-|------|---------|
-| auth.js | authMiddleware (JWT verify), generateToken, pre-auth middleware |
-
-## src/socket/
-| File | Purpose |
-|------|---------|
-| socketHandler.js | Socket.io events: sync-start, sync-data, sync-complete, pairing events |
-
-## src/services/
-| File | Purpose |
-|------|---------|
-| aiInsights.js | Groq API (llama-3.1-8b-instant) — AI financial narration |
-| aiAnalytics.js | Analytics data prep for AI |
-| whatsapp.js | Cronberry WABA OTP + payment reminders |
-| notifications.js | Push notifications + WhatsApp reminders dispatcher |
-| scheduler.js | node-cron: payment reminder scheduler, alert jobs |
-| email.js | OTP email fallback |
-| push.js | FCM push token management |
-| sms.js | SMS OTP fallback |
-| helpRetrieval.js | KB search / RAG |
-| helpEmbeddings.js | Help KB embedding index |
-| helpDirectAnswer.js | Direct answer from KB |
-
-## src/utils/
-| File | Purpose |
-|------|---------|
-| gstClassifier.js | Assigns GST tabs (GSTR1/2B/3B) per voucher |
-| taxClassifier.js | Other tax classification helpers |
-
-## src/kb/
-Markdown knowledge base files used for RAG/help answers.
-Do not modify unless updating help content.
-
-## Root Files
-| File | Purpose |
-|------|---------|
-| src/server.js | App entry: Express setup, route mounting, Socket.io init |
-| ecosystem.config.cjs | PM2 process config |
-| data/tallydekho.db | SQLite leftover (ignore — app uses PostgreSQL) |
-| logs/ | Runtime logs (ignore in agent tasks) |
+| controllers/ingestProcessor.js | Tally XML → PostgreSQL |
+| socket/socketHandler.js | WS register / workspace / company rooms |

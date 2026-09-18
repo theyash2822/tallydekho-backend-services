@@ -3,7 +3,6 @@ import { authMiddleware } from '../middleware/auth.js';
 import { resolveWorkspaceMiddleware, bindWorkspaceParam, requireCapability } from '../middleware/workspaceContext.js';
 import {
   ensurePersonalWorkspace,
-  isOwnerOrAdmin,
   listWorkspacesForUser,
   getWorkspaceContext,
   renameWorkspace,
@@ -197,7 +196,7 @@ router.get(
   '/workspaces/:id/members',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.view'),
+  requireCapability('members.view'),
   async (req, res) => {
     try {
       const members = await listMembers(req.params.id);
@@ -212,10 +211,10 @@ router.get(
   '/workspaces/:id/members/:membershipId/scopes',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.scope.manage'),
+  requireCapability('members.scope_manage'),
   async (req, res) => {
     try {
-      const scopes = await getMemberScopes(req.params.membershipId);
+      const scopes = await getMemberScopes(req.params.membershipId, req.params.id);
       res.json({ success: true, data: scopes });
     } catch (err) {
       errJson(res, err);
@@ -227,10 +226,10 @@ router.put(
   '/workspaces/:id/members/:membershipId/scopes',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.scope.manage'),
+  requireCapability('members.scope_manage'),
   async (req, res) => {
     try {
-      const scopes = await putMemberScopes(req.params.membershipId, req.body || {});
+      const scopes = await putMemberScopes(req.params.membershipId, req.body || {}, req.params.id);
       res.json({ success: true, data: scopes });
     } catch (err) {
       errJson(res, err);
@@ -623,7 +622,7 @@ router.get(
   '/workspaces/:id/roles',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.roles.manage'),
+  requireCapability('roles.edit'),
   async (req, res) => {
     try {
       const roles = await listRoles(req.params.id);
@@ -638,7 +637,7 @@ router.get(
   '/workspaces/:id/roles/:roleId',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.roles.manage'),
+  requireCapability('roles.edit'),
   async (req, res) => {
     try {
       const role = await getRole(req.params.roleId);
@@ -656,7 +655,7 @@ router.patch(
   '/workspaces/:id/roles/:roleId',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.roles.manage'),
+  requireCapability('roles.edit'),
   async (req, res) => {
     try {
       const role = await getRole(req.params.roleId);
@@ -669,6 +668,8 @@ router.patch(
         entryMode: body.entry_mode ?? body.entryMode,
         capabilities: body.capabilities,
         sensitivePolicies: body.sensitivePolicies ?? body.sensitive_policies,
+        actorUserId: req.user.userId,
+        workspaceId: req.params.id,
       });
       res.json({ success: true, data: updated });
     } catch (err) {
@@ -681,7 +682,7 @@ router.post(
   '/workspaces/:id/roles',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.roles.manage'),
+  requireCapability('roles.edit'),
   async (req, res) => {
     try {
       const body = req.body || {};
@@ -690,6 +691,7 @@ router.post(
         entryMode: body.entry_mode ?? body.entryMode ?? 'BOTH',
         capabilities: body.capabilities || {},
         sensitivePolicies: body.sensitivePolicies || body.sensitive_policies || {},
+        actorUserId: req.user.userId,
       });
       res.status(201).json({ success: true, data: role });
     } catch (err) {
@@ -702,7 +704,7 @@ router.delete(
   '/workspaces/:id/roles/:roleId',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.roles.manage'),
+  requireCapability('roles.edit'),
   async (req, res) => {
     try {
       await deleteRole(req.params.roleId, req.params.id);
@@ -734,7 +736,7 @@ router.post(
   '/workspaces/:id/invitations',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.invite'),
+  requireCapability('members.invite'),
   async (req, res) => {
     try {
       const body = req.body || {};
@@ -821,7 +823,7 @@ router.get(
   '/workspaces/:id/audit',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.view'),
+  requireCapability('members.view'),
   async (req, res) => {
     try {
       const rows = await listAudit(req.params.id, req.query.limit);
@@ -1009,7 +1011,7 @@ router.get(
   '/workspaces/:id/seats',
   authMiddleware,
   bindWorkspaceParam,
-  requireCapability('workspace.members.view'),
+  requireCapability('members.view'),
   async (req, res) => {
     try {
       const seats = await listSeats(req.params.id);
@@ -1037,13 +1039,9 @@ router.post(
 
 // ── Existing approvals / hard-sync / backup / restore (workspace header) ─────
 
-router.get('/workspace/approvals', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.get('/workspace/approvals', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
     const wsId = req.workspaceId;
-    const allowed = await isOwnerOrAdmin(req.user.userId, wsId);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not authorized' } });
-    }
     const hardSync = await listPendingHardSync(wsId);
     const rest = await listWorkspaceApprovals(wsId);
     const { rows: ws } = await query('SELECT id, name FROM workspaces WHERE id = $1', [wsId]);
@@ -1090,12 +1088,8 @@ router.post('/workspace/hard-sync/:id/reject', authMiddleware, resolveWorkspaceM
   }
 });
 
-router.get('/workspace/backups', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+router.get('/workspace/backups', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.workspaceId);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not authorized' } });
-    }
     const backups = await listAvailableBackups(req.workspaceId, 3);
     res.json({ success: true, data: backups });
   } catch (err) {
@@ -1207,8 +1201,8 @@ router.get('/workspaces/:id/company-years', authMiddleware, bindWorkspaceParam, 
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'companyGuid required' } });
     }
     const { rows: owned } = await query(
-      `SELECT guid FROM companies WHERE guid = $1 AND (workspace_id = $2 OR user_id = $3) LIMIT 1`,
-      [companyGuid, req.params.id, req.user.userId]
+      `SELECT guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+      [companyGuid, req.params.id]
     );
     if (!owned[0]) {
       return res.status(403).json({ success: false, error: { code: 'COMPANY_SCOPE_DENIED', message: 'Company not in workspace' } });
@@ -1234,7 +1228,7 @@ router.get('/workspaces/:id/tally/status', authMiddleware, bindWorkspaceParam, a
   }
 });
 
-router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, async (req, res) => {
+router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, requireCapability('tally.pair'), async (req, res) => {
   try {
     const pairing_code = req.body?.pairing_code || req.body?.pairingCode || req.body?.pairCode || req.body?.code;
     if (!pairing_code) {
@@ -1305,7 +1299,7 @@ router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, as
   }
 });
 
-router.post('/workspaces/:id/tally/unpair', authMiddleware, bindWorkspaceParam, async (req, res) => {
+router.post('/workspaces/:id/tally/unpair', authMiddleware, bindWorkspaceParam, requireCapability('tally.unpair'), async (req, res) => {
   try {
     const { unpairWorkspace } = await import('../services/workspacePairingService.js');
     const result = await unpairWorkspace({
@@ -1346,12 +1340,8 @@ router.post('/workspaces/:id/tally/unpair', authMiddleware, bindWorkspaceParam, 
   }
 });
 
-router.get('/workspaces/:id/approvals', authMiddleware, bindWorkspaceParam, async (req, res) => {
+router.get('/workspaces/:id/approvals', authMiddleware, bindWorkspaceParam, requireCapability('tally.restore_replace'), async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.params.id);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Not authorized' } });
-    }
     const hardSync = await listPendingHardSync(req.params.id);
     const rest = await listWorkspaceApprovals(req.params.id);
     const { rows: ws } = await query('SELECT id, name FROM workspaces WHERE id = $1', [req.params.id]);
@@ -1471,12 +1461,8 @@ router.get('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspace
   }
 });
 
-router.post('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspaceParam, async (req, res) => {
+router.post('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspaceParam, requireCapability('integrations.configure'), async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.params.id);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Owner/Admin only' } });
-    }
     const domain = String(req.params.domain || '').toLowerCase();
     if (!['gst', 'einvoice', 'eway'].includes(domain)) {
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid domain' } });
@@ -1519,12 +1505,8 @@ router.post('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspac
   }
 });
 
-router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bindWorkspaceParam, async (req, res) => {
+router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bindWorkspaceParam, requireCapability('integrations.configure'), async (req, res) => {
   try {
-    const allowed = await isOwnerOrAdmin(req.user.userId, req.params.id);
-    if (!allowed) {
-      return res.status(403).json({ success: false, error: { code: 'WORKSPACE_ACCESS_DENIED', message: 'Owner/Admin only' } });
-    }
     const domain = String(req.params.domain || '').toLowerCase();
     const { rows } = await query(
       `SELECT status FROM workspace_integrations WHERE workspace_id = $1 AND domain = $2 LIMIT 1`,

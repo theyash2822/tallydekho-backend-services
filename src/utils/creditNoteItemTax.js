@@ -331,17 +331,17 @@ export function geometryHasAttributedTax(geometry) {
  * Call after app_vouchers insert with the same payload shape as /tally/voucher/sales.
  */
 export async function persistVoucherLineTaxes(queryFn, {
-  companyGuid,
+  companyId,
   tdkReferenceNo,
   voucherGuid = null,
   items = [],
   taxes = [],
   logistics = [],
 } = {}) {
-  if (!companyGuid || !tdkReferenceNo) return { inserted: 0 };
+  if (!companyId || !tdkReferenceNo) return { inserted: 0 };
   await queryFn(
-    `DELETE FROM voucher_line_taxes WHERE company_guid = $1 AND tdk_reference_no = $2`,
-    [companyGuid, tdkReferenceNo]
+    `DELETE FROM voucher_line_taxes WHERE company_id=$1 AND tdk_reference_no = $2`,
+    [companyId, tdkReferenceNo]
   ).catch(() => {});
 
   const rows = [];
@@ -384,7 +384,7 @@ export async function persistVoucherLineTaxes(queryFn, {
           ledger_name, tax_rate, tax_amount, taxable_value, source)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [
-        companyGuid,
+        companyId,
         tdkReferenceNo,
         voucherGuid,
         row.stockItemName,

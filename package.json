@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test \"src/__tests__/*.test.js\""
+    "test:unit": "RBAC_UNIT_ONLY=1 node --import dotenv/config --test \"src/__tests__/*.test.js\"",
+    "test:rbac": "RBAC_INTEGRATION=1 node --import dotenv/config --test --test-concurrency=1 \"src/__tests__/rbac/*.test.js\"",
+    "test": "npm run test:unit && npm run test:rbac",
+    "test:ci": "npm test",
+    "verify:legacy-columns": "node scripts/verify-rbac-legacy-column-removal.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1042.0",
@@ -30,5 +34,8 @@
     "pg": "^8.20.0",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
   }
 }

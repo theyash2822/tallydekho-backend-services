@@ -1,3 +1,4 @@
+import { requireResolvedCompanyId } from '../utils/companyOwnership.js';
 /**
  * AI Routes — Real data-driven analytics
  * Uses statistical models on actual historical data
@@ -7,6 +8,7 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { verifyCompanyAccess } from '../middleware/companyAccess.js';
 import { linearRegression, movingAverage, pctChange, generateInsights } from '../services/aiAnalytics.js';
 import { retrieveKBContext, retrieveKBContextSemantic, buildSystemPrompt } from '../services/helpRetrieval.js';
 import { tryFAQAnswer, tryDirectKBAnswer } from '../services/helpDirectAnswer.js';
@@ -17,8 +19,13 @@ const router = Router();
 // GET /ai-insights — Full AI dashboard with forecast + insights + growth
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/ai-insights', authMiddleware, async (req, res) => {
-  const { companyGuid } = req.query;
+  const companyGuid = req.query.companyGuid || req.query.companyId;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!await verifyCompanyAccess(req, res, companyGuid, {
+    capability: 'ai_insights.view',
+    responseShape: 'data',
+  })) return;
+  const companyId = requireResolvedCompanyId(req);
 
   try {
     const now = new Date();
@@ -34,13 +41,13 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
         SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchases,
         COUNT(CASE WHEN voucher_type ILIKE '%Sales%' THEN 1 END) as invoice_count
       FROM vouchers
-      WHERE company_guid=$1
+      WHERE company_id=$1
         AND is_cancelled=FALSE
         AND date::date >= NOW() - INTERVAL '16 weeks'
         AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
       GROUP BY DATE_TRUNC('week', date::date)
       ORDER BY week_start
-    `, [companyGuid]).catch(() => ({ rows: [] }));
+    `, [companyId]).catch(() => ({ rows: [] }));
 
     // Split into prev 8 weeks (forecast base) and last 8 weeks (actual)
     const allWeeks = weeklyRows;
@@ -76,12 +83,12 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
         SUM(CASE WHEN voucher_type ILIKE '%Sales%' THEN amount ELSE 0 END) as sales,
         SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN amount ELSE 0 END) as purchases
       FROM vouchers
-      WHERE company_guid=$1 AND is_cancelled=FALSE
+      WHERE company_id=$1 AND is_cancelled=FALSE
         AND date BETWEEN $2 AND $3
         AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
       GROUP BY TO_CHAR(date::date, 'Mon'), EXTRACT(MONTH FROM date::date)
       ORDER BY month_num
-    `, [companyGuid, fyStart, fyEnd]).catch(() => ({ rows: [] }));
+    `, [companyId, fyStart, fyEnd]).catch(() => ({ rows: [] }));
 
     const monthlySales = monthlyRows.map(r => parseFloat(r.sales || 0));
     const monthlyPurchases = monthlyRows.map(r => parseFloat(r.purchases || 0));
@@ -115,11 +122,11 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
         SUM(amount) as revenue,
         COUNT(*) as invoice_count
       FROM vouchers
-      WHERE company_guid=$1 AND voucher_type ILIKE '%Sales%'
+      WHERE company_id=$1 AND voucher_type ILIKE '%Sales%'
         AND is_cancelled=FALSE AND date BETWEEN $2 AND $3
         AND party_name IS NOT NULL AND party_name != ''
       GROUP BY party_name ORDER BY revenue DESC LIMIT 5
-    `, [companyGuid, fyStart, fyEnd]).catch(() => ({ rows: [] }));
+    `, [companyId, fyStart, fyEnd]).catch(() => ({ rows: [] }));
 
     const topCustomers = custRows.map(r => ({
       name: r.name,
@@ -136,9 +143,9 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
       SELECT name, closing_qty as current_stock, closing_rate as unit_price,
         COALESCE(closing_qty * closing_rate, 0) as total_value
       FROM stocks
-      WHERE company_guid=$1
+      WHERE company_id=$1
       ORDER BY total_value DESC LIMIT 20
-    `, [companyGuid]).catch(() => ({ rows: [] }));
+    `, [companyId]).catch(() => ({ rows: [] }));
 
     const totalInventoryValue = stockRows.reduce((s, r) => s + parseFloat(r.total_value || 0), 0);
     const inventoryTurnover = totalInventoryValue > 0
@@ -156,9 +163,9 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
     const { rows: recRows } = await query(`
       SELECT COALESCE(SUM(ABS(closing_balance)),0) as v
       FROM ledgers
-      WHERE company_guid=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')
+      WHERE company_id=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')
         AND closing_balance > 0
-    `, [companyGuid]).catch(() => ({ rows: [{ v: 0 }] }));
+    `, [companyId]).catch(() => ({ rows: [{ v: 0 }] }));
 
     const outstanding = parseFloat(recRows[0]?.v || 0);
     const outstandingRatio = totalSalesFY > 0 ? outstanding / totalSalesFY : 0;

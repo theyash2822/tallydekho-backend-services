@@ -82,11 +82,11 @@ const CAPABILITIES = [
   { key: 'integrations.configure', display_name: 'Configure Integrations', category: 'WORKSPACE', supports_entry_mode: false, protected_authority: null, customer_surface: true },
 
   // Protected Owner/Admin
-  { key: 'tally.pair', display_name: 'Pair Tally', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_ADMIN', customer_surface: true },
-  { key: 'tally.unpair', display_name: 'Unpair Tally', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_ADMIN', customer_surface: true },
-  { key: 'tally.restore_replace', display_name: 'Approve Restore / Replace', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_ADMIN', customer_surface: true },
-  { key: 'members.suspend', display_name: 'Suspend Members', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_ADMIN', customer_surface: true },
-  { key: 'members.unsuspend', display_name: 'Unsuspend Members', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_ADMIN', customer_surface: true },
+  { key: 'tally.pair', display_name: 'Pair Tally', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_OR_ADMIN_ROLE', customer_surface: true },
+  { key: 'tally.unpair', display_name: 'Unpair Tally', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_OR_ADMIN_ROLE', customer_surface: true },
+  { key: 'tally.restore_replace', display_name: 'Approve Restore / Replace', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_OR_ADMIN_ROLE', customer_surface: true },
+  { key: 'members.suspend', display_name: 'Suspend Members', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_OR_ADMIN_ROLE', customer_surface: true },
+  { key: 'members.unsuspend', display_name: 'Unsuspend Members', category: 'PROTECTED', supports_entry_mode: false, protected_authority: 'OWNER_OR_ADMIN_ROLE', customer_surface: true },
 
   // Owner-only
   { key: 'billing.manage', display_name: 'Manage Billing', category: 'OWNER', supports_entry_mode: false, protected_authority: 'OWNER', customer_surface: true },
@@ -127,7 +127,7 @@ export function ownerOnlyKeys() {
 
 export function ownerAdminKeys() {
   return CAPABILITIES.filter(
-    (c) => c.protected_authority === 'OWNER_ADMIN' || c.protected_authority === 'OWNER'
+    (c) => c.protected_authority === 'OWNER_OR_ADMIN_ROLE' || c.protected_authority === 'OWNER'
   ).map((c) => c.key);
 }
 
@@ -262,26 +262,25 @@ export const BUILTIN_ROLE_DEFS = [
 ];
 
 export function adminProtectedKeys() {
-  return CAPABILITIES.filter((c) => c.protected_authority === 'OWNER_ADMIN').map((c) => c.key);
+  return CAPABILITIES.filter((c) => c.protected_authority === 'OWNER_OR_ADMIN_ROLE').map((c) => c.key);
 }
 
-/** Legacy aliases used by early workspaceApi drafts — map to LOCKED keys. */
-export const CAPABILITY_ALIASES = {
-  'workspace.members.view': 'members.view',
-  'workspace.members.invite': 'members.invite',
-  'workspace.members.remove': 'members.remove',
-  'workspace.roles.manage': 'roles.edit',
-  'workspace.scope.manage': 'members.scope_manage',
-  'workspace.settings.manage': 'workspace.settings.manage',
-  'workspace.tally.pair': 'tally.pair',
-  'workspace.tally.unpair': 'tally.unpair',
-  'workspace.restore.approve': 'tally.restore_replace',
-  'workspace.hard_sync.approve': 'tally.restore_replace',
-  'integrations.manage': 'integrations.configure',
-  'integrations.activate': 'integrations.configure',
-  'billing.wallet.view': 'billing.manage',
-};
+/** High-risk caps custom roles must never receive (CTO Phase 3). */
+export function nonDelegableCapabilityKeys() {
+  return [
+    ...ownerOnlyKeys(),
+    ...adminProtectedKeys(),
+    'members.remove',
+    'members.role_assign',
+    'members.suspend',
+    'members.unsuspend',
+    'roles.create',
+    'roles.edit',
+    'roles.delete',
+  ];
+}
 
+/** Capability keys are canonical only — aliases removed in Phase 3. */
 export function resolveCapabilityKey(key) {
-  return CAPABILITY_ALIASES[key] || key;
+  return key;
 }

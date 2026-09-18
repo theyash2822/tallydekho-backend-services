@@ -1,9 +1,11 @@
 /**
- * Hard-sync rebuild: purge Tally projection data for a company GUID.
+ * Hard-sync rebuild: purge Tally projection data for a company by internal id.
  * Keeps the companies row + app-layer tables (write_queue, app_vouchers, settings).
  * Normal sync must NEVER call this.
+ *
+ * Ownership is companies.id — never delete by company_guid alone (cross-tenant safe).
  */
-import { getClient } from '../db/schema.js';
+import { getClient, query } from '../db/schema.js';
 
 /** Tables that store synced Tally projection data (delete order: children → parents). */
 const TALLY_PROJECTION_TABLES = [
@@ -38,16 +40,19 @@ const TALLY_PROJECTION_TABLES = [
 ];
 
 /**
- * @param {string} companyGuid
- * @returns {Promise<{ companyGuid: string, deleted: Record<string, number> }>}
+ * @param {number|string} companyId
+ * @param {{ companyGuid?: string }} [meta]
+ * @returns {Promise<{ companyId: number, companyGuid: string|null, deleted: Record<string, number> }>}
  */
-export async function purgeCompanyTallyData(companyGuid) {
-  if (!companyGuid || typeof companyGuid !== 'string') {
-    throw new Error('companyGuid required');
+export async function purgeCompanyTallyDataById(companyId, meta = {}) {
+  const id = Number(companyId);
+  if (!Number.isFinite(id)) {
+    throw new Error('companyId required');
   }
 
   const client = await getClient();
   const deleted = {};
+  const companyGuid = meta.companyGuid ?? null;
 
   try {
     await client.query('BEGIN');
@@ -55,8 +60,8 @@ export async function purgeCompanyTallyData(companyGuid) {
     for (const table of TALLY_PROJECTION_TABLES) {
       try {
         const res = await client.query(
-          `DELETE FROM ${table} WHERE company_guid = $1`,
-          [companyGuid]
+          `DELETE FROM ${table} WHERE company_id = $1`,
+          [id]
         );
         deleted[table] = res.rowCount || 0;
       } catch (err) {
@@ -65,16 +70,21 @@ export async function purgeCompanyTallyData(companyGuid) {
           deleted[table] = 0;
           continue;
         }
+        // Column may be missing on transitional tables — skip
+        if (err.code === '42703') {
+          deleted[table] = 0;
+          continue;
+        }
         throw err;
       }
     }
 
     await client.query('COMMIT');
-    console.log(`[PURGE] Hard-sync rebuild wiped tally data for ${companyGuid}`, deleted);
-    return { companyGuid, deleted };
+    console.log(`[PURGE] Hard-sync rebuild wiped tally data for company_id=${id}`, deleted);
+    return { companyId: id, companyGuid, deleted };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error(`[PURGE] Failed for ${companyGuid}:`, err.message);
+    console.error(`[PURGE] Failed for company_id=${id}:`, err.message);
     throw err;
   } finally {
     client.release();
@@ -82,14 +92,43 @@ export async function purgeCompanyTallyData(companyGuid) {
 }
 
 /**
+ * Resolve workspace-scoped company then purge by id.
+ * @param {string} companyGuid
+ * @param {{ workspaceId?: string, companyId?: number|string }} [opts]
+ */
+export async function purgeCompanyTallyData(companyGuid, opts = {}) {
+  if (opts.companyId != null) {
+    return purgeCompanyTallyDataById(opts.companyId, { companyGuid });
+  }
+  if (!companyGuid || typeof companyGuid !== 'string') {
+    throw new Error('companyGuid required');
+  }
+  if (!opts.workspaceId) {
+    throw new Error('workspaceId required with companyGuid for purge');
+  }
+  const { rows } = await query(
+    `SELECT id, guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+    [companyGuid, opts.workspaceId]
+  );
+  if (!rows[0]) {
+    return { companyId: null, companyGuid, deleted: {} };
+  }
+  return purgeCompanyTallyDataById(rows[0].id, { companyGuid: rows[0].guid });
+}
+
+/**
  * Purge multiple selected companies (hard sync only).
  * @param {string[]} companyGuids
+ * @param {string} workspaceId
  */
-export async function purgeCompaniesForHardSync(companyGuids) {
+export async function purgeCompaniesForHardSync(companyGuids, workspaceId) {
+  if (!workspaceId) {
+    throw new Error('workspaceId required for hard-sync purge');
+  }
   const guids = [...new Set((companyGuids || []).filter(Boolean))];
   const results = [];
   for (const guid of guids) {
-    results.push(await purgeCompanyTallyData(guid));
+    results.push(await purgeCompanyTallyData(guid, { workspaceId }));
   }
   return results;
 }

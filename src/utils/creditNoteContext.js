@@ -68,17 +68,17 @@ export function isSalesInvoiceRow(voucher) {
 }
 
 /** Resolve a Sales invoice by GUID (preferred) or voucher number, company-scoped. */
-export async function resolveInvoiceForReturn(companyGuid, ref) {
+export async function resolveInvoiceForReturn(companyId, ref) {
   const key = String(ref ?? '').trim();
-  if (!companyGuid || !key) return null;
+  if (!companyId || !key) return null;
   const { rows } = await query(
     `SELECT * FROM vouchers
-      WHERE company_guid = $2
+      WHERE company_id=$2
         AND (guid = $1 OR voucher_number = $1)
         AND COALESCE(is_cancelled, FALSE) = FALSE
       ORDER BY (guid = $1)::int DESC, date DESC NULLS LAST, id DESC
       LIMIT 1`,
-    [key, companyGuid]
+    [key, companyId]
   );
   return rows[0] || null;
 }
@@ -102,19 +102,19 @@ function appVoucherTargetsInvoice(payload, invoice, refKeys) {
 /**
  * Build the full Sales Return context for one Sales invoice.
  *
- * @param {string} companyGuid
+ * @param {string} companyId
  * @param {object} invoice  row from `vouchers` (already verified as Sales + owned)
  * @returns {Promise<object>} { linkedInvoice, party, items, invoiceSalesLedgers,
  *   companySalesLedgers, taxes, gst, otherLedgers, priorReturns }
  */
-export async function loadCreditNoteContext(companyGuid, invoice) {
+export async function loadCreditNoteContext(companyId, invoice) {
   const invoiceGuid = invoice.guid;
 
   // ── TDK reference + Sales payload (app-created invoices — best tax geometry) ──
   const { rows: invAvRows } = await query(
     `SELECT tdk_reference_no, payload, tally_guid
        FROM app_vouchers
-      WHERE company_guid = $1
+      WHERE company_id=$1
         AND voucher_type IN ('sales_invoice', 'sales')
         AND (
           tally_voucher_no = $2
@@ -126,7 +126,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
         id DESC
       LIMIT 1`,
     [
-      companyGuid,
+      companyId,
       invoice.voucher_number || '',
       invoice.reference || '',
     ]
@@ -168,58 +168,58 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
               ABS(COALESCE(vi.discount, 0))                     AS discount
          FROM voucher_inventory_items vi
          LEFT JOIN stocks s
-           ON s.name = vi.stock_item_name AND s.company_guid = vi.company_guid
-        WHERE vi.voucher_guid = $1 AND vi.company_guid = $2
+           ON s.name = vi.stock_item_name AND s.company_id = vi.company_id
+        WHERE vi.voucher_guid = $1 AND vi.company_id=$2
         ORDER BY vi.stock_item_name ASC, vi.id ASC`,
-      [invoiceGuid, companyGuid]
+      [invoiceGuid, companyId]
     ),
     query(
       `SELECT vle.ledger_name, vle.amount, vle.dr_cr, vle.line_index,
               l.guid AS ledger_guid, l.parent AS ledger_parent
          FROM voucher_ledger_entries vle
          LEFT JOIN ledgers l
-           ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-        WHERE vle.voucher_guid = $1 AND vle.company_guid = $2
+           ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+        WHERE vle.voucher_guid = $1 AND vle.company_id=$2
         ORDER BY vle.line_index ASC, vle.id ASC`,
-      [invoiceGuid, companyGuid]
+      [invoiceGuid, companyId]
     ),
     // Every ledger under Sales Accounts (walked recursively, so sub-groups count).
     query(
       `WITH RECURSIVE sales_groups AS (
          SELECT name FROM groups
-          WHERE company_guid = $1 AND name ILIKE 'Sales Account%'
+          WHERE company_id=$1 AND name ILIKE 'Sales Account%'
          UNION ALL
          SELECT g.name FROM groups g
            JOIN sales_groups sg ON g.parent = sg.name
-          WHERE g.company_guid = $1
+          WHERE g.company_id=$1
        )
        SELECT DISTINCT l.name, l.guid, l.parent
          FROM ledgers l
-        WHERE l.company_guid = $1
+        WHERE l.company_id=$1
           AND (l.parent IN (SELECT name FROM sales_groups) OR l.parent ILIKE '%Sales Account%')
         ORDER BY l.name ASC`,
-      [companyGuid]
+      [companyId]
     ),
     query(
       `SELECT taxable_amount, cgst_amount, sgst_amount, igst_amount, gst_reg_type, place_of_supply
          FROM gst_voucher_details
-        WHERE voucher_guid = $1 AND company_guid = $2 LIMIT 1`,
-      [invoiceGuid, companyGuid]
+        WHERE voucher_guid = $1 AND company_id=$2 LIMIT 1`,
+      [invoiceGuid, companyId]
     ).catch(() => ({ rows: [] })),
     query(
       `SELECT name, guid, gstin, pan, phone, email, address, parent
-         FROM ledgers WHERE company_guid = $1 AND name = $2 LIMIT 1`,
-      [companyGuid, invoice.party_name || '']
+         FROM ledgers WHERE company_id=$1 AND name = $2 LIMIT 1`,
+      [companyId, invoice.party_name || '']
     ).catch(() => ({ rows: [] })),
     // Original invoice GSTRATE when AllVoucher ingest stored it on voucher_items.
     // Never fall back to stocks.tax_rate (today's master).
     query(
       `SELECT item_name, MAX(ABS(COALESCE(tax_rate, 0))) AS tax_rate
          FROM voucher_items
-        WHERE voucher_guid = $1 AND company_guid = $2
+        WHERE voucher_guid = $1 AND company_id=$2
           AND ABS(COALESCE(tax_rate, 0)) > 0
         GROUP BY item_name`,
-      [invoiceGuid, companyGuid]
+      [invoiceGuid, companyId]
     ).catch(() => ({ rows: [] })),
   ]);
 
@@ -311,13 +311,13 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
                 ABS(COALESCE(cn.amount, 0)) AS amount,
                 cn.bill_ref_name, cn.bill_type
            FROM vouchers cn
-          WHERE cn.company_guid = $1
+          WHERE cn.company_id=$1
             AND COALESCE(cn.is_cancelled, FALSE) = FALSE
             AND (cn.voucher_type ILIKE '%Credit Note%' OR COALESCE(cn.voucher_type_parent, '') = 'Credit Note')
             AND COALESCE(cn.bill_type, '') = 'Agst Ref'
             AND LOWER(TRIM(COALESCE(cn.bill_ref_name, ''))) = ANY($2::text[])
           ORDER BY cn.date ASC NULLS LAST, cn.id ASC`,
-        [companyGuid, billRefCandidates.map(normalizeName)]
+        [companyId, billRefCandidates.map(normalizeName)]
       )
     : { rows: [] };
 
@@ -328,9 +328,9 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       `SELECT stock_item_name,
               SUM(ABS(COALESCE(NULLIF(billed_qty, 0), actual_qty, 0))) AS qty
          FROM voucher_inventory_items
-        WHERE company_guid = $1 AND voucher_guid = ANY($2::text[])
+        WHERE company_id=$1 AND voucher_guid = ANY($2::text[])
         GROUP BY stock_item_name`,
-      [companyGuid, syncedGuids]
+      [companyId, syncedGuids]
     );
     for (const row of syncedItemRows) {
       syncedQtyByItem.set(normalizeName(row.stock_item_name), num(row.qty));
@@ -349,7 +349,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
             books_impact_status, original_entry_type, current_entry_type,
             voucher_date, total_amount, payload, created_at
        FROM app_vouchers av
-      WHERE av.company_guid = $1
+      WHERE av.company_id=$1
         AND av.voucher_type = 'credit_note'
         AND av.tally_sync_status <> 'failed'
         AND (
@@ -365,7 +365,7 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
       ORDER BY av.id ASC`,
     // Never swallow a failure here: an empty result would silently allow an
     // over-return past a Credit Note that is queued but not yet in Tally.
-    [companyGuid, String(invoiceGuid || ''), [...refKeys]]
+    [companyId, String(invoiceGuid || ''), [...refKeys]]
   );
 
   const pendingQtyByItem = new Map();
@@ -445,13 +445,13 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
     `SELECT stock_item_name, line_index, ledger_name, tax_rate, tax_amount,
             taxable_value, source
        FROM voucher_line_taxes
-      WHERE company_guid = $1
+      WHERE company_id=$1
         AND (
           ($2::text IS NOT NULL AND voucher_guid = $2)
           OR ($3::text IS NOT NULL AND tdk_reference_no = $3)
         )
       ORDER BY line_index ASC, id ASC`,
-    [companyGuid, invoiceGuid || null, invoiceTdkRef || null]
+    [companyId, invoiceGuid || null, invoiceTdkRef || null]
   ).catch(() => ({ rows: [] }));
 
   let itemTaxGeometry = null;
@@ -657,8 +657,8 @@ export async function loadCreditNoteContext(companyGuid, invoice) {
  * Resolve the invoice + context in one step, returning a uniform failure shape so
  * both the read endpoint and the writer emit identical error messages.
  */
-export async function resolveCreditNoteContext(companyGuid, invoiceRef) {
-  const invoice = await resolveInvoiceForReturn(companyGuid, invoiceRef);
+export async function resolveCreditNoteContext(companyId, invoiceRef) {
+  const invoice = await resolveInvoiceForReturn(companyId, invoiceRef);
   if (!invoice) {
     return { ok: false, status: 404, code: 'INVOICE_NOT_FOUND', message: `Sales invoice not found for "${invoiceRef}"` };
   }
@@ -668,6 +668,6 @@ export async function resolveCreditNoteContext(companyGuid, invoiceRef) {
       message: `Voucher ${invoice.voucher_number || invoiceRef} is a ${invoice.voucher_type || 'non-Sales'} voucher — a Sales Return must be raised against a Sales invoice`,
     };
   }
-  const context = await loadCreditNoteContext(companyGuid, invoice);
+  const context = await loadCreditNoteContext(companyId, invoice);
   return { ok: true, invoice, context };
 }

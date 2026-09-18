@@ -37,7 +37,10 @@ async function loadScopes(membershipId) {
     [membershipId]
   );
   const { rows: companies } = await query(
-    `SELECT company_guid FROM member_company_access WHERE membership_id = $1`,
+    `SELECT c.guid AS company_guid, mca.company_id
+       FROM member_company_access mca
+       JOIN companies c ON c.id = mca.company_id
+      WHERE mca.membership_id = $1`,
     [membershipId]
   );
   const { rows: fys } = await query(
@@ -72,11 +75,9 @@ async function loadScopes(membershipId) {
   };
 }
 
-function isAdminMembership(membership, role) {
-  if (!membership) return false;
-  if (membership.membership_type === 'ADMIN') return true;
-  if (role?.system_key === 'ADMIN') return true;
-  return false;
+/** Admin-equivalent = MEMBER with builtin ADMIN role (Phase 6). Not membership_type. */
+export function isAdminRole(role) {
+  return role?.system_key === 'ADMIN';
 }
 
 /**
@@ -145,9 +146,6 @@ export async function authorize({
   entryKind = null,
 }) {
   try {
-    if (!flag('rbas_enabled')) {
-      return { decision: 'ALLOW', reason: 'RBAS_DISABLED' };
-    }
     const capabilityKey = resolveCapabilityKey(capability);
     const membership = await loadMembership(userId, workspaceId);
     const gate = membershipAuthzGate(membership);
@@ -162,9 +160,9 @@ export async function authorize({
     }
 
     const role = membership.role_id ? await getRole(membership.role_id) : null;
-    const admin = isAdminMembership(membership, role);
+    const admin = isAdminRole(role);
 
-    if (admin && cap.protected_authority === 'OWNER_ADMIN') {
+    if (admin && cap.protected_authority === 'OWNER_OR_ADMIN_ROLE') {
       return { decision: 'ALLOW' };
     }
 
@@ -225,6 +223,19 @@ export async function authorize({
   }
 }
 
+/** Fail closed throw if capability not granted. Canonical replacement for isOwnerOrAdmin gates. */
+export async function assertCapability(userId, workspaceId, capability) {
+  const result = await authorize({ userId, workspaceId, capability });
+  if (result.decision !== 'ALLOW') {
+    const err = new Error('Capability not granted');
+    err.code = result.reason || 'CAPABILITY_DENIED';
+    err.httpStatus = 403;
+    err.capability = capability;
+    throw err;
+  }
+  return result;
+}
+
 /**
  * Effective access bundle for workspace context / mobile bootstrap.
  */
@@ -248,7 +259,7 @@ export async function getEffectiveAccess(userId, workspaceId) {
     }
 
     const role = membership.role_id ? await getRole(membership.role_id) : null;
-    const admin = isAdminMembership(membership, role);
+    const admin = isAdminRole(role);
     let capabilities = [];
     if (role) {
       capabilities = Object.entries(role.capabilities || {})
@@ -258,8 +269,6 @@ export async function getEffectiveAccess(userId, workspaceId) {
         const extra = new Set([...capabilities, ...ownerAdminKeys().filter((k) => !ownerOnlyKeys().includes(k))]);
         capabilities = [...extra];
       }
-    } else if (admin) {
-      capabilities = ownerAdminKeys().filter((k) => !ownerOnlyKeys().includes(k));
     }
 
     const scopes = await loadScopes(membership.id);

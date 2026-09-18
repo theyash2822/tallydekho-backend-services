@@ -1,7 +1,7 @@
 import { v4 as uuid } from 'uuid';
 import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
-import { resolveMembership, isOwnerOrAdminMembership } from './authzService.js';
+import { assertCapability } from './authorizationService.js';
 import { tryReserveCredits } from './billingStubService.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -42,9 +42,7 @@ export async function listIntegrations(workspaceId) {
  */
 export async function setIntegrationConfig({ workspaceId, domain, userId, config }) {
   assertDomain(domain);
-  const membership = await resolveMembership(userId, workspaceId);
-  const ownerOrAdmin = await isOwnerOrAdminMembership(membership);
-  if (!ownerOrAdmin) throw new IntegrationError('WORKSPACE_ACCESS_DENIED', 'Only Owner/Admin can configure integrations.', 403);
+  await assertCapability(userId, workspaceId, 'integrations.configure');
 
   const existing = await getIntegration(workspaceId, domain);
   const nextStatus = existing.status === 'NOT_CONFIGURED' ? 'CONFIGURED' : existing.status;
@@ -67,9 +65,7 @@ export async function setIntegrationConfig({ workspaceId, domain, userId, config
  */
 export async function activateIntegration({ workspaceId, domain, userId, idempotencyKey = null }) {
   assertDomain(domain);
-  const membership = await resolveMembership(userId, workspaceId);
-  const ownerOrAdmin = await isOwnerOrAdminMembership(membership);
-  if (!ownerOrAdmin) throw new IntegrationError('WORKSPACE_ACCESS_DENIED', 'Only Owner/Admin can activate integrations.', 403);
+  await assertCapability(userId, workspaceId, 'integrations.configure');
 
   const integration = await getIntegration(workspaceId, domain);
   if (integration.status === 'NOT_CONFIGURED') {

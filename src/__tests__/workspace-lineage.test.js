@@ -94,7 +94,7 @@ test('capability registry: builtin system_keys are unique and non-display', () =
   assert.ok(keys.includes('INVENTORY'));
   assert.ok(keys.includes('VIEWER'));
   assert.ok(keys.includes('AUDITOR'));
-  assert.ok(getCapability('tally.pair')?.protected_authority === 'OWNER_ADMIN');
+  assert.ok(getCapability('tally.pair')?.protected_authority === 'OWNER_OR_ADMIN_ROLE');
   assert.ok(getCapability('sales_invoice.create')?.supports_entry_mode === true);
   assert.equal(getCapability('sales_invoice.edit'), null); // LOCKED: no generic edit
   assert.equal(getCapability('sales_invoice.delete'), null); // LOCKED: no generic delete

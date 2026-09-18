@@ -9,6 +9,8 @@ import {
   allSensitivePolicyKeys,
   BUILTIN_ROLE_DEFS,
   ownerOnlyKeys,
+  ownerAdminKeys,
+  nonDelegableCapabilityKeys,
 } from './capabilityRegistry.js';
 import { audit } from './auditService.js';
 
@@ -72,6 +74,8 @@ export async function seedBuiltinRoles(workspaceId) {
       [workspaceId, def.system_key]
     );
     if (existing[0]) {
+      // Refresh grants so older workspaces pick up new catalogue keys (e.g. members.remove)
+      await refreshBuiltinRoleCapabilities(existing[0].id, def.system_key);
       seeded.push(existing[0].id);
       continue;
     }
@@ -79,6 +83,25 @@ export async function seedBuiltinRoles(workspaceId) {
     if (id) seeded.push(id);
   }
   return seeded;
+}
+
+/** Ensure builtin role has template keys that are missing only (seed-once additive).
+ * NEVER overwrite granted=FALSE after Owner/Admin edits a role.
+ */
+export async function refreshBuiltinRoleCapabilities(roleId, systemKey) {
+  if (!roleId || !systemKey) return;
+  const wanted = new Set(defaultKeysForTemplate(systemKey));
+  if (String(systemKey).toUpperCase() === 'ADMIN') {
+    for (const k of ownerAdminKeys()) wanted.add(k);
+  }
+  for (const key of wanted) {
+    await query(
+      `INSERT INTO role_capabilities (role_id, capability_key, granted)
+       VALUES ($1,$2,TRUE)
+       ON CONFLICT (role_id, capability_key) DO NOTHING`,
+      [roleId, key]
+    );
+  }
 }
 
 /** @deprecated alias — Owner is not a role; prefer seedBuiltinRoles */
@@ -146,9 +169,10 @@ export async function getEntryModeForMembership(membership) {
 }
 
 /**
- * Update capability grants. Admin system_key always forces OWNER_ADMIN protected keys granted.
+ * Update capability grants. Admin system_key always forces OWNER_OR_ADMIN_ROLE protected keys granted.
+ * Anti-escalation: actor may only grant capabilities they themselves hold (OWNER exempt).
  */
-export async function updateRoleCapabilities(roleId, grantsMap = {}) {
+export async function updateRoleCapabilities(roleId, grantsMap = {}, { actorUserId, workspaceId } = {}) {
   const role = await getRole(roleId);
   if (!role) {
     const err = new Error('Role not found');
@@ -160,10 +184,31 @@ export async function updateRoleCapabilities(roleId, grantsMap = {}) {
   for (const key of Object.keys(next)) {
     if (!getCapability(key)) delete next[key];
   }
+  // Custom roles cannot receive high-risk / non-delegable capabilities
+  if (role.system_key !== 'ADMIN') {
+    for (const k of nonDelegableCapabilityKeys()) next[k] = false;
+  }
   if (role.system_key === 'ADMIN') {
     for (const k of adminProtectedKeys()) next[k] = true;
   }
   for (const k of ownerOnlyKeys()) next[k] = false;
+
+  if (actorUserId && workspaceId) {
+    const { getEffectiveAccess } = await import('./authorizationService.js');
+    const access = await getEffectiveAccess(actorUserId, workspaceId);
+    const mt = access?.membership?.membership_type;
+    if (mt !== 'OWNER') {
+      const held = new Set(access?.capabilities || []);
+      for (const [k, granted] of Object.entries(next)) {
+        if (granted && !held.has(k)) {
+          const err = new Error(`Cannot grant capability you do not hold: ${k}`);
+          err.code = 'PRIVILEGE_ESCALATION';
+          err.httpStatus = 403;
+          throw err;
+        }
+      }
+    }
+  }
 
   await setCapabilities(roleId, next);
   await query(`UPDATE workspace_roles SET updated_at = $2 WHERE id = $1`, [roleId, now()]);
@@ -199,7 +244,7 @@ export async function updateEntryMode(roleId, entryMode) {
   return getRole(roleId);
 }
 
-export async function updateRoleMeta(roleId, { displayName, entryMode, capabilities, sensitivePolicies } = {}) {
+export async function updateRoleMeta(roleId, { displayName, entryMode, capabilities, sensitivePolicies, actorUserId, workspaceId } = {}) {
   const role = await getRole(roleId);
   if (!role) {
     const err = new Error('Role not found');
@@ -214,14 +259,16 @@ export async function updateRoleMeta(roleId, { displayName, entryMode, capabilit
     );
   }
   if (entryMode != null) await updateEntryMode(roleId, entryMode);
-  if (capabilities && typeof capabilities === 'object') await updateRoleCapabilities(roleId, capabilities);
+  if (capabilities && typeof capabilities === 'object') {
+    await updateRoleCapabilities(roleId, capabilities, { actorUserId, workspaceId });
+  }
   if (sensitivePolicies && typeof sensitivePolicies === 'object') {
     await updateSensitivePolicies(roleId, sensitivePolicies);
   }
   return getRole(roleId);
 }
 
-export async function createCustomRole(workspaceId, { displayName, entryMode = 'BOTH', capabilities = {}, sensitivePolicies = {} }) {
+export async function createCustomRole(workspaceId, { displayName, entryMode = 'BOTH', capabilities = {}, sensitivePolicies = {}, actorUserId } = {}) {
   const name = String(displayName || '').trim();
   if (!name) {
     const err = new Error('display_name required');
@@ -239,6 +286,18 @@ export async function createCustomRole(workspaceId, { displayName, entryMode = '
   );
   const grants = Object.fromEntries(allKeys().map((k) => [k, !!capabilities[k]]));
   for (const k of ownerOnlyKeys()) grants[k] = false;
+  for (const k of nonDelegableCapabilityKeys()) grants[k] = false;
+  if (actorUserId) {
+    const { getEffectiveAccess } = await import('./authorizationService.js');
+    const access = await getEffectiveAccess(actorUserId, workspaceId);
+    const mt = access?.membership?.membership_type;
+    if (mt !== 'OWNER') {
+      const held = new Set(access?.capabilities || []);
+      for (const k of Object.keys(grants)) {
+        if (grants[k] && !held.has(k)) grants[k] = false;
+      }
+    }
+  }
   await setCapabilities(roleId, grants);
   await setSensitivePolicies(roleId, {
     ...Object.fromEntries(allSensitivePolicyKeys().map((k) => [k, false])),

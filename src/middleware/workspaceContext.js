@@ -77,23 +77,6 @@ export function bindWorkspaceParam(req, res, next) {
 /** Alias for callers that prefer attachWorkspaceContext naming. */
 export const attachWorkspaceContext = resolveWorkspaceMiddleware;
 
-export async function optionalWorkspaceContext(req, res, next) {
-  try {
-    const userId = req.user?.userId;
-    const headerId = readWorkspaceHeader(req);
-    if (!userId || !headerId) return next();
-    const membership = await loadMembership(userId, headerId);
-    if (membership?.status === 'ACTIVE') {
-      req.workspaceId = headerId;
-      req.workspace = await getWorkspaceById(headerId);
-      req.membership = membership;
-    }
-    next();
-  } catch {
-    next();
-  }
-}
-
 /**
  * Middleware factory: require a capability key after resolveWorkspaceMiddleware.
  */

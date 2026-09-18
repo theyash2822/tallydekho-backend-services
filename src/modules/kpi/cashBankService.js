@@ -27,20 +27,20 @@ function enumerateDays(from, to) {
   return days;
 }
 
-async function dailyCashMoves(companyGuid, from, to) {
+async function dailyCashMoves(companyId, from, to) {
   const { rows } = await query(
     `SELECT v.date::text AS day,
             SUM(CASE WHEN vle.dr_cr = 'Dr' THEN ABS(vle.amount) ELSE 0 END) AS inflow,
             SUM(CASE WHEN vle.dr_cr = 'Cr' THEN ABS(vle.amount) ELSE 0 END) AS outflow
      FROM voucher_ledger_entries vle
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1 AND v.is_cancelled = FALSE
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     WHERE vle.company_id=$1 AND v.is_cancelled = FALSE
        AND v.date BETWEEN $2 AND $3
        AND ${CASH_LEDGER_SQL}
      GROUP BY v.date
      ORDER BY v.date ASC`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
   const map = new Map();
   for (const r of rows) {
@@ -52,20 +52,20 @@ async function dailyCashMoves(companyGuid, from, to) {
   return map;
 }
 
-async function dailyBankMoves(companyGuid, from, to) {
+async function dailyBankMoves(companyId, from, to) {
   const { rows } = await query(
     `SELECT v.date::text AS day,
             SUM(CASE WHEN vle.dr_cr = 'Dr' THEN ABS(vle.amount) ELSE 0 END) AS inflow,
             SUM(CASE WHEN vle.dr_cr = 'Cr' THEN ABS(vle.amount) ELSE 0 END) AS outflow
      FROM voucher_ledger_entries vle
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1 AND v.is_cancelled = FALSE
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     WHERE vle.company_id=$1 AND v.is_cancelled = FALSE
        AND v.date BETWEEN $2 AND $3
        AND ${BANK_LEDGER_SQL}
      GROUP BY v.date
      ORDER BY v.date ASC`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
   const map = new Map();
   for (const r of rows) {
@@ -96,38 +96,38 @@ function buildDailyBalanceSeries(dayKeys, moveMap, currentBalance) {
   }));
 }
 
-export async function buildCashInHandPayload(companyGuid, { from, to } = {}) {
+export async function buildCashInHandPayload(companyId, { from, to } = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const yesterday = addDays(today, -1);
 
   const { rows: cashLedgers } = await query(
     `SELECT name, closing_balance FROM ledgers
-     WHERE company_guid=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%' OR name ILIKE 'Cash')
+     WHERE company_id=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%' OR name ILIKE 'Cash')
      ORDER BY ABS(closing_balance) DESC`,
-    [companyGuid]
+    [companyId]
   );
   const { rows: txns } = await query(
     `SELECT v.guid, v.voucher_number, v.party_name, v.voucher_type, v.amount, v.date, v.narration,
             COALESCE((
               SELECT CASE WHEN bool_or(vle.dr_cr='Dr') THEN 'in' ELSE 'out' END
               FROM voucher_ledger_entries vle
-              JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-              WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
+              JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+              WHERE vle.voucher_guid=v.guid AND vle.company_id=v.company_id
                 AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
             ), 'out') AS direction
      FROM vouchers v
-     WHERE v.company_guid=$1 AND v.is_cancelled=FALSE
+     WHERE v.company_id=$1 AND v.is_cancelled=FALSE
        AND v.voucher_type IN ('Payment','Receipt','Contra')
        AND v.date BETWEEN $2 AND $3
        AND EXISTS (
          SELECT 1 FROM voucher_ledger_entries vle
-         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-         WHERE vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
+         JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+         WHERE vle.voucher_guid=v.guid AND vle.company_id=v.company_id
            AND (l.parent ILIKE '%Cash%' OR l.name ILIKE '%Cash%')
        )
      ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
      LIMIT 50`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
 
   const balance = money(cashLedgers.reduce((s, l) => s + Math.abs(parseFloat(l.closing_balance || 0)), 0));
@@ -144,7 +144,7 @@ export async function buildCashInHandPayload(companyGuid, { from, to } = {}) {
 
   const seriesDays = 30;
   const seriesFrom = addDays(today, -(seriesDays - 1));
-  const moveMap = await dailyCashMoves(companyGuid, seriesFrom, today);
+  const moveMap = await dailyCashMoves(companyId, seriesFrom, today);
   const dayKeys = enumerateDays(seriesFrom, today);
   const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, balance);
 
@@ -219,7 +219,7 @@ export async function buildCashInHandPayload(companyGuid, { from, to } = {}) {
   };
 }
 
-export async function buildBankBalancePayload(companyGuid, { from, to } = {}) {
+export async function buildBankBalancePayload(companyId, { from, to } = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const yesterday = addDays(today, -1);
 
@@ -227,7 +227,7 @@ export async function buildBankBalancePayload(companyGuid, { from, to } = {}) {
     `SELECT name, closing_balance, parent,
             bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder
      FROM ledgers
-     WHERE company_guid=$1
+     WHERE company_id=$1
        AND (
          parent ILIKE '%Bank Accounts%' OR parent ILIKE '%Bank Account%'
          OR parent ILIKE '%Bank OD%' OR parent ILIKE '%Overdraft%'
@@ -235,20 +235,20 @@ export async function buildBankBalancePayload(companyGuid, { from, to } = {}) {
              AND parent NOT ILIKE '%Bank Interest%' AND parent NOT ILIKE '%Bank Exp%')
        )
      ORDER BY ABS(closing_balance) DESC`,
-    [companyGuid]
+    [companyId]
   );
   const { rows: txnRows } = await query(
     `SELECT vle.ledger_name, v.guid, v.voucher_number, v.party_name, v.voucher_type, v.date,
             ABS(vle.amount) AS amount, vle.dr_cr
      FROM voucher_ledger_entries vle
-     JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_guid=vle.company_guid
-     JOIN ledgers l ON l.name=vle.ledger_name AND l.company_guid=vle.company_guid
-     WHERE vle.company_guid=$1 AND v.is_cancelled=FALSE
+     JOIN vouchers v ON v.guid=vle.voucher_guid AND v.company_id=vle.company_id
+     JOIN ledgers l ON l.name=vle.ledger_name AND l.company_id=vle.company_id
+     WHERE vle.company_id=$1 AND v.is_cancelled=FALSE
        AND v.date BETWEEN $2 AND $3
        AND ${BANK_LEDGER_SQL}
      ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
      LIMIT 300`,
-    [companyGuid, from, to]
+    [companyId, from, to]
   );
 
   const byBank = new Map();
@@ -283,7 +283,7 @@ export async function buildBankBalancePayload(companyGuid, { from, to } = {}) {
 
   const seriesDays = 30;
   const seriesFrom = addDays(today, -(seriesDays - 1));
-  const moveMap = await dailyBankMoves(companyGuid, seriesFrom, today);
+  const moveMap = await dailyBankMoves(companyId, seriesFrom, today);
   const dayKeys = enumerateDays(seriesFrom, today);
   const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, total);
 

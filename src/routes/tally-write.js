@@ -5,7 +5,7 @@
 import { Router } from 'express';
 import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
-import { requireTallyWriteAccess } from '../middleware/companyAccess.js';
+import { requireTallyWriteAccess, verifyCompanyAccess } from '../middleware/companyAccess.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
 import {
@@ -54,16 +54,50 @@ const require = createRequire(import.meta.url);
 let _socketService = null;
 export function setTallyWriteSocket(s) { _socketService = s; }
 
+/** After requireTallyWriteAccess — internal id + Tally GUID for Desktop. */
+
+function resolvedCompany(req) {
+  const id = req.company?.id;
+  const tallyGuid = req.company?.tallyGuid || req.body?.companyGuid || req.body?.company_guid;
+  if (id == null) {
+    const err = new Error('Company not resolved');
+    err.httpStatus = 403;
+    throw err;
+  }
+  return { id: Number(id), tallyGuid, workspaceId: req.company?.workspaceId || null };
+}
+
 /** Ask desktop to pull newly created voucher(s) via SingleVoucher.xml (REFERENCE + number). */
-async function requestDesktopSyncAfterWrite({ userId, companyGuid, companyName, tdkRef, tallyIds = [], extra = {} }) {
+async function requestDesktopSyncAfterWrite({ userId, workspaceId = null, companyId = null, companyGuid, companyName, tdkRef, tallyIds = [], extra = {} }) {
   if (!_socketService?.connectedClients) return;
   try {
-    const { rows: devRows } = await query(
-      'SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE ORDER BY last_seen DESC LIMIT 1',
-      [userId]
-    );
-    if (!devRows[0]?.device_id) return;
-    const ds = _socketService.connectedClients.get('desktop_' + devRows[0].device_id);
+    let deviceId = null;
+    let wsId = workspaceId;
+    if (!wsId && companyId != null) {
+      const { rows: cos } = await query(
+        `SELECT workspace_id, guid FROM companies WHERE id = $1 LIMIT 1`,
+        [companyId]
+      );
+      wsId = cos[0]?.workspace_id || null;
+      if (!companyGuid) companyGuid = cos[0]?.guid;
+    }
+    if (wsId) {
+      const { rows: bind } = await query(
+        `SELECT active_device_id FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+        [wsId]
+      );
+      deviceId = bind[0]?.active_device_id || null;
+      if (!deviceId) {
+        const { rows: byWs } = await query(
+          `SELECT device_id FROM devices WHERE workspace_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1`,
+          [wsId]
+        );
+        deviceId = byWs[0]?.device_id || null;
+      }
+    }
+    // No devices.user_id fallback — Workspace binding is sole Desktop routing source
+    if (!deviceId) return;
+    const ds = _socketService.connectedClients.get('desktop_' + deviceId);
     if (!ds?.connected) return;
     const ids = (Array.isArray(tallyIds) ? tallyIds : []).map(String).filter(Boolean);
     ds.emit('sync:request', {
@@ -88,7 +122,7 @@ async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], r
   if (!queueId || !userId) return;
   try {
     const { rows } = await query(
-      `SELECT wq.company_guid, wq.payload, wq.tally_id, av.tdk_reference_no
+      `SELECT wq.company_id, wq.company_guid, wq.workspace_id, wq.payload, wq.tally_id, av.tdk_reference_no
          FROM write_queue wq
          LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
         WHERE wq.id = $1
@@ -103,9 +137,19 @@ async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], r
     }
     payload = payload || {};
     const ids = [...tallyIds, row.tally_id].map(String).filter(id => id && id !== '0' && id !== 'undefined');
+    let companyGuid = row.company_guid;
+    if (row.company_id != null) {
+      const { rows: cos } = await query(
+        `SELECT guid, workspace_id FROM companies WHERE id = $1 LIMIT 1`,
+        [row.company_id]
+      );
+      companyGuid = cos[0]?.guid || companyGuid;
+    }
     await requestDesktopSyncAfterWrite({
       userId,
-      companyGuid: row.company_guid,
+      companyId: row.company_id,
+      workspaceId: row.workspace_id,
+      companyGuid,
       companyName: payload.companyName,
       tdkRef: row.tdk_reference_no || null,
       tallyIds: ids,
@@ -154,22 +198,37 @@ const escapeXml = (value = '') => String(value)
   .replace(/'/g, '&apos;');
 
 // ── Helper: forward to Tally via device ──────────────────────────────────────
-const forwardToTally = async (companyGuid, userId, xmlBody) => {
+const forwardToTally = async (companyGuid, userId, xmlBody, opts = {}) => {
+  const companyId = opts.companyId != null ? Number(opts.companyId) : null;
   let device = null;
-  const { rows: byWs } = await query(
-    `SELECT d.* FROM devices d
-     JOIN companies c ON c.workspace_id = d.workspace_id
-     WHERE c.guid = $1 AND d.paired = TRUE AND d.binding_status IN ('ACTIVE','RESTORE_PENDING')
-     ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
-    [companyGuid]
-  ).catch(() => ({ rows: [] }));
-  device = byWs[0] || null;
-  if (!device) {
-    const { rows } = await query(
-      'SELECT * FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [userId]
-    );
-    device = rows[0];
+  if (companyId != null && Number.isFinite(companyId)) {
+    const { rows: byWs } = await query(
+      `SELECT d.* FROM devices d
+       JOIN companies c ON c.workspace_id = d.workspace_id
+       WHERE c.id = $1 AND d.paired = TRUE AND d.binding_status IN ('ACTIVE','RESTORE_PENDING')
+       ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
+    device = byWs[0] || null;
+    if (!device) {
+      const { rows: byCompanyWs } = await query(
+        `SELECT d.* FROM devices d
+         JOIN companies c ON c.workspace_id = d.workspace_id
+         WHERE c.id = $1 AND d.paired = TRUE
+         ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
+        [companyId]
+      ).catch(() => ({ rows: [] }));
+      device = byCompanyWs[0] || null;
+    }
+  } else if (opts.workspaceId && companyGuid) {
+    const { rows: byWs } = await query(
+      `SELECT d.* FROM devices d
+       JOIN companies c ON c.workspace_id = d.workspace_id
+       WHERE c.guid = $1 AND c.workspace_id = $2 AND d.paired = TRUE
+       ORDER BY d.last_seen DESC NULLS LAST LIMIT 1`,
+      [companyGuid, opts.workspaceId]
+    ).catch(() => ({ rows: [] }));
+    device = byWs[0] || null;
   }
   // No device paired — queue it anyway; will push when device pairs
   if (!device) return { status: 'desktop_offline', message: 'No paired desktop. Entry saved — will push when desktop connects.' };
@@ -195,18 +254,29 @@ const forwardToTally = async (companyGuid, userId, xmlBody) => {
   return { deviceId: device.device_id, jobId, status: 'desktop_offline', message: 'Desktop not connected. Entry saved — will push when desktop comes online.' };
 };
 
-// ── Helper: log entry to write_queue (workspace-scoped; owner desktop via workspace_id) ─
-const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml, workspaceId = null) => {
-  // Prefer explicit workspace; else resolve from company binding
+// ── Helper: log entry to write_queue (company_id authoritative; guid for Desktop) ─
+const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml, companyId = null, workspaceId = null) => {
   let wsId = workspaceId;
-  if (!wsId) {
+  let resolvedId = companyId != null ? Number(companyId) : null;
+  let resolvedGuid = companyGuid;
+  if (resolvedId != null && Number.isFinite(resolvedId)) {
     const { rows: cRows } = await query(
-      `SELECT workspace_id FROM companies WHERE guid = $1 LIMIT 1`,
-      [companyGuid]
+      `SELECT id, guid, workspace_id FROM companies WHERE id = $1 LIMIT 1`,
+      [resolvedId]
     ).catch(() => ({ rows: [] }));
-    wsId = cRows[0]?.workspace_id || null;
+    if (cRows[0]) {
+      resolvedGuid = cRows[0].guid;
+      wsId = wsId || cRows[0].workspace_id;
+    }
+  } else if (wsId && companyGuid) {
+    const { rows: cRows } = await query(
+      `SELECT id, guid, workspace_id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+      [companyGuid, wsId]
+    ).catch(() => ({ rows: [] }));
+    wsId = cRows[0]?.workspace_id || wsId;
+    resolvedId = cRows[0]?.id ?? null;
+    resolvedGuid = cRows[0]?.guid || companyGuid;
   }
-  // Queue owner = Workspace Owner's user_id so Desktop pull never uses member personal desktop
   let queueUserId = userId;
   if (wsId) {
     const { rows: wRows } = await query(
@@ -216,10 +286,10 @@ const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount,
     if (wRows[0]?.owner_user_id) queueUserId = wRows[0].owner_user_id;
   }
   const { rows } = await query(
-    `INSERT INTO write_queue (user_id, company_guid, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at, workspace_id, actor_user_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT, $8, $9)
+    `INSERT INTO write_queue (user_id, company_guid, company_id, entry_type, entry_label, amount, payload, xml, status, attempt_count, created_at, updated_at, workspace_id, actor_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'processing', 0, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10)
      RETURNING id`,
-    [queueUserId, companyGuid, entryType, entryLabel, amount || null, JSON.stringify(payload), xml, wsId, userId]
+    [queueUserId, resolvedGuid, resolvedId, entryType, entryLabel, amount || null, JSON.stringify(payload), xml, wsId, userId]
   );
   return rows[0]?.id;
 };
@@ -302,7 +372,7 @@ const updateWriteQueue = async (id, result, error) => {
         if (tdkRef && companyGuid) {
           const { rows: vRows } = await query(
             `SELECT voucher_number FROM vouchers
-              WHERE company_guid = $1
+              WHERE company_id = $1
                 AND (
                   narration ILIKE '%' || $2 || '%'
                   OR COALESCE(reference,'') ILIKE '%' || $2 || '%'
@@ -310,7 +380,7 @@ const updateWriteQueue = async (id, result, error) => {
                 AND COALESCE(is_cancelled, false) = false
               ORDER BY date DESC NULLS LAST, alter_id DESC NULLS LAST
               LIMIT 1`,
-            [companyGuid, tdkRef]
+            [req.company?.id, tdkRef]
           );
           if (vRows[0]?.voucher_number) resolvedVoucherNumber = String(vRows[0].voucher_number);
         }
@@ -336,13 +406,13 @@ const updateWriteQueue = async (id, result, error) => {
           books_impact_status   = 'posted',
           updated_at            = EXTRACT(EPOCH FROM NOW())::BIGINT
       WHERE write_queue_id = $2
-      RETURNING company_guid, tdk_reference_no, tally_voucher_no
+      RETURNING company_id, company_guid, tdk_reference_no, tally_voucher_no
     `, [resolvedVoucherNumber || null, id]).catch(e => { console.error('[app_vouchers sync]', e.message); return { rows: [] }; });
     const avRows = avResult?.rows ?? [];
     const emitNo = resolvedVoucherNumber || avRows[0]?.tally_voucher_no || null;
     if (avRows.length > 0 && emitNo) {
-      const { company_guid, tdk_reference_no } = avRows[0];
-      _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, emitNo);
+      const { company_id, company_guid, tdk_reference_no } = avRows[0];
+      _socketService?.emitVoucherSynced?.(company_guid, tdk_reference_no, emitNo, { companyId: company_id });
     }
 
     if (resolvedVoucherNumber) {
@@ -351,23 +421,23 @@ const updateWriteQueue = async (id, result, error) => {
         try {
           // Get companyGuid and userId from write_queue entry
           const { rows: wqRows } = await query(
-            `SELECT user_id, company_guid FROM write_queue WHERE id = $1`, [id]
+            `SELECT user_id, company_guid, company_id FROM write_queue WHERE id = $1`, [id]
           ).catch(() => ({ rows: [] }));
           if (!wqRows[0]) return;
-          const { user_id: userId, company_guid: companyGuid } = wqRows[0];
+          const { user_id: userId, company_guid: companyGuid, company_id: wqCompanyId } = wqRows[0];
 
           // Check if auto-IRN is configured for this company
           const { rows: cfgRows } = await query(
-            `SELECT e_invoice_applicable, e_invoice_mode FROM company_compliance_config WHERE company_guid = $1`,
-            [companyGuid]
+            `SELECT e_invoice_applicable, e_invoice_mode FROM company_compliance_config WHERE company_id = $1`,
+            [wqCompanyId]
           ).catch(() => ({ rows: [] }));
           const cfg = cfgRows[0];
           if (cfg?.e_invoice_applicable !== 'applicable_configured' || cfg?.e_invoice_mode !== 'auto') return;
 
           // Get voucherGuid for this write_queue entry
           const { rows: vRows } = await query(
-            `SELECT guid FROM vouchers WHERE company_guid = $1 AND voucher_number = $2`,
-            [companyGuid, resolvedVoucherNumber]
+            `SELECT guid FROM vouchers WHERE company_id = $1 AND voucher_number = $2`,
+            [wqCompanyId, resolvedVoucherNumber]
           ).catch(() => ({ rows: [] }));
           if (!vRows[0]?.guid) return;
 
@@ -378,7 +448,7 @@ const updateWriteQueue = async (id, result, error) => {
           if (!einvoiceCreds?.gstin || !einvoiceCreds?.username) return;
 
           const { rows: coRows } = await query(
-            `SELECT gstin, name FROM companies WHERE guid = $1`, [companyGuid]
+            `SELECT gstin, name FROM companies WHERE id = $1`, [wqCompanyId]
           ).catch(() => ({ rows: [] }));
           const { rows: voucherRows } = await query(
             `SELECT * FROM vouchers WHERE guid = $1`, [vRows[0].guid]
@@ -389,8 +459,8 @@ const updateWriteQueue = async (id, result, error) => {
             await generateIRN(companyGuid, voucherRows[0], coRows[0], einvoiceCreds);
             console.log(`[auto-IRN] Success for ${resolvedVoucherNumber}`);
             await query(
-              `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_guid = $1 AND tally_voucher_no = $2`,
-              [companyGuid, resolvedVoucherNumber]
+              `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id = $1 AND tally_voucher_no = $2`,
+              [wqCompanyId, resolvedVoucherNumber]
             ).catch(() => {});
           }
         } catch (autoErr) {
@@ -403,15 +473,15 @@ const updateWriteQueue = async (id, result, error) => {
         try {
           // Get companyGuid and userId from write_queue entry
           const { rows: wqRowsEWB } = await query(
-            `SELECT user_id, company_guid FROM write_queue WHERE id = $1`, [id]
+            `SELECT user_id, company_guid, company_id FROM write_queue WHERE id = $1`, [id]
           ).catch(() => ({ rows: [] }));
           if (!wqRowsEWB[0]) return;
-          const { user_id: userId, company_guid: companyGuid } = wqRowsEWB[0];
+          const { user_id: userId, company_guid: companyGuid, company_id: wqCompanyId } = wqRowsEWB[0];
 
           // Check if auto-EWB is configured for this company
           const { rows: ewbCfgRows } = await query(
-            `SELECT e_way_bill_applicable, e_way_bill_mode FROM company_compliance_config WHERE company_guid = $1`,
-            [companyGuid]
+            `SELECT e_way_bill_applicable, e_way_bill_mode FROM company_compliance_config WHERE company_id = $1`,
+            [wqCompanyId]
           ).catch(() => ({ rows: [] }));
           const ewbCfg = ewbCfgRows[0];
           if (ewbCfg?.e_way_bill_applicable !== 'applicable_configured' || ewbCfg?.e_way_bill_mode !== 'auto') return;
@@ -420,24 +490,24 @@ const updateWriteQueue = async (id, result, error) => {
           const { rows: vRowsEWB } = await query(
             `SELECT v.*, av.payload as av_payload
              FROM vouchers v
-             LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_guid = v.company_guid
+             LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_id = v.company_id
              AND av.write_queue_id = $3
              AND av.voucher_date::text = v.date
              AND (
                (COALESCE(av.tdk_reference_no, '') <> '' AND COALESCE(v.reference, '') = av.tdk_reference_no)
                OR COALESCE(av.tdk_reference_no, '') = ''
              )
-             WHERE v.company_guid = $1 AND v.voucher_number = $2
+             WHERE v.company_id = $1 AND v.voucher_number = $2
              ORDER BY (av.payload IS NOT NULL) DESC, v.date DESC
              LIMIT 1`,
-            [companyGuid, resolvedVoucherNumber, id]
+            [req.company?.id, resolvedVoucherNumber, id]
           ).catch(() => ({ rows: [] }));
           if (!vRowsEWB[0]) return;
 
           const dispatchDetails = vRowsEWB[0].av_payload?.dispatch_details;
           if (!dispatchDetails?.dispatch_from || !dispatchDetails?.ship_to) return;
 
-          const { rows: coRowsEWB }   = await query(`SELECT * FROM companies WHERE guid = $1`, [companyGuid]).catch(() => ({ rows: [] }));
+          const { rows: coRowsEWB }   = await query(`SELECT * FROM companies WHERE id = $1`, [wqCompanyId]).catch(() => ({ rows: [] }));
           const { rows: ewbUserRows } = await query(`SELECT integration_settings FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
           const ewbCreds = ewbUserRows[0]?.integration_settings?.ewaybill || {};
 
@@ -452,16 +522,25 @@ const updateWriteQueue = async (id, result, error) => {
 };
 
 // ── TDK Reference Generator ────────────────────────────────────────────────────
-async function generateTDKReference(companyGuid, isOptional, voucherTypeCode = 'SAL') {
+async function generateTDKReference(companyGuid, isOptional, voucherTypeCode = 'SAL', companyId = null) {
   const prefix = isOptional ? `OPT-${voucherTypeCode}` : voucherTypeCode;
   const year = new Date().getFullYear();
+  const id = companyId != null ? Number(companyId) : null;
+  if (id == null || !Number.isFinite(id)) {
+    throw new Error('companyId required for TDK reference');
+  }
+  let guid = companyGuid;
+  if (!guid) {
+    const { rows: cos } = await query(`SELECT guid FROM companies WHERE id = $1 LIMIT 1`, [id]);
+    guid = cos[0]?.guid;
+  }
   const { rows } = await query(
-    `INSERT INTO tdk_reference_counters (company_guid, voucher_prefix, fiscal_year, last_seq)
-     VALUES ($1, $2, $3, 1)
-     ON CONFLICT (company_guid, voucher_prefix, fiscal_year)
+    `INSERT INTO tdk_reference_counters (company_id, company_guid, voucher_prefix, fiscal_year, last_seq)
+     VALUES ($1, $2, $3, $4, 1)
+     ON CONFLICT (company_id, voucher_prefix, fiscal_year)
      DO UPDATE SET last_seq = tdk_reference_counters.last_seq + 1
      RETURNING last_seq`,
-    [companyGuid, prefix, year]
+    [id, guid, prefix, year]
   );
   const seq = rows[0].last_seq;
   return `TDK-${prefix}-${year}-${String(seq).padStart(4, '0')}`;
@@ -470,20 +549,29 @@ async function generateTDKReference(companyGuid, isOptional, voucherTypeCode = '
 // ── TallyDekho Series Invoice Number Generator ────────────────────────────────
 // Returns formatted invoice number e.g. TD/SAL/26-27/00001
 // Used when numbering_policy = 'tallydekho_series'
-async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL') {
+async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL', companyId = null) {
   const now = new Date();
   const month = now.getMonth() + 1;
   const curYear = now.getFullYear();
   const startYear = month >= 4 ? curYear : curYear - 1; // April = start of Indian FY
   const fiscalShort = `${String(startYear).slice(2)}-${String(startYear + 1).slice(2)}`;
   const prefix = `TDINV-${voucherTypeCode}`;
+  const id = companyId != null ? Number(companyId) : null;
+  if (id == null || !Number.isFinite(id)) {
+    throw new Error('companyId required for TD series');
+  }
+  let guid = companyGuid;
+  if (!guid) {
+    const { rows: cos } = await query(`SELECT guid FROM companies WHERE id = $1 LIMIT 1`, [id]);
+    guid = cos[0]?.guid;
+  }
   const { rows } = await query(
-    `INSERT INTO tdk_reference_counters (company_guid, voucher_prefix, fiscal_year, last_seq)
-     VALUES ($1, $2, $3, 1)
-     ON CONFLICT (company_guid, voucher_prefix, fiscal_year)
+    `INSERT INTO tdk_reference_counters (company_id, company_guid, voucher_prefix, fiscal_year, last_seq)
+     VALUES ($1, $2, $3, $4, 1)
+     ON CONFLICT (company_id, voucher_prefix, fiscal_year)
      DO UPDATE SET last_seq = tdk_reference_counters.last_seq + 1
      RETURNING last_seq`,
-    [companyGuid, prefix, startYear]
+    [id, guid, prefix, startYear]
   );
   const seq = rows[0].last_seq;
   return `TD/${voucherTypeCode}/${fiscalShort}/${String(seq).padStart(5, '0')}`;
@@ -500,7 +588,7 @@ async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL') {
  */
 async function loadVoucherTagContext(companyGuid, partyLedger, items = []) {
   const names = (items || []).map(i => i.itemName || i.name).filter(Boolean);
-  const ctx = await loadDocumentContext(companyGuid, partyLedger, names).catch(() => null);
+  const ctx = await loadDocumentContext(req.company?.id, partyLedger, names).catch(() => null);
   const masters = ctx?.itemMasters || new Map();
   return {
     partyGstin: ctx?.partyRow?.gstin || '',
@@ -564,7 +652,7 @@ async function createReceiptForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const dt = tallyDate(date);
-  const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP');
+  const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP', req.company?.id);
   // A non-cash receipt carries the instrument on the bank leg, exactly like the
   // standalone Receipt route; without it Tally shows a bare bank entry.
   // The allocation amount must match the bank leg's signed AMOUNT (-amt here).
@@ -620,7 +708,7 @@ ${bankAllocXml}
 
   const label = `${partyLedger} ← ${bankLedger} (linked: ${parentTdkRef})`;
   const payload = { companyGuid, companyName, date, partyLedger, bankLedger, amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration };
-  const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml).catch(() => null);
+  const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml, req.company?.id).catch(() => null);
 
   // Create child app_voucher (linked to invoice via parent_invoice_uuid).
   // 2026-07-01 R4: explicitly set created_at to match the parent Sales invoice's timestamp
@@ -632,7 +720,7 @@ ${bankAllocXml}
     const createdAtSql = parentCreatedAt
       ? `$11::bigint`
       : `EXTRACT(EPOCH FROM NOW())::bigint`;
-    const insertParams = [companyGuid, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
+    const insertParams = [req.company?.id, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
     const avResult = await query(
@@ -647,7 +735,7 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, userId, xml);
+    const result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
@@ -691,7 +779,7 @@ async function createPaymentForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const dt = tallyDate(date);
-  const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY');
+  const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY', req.company?.id);
   const bankAllocXml = buildBankAllocationXml({
     paymentMethod, instrument, date, amount: amt, favouring: partyLedger,
     reference: reference || parentTdkRef,
@@ -748,12 +836,12 @@ ${bankAllocXml}
     amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration,
     paymentMethod: 'Bank', billAllocations: [{ billRefName: parentTdkRef, billType: 'Agst Ref', amount: amt }],
   };
-  const qId = await logWriteQueue(userId, companyGuid, 'payment', label, amt, payload, xml).catch(() => null);
+  const qId = await logWriteQueue(userId, companyGuid, 'payment', label, amt, payload, xml, req.company?.id).catch(() => null);
 
   let paymentUuid = null;
   if (qId) {
     const createdAtSql = parentCreatedAt ? `$11::bigint` : `EXTRACT(EPOCH FROM NOW())::bigint`;
-    const insertParams = [companyGuid, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
+    const insertParams = [req.company?.id, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
     const avResult = await query(
@@ -768,7 +856,7 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, userId, xml);
+    const result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     return { ok: true, queued: offline, queueId: qId, tdkRef: payTdkRef, paymentUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
@@ -923,7 +1011,7 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
       `SELECT id, tdk_reference_no, invoice_uuid, tally_voucher_no, tally_sync_status,
               books_impact_status, payload, write_queue_id, created_at
          FROM app_vouchers
-        WHERE company_guid = $1
+        WHERE company_id = $1
           AND voucher_type = 'sales_invoice'
           AND user_id = $2
           AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($3))
@@ -932,7 +1020,7 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
           AND created_at > EXTRACT(EPOCH FROM NOW())::BIGINT - 120
         ORDER BY id DESC
         LIMIT 5`,
-      [companyGuid, req.user.userId, partyLedger, amt, date || null]
+      [req.company?.id, req.user.userId, partyLedger, amt, date || null]
     );
     const dup = recent.find(r => itemFingerprint(r.payload?.items) === thisFp);
     if (dup) {
@@ -1057,22 +1145,21 @@ ${consigneeAddrXml}
   }
 
   // Generate TDK reference
-  const tdkRef = await generateTDKReference(companyGuid, isOptional).catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'SAL', req.company?.id).catch(() => null);
 
   // TallyDekho Series: generate invoice number immediately (we own the sequence)
   // This number is stable and final — no 10s wait needed for Share PDF
   let tdkInvoiceNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'SAL').catch(() => null);
+    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'SAL', req.company?.id).catch(() => null);
     if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
 
   // Sales and Proforma now share one builder, so a regular Sales Invoice sends the
   // same PARTYNAME / OBJVIEW / VCHENTRYMODE / unit-suffixed qty set that Proforma
   // already did, plus the GST tags a native Tally entry carries.
-  const salesCtx = await loadDocumentContext(
-    companyGuid,
+  const salesCtx = await loadDocumentContext(req.company?.id,
     partyLedger,
     items.map(i => i.itemName || i.name).filter(Boolean)
   ).catch(() => null);
@@ -1115,7 +1202,7 @@ ${consigneeAddrXml}
   });
 
   const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
-  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml).catch(() => null);
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'sales', label, amt, req.body, xml, req.company?.id).catch(() => null);
 
   // Create app_voucher lifecycle record.
   // 2026-07-01 R4: RETURNING created_at as well so we can pass the same timestamp to
@@ -1130,7 +1217,7 @@ ${consigneeAddrXml}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid, created_at`,
-      [companyGuid, req.user.userId, queueId, tdkRef, original_entry_type,
+      [req.company?.id, req.user.userId, queueId, tdkRef, original_entry_type,
        numbering_policy,
        tdkInvoiceNo || null,     // pre-set for tallydekho_series; null for tally_prime_series
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
@@ -1150,7 +1237,7 @@ ${consigneeAddrXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
 
@@ -1233,7 +1320,7 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
   const vchType = voucherType || 'Sales';
   const fullNarration = narration || '';
 
-  const tdkRef = await generateTDKReference(companyGuid, false, 'PRF').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, false, 'PRF', req.company?.id).catch(() => null);
 
   const xml = buildSalesLikeVoucherXml({
     companyName,
@@ -1254,7 +1341,7 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
 
   const label = `${partyLedger}${voucherNumber ? ' #' + voucherNumber : ''}`;
   const persistPayload = { ...req.body, isOptional: true, original_entry_type: 'optional', tdkRef };
-  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'proforma', label, amt, persistPayload, xml).catch(() => null);
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'proforma', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let invoiceUuid = null;
   if (queueId && tdkRef) {
@@ -1265,7 +1352,7 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'proforma_invoice',$4,'optional','optional','queued','not_posted','tally_prime_series',$5,$6,$7,$8,$9)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, queueId, tdkRef,
+      [req.company?.id, req.user.userId, queueId, tdkRef,
        voucherNumber || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[app_vouchers] proforma insert failed:', e.message); return { rows: [] }; });
@@ -1281,7 +1368,7 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(queueId, result, null);
     const offline = result?.status === 'desktop_offline';
     if (!offline) {
@@ -1330,8 +1417,8 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
 
   const { rows: avRows } = await query(
     `SELECT * FROM app_vouchers
-      WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3 AND voucher_type='proforma_invoice'`,
-    [tdkRef, companyGuid, req.user.userId]
+      WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3 AND voucher_type='proforma_invoice'`,
+    [tdkRef, req.company?.id, req.user.userId]
   );
   const av = avRows[0];
   if (!av) return res.status(404).json({ status: false, message: 'Proforma not found' });
@@ -1391,7 +1478,7 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
   const { rows: vRows } = await query(
     `SELECT guid, voucher_number, is_optional, date
        FROM vouchers
-      WHERE company_guid = $1
+      WHERE company_id = $1
         AND COALESCE(is_cancelled, FALSE) = FALSE
         AND (
           ($2 <> '' AND guid = $2)
@@ -1401,7 +1488,7 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
       ORDER BY CASE WHEN COALESCE(is_optional, FALSE) THEN 0 ELSE 1 END,
                synced_at DESC NULLS LAST
       LIMIT 1`,
-    [companyGuid, av.tally_guid || '', tdkRef, av.tally_voucher_no || '']
+    [req.company?.id, av.tally_guid || '', tdkRef, av.tally_voucher_no || '']
   ).catch(() => ({ rows: [] }));
   const { rows: wqRows } = await query(
     `SELECT tally_id FROM write_queue WHERE id=$1`,
@@ -1449,12 +1536,12 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
   });
 
   const queueId = await logWriteQueue(
-    req.user.userId, companyGuid, 'proforma_convert',
+    req.user.userId, req.company?.id, 'proforma_convert',
     `${partyLedger} (convert to invoice)`, amt, { ...p, convert: true, tdkRef }, xml
   ).catch(() => null);
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     const createdCount = Number(result?.created || 0);
     const alteredCount = Number(result?.altered || 0);
     const resultId = String(result?.tallyId || '').trim();
@@ -1570,12 +1657,12 @@ router.post('/debug/alter-probe', authMiddleware, async (req, res) => {
     companyName, vchType, dt, masterId: String(masterId), tagName, narration,
   });
   const queueId = await logWriteQueue(
-    req.user.userId, companyGuid, 'alter_probe',
+    req.user.userId, req.company?.id, 'alter_probe',
     `Alter probe MASTERID ${masterId}`, 0,
     { probe: true, masterId, date: dt, tagName, narration }, xml
   ).catch(() => null);
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(queueId, result, null);
     console.log('[alter-probe]', {
       masterId, dt, tagName,
@@ -1625,11 +1712,11 @@ router.post('/voucher/payment', authMiddleware, requireTallyWriteAccess('/vouche
   const amt = parseFloat(amount) || 0;
   const dt = tallyDate(date);
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PAY').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PAY', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -1740,7 +1827,7 @@ ${bankAllocXml}
   };
 
   const label = `${partyLedger} → ${cashOrBankLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'payment', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'payment', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let paymentUuid = null;
   if (qId && tdkRef) {
@@ -1750,7 +1837,7 @@ ${bankAllocXml}
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'payment',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, partyLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[payment-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -1758,13 +1845,13 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -1848,11 +1935,11 @@ router.post('/voucher/receipt', authMiddleware, requireTallyWriteAccess('/vouche
   const amt = parseFloat(amount) || 0;
   const dt = tallyDate(date);
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'RCP').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'RCP', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -1947,7 +2034,7 @@ ${bankAllocXml}
   };
 
   const label = `${partyLedger} ← ${cashOrBankLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'receipt', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'receipt', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let receiptUuid = null;
   if (qId && tdkRef) {
@@ -1957,7 +2044,7 @@ ${bankAllocXml}
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, partyLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -1965,14 +2052,14 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     // Prefer live ack number; else read what updateWriteQueue may have backfilled onto app_vouchers.
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -2046,11 +2133,11 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
   const dt = tallyDate(date);
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'JOR').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'JOR', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'JOR').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'JOR', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -2105,7 +2192,7 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
   };
 
   const label = `${drLedger} / ${crLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'journal', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'journal', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let journalUuid = null;
   if (qId && tdkRef) {
@@ -2116,7 +2203,7 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'journal',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        drLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -2125,13 +2212,13 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -2199,11 +2286,11 @@ router.post('/voucher/contra', authMiddleware, requireTallyWriteAccess('/voucher
   const dt = tallyDate(date);
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CON').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CON', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'CON').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'CON', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -2343,7 +2430,7 @@ ${toBankAlloc}
   };
 
   const label = `${fromLedger} → ${toLedger}${tdkRef ? ' (' + tdkRef + ')' : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'contra', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'contra', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let contraUuid = null;
   if (qId && tdkRef) {
@@ -2354,7 +2441,7 @@ ${toBankAlloc}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'contra',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        fromLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -2363,13 +2450,13 @@ ${toBankAlloc}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -2428,12 +2515,12 @@ router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/vo
   const dt = tallyDate(date);
   const dueDt = dueDate ? tallyDate(dueDate) : dt;
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'SOR').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'SOR', req.company?.id).catch(() => null);
 
   let tdkOrderNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'SOR').catch(() => null);
+    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'SOR', req.company?.id).catch(() => null);
     if (tdkOrderNo) effectiveVoucherNumber = tdkOrderNo;
   }
 
@@ -2554,7 +2641,7 @@ ${soExtrasXml}
 </IMPORTDATA></BODY></ENVELOPE>`;
 
   const label = `${partyLedger}${effectiveVoucherNumber ? ' #' + effectiveVoucherNumber : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'sales_order', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'sales_order', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let orderUuid = null;
   if (qId && tdkRef) {
@@ -2565,7 +2652,7 @@ ${soExtrasXml}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'sales_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, original_entry_type,
+      [req.company?.id, req.user.userId, qId, tdkRef, original_entry_type,
        numbering_policy,
        tdkOrderNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -2574,7 +2661,7 @@ ${soExtrasXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     if (!offline && orderUuid) {
@@ -2863,7 +2950,7 @@ ${mailingDetailsXml}
 </REQUESTDATA>
 </IMPORTDATA></BODY></ENVELOPE>`;
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'party', name, null, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'party', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
       companyGuid,
@@ -2875,7 +2962,7 @@ ${mailingDetailsXml}
     });
   }
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
 
@@ -2887,9 +2974,9 @@ ${mailingDetailsXml}
       `INSERT INTO ledgers (guid, company_guid, name, parent, gstin, pan, address, state_name, pincode, gst_registration_type, opening_balance, closing_balance, balance_type, tax_rate)
        SELECT gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12
        WHERE NOT EXISTS (
-         SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+         SELECT 1 FROM ledgers WHERE company_id = $1 AND LOWER(name) = LOWER($2)
        )`,
-      [companyGuid, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType, isDutiesLedger ? ratePct : 0]
+      [req.company?.id, name, parent, gstin || '', pan || '', address || '', state || null, pincode || null, gstRegTypeFinal || null, obAmt, balanceType, isDutiesLedger ? ratePct : 0]
     ).catch((e) => { console.warn('[party-immediate-insert]', e.message); }); // fire-and-forget, don't block response
 
     // Masters need LedgerFull pull (not SingleVoucher) — empty tallyIds forces full post-write sync.
@@ -2953,7 +3040,7 @@ router.post('/report', authMiddleware, async (req, res) => {
   };
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, JSON.stringify(requestPayload));
+    const result = await forwardToTally(companyGuid, req.user.userId, JSON.stringify(requestPayload, { companyId: req.company?.id }));
     res.json({ status: true, message: `${tallyReport} report requested`, data: result });
   } catch (e) {
     res.status(500).json({ status: false, message: e.message });
@@ -2970,7 +3057,7 @@ router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/maste
   const effectiveParent = (parentGodown && parentGodown.toLowerCase() !== 'primary') ? parentGodown : '';
   const parentXml = effectiveParent ? `<PARENT>${effectiveParent}</PARENT>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><GODOWN NAME="${name}" ACTION="Create"><NAME>${name}</NAME>${parentXml}${addressXml}</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'warehouse', name, null, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'warehouse', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
       companyGuid,
@@ -2982,7 +3069,7 @@ router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/maste
     });
   }
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     if (!offline) {
@@ -3030,12 +3117,12 @@ router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('
   const dt = tallyDate(date);
   const dueDt = dueDate ? tallyDate(dueDate) : dt;
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'POR').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'POR', req.company?.id).catch(() => null);
 
   let tdkOrderNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'POR').catch(() => null);
+    tdkOrderNo = await generateTDSeriesNumber(companyGuid, 'POR', req.company?.id).catch(() => null);
     if (tdkOrderNo) effectiveVoucherNumber = tdkOrderNo;
   }
 
@@ -3158,7 +3245,7 @@ ${poExtrasXml}
 </IMPORTDATA></BODY></ENVELOPE>`;
 
   const label = `${partyLedger}${effectiveVoucherNumber ? ' #' + effectiveVoucherNumber : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase_order', label, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase_order', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let orderUuid = null;
   if (qId && tdkRef) {
@@ -3169,7 +3256,7 @@ ${poExtrasXml}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'purchase_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, original_entry_type || (isOptional ? 'optional' : 'regular'),
+      [req.company?.id, req.user.userId, qId, tdkRef, original_entry_type || (isOptional ? 'optional' : 'regular'),
        numbering_policy,
        tdkOrderNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3178,7 +3265,7 @@ ${poExtrasXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     if (!offline && orderUuid) {
@@ -3245,7 +3332,7 @@ router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/vouch
   const payAmt = make_payment?.ledgerName && parseFloat(make_payment.amount) > 0
     ? parseFloat(make_payment.amount) : 0;
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PUR').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'PUR', req.company?.id).catch(() => null);
   // Keep narration user/business-friendly (no TDK ids). Identity = REFERENCE + bill New Ref.
   // LOCKED DECISIONS 2026-07-16: FORBIDDEN stuffing TDK into narration as primary identity.
   const fullNarration = narration || '';
@@ -3253,7 +3340,7 @@ router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/vouch
   let tdkInvoiceNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'PUR').catch(() => null);
+    tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'PUR', req.company?.id).catch(() => null);
     if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
 
@@ -3382,7 +3469,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
 </IMPORTDATA></BODY></ENVELOPE>`;
 
   const persistPayload = { ...req.body, tdkRef, make_payment, narration: fullNarration, voucherType: vchType, againstOrderNo: againstOrderNo || null };
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'purchase', partyLedger, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
   let invoiceUuid = null;
   let invoiceCreatedAt = null;
@@ -3394,7 +3481,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'purchase_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid, created_at`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : (original_entry_type || 'regular'),
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : (original_entry_type || 'regular'),
        numbering_policy || 'tally_prime_series',
        tdkInvoiceNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3404,7 +3491,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
   }
 
   try {
-    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, r, null);
     const off = r?.status === 'desktop_offline';
 
@@ -3781,16 +3868,16 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
   let qId = null;
   let creditNoteUuid = null;
   try {
-    // ── Ownership ────────────────────────────────────────────────────────────
+    // ── Ownership (workspace lineage — middleware already gated access) ───────
     const { rows: coRows } = await query(
-      'SELECT guid, name FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      'SELECT guid, name FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [req.company?.id, req.workspaceId]
     );
     if (!coRows[0]) return bad('Company not found or access denied', 403);
     const resolvedCompanyName = companyName || coRows[0].name;
 
     // ── Linked Sales invoice + cumulative return context ─────────────────────
-    const resolved = await resolveCreditNoteContext(companyGuid, invoiceRef);
+    const resolved = await resolveCreditNoteContext(req.company?.id, invoiceRef);
     if (!resolved.ok) return bad(resolved.message, resolved.status);
     const { invoice, context } = resolved;
 
@@ -3824,12 +3911,12 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
     }
 
     // ── TDK reference + numbering ────────────────────────────────────────────
-    const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CN').catch(() => null);
+    const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CN', req.company?.id).catch(() => null);
     // Tally series → blank VOUCHERNUMBER, Tally assigns it and syncs it back.
     let tdkCreditNoteNo = null;
     let effectiveVoucherNumber = '';
     if (numbering_policy === 'tallydekho_series' && !isOptional) {
-      tdkCreditNoteNo = await generateTDSeriesNumber(companyGuid, 'CN').catch(() => null);
+      tdkCreditNoteNo = await generateTDSeriesNumber(companyGuid, 'CN', req.company?.id).catch(() => null);
       if (tdkCreditNoteNo) effectiveVoucherNumber = tdkCreditNoteNo;
     }
 
@@ -3886,7 +3973,7 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
     };
 
     const label = `${partyLedger} ← return vs ${invoice.voucher_number || billRefName}`;
-    qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', label, amt, persistPayload, xml).catch(() => null);
+    qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
     if (qId && tdkRef) {
       const avResult = await query(
@@ -3896,7 +3983,7 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
           party_name, total_amount, voucher_date, payload)
          VALUES ($1,$2,$3,'credit_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
          RETURNING invoice_uuid`,
-        [companyGuid, req.user.userId, qId, tdkRef, entryType,
+        [req.company?.id, req.user.userId, qId, tdkRef, entryType,
          numbering_policy,
          tdkCreditNoteNo || null,
          partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3904,7 +3991,7 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
       creditNoteUuid = avResult?.rows?.[0]?.invoice_uuid || null;
     }
 
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
 
@@ -4254,13 +4341,13 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
   let debitNoteUuid = null;
   try {
     const { rows: coRows } = await query(
-      'SELECT guid, name FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, req.user.userId]
+      'SELECT guid, name FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+      [req.company?.id, req.workspaceId]
     );
     if (!coRows[0]) return bad('Company not found or access denied', 403);
     const resolvedCompanyName = companyName || coRows[0].name;
 
-    const resolved = await resolveDebitNoteContext(companyGuid, invoiceRef);
+    const resolved = await resolveDebitNoteContext(req.company?.id, invoiceRef);
     if (!resolved.ok) return bad(resolved.message, resolved.status);
     const { invoice, context } = resolved;
 
@@ -4291,11 +4378,11 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
     }
 
     // DBN — must not collide with Delivery Note DN
-    const tdkRef = await generateTDKReference(companyGuid, isOptional, 'DBN').catch(() => null);
+    const tdkRef = await generateTDKReference(companyGuid, isOptional, 'DBN', req.company?.id).catch(() => null);
     let tdkDebitNoteNo = null;
     let effectiveVoucherNumber = '';
     if (numbering_policy === 'tallydekho_series' && !isOptional) {
-      tdkDebitNoteNo = await generateTDSeriesNumber(companyGuid, 'DBN').catch(() => null);
+      tdkDebitNoteNo = await generateTDSeriesNumber(companyGuid, 'DBN', req.company?.id).catch(() => null);
       if (tdkDebitNoteNo) effectiveVoucherNumber = tdkDebitNoteNo;
     }
 
@@ -4351,7 +4438,7 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
     };
 
     const label = `${partyLedger} ← return vs ${invoice.voucher_number || billRefName}`;
-    qId = await logWriteQueue(req.user.userId, companyGuid, 'debit_note', label, amt, persistPayload, xml).catch(() => null);
+    qId = await logWriteQueue(req.user.userId, companyGuid, 'debit_note', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
     if (qId && tdkRef) {
       const avResult = await query(
@@ -4361,7 +4448,7 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
           party_name, total_amount, voucher_date, payload)
          VALUES ($1,$2,$3,'debit_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
          RETURNING invoice_uuid`,
-        [companyGuid, req.user.userId, qId, tdkRef, entryType,
+        [req.company?.id, req.user.userId, qId, tdkRef, entryType,
          numbering_policy,
          tdkDebitNoteNo || null,
          partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -4369,7 +4456,7 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
       debitNoteUuid = avResult?.rows?.[0]?.invoice_uuid || null;
     }
 
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
 
@@ -4532,13 +4619,13 @@ router.post('/voucher/delivery-note', authMiddleware, requireTallyWriteAccess('/
     referenceDate: req.body.referenceDate || linked_order?.order_date || '',
   });
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'DN').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'DN', req.company?.id).catch(() => null);
 
   // TallyDekho Series: we own the sequence, so the number is final immediately.
   let tdkDeliveryNoteNo = null;
   let effectiveVoucherNumber = voucherNumber || '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkDeliveryNoteNo = await generateTDSeriesNumber(companyGuid, 'DN').catch(() => null);
+    tdkDeliveryNoteNo = await generateTDSeriesNumber(companyGuid, 'DN', req.company?.id).catch(() => null);
     if (tdkDeliveryNoteNo) effectiveVoucherNumber = tdkDeliveryNoteNo;
   }
 
@@ -4671,7 +4758,7 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
 </IMPORTDATA></BODY></ENVELOPE>`;
 
   const label = `${partyLedger}${effectiveVoucherNumber ? ' #' + effectiveVoucherNumber : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'delivery_note', label, amt, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'delivery_note', label, amt, req.body, xml, req.company?.id).catch(() => null);
 
   let deliveryNoteUuid = null;
   if (qId && tdkRef) {
@@ -4682,7 +4769,7 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'delivery_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, entryType,
+      [req.company?.id, req.user.userId, qId, tdkRef, entryType,
        numbering_policy,
        tdkDeliveryNoteNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
@@ -4691,7 +4778,7 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml);
+    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
 
@@ -4741,7 +4828,7 @@ router.post('/voucher/cancel', authMiddleware, requireTallyWriteAccess('/voucher
   const { companyGuid, companyName, voucherGuid, voucherType, voucherNumber, date } = req.body;
   if (!companyGuid || !voucherGuid) return res.status(400).json({ status: false, message: 'voucherGuid required' });
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${voucherType}" ACTION="Cancel"><DATE>${tallyDate(date)}</DATE><VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><GUID>${voucherGuid}</GUID></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  try { const r = await forwardToTally(companyGuid, req.user.userId, xml); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
+  try { const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id }); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
 router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/master/stock-item'), async (req, res) => {
@@ -4782,7 +4869,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   const _today = new Date(); const _appFrom = `${_today.getFullYear()}${String(_today.getMonth()+1).padStart(2,'0')}${String(_today.getDate()).padStart(2,'0')}`;
   const gstXml = hsnCode ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM><HSNCODE>${hsnCode}</HSNCODE><TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
       companyGuid,
@@ -4794,7 +4881,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
     });
   }
   try {
-    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, r, null);
     const offItem = r?.status === 'desktop_offline';
 
@@ -4808,11 +4895,11 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
       const godown = String(warehouse || '').trim();
       const dt = tallyDate(date || new Date().toISOString().slice(0, 10));
       const narration = `Opening Balance | ${name} @ ${godown}`;
-      const tdkRef = await generateTDKReference(companyGuid, false, 'PHY').catch(() => null);
+      const tdkRef = await generateTDKReference(companyGuid, false, 'PHY', req.company?.id).catch(() => null);
       let tdkVoucherNo = null;
       let effectiveVoucherNumber = '';
       if (numbering_policy === 'tallydekho_series') {
-        tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY').catch(() => null);
+        tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY', req.company?.id).catch(() => null);
         if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
       }
 
@@ -4864,7 +4951,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
         openVal || null,
         persistPayload,
         physicalXml
-      ).catch(() => null);
+      , req.company?.id).catch(() => null);
 
       openingQueueId = qId2 || null;
 
@@ -4902,7 +4989,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
       }
 
       try {
-        const r2 = await forwardToTally(companyGuid, req.user.userId, physicalXml);
+        const r2 = await forwardToTally(companyGuid, req.user.userId, physicalXml, { companyId: req.company?.id });
         await updateWriteQueue(qId2, r2, null);
 
         offOpening = r2?.status === 'desktop_offline';
@@ -4947,8 +5034,8 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
     if (!tallyRejected) {
       try {
         const { rows: existing } = await query(
-          `SELECT guid FROM stocks WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
-          [companyGuid, name]
+          `SELECT guid FROM stocks WHERE company_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+          [req.company?.id, name]
         );
         if (existing[0]?.guid) {
           stockGuid = existing[0].guid;
@@ -4963,8 +5050,8 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
                closing_rate = CASE WHEN $8 > 0 THEN $8 WHEN $7 > 0 THEN $7 ELSE closing_rate END,
                closing_value = CASE WHEN $6 > 0 THEN ($6 * COALESCE(NULLIF($8,0), NULLIF($7,0), closing_rate, 0)) ELSE closing_value END,
                synced_at = EXTRACT(EPOCH FROM NOW())::BIGINT
-             WHERE company_guid = $1 AND guid = $2`,
-            [companyGuid, stockGuid, effectiveGroup, unit, taxRate, qty, rate, saleRate]
+             WHERE company_id = $1 AND guid = $2`,
+            [req.company?.id, stockGuid, effectiveGroup, unit, taxRate, qty, rate, saleRate]
           ).catch(() => {});
         } else {
           const { rows: inserted } = await query(
@@ -4978,7 +5065,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
                EXTRACT(EPOCH FROM NOW())::BIGINT
              )
              RETURNING guid`,
-            [companyGuid, name, effectiveGroup, unit, hsnCode || null, taxRate || 0, qty, rate, saleRate]
+            [req.company?.id, name, effectiveGroup, unit, hsnCode || null, taxRate || 0, qty, rate, saleRate]
           );
           stockGuid = inserted[0]?.guid || null;
         }
@@ -4991,16 +5078,16 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
         try {
           const { rows: [existingBc] } = await query(
             `SELECT barcode FROM stock_barcodes
-             WHERE stock_guid = $1 AND company_guid = $2 AND is_primary = TRUE AND status = 'active'
+             WHERE stock_guid = $1 AND company_id = $2 AND is_primary = TRUE AND status = 'active'
              LIMIT 1`,
-            [stockGuid, companyGuid]
+            [stockGuid, req.company?.id]
           );
           if (existingBc?.barcode) {
             barcode = existingBc.barcode;
           } else {
             const { rows: [{ cnt }] } = await query(
-              `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_guid = $1`,
-              [companyGuid]
+              `SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_id = $1`,
+              [req.company?.id]
             );
             const slug = String(companyGuid).replace(/[^A-Z0-9]/gi, '').slice(0, 4).toUpperCase().padEnd(4, 'X');
             let tries = 0;
@@ -5008,8 +5095,8 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
               barcode = `TDK${slug}${(cnt + tries + 1).toString().padStart(7, '0').slice(-7)}`;
               tries += 1;
               const { rows: [dup] } = await query(
-                `SELECT 1 FROM stock_barcodes WHERE company_guid = $1 AND barcode = $2`,
-                [companyGuid, barcode]
+                `SELECT 1 FROM stock_barcodes WHERE company_id = $1 AND barcode = $2`,
+                [req.company?.id, barcode]
               );
               if (!dup) break;
             } while (tries < 10);
@@ -5020,7 +5107,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
               `INSERT INTO stock_barcodes
                  (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
                VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)`,
-              [companyGuid, stockGuid, name, barcode, barcodeType || 'CODE128', syncTarget, tallyStatus]
+              [req.company?.id, stockGuid, name, barcode, barcodeType || 'CODE128', syncTarget, tallyStatus]
             );
           }
         } catch (e) {
@@ -5112,7 +5199,7 @@ router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess(
 
   const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'alter_stock_item', existingName, null, req.body, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'alter_stock_item', existingName, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
       companyGuid,
@@ -5124,7 +5211,7 @@ router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess(
     });
   }
   try {
-    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, r, null);
     if (r?.status === false) {
       // Tally rejected (LINEERROR) — return error so mobile shows failure, not fake success
@@ -5181,11 +5268,11 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
     }
   }
 
-  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'STJ').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, isOptional, 'STJ', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series' && !isOptional) {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'STJ').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'STJ', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -5233,7 +5320,7 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
   };
 
   const label = `${labelFrom} → ${toGodown} (${normalizedItems.length} items)${tdkRef ? ' (' + tdkRef + ')' : ''}`;
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', label, transferValue || null, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_transfer', label, transferValue || null, persistPayload, xml, req.company?.id).catch(() => null);
 
   let transferUuid = null;
   if (qId && tdkRef) {
@@ -5244,7 +5331,7 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'stock_transfer',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        `${labelFrom} → ${toGodown}`, transferValue || null, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -5253,13 +5340,13 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
   }
 
   try {
-    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, r, null);
     let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -5343,11 +5430,11 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
   const dt        = tallyDate(date);
   const narration = `${adjustmentReason}${adjustmentDirection ? ' - ' + adjustmentDirection : ''}${note ? ' | ' + note : ''}`;
 
-  const tdkRef = await generateTDKReference(companyGuid, false, 'PHY').catch(() => null);
+  const tdkRef = await generateTDKReference(companyGuid, false, 'PHY', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
   let effectiveVoucherNumber = '';
   if (numbering_policy === 'tallydekho_series') {
-    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY').catch(() => null);
+    tdkVoucherNo = await generateTDSeriesNumber(companyGuid, 'PHY', req.company?.id).catch(() => null);
     if (tdkVoucherNo) effectiveVoucherNumber = tdkVoucherNo;
   }
 
@@ -5377,7 +5464,7 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
 
   const label = `${adjustmentReason}: ${stockName} (${isIncrease ? '+' : '-'}${qty} @ ${godown})${tdkRef ? ' (' + tdkRef + ')' : ''}`;
   const adjValue = qty * (parseFloat(req.body.rate) || 0);
-  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, adjValue || null, persistPayload, xml).catch(() => null);
+  const qId = await logWriteQueue(req.user.userId, companyGuid, 'stock_adjustment', label, adjValue || null, persistPayload, xml, req.company?.id).catch(() => null);
 
   let adjustmentUuid = null;
   if (qId && tdkRef) {
@@ -5388,7 +5475,7 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
         party_name, total_amount, voucher_date, payload)
        VALUES ($1,$2,$3,'stock_adjustment',$4,'regular','regular','queued','not_posted',$5,$6,$7,$8,$9,$10)
        RETURNING invoice_uuid`,
-      [companyGuid, req.user.userId, qId, tdkRef,
+      [req.company?.id, req.user.userId, qId, tdkRef,
        numbering_policy, tdkVoucherNo || null,
        stockName, adjValue || null, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -5414,7 +5501,7 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
 
   // ── Forward to Tally ─────────────────────────────────────────────────────────
   try {
-    const r = await forwardToTally(companyGuid, req.user.userId, xml);
+    const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(qId, r, null);
     // Update adjustment status
     if (adjustmentId) {
@@ -5424,8 +5511,8 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
     let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 LIMIT 1`,
-        [tdkRef, companyGuid]
+        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
     }
@@ -5473,9 +5560,11 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
 router.get('/audit-trail', authMiddleware, async (req, res) => {
   const { companyGuid, status, limit = 50, offset = 0 } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!(await verifyCompanyAccess(req, res, companyGuid))) return;
   try {
-    const conditions = ['company_guid = $1', 'user_id = $2'];
-    const params = [companyGuid, req.user.userId];
+    const companyId = req.company.id;
+    const conditions = ['company_id = $1', 'user_id = $2'];
+    const params = [companyId, req.user.userId];
     if (status) { conditions.push(`status = $${params.length + 1}`); params.push(status); }
     const { rows } = await query(
       `SELECT id, entry_type, entry_label, amount, status, tally_voucher_number, tally_id, error_message, attempt_count, created_at, updated_at, source
@@ -5488,8 +5577,8 @@ router.get('/audit-trail', authMiddleware, async (req, res) => {
        SUM(CASE WHEN status='desktop_offline' THEN 1 ELSE 0 END) as offline_count,
        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_count,
        SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending_count
-       FROM write_queue WHERE company_guid = $1 AND user_id = $2`,
-      [companyGuid, req.user.userId]
+       FROM write_queue WHERE company_id = $1 AND user_id = $2`,
+      [companyId, req.user.userId]
     );
     res.json({ status: true, data: { entries: rows, stats: countRows[0] } });
   } catch (e) {
@@ -5569,7 +5658,7 @@ export async function retrySingleEntry(entryId, userId) {
       return { success: true, alreadySuccess: true, message: 'Already pushed to Tally', voucherNumber: entry.tally_voucher_number };
     }
 
-    const result = await forwardToTally(entry.company_guid, userId, entry.xml);
+    const result = await forwardToTally(entry.company_guid, userId, entry.xml, { companyId: entry.company_id });
     await updateWriteQueue(entryId, result, null);
     const offline = result?.status === 'desktop_offline';
     return {
@@ -5625,7 +5714,16 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
     }
     if (companyGuid) {
       params.push(companyGuid);
-      clauses.push(`company_guid = $${params.length}`);
+      const gIdx = params.length;
+      if (workspaceId) {
+        params.push(workspaceId);
+        const wsForCo = params.length;
+        clauses.push(
+          `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
+        );
+      } else {
+        clauses.push(`company_id IN (SELECT id FROM companies WHERE guid = $${gIdx}) OR company_guid = $${gIdx}`);
+      }
     }
     const { rows } = await query(
       `SELECT * FROM write_queue WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,
@@ -5656,7 +5754,7 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
           });
           continue;
         }
-        const result = await forwardToTally(entry.company_guid, userId, entry.xml);
+        const result = await forwardToTally(entry.company_guid, userId, entry.xml, { companyId: entry.company_id });
         await updateWriteQueue(entry.id, result, null);
         // This retry re-pushes stored XML only, so a Sales/Purchase with Collect/Make
         // Payment Now would otherwise post without its paired Receipt/Payment.
@@ -5730,7 +5828,7 @@ router.get('/write-queue/history', authMiddleware, async (req, res) => {
                       WHEN 'failed'          THEN 'failed'
                       ELSE status
                     END as v2_status
-             FROM write_queue WHERE user_id = $1 AND company_guid = $2`;
+             FROM write_queue WHERE user_id = $1 AND company_id = $2`;
     const params = [req.user.userId, companyGuidVal];
     if (status) { q += ` AND status = $${params.length + 1}`; params.push(status); }
     q += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
@@ -5787,8 +5885,8 @@ router.post('/master/bank', authMiddleware, requireTallyWriteAccess('/master/ban
   let tallyAction = 'Create';
   try {
     const { rows: existingRows } = await query(
-      `SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
-      [companyGuid, ledgerName]
+      `SELECT 1 FROM ledgers WHERE company_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+      [req.company?.id, ledgerName]
     );
     if (existingRows.length) tallyAction = 'Alter';
   } catch { /* Create */ }
@@ -5845,7 +5943,7 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
     accountHolderName: holderName || null,
     tallyAction,
   };
-  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'bank', ledgerName, openBal, payload, xml);
+  const queueId = await logWriteQueue(req.user.userId, companyGuid, 'bank', ledgerName, openBal, payload, xml, req.company?.id);
   if (queueId) {
     await insertAppMaster({
       companyGuid,
@@ -5870,7 +5968,7 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
          )
          SELECT gen_random_uuid()::text, $1, $2, $3, $4, $4, 'Dr', $5, $6, $7, $8, $9, $10
          WHERE NOT EXISTS (
-           SELECT 1 FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+           SELECT 1 FROM ledgers WHERE company_id = $1 AND LOWER(name) = LOWER($2)
          )`,
         [
           companyGuid, ledgerName, parentGroup, openBal,
@@ -5887,7 +5985,7 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
            bank_branch        = COALESCE(NULLIF($7, ''), bank_branch),
            bank_holder        = COALESCE(NULLIF($8, ''), bank_holder),
            bank_account_type  = COALESCE(NULLIF($9, ''), bank_account_type)
-         WHERE company_guid = $1 AND LOWER(name) = LOWER($2)`,
+         WHERE company_id = $1 AND LOWER(name) = LOWER($2)`,
         [
           companyGuid, ledgerName, parentGroup,
           accNo, ifscCode, institutionName, branchName, holderName, typeRaw,
@@ -5900,7 +5998,7 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
 
   let result;
   try {
-    result = await forwardToTally(companyGuid, req.user.userId, xml);
+    result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
     await updateWriteQueue(queueId, result, null);
     await upsertLocalBank();
     const offline = result?.status === 'desktop_offline';
@@ -5961,10 +6059,10 @@ router.get('/master/bank', authMiddleware, async (req, res) => {
     const { rows } = await query(`
       SELECT id, payload, status, created_at
       FROM write_queue
-      WHERE user_id=$1 AND company_guid=$2 AND operation='bank'
+      WHERE user_id=$1 AND company_id=$2 AND operation='bank'
       ORDER BY created_at DESC
       LIMIT 50
-    `, [req.user.userId, companyGuid]);
+    `, [req.user.userId, req.company?.id]);
     const accounts = rows.map(r => ({
       id: r.id.toString(),
       ...r.payload,
@@ -5995,8 +6093,8 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
   // Read existing sku from stocks table so we can preserve it in Tally
   // stocks.sku = PartNumber / OnlyAlias synced from Tally's StockItem XML
   const { rows: [stockRow] } = await query(
-    'SELECT sku FROM stocks WHERE guid=$1 AND company_guid=$2',
-    [stockGuid, companyGuid]
+    'SELECT sku FROM stocks WHERE guid=$1 AND company_id=$2',
+    [stockGuid, req.company?.id]
   ).catch(() => ({ rows: [{}] }));
   const existingSku = stockRow?.sku || '';
 
@@ -6033,14 +6131,14 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
   }
 
   const queueId = await logWriteQueue(
-    userId, companyGuid, 'barcode_sync',
+    userId, req.company?.id, 'barcode_sync',
     `${stockName} → ${barcode} (${syncTarget})`,
     null, { stockGuid, stockName, barcode, syncTarget }, xml
   ).catch(() => null);
 
   let result;
   try {
-    result = await forwardToTally(companyGuid, userId, xml);
+    result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
   } catch (err) {
     result = { status: 'failed', message: err.message };
   }
@@ -6098,7 +6196,16 @@ router.post('/desktop/writeback/pending', requireDeviceCredential, async (req, r
     }
     if (companyGuid) {
       params.push(companyGuid);
-      clauses.push(`company_guid = $${params.length}`);
+      const gIdx = params.length;
+      if (desktop.workspaceId) {
+        params.push(desktop.workspaceId);
+        const wsForCo = params.length;
+        clauses.push(
+          `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
+        );
+      } else {
+        clauses.push(`(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx}) OR company_guid = $${gIdx})`);
+      }
     }
     params.push(maxLimit);
     const { rows } = await query(
@@ -6209,7 +6316,7 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
           [tallyVoucherNumber, tallyVoucherGuid || null, outboxId]
         ).catch(() => ({ rows: [] }));
         if (avRows[0]?.tdk_reference_no) {
-          _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber);
+          _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber, { companyId: avRows[0].company_id });
         }
       }
       // Desktop completed a deferred push without going through the Sales/Purchase
@@ -6249,8 +6356,8 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, requireTallyWriteAccess(
 
     // Lookup the invoice
     const { rows: avRows } = await query(
-      `SELECT invoice_uuid, books_impact_status FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
-      [tdkRef, companyGuid, req.user.userId]
+      `SELECT invoice_uuid, books_impact_status FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
+      [tdkRef, req.company?.id, req.user.userId]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
 
@@ -6265,7 +6372,7 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, requireTallyWriteAccess(
       `INSERT INTO invoice_pdf_versions (tdk_reference_no, invoice_uuid, company_guid, user_id, version_no, pdf_type, posting_tag, invoice_number, invoice_number_label, watermark, file_name)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (tdk_reference_no, version_no) DO NOTHING`,
-      [tdkRef, avRows[0].invoice_uuid, companyGuid, req.user.userId, versionNo,
+      [tdkRef, avRows[0].invoice_uuid, req.company?.id, req.user.userId, versionNo,
        pdfType, avRows[0].books_impact_status === 'posted' ? 'Posted' : 'Not Posted',
        invoiceNumber || null, invoiceNumberLabel || 'Pending from TallyPrime', watermark || null, fileName || null]
     );
@@ -6404,7 +6511,7 @@ async function buildVoucherDocument(av, ctxOverride = null) {
     .map((i) => i.itemName || i.name)
     .filter(Boolean);
   const ctx = ctxOverride
-    || await loadDocumentContext(av.company_guid, partyName, itemNames);
+    || await loadDocumentContext(av.company_id, partyName, itemNames);
   const company = buildCompanyBlock(ctx.companyRow, p, ctx.printProfile);
   const party = buildPartyBlock(ctx.partyRow, partyName);
   const numbering = documentNumbering(av);
@@ -6740,13 +6847,13 @@ async function buildVoucherDocument(av, ctxOverride = null) {
 }
 
 // ── Helper: poll for Tally voucher number up to maxWaitMs ─────────────────────
-async function waitForTallyNumber(tdkRef, companyGuid, userId, maxWaitMs = 10000) {
+async function waitForTallyNumber(tdkRef, companyId, userId, maxWaitMs = 10000) {
   const pollInterval = 600;
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const { rows } = await query(
-      `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
-      [tdkRef, companyGuid, userId]
+      `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
+      [tdkRef, companyId, userId]
     ).catch(() => ({ rows: [] }));
     if (rows[0]?.tally_voucher_no) return rows[0].tally_voucher_no;
     await new Promise(r => setTimeout(r, pollInterval));
@@ -6761,6 +6868,7 @@ router.get('/master/:queueId/preview', authMiddleware, async (req, res) => {
     const queueId = parseInt(req.params.queueId, 10);
     const { companyGuid } = req.query;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!(await verifyCompanyAccess(req, res, companyGuid))) return;
     if (!queueId) return res.status(400).json({ status: false, message: 'queueId required' });
 
     const { rows } = await query(
@@ -6771,10 +6879,10 @@ router.get('/master/:queueId/preview', authMiddleware, async (req, res) => {
          FROM write_queue wq
          LEFT JOIN app_masters am ON am.write_queue_id = wq.id
         WHERE wq.id = $1
-          AND wq.company_guid = $2
+          AND wq.company_id = $2
           AND wq.user_id = $3
           AND wq.entry_type IN ('party','bank','warehouse','item','alter_stock_item')`,
-      [queueId, companyGuid, req.user.userId]
+      [queueId, req.company.id, req.user.userId]
     );
     if (!rows[0]) return res.status(404).json({ status: false, message: 'Master entry not found' });
 
@@ -6790,17 +6898,17 @@ router.get('/master/:queueId/preview', authMiddleware, async (req, res) => {
         `SELECT guid, name, parent, gstin, pan, address, state_name, pincode,
                 gst_registration_type, opening_balance, closing_balance, balance_type, tax_rate, phone, email
            FROM ledgers
-          WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+          WHERE company_id = $1 AND LOWER(name) = LOWER($2)
           ORDER BY CASE WHEN guid LIKE $1 || '%' THEN 0 ELSE 1 END
           LIMIT 1`,
-        [companyGuid, masterName]
+        [req.company?.id, masterName]
       ).catch(() => ({ rows: [] }));
       live = ledgers[0] || null;
     } else if (masterType === 'warehouse') {
       const { rows: wh } = await query(
         `SELECT guid, name, parent, address FROM warehouses
-          WHERE company_guid = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
-        [companyGuid, masterName]
+          WHERE company_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+        [req.company?.id, masterName]
       ).catch(() => ({ rows: [] }));
       live = wh[0] || null;
     } else if (masterType === 'item' || masterType === 'alter_stock_item') {
@@ -6808,10 +6916,10 @@ router.get('/master/:queueId/preview', authMiddleware, async (req, res) => {
         `SELECT guid, name, group_name, unit, hsn, tax_rate, opening_qty, opening_rate,
                 closing_qty, closing_rate, closing_value
            FROM stocks
-          WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+          WHERE company_id = $1 AND LOWER(name) = LOWER($2)
           ORDER BY CASE WHEN guid LIKE $1 || '%' THEN 0 ELSE 1 END
           LIMIT 1`,
-        [companyGuid, masterName]
+        [req.company?.id, masterName]
       ).catch(() => ({ rows: [] }));
       live = stocks[0] || null;
     }
@@ -6892,8 +7000,8 @@ router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
 
     const { rows: avRows } = await query(
-      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
-      [tdkRef, companyGuid, req.user.userId]
+      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
+      [tdkRef, req.company?.id, req.user.userId]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
     const av = avRows[0];
@@ -6917,15 +7025,15 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, requireTallyWriteAcces
 
     // Check current state first
     const { rows: avRows } = await query(
-      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_guid=$2 AND user_id=$3`,
-      [tdkRef, companyGuid, req.user.userId]
+      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
+      [tdkRef, req.company?.id, req.user.userId]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
     let av = avRows[0];
 
     // If we need to wait and no Tally number yet → poll
     if (shouldWait && !av.tally_voucher_no && av.numbering_policy === 'tally_prime_series') {
-      const tallyNo = await waitForTallyNumber(tdkRef, companyGuid, req.user.userId, maxWaitMs);
+      const tallyNo = await waitForTallyNumber(tdkRef, req.company?.id, req.user.userId, maxWaitMs);
       if (tallyNo) {
         // Refresh row
         const { rows: fresh } = await query(

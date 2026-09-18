@@ -14,6 +14,31 @@ export function demoCompanyGuidForWorkspace(workspaceId) {
   return `dddddddd-dddd-4ddd-8ddd-${hex}`;
 }
 
+/** True for Demo Company rows (name or reserved GUID prefix). */
+export function isDemoCompany(c) {
+  if (!c) return false;
+  const name = String(c.name || '').toLowerCase().trim();
+  const guid = String(c.guid || c.id || '');
+  return (
+    name.startsWith('demo')
+    || guid.startsWith('DEMO')
+    || guid.startsWith('dddddddd-dddd-4ddd-8ddd-')
+  );
+}
+
+/**
+ * Paired (CONNECTED) → hide Demo Company (live books only).
+ * Unpaired / reconnecting / unknown → Demo Company only (fail-closed).
+ * Universal MD §8: real synced data stays stored but hidden from operational APIs/UI.
+ */
+export function filterCompaniesByPairingStatus(companies, pairingStatus) {
+  const list = Array.isArray(companies) ? companies : [];
+  const status = String(pairingStatus || '').toUpperCase();
+  if (status === 'CONNECTED') return list.filter((c) => !isDemoCompany(c));
+  // UNPAIRED | RECONNECTING | anything else → Demo only (never leak live books)
+  return list.filter((c) => isDemoCompany(c));
+}
+
 function currentIndianFy(ref = new Date()) {
   const y = ref.getUTCFullYear();
   const m = ref.getUTCMonth() + 1;
@@ -46,7 +71,7 @@ function gid(companyGuid, suffix) {
   return `${companyGuid}-${suffix}`;
 }
 
-async function upsertLedger(companyGuid, row, ts) {
+async function upsertLedger(companyId, companyGuid, row, ts) {
   const {
     guid, name, parent, nature = null,
     opening = 0, closing = 0, balanceType = 'Dr',
@@ -56,11 +81,11 @@ async function upsertLedger(companyGuid, row, ts) {
   } = row;
   await query(
     `INSERT INTO ledgers
-       (guid, company_guid, name, parent, nature, opening_balance, closing_balance, balance_type,
+       (guid, company_guid, company_id, name, parent, nature, opening_balance, closing_balance, balance_type,
         alias, gstin, mobile, phone, email, address, state_name, pincode, pan,
         bank_account_no, bank_ifsc, bank_name, synced_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-     ON CONFLICT (guid, company_guid) DO UPDATE SET
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+     ON CONFLICT (company_id, guid) DO UPDATE SET
        name = EXCLUDED.name, parent = EXCLUDED.parent, nature = EXCLUDED.nature,
        opening_balance = EXCLUDED.opening_balance, closing_balance = EXCLUDED.closing_balance,
        balance_type = EXCLUDED.balance_type, alias = EXCLUDED.alias, gstin = EXCLUDED.gstin,
@@ -69,40 +94,40 @@ async function upsertLedger(companyGuid, row, ts) {
        pan = EXCLUDED.pan, bank_account_no = EXCLUDED.bank_account_no,
        bank_ifsc = EXCLUDED.bank_ifsc, bank_name = EXCLUDED.bank_name, synced_at = EXCLUDED.synced_at`,
     [
-      guid, companyGuid, name, parent, nature, opening, closing, balanceType,
+      guid, companyGuid, companyId, name, parent, nature, opening, closing, balanceType,
       alias, gstin, mobile, phone, email, address, stateName, pincode, pan,
       bankAccountNo, bankIfsc, bankName, ts,
     ]
   );
 }
 
-async function clearDemoTransactions(companyGuid) {
-  await query('DELETE FROM voucher_ledger_entries WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM voucher_inventory_items WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM stock_transactions WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM batch_allocations WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM bill_outstanding WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM vouchers WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM stock_fy_valuation WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM ledger_fy_balances WHERE company_guid = $1', [companyGuid]);
-  await query('DELETE FROM kpi_ar_ap_snapshots WHERE company_guid = $1', [companyGuid]).catch(() => {});
-  await query('DELETE FROM kpi_loans_snapshots WHERE company_guid = $1', [companyGuid]).catch(() => {});
+async function clearDemoTransactions(companyId) {
+  await query('DELETE FROM voucher_ledger_entries WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM voucher_inventory_items WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM stock_transactions WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM batch_allocations WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM bill_outstanding WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM vouchers WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM stock_fy_valuation WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM ledger_fy_balances WHERE company_id = $1', [companyId]);
+  await query('DELETE FROM kpi_ar_ap_snapshots WHERE company_id = $1', [companyId]).catch(() => {});
+  await query('DELETE FROM kpi_loans_snapshots WHERE company_id = $1', [companyId]).catch(() => {});
 }
 
-async function insertVoucher(companyGuid, v, ts, fy) {
+async function insertVoucher(companyId, companyGuid, v, ts, fy) {
   await query(
     `INSERT INTO vouchers
-       (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date,
+       (guid, company_guid, company_id, voucher_number, voucher_type, voucher_type_parent, date,
         party_name, party_guid, amount, narration, reference, is_cancelled, is_optional,
         synced_at, financial_year, party_gstin, place_of_supply, is_gst_relevant)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16,$17)
-     ON CONFLICT (guid, company_guid) DO UPDATE SET
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,$13,$14,$15,$16,$17,$18)
+     ON CONFLICT (company_id, guid) DO UPDATE SET
        voucher_number = EXCLUDED.voucher_number, voucher_type = EXCLUDED.voucher_type,
        date = EXCLUDED.date, party_name = EXCLUDED.party_name, party_guid = EXCLUDED.party_guid,
        amount = EXCLUDED.amount, narration = EXCLUDED.narration, financial_year = EXCLUDED.financial_year,
        synced_at = EXCLUDED.synced_at`,
     [
-      v.guid, companyGuid, v.number, v.type, v.typeParent || v.type, v.date,
+      v.guid, companyGuid, companyId, v.number, v.type, v.typeParent || v.type, v.date,
       v.partyName || null, v.partyGuid || null, v.amount, v.narration || null,
       v.reference || null, !!v.optional, ts, fy,
       v.partyGstin || null, v.pos || 'Karnataka', v.gst !== false,
@@ -110,63 +135,63 @@ async function insertVoucher(companyGuid, v, ts, fy) {
   );
 }
 
-async function insertVle(companyGuid, voucherGuid, lines, fy) {
+async function insertVle(companyId, companyGuid, voucherGuid, lines, fy) {
   for (let i = 0; i < lines.length; i++) {
     const L = lines[i];
     await query(
       `INSERT INTO voucher_ledger_entries
-         (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index, financial_year)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (voucher_guid, company_guid, ledger_name, line_index) DO UPDATE SET
+         (voucher_guid, company_guid, company_id, ledger_name, ledger_guid, amount, dr_cr, line_index, financial_year)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (company_id, voucher_guid, ledger_name, line_index) DO UPDATE SET
          amount = EXCLUDED.amount, ledger_guid = EXCLUDED.ledger_guid, dr_cr = EXCLUDED.dr_cr,
          financial_year = EXCLUDED.financial_year`,
-      [voucherGuid, companyGuid, L.name, L.guid, L.amount, L.drCr, i, fy]
+      [voucherGuid, companyGuid, companyId, L.name, L.guid, L.amount, L.drCr, i, fy]
     );
   }
 }
 
-async function insertInvLine(companyGuid, voucherGuid, line, fy) {
+async function insertInvLine(companyId, companyGuid, voucherGuid, line, fy) {
   await query(
     `INSERT INTO voucher_inventory_items
-       (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty,
+       (voucher_guid, company_guid, company_id, stock_item_name, stock_item_guid, actual_qty, billed_qty,
         rate, amount, godown_name, batch_name, unit, hsn, tax_rate, financial_year)
-     VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-     ON CONFLICT (voucher_guid, company_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
+     VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
        actual_qty = EXCLUDED.actual_qty, billed_qty = EXCLUDED.billed_qty,
        rate = EXCLUDED.rate, amount = EXCLUDED.amount, financial_year = EXCLUDED.financial_year`,
     [
-      voucherGuid, companyGuid, line.name, line.guid, line.qty, line.rate, line.amount,
+      voucherGuid, companyGuid, companyId, line.name, line.guid, line.qty, line.rate, line.amount,
       line.godown, line.batch, line.unit, line.hsn, line.taxRate, fy,
     ]
   );
 }
 
-async function insertStockTxn(companyGuid, row, ts, fy) {
+async function insertStockTxn(companyId, companyGuid, row, ts, fy) {
   await query(
     `INSERT INTO stock_transactions
-       (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, financial_year)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-     ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO UPDATE SET
+       (stock_guid, company_guid, company_id, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, financial_year)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
        qty = EXCLUDED.qty, rate = EXCLUDED.rate, value = EXCLUDED.value, date = EXCLUDED.date,
        financial_year = EXCLUDED.financial_year, synced_at = EXCLUDED.synced_at`,
     [
-      row.stockName, companyGuid, row.voucherGuid, row.voucherType, row.date,
+      row.stockName, companyGuid, companyId, row.voucherGuid, row.voucherType, row.date,
       Math.abs(row.qty), row.rate, Math.abs(row.value), row.type, row.warehouse, ts, fy,
     ]
   );
 }
 
-async function insertBatch(companyGuid, row, fy) {
+async function insertBatch(companyId, companyGuid, row, fy) {
   await query(
     `INSERT INTO batch_allocations
-       (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
+       (voucher_guid, company_guid, company_id, stock_item_name, stock_item_guid, batch_name,
         expiry_date, mfg_date, qty, rate, godown_name, financial_year)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-     ON CONFLICT (voucher_guid, company_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+     ON CONFLICT (company_id, voucher_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
        qty = EXCLUDED.qty, rate = EXCLUDED.rate, expiry_date = EXCLUDED.expiry_date,
        mfg_date = EXCLUDED.mfg_date, financial_year = EXCLUDED.financial_year`,
     [
-      row.voucherGuid, companyGuid, row.stockName, row.stockGuid, row.batch,
+      row.voucherGuid, companyGuid, companyId, row.stockName, row.stockGuid, row.batch,
       row.expiry || null, row.mfg || null, row.qty, row.rate, row.godown, fy,
     ]
   );
@@ -183,29 +208,38 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
 
   await query(
     `INSERT INTO companies
-       (guid, user_id, workspace_id, name, formal_name, gstin, address, state, country, currency,
+       (guid, workspace_id, name, formal_name, gstin, address, state, country, currency,
         fy_start, fy_end, is_active, synced_at, created_at, pincode, pan, phone, mobile, email, website,
         gst_taxpayer_type)
-     VALUES ($1,$2,$3,'Demo Company','Demo Company Pvt Ltd','29AABCD1234A1Z5',
-             '42 MG Road, Indiranagar','Karnataka','India','INR',$4,$5,TRUE,$6,$6,
+     VALUES ($1,$2,'Demo Company','Demo Company Pvt Ltd','29AABCD1234A1Z5',
+             '42 MG Road, Indiranagar','Karnataka','India','INR',$3,$4,TRUE,$5,$5,
              '560038','AABCD1234A','08041234567','9024400000','demo@tallydekho.com','https://demo.tallydekho.com',
              'Regular')
-     ON CONFLICT (guid) DO UPDATE SET
-       user_id = EXCLUDED.user_id, workspace_id = EXCLUDED.workspace_id, name = 'Demo Company',
+     ON CONFLICT (workspace_id, guid) DO UPDATE SET
+       name = 'Demo Company',
        formal_name = EXCLUDED.formal_name, gstin = EXCLUDED.gstin, address = EXCLUDED.address,
        state = EXCLUDED.state, fy_start = EXCLUDED.fy_start, fy_end = EXCLUDED.fy_end,
        is_active = TRUE, synced_at = EXCLUDED.synced_at, pincode = EXCLUDED.pincode,
        pan = EXCLUDED.pan, phone = EXCLUDED.phone, mobile = EXCLUDED.mobile,
        email = EXCLUDED.email, website = EXCLUDED.website`,
-    [companyGuid, userId, workspaceId, fy.begin, fy.end, ts]
+    [companyGuid, workspaceId, fy.begin, fy.end, ts]
   );
 
+  const { rows: companyIdRows } = await query(
+    'SELECT id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
+    [companyGuid, workspaceId]
+  );
+  const companyId = companyIdRows[0]?.id;
+  if (!companyId) {
+    throw new Error(`[demo] company_id missing after upsert for ${companyGuid}`);
+  }
+
   await query(
-    `INSERT INTO company_years (company_guid, fin_year, begin_date, end_date, is_active)
-     VALUES ($1,$2,$3,$4,TRUE)
-     ON CONFLICT (company_guid, fin_year) DO UPDATE SET
+    `INSERT INTO company_years (company_guid, company_id, fin_year, begin_date, end_date, is_active)
+     VALUES ($1,$2,$3,$4,$5,TRUE)
+     ON CONFLICT (company_id, fin_year) DO UPDATE SET
        begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, is_active = TRUE`,
-    [companyGuid, fy.finYear, fy.begin, fy.end]
+    [companyGuid, companyId, fy.finYear, fy.begin, fy.end]
   );
 
   // ── Groups ──────────────────────────────────────────────────────────────
@@ -227,21 +261,21 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
   ];
   for (const [name, parent, nature] of groupDefs) {
     await query(
-      `INSERT INTO groups (guid, company_guid, name, parent, nature, is_primary, synced_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (guid, company_guid) DO UPDATE SET
+      `INSERT INTO groups (guid, company_guid, company_id, name, parent, nature, is_primary, synced_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (company_id, guid) DO UPDATE SET
          parent = EXCLUDED.parent, nature = EXCLUDED.nature, synced_at = EXCLUDED.synced_at`,
-      [gid(companyGuid, `grp-${name.replace(/\W+/g, '-').toLowerCase()}`), companyGuid, name, parent, nature, !parent, ts]
+      [gid(companyGuid, `grp-${name.replace(/\W+/g, '-').toLowerCase()}`), companyGuid, companyId, name, parent, nature, !parent, ts]
     );
   }
 
   // ── Units / warehouses / inventory settings ─────────────────────────────
   for (const [name, formal] of [['Nos', 'Numbers'], ['Kg', 'Kilograms'], ['Ltr', 'Litres'], ['Box', 'Boxes']]) {
     await query(
-      `INSERT INTO units (guid, company_guid, name, formal_name, is_simple_unit, synced_at)
-       VALUES ($1,$2,$3,$4,TRUE,$5)
-       ON CONFLICT (name, company_guid) DO UPDATE SET formal_name = EXCLUDED.formal_name, synced_at = EXCLUDED.synced_at`,
-      [gid(companyGuid, `u-${name.toLowerCase()}`), companyGuid, name, formal, ts]
+      `INSERT INTO units (guid, company_guid, company_id, name, formal_name, is_simple_unit, synced_at)
+       VALUES ($1,$2,$3,$4,$5,TRUE,$6)
+       ON CONFLICT (company_id, name) DO UPDATE SET formal_name = EXCLUDED.formal_name, synced_at = EXCLUDED.synced_at`,
+      [gid(companyGuid, `u-${name.toLowerCase()}`), companyGuid, companyId, name, formal, ts]
     );
   }
 
@@ -251,19 +285,19 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
   ];
   for (const w of warehouses) {
     await query(
-      `INSERT INTO warehouses (guid, company_guid, name, parent, address, synced_at)
-       VALUES ($1,$2,$3,'Primary',$4,$5)
-       ON CONFLICT (name, company_guid) DO UPDATE SET address = EXCLUDED.address, synced_at = EXCLUDED.synced_at`,
-      [w.guid, companyGuid, w.name, w.address, ts]
+      `INSERT INTO warehouses (guid, company_guid, company_id, name, parent, address, synced_at)
+       VALUES ($1,$2,$3,$4,'Primary',$5,$6)
+       ON CONFLICT (company_id, name) DO UPDATE SET address = EXCLUDED.address, synced_at = EXCLUDED.synced_at`,
+      [w.guid, companyGuid, companyId, w.name, w.address, ts]
     );
   }
 
   await query(
-    `INSERT INTO company_inventory_settings (company_guid, batch_tracking_app_enabled, expiry_tracking_app_enabled)
-     VALUES ($1, TRUE, TRUE)
-     ON CONFLICT (company_guid) DO UPDATE SET
+    `INSERT INTO company_inventory_settings (company_guid, company_id, batch_tracking_app_enabled, expiry_tracking_app_enabled)
+     VALUES ($1, $2, TRUE, TRUE)
+     ON CONFLICT (company_id) DO UPDATE SET
        batch_tracking_app_enabled = TRUE, expiry_tracking_app_enabled = TRUE, updated_at = now()`,
-    [companyGuid]
+    [companyGuid, companyId]
   ).catch(() => {});
 
   // ── Ledgers ─────────────────────────────────────────────────────────────
@@ -329,14 +363,14 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     },
   };
   for (const row of Object.values(ledgers)) {
-    await upsertLedger(companyGuid, row, ts);
+    await upsertLedger(companyId, companyGuid, row, ts);
     await query(
       `INSERT INTO ledger_fy_balances
-         (ledger_guid, ledger_name, company_guid, financial_year, opening_balance, balance_type)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (company_guid, ledger_name, financial_year) DO UPDATE SET
+         (ledger_guid, ledger_name, company_guid, company_id, financial_year, opening_balance, balance_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (company_id, ledger_name, financial_year) DO UPDATE SET
          opening_balance = EXCLUDED.opening_balance, balance_type = EXCLUDED.balance_type, ledger_guid = EXCLUDED.ledger_guid`,
-      [row.guid, row.name, companyGuid, fy.finYear, row.opening, row.balanceType]
+      [row.guid, row.name, companyGuid, companyId, fy.finYear, row.opening, row.balanceType]
     );
   }
 
@@ -369,37 +403,37 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     stocks[s.key] = { ...s, guid };
     await query(
       `INSERT INTO stocks
-         (guid, company_guid, name, alias, category, group_name, unit, hsn, tax_rate,
+         (guid, company_guid, company_id, name, alias, category, group_name, unit, hsn, tax_rate,
           opening_qty, opening_rate, closing_qty, closing_rate, closing_value, reorder_level,
           sku, description, batch_enabled, expiry_enabled, synced_at)
-       VALUES ($1,$2,$3,$4,$5,'Primary',$6,$7,18,$8,$9,$10,$9,$11,$12,$13,$14,$15,$16,$17)
-       ON CONFLICT (guid, company_guid) DO UPDATE SET
+       VALUES ($1,$2,$3,$4,$5,$6,'Primary',$7,$8,18,$9,$10,$11,$10,$12,$13,$14,$15,$16,$17,$18)
+       ON CONFLICT (company_id, guid) DO UPDATE SET
          name = EXCLUDED.name, closing_qty = EXCLUDED.closing_qty, closing_rate = EXCLUDED.closing_rate,
          closing_value = EXCLUDED.closing_value, reorder_level = EXCLUDED.reorder_level,
          batch_enabled = EXCLUDED.batch_enabled, expiry_enabled = EXCLUDED.expiry_enabled,
          synced_at = EXCLUDED.synced_at`,
       [
-        guid, companyGuid, s.name, s.key.toUpperCase(), s.cat, s.unit, s.hsn,
+        guid, companyGuid, companyId, s.name, s.key.toUpperCase(), s.cat, s.unit, s.hsn,
         s.openQty, s.rate, s.closeQty, s.closeQty * s.rate, s.reorder,
         `SKU-${s.key.toUpperCase()}`, `Demo ${s.name}`, !!s.batch, !!s.expiry, ts,
       ]
     );
     await query(
       `INSERT INTO stock_fy_valuation
-         (company_guid, financial_year, stock_name, stock_guid,
+         (company_guid, company_id, financial_year, stock_name, stock_guid,
           opening_qty, opening_rate, opening_value, closing_qty, closing_rate, closing_value, synced_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10)
-       ON CONFLICT (company_guid, financial_year, stock_name) DO UPDATE SET
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$7,$10,$11)
+       ON CONFLICT (company_id, financial_year, stock_name) DO UPDATE SET
          opening_qty = EXCLUDED.opening_qty, closing_qty = EXCLUDED.closing_qty,
          closing_value = EXCLUDED.closing_value, synced_at = EXCLUDED.synced_at`,
       [
-        companyGuid, fy.finYear, s.name, guid,
+        companyGuid, companyId, fy.finYear, s.name, guid,
         s.openQty, s.rate, s.openQty * s.rate, s.closeQty, s.closeQty * s.rate, ts,
       ]
     );
   }
 
-  await clearDemoTransactions(companyGuid);
+  await clearDemoTransactions(companyId);
 
   // Spread dates across FY up to today (no future vouchers) + denser recent window
   const dates = [];
@@ -449,26 +483,26 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       const taxable = qty * sk.rate;
       const g = gstSplit(taxable);
       const vGuid = gid(companyGuid, `v-sales-${String(salesN).padStart(3, '0')}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: vGuid, number: `DEMO-SI-${salesN}`, type: 'Sales', date,
         partyName: debtor.name, partyGuid: debtor.guid, amount: g.total,
         narration: `Demo sale of ${sk.name} to ${debtor.name}`, partyGstin: debtor.gstin || null,
       }, ts, fy.finYear);
-      await insertVle(companyGuid, vGuid, [
+      await insertVle(companyId, companyGuid, vGuid, [
         { name: debtor.name, guid: debtor.guid, amount: g.total, drCr: 'Dr' },
         { name: 'Sales', guid: ledgers.sales.guid, amount: g.taxable, drCr: 'Cr' },
         { name: 'CGST', guid: ledgers.cgst.guid, amount: g.cgst, drCr: 'Cr' },
         { name: 'SGST', guid: ledgers.sgst.guid, amount: g.sgst, drCr: 'Cr' },
       ], fy.finYear);
-      await insertInvLine(companyGuid, vGuid, {
+      await insertInvLine(companyId, companyGuid, vGuid, {
         name: sk.name, guid: sk.guid, qty, rate: sk.rate, amount: taxable,
         godown: wh, batch, unit: sk.unit, hsn: sk.hsn, taxRate: 18,
       }, fy.finYear);
-      await insertStockTxn(companyGuid, {
+      await insertStockTxn(companyId, companyGuid, {
         stockName: sk.name, voucherGuid: vGuid, voucherType: 'Sales', date,
         qty, rate: sk.rate, value: taxable, type: 'outward', warehouse: wh,
       }, ts, fy.finYear);
-      await insertBatch(companyGuid, {
+      await insertBatch(companyId, companyGuid, {
         voucherGuid: vGuid, stockName: sk.name, stockGuid: sk.guid, batch,
         qty: -qty, rate: sk.rate, godown: wh,
         mfg: addDays(date, -120),
@@ -476,9 +510,9 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       }, fy.finYear);
       await query(
         `INSERT INTO bill_outstanding
-           (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, synced_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'DR',$9)`,
-        [vGuid, companyGuid, debtor.name, `DEMO-SI-${salesN}`, date, addDays(date, 30), g.total, Math.round(g.total * 0.6 * 100) / 100, ts]
+           (voucher_guid, company_guid, company_id, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'DR',$10)`,
+        [vGuid, companyGuid, companyId, debtor.name, `DEMO-SI-${salesN}`, date, addDays(date, 30), g.total, Math.round(g.total * 0.6 * 100) / 100, ts]
       );
     }
 
@@ -489,26 +523,26 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       const taxable = qty * pk.rate;
       const g = gstSplit(taxable);
       const vGuid = gid(companyGuid, `v-purch-${String(purchN).padStart(3, '0')}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: vGuid, number: `DEMO-PI-${purchN}`, type: 'Purchase', date,
         partyName: creditor.name, partyGuid: creditor.guid, amount: g.total,
         narration: `Demo purchase of ${pk.name}`, partyGstin: creditor.gstin || null,
       }, ts, fy.finYear);
-      await insertVle(companyGuid, vGuid, [
+      await insertVle(companyId, companyGuid, vGuid, [
         { name: 'Purchase', guid: ledgers.purchase.guid, amount: g.taxable, drCr: 'Dr' },
         { name: 'CGST', guid: ledgers.cgst.guid, amount: g.cgst, drCr: 'Dr' },
         { name: 'SGST', guid: ledgers.sgst.guid, amount: g.sgst, drCr: 'Dr' },
         { name: creditor.name, guid: creditor.guid, amount: g.total, drCr: 'Cr' },
       ], fy.finYear);
-      await insertInvLine(companyGuid, vGuid, {
+      await insertInvLine(companyId, companyGuid, vGuid, {
         name: pk.name, guid: pk.guid, qty, rate: pk.rate, amount: taxable,
         godown: wh, batch: pBatch, unit: pk.unit, hsn: pk.hsn, taxRate: 18,
       }, fy.finYear);
-      await insertStockTxn(companyGuid, {
+      await insertStockTxn(companyId, companyGuid, {
         stockName: pk.name, voucherGuid: vGuid, voucherType: 'Purchase', date,
         qty, rate: pk.rate, value: taxable, type: 'inward', warehouse: wh,
       }, ts, fy.finYear);
-      await insertBatch(companyGuid, {
+      await insertBatch(companyId, companyGuid, {
         voucherGuid: vGuid, stockName: pk.name, stockGuid: pk.guid, batch: pBatch,
         qty, rate: pk.rate, godown: wh,
         mfg: addDays(date, -30),
@@ -516,9 +550,9 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       }, fy.finYear);
       await query(
         `INSERT INTO bill_outstanding
-           (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, synced_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'CR',$9)`,
-        [vGuid, companyGuid, creditor.name, `DEMO-PI-${purchN}`, date, addDays(date, 21), g.total, Math.round(g.total * 0.5 * 100) / 100, ts]
+           (voucher_guid, company_guid, company_id, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'CR',$10)`,
+        [vGuid, companyGuid, companyId, creditor.name, `DEMO-PI-${purchN}`, date, addDays(date, 21), g.total, Math.round(g.total * 0.5 * 100) / 100, ts]
       );
     }
 
@@ -529,12 +563,12 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       const useCash = di % 4 === 1;
       const bankOrCash = useCash ? ledgers.cash : ledgers.bank;
       const vGuid = gid(companyGuid, `v-rcpt-${String(rcptN).padStart(3, '0')}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: vGuid, number: `DEMO-RCPT-${rcptN}`, type: 'Receipt', date,
         partyName: debtor.name, partyGuid: debtor.guid, amount,
         narration: `Receipt from ${debtor.name}`,
       }, ts, fy.finYear);
-      await insertVle(companyGuid, vGuid, [
+      await insertVle(companyId, companyGuid, vGuid, [
         { name: bankOrCash.name, guid: bankOrCash.guid, amount, drCr: 'Dr' },
         { name: debtor.name, guid: debtor.guid, amount, drCr: 'Cr' },
       ], fy.finYear);
@@ -547,12 +581,12 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       const useCash = di % 5 === 0;
       const bankOrCash = useCash ? ledgers.cash : ledgers.bank;
       const vGuid = gid(companyGuid, `v-pmt-${String(pmtN).padStart(3, '0')}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: vGuid, number: `DEMO-PMT-${pmtN}`, type: 'Payment', date,
         partyName: creditor.name, partyGuid: creditor.guid, amount,
         narration: `Payment to ${creditor.name}`,
       }, ts, fy.finYear);
-      await insertVle(companyGuid, vGuid, [
+      await insertVle(companyId, companyGuid, vGuid, [
         { name: creditor.name, guid: creditor.guid, amount, drCr: 'Dr' },
         { name: bankOrCash.name, guid: bankOrCash.guid, amount, drCr: 'Cr' },
       ], fy.finYear);
@@ -565,12 +599,12 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
       const head = expenseHeads[di % expenseHeads.length];
       const amount = head === ledgers.salary ? 45000 : head === ledgers.rent ? 25000 : 2500 + (di % 6) * 400;
       const vGuid = gid(companyGuid, `v-exp-${String(expN).padStart(3, '0')}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: vGuid, number: `DEMO-EXP-${expN}`, type: 'Payment', typeParent: 'Payment', date,
         partyName: head.name, partyGuid: head.guid, amount,
         narration: `${head.name} for period`,
       }, ts, fy.finYear);
-      await insertVle(companyGuid, vGuid, [
+      await insertVle(companyId, companyGuid, vGuid, [
         { name: head.name, guid: head.guid, amount, drCr: 'Dr' },
         { name: ledgers.bank.name, guid: ledgers.bank.guid, amount, drCr: 'Cr' },
       ], fy.finYear);
@@ -583,11 +617,11 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     const amount = 3200;
     const date = clampIso(addDays(todayClamped, -10), fy.begin, fy.end);
     const vGuid = gid(companyGuid, 'v-jnl-001');
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: vGuid, number: 'DEMO-JNL-1', type: 'Journal', date, amount,
       narration: 'Bank interest credited',
     }, ts, fy.finYear);
-    await insertVle(companyGuid, vGuid, [
+    await insertVle(companyId, companyGuid, vGuid, [
       { name: ledgers.bank.name, guid: ledgers.bank.guid, amount, drCr: 'Dr' },
       { name: ledgers.interestInc.name, guid: ledgers.interestInc.guid, amount, drCr: 'Cr' },
     ], fy.finYear);
@@ -599,11 +633,11 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     const amount = 10000;
     const date = clampIso(addDays(todayClamped, -3), fy.begin, fy.end);
     const vGuid = gid(companyGuid, 'v-cntr-001');
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: vGuid, number: 'DEMO-CNTR-1', type: 'Contra', date, amount,
       narration: 'Cash deposited to bank',
     }, ts, fy.finYear);
-    await insertVle(companyGuid, vGuid, [
+    await insertVle(companyId, companyGuid, vGuid, [
       { name: ledgers.bank.name, guid: ledgers.bank.guid, amount, drCr: 'Dr' },
       { name: ledgers.cash.name, guid: ledgers.cash.guid, amount, drCr: 'Cr' },
     ], fy.finYear);
@@ -621,7 +655,7 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     otherN += 1;
     const date = clampIso(addDays(todayClamped, -ex.key.length), fy.begin, fy.end);
     const vGuid = gid(companyGuid, `v-${ex.key}-001`);
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: vGuid, number: ex.num, type: ex.type, date,
       partyName: ex.party.name, partyGuid: ex.party.guid, amount: ex.amount,
       narration: `Demo ${ex.type}`,
@@ -631,21 +665,21 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
   // Opening stock batches so godown qty > 0
   for (const s of Object.values(stocks)) {
     const openGuid = gid(companyGuid, `v-open-${s.key}`);
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: openGuid, number: `DEMO-OB-${s.key.toUpperCase()}`, type: 'Stock Journal',
       date: fy.begin, amount: 0, narration: `Opening stock ${s.name}`,
     }, ts, fy.finYear);
     const mainQty = Math.max(0, Math.floor(s.openQty * 0.7));
     const shopQty = Math.max(0, s.openQty - mainQty);
     if (mainQty > 0) {
-      await insertBatch(companyGuid, {
+      await insertBatch(companyId, companyGuid, {
         voucherGuid: openGuid, stockName: s.name, stockGuid: s.guid,
         batch: s.batch ? 'OPEN-01' : 'Primary Batch',
         qty: mainQty, rate: s.rate, godown: 'Main Godown',
         mfg: addDays(fy.begin, -60),
         expiry: s.expiry ? addDays(fy.begin, 180) : null,
       }, fy.finYear);
-      await insertStockTxn(companyGuid, {
+      await insertStockTxn(companyId, companyGuid, {
         stockName: s.name, voucherGuid: openGuid, voucherType: 'Stock Journal',
         date: fy.begin, qty: mainQty, rate: s.rate, value: mainQty * s.rate,
         type: 'inward', warehouse: 'Main Godown',
@@ -653,18 +687,18 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     }
     if (shopQty > 0) {
       const openGuid2 = gid(companyGuid, `v-open2-${s.key}`);
-      await insertVoucher(companyGuid, {
+      await insertVoucher(companyId, companyGuid, {
         guid: openGuid2, number: `DEMO-OB2-${s.key.toUpperCase()}`, type: 'Stock Journal',
         date: fy.begin, amount: 0, narration: `Opening shop stock ${s.name}`,
       }, ts, fy.finYear);
-      await insertBatch(companyGuid, {
+      await insertBatch(companyId, companyGuid, {
         voucherGuid: openGuid2, stockName: s.name, stockGuid: s.guid,
         batch: s.batch ? 'OPEN-02' : 'Primary Batch',
         qty: shopQty, rate: s.rate, godown: 'Shop Floor',
         mfg: addDays(fy.begin, -60),
         expiry: s.expiry ? addDays(fy.begin, 30) : null, // near expiry sample
       }, fy.finYear);
-      await insertStockTxn(companyGuid, {
+      await insertStockTxn(companyId, companyGuid, {
         stockName: s.name, voucherGuid: openGuid2, voucherType: 'Stock Journal',
         date: fy.begin, qty: shopQty, rate: s.rate, value: shopQty * s.rate,
         type: 'inward', warehouse: 'Shop Floor',
@@ -677,20 +711,20 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     const oil = stocks.oil;
     const vGuid = gid(companyGuid, 'v-expbatch-001');
     const vGuid2 = gid(companyGuid, 'v-expbatch-002');
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: vGuid, number: 'DEMO-BATCH-EXP', type: 'Stock Journal',
       date: todayClamped, amount: 0, narration: 'Expiry demo batches',
     }, ts, fy.finYear);
-    await insertVoucher(companyGuid, {
+    await insertVoucher(companyId, companyGuid, {
       guid: vGuid2, number: 'DEMO-BATCH-SOON', type: 'Stock Journal',
       date: todayClamped, amount: 0, narration: 'Near-expiry demo batch',
     }, ts, fy.finYear);
-    await insertBatch(companyGuid, {
+    await insertBatch(companyId, companyGuid, {
       voucherGuid: vGuid, stockName: oil.name, stockGuid: oil.guid, batch: 'EXP-PAST',
       qty: 4, rate: oil.rate, godown: 'Main Godown',
       mfg: addDays(todayClamped, -200), expiry: addDays(todayClamped, -5),
     }, fy.finYear);
-    await insertBatch(companyGuid, {
+    await insertBatch(companyId, companyGuid, {
       voucherGuid: vGuid2, stockName: oil.name, stockGuid: oil.guid, batch: 'EXP-SOON',
       qty: 6, rate: oil.rate, godown: 'Shop Floor',
       mfg: addDays(todayClamped, -100), expiry: addDays(todayClamped, 12),
@@ -702,23 +736,23 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
   for (const asOf of asOfs) {
     const i = asOfs.indexOf(asOf);
     await query(
-      `INSERT INTO kpi_ar_ap_snapshots (company_guid, side, as_of, total, aging)
-       VALUES ($1,'AR',$2,$3,$4::jsonb)
-       ON CONFLICT (company_guid, side, as_of) DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging`,
-      [companyGuid, asOf, 124800 - i * 4000, JSON.stringify({ '0-30': 50000, '31-60': 40000, '61-90': 20000, '90+': 14800 })]
+      `INSERT INTO kpi_ar_ap_snapshots (company_id, company_guid, side, as_of, total, aging)
+       VALUES ($1,$2,'AR',$3,$4,$5::jsonb)
+       ON CONFLICT (company_id, side, as_of) DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging`,
+      [companyId, companyGuid, asOf, 124800 - i * 4000, JSON.stringify({ '0-30': 50000, '31-60': 40000, '61-90': 20000, '90+': 14800 })]
     ).catch(() => {});
     await query(
-      `INSERT INTO kpi_ar_ap_snapshots (company_guid, side, as_of, total, aging)
-       VALUES ($1,'AP',$2,$3,$4::jsonb)
-       ON CONFLICT (company_guid, side, as_of) DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging`,
-      [companyGuid, asOf, 84500 - i * 2000, JSON.stringify({ '0-30': 30000, '31-60': 28000, '61-90': 15000, '90+': 11500 })]
+      `INSERT INTO kpi_ar_ap_snapshots (company_id, company_guid, side, as_of, total, aging)
+       VALUES ($1,$2,'AP',$3,$4,$5::jsonb)
+       ON CONFLICT (company_id, side, as_of) DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging`,
+      [companyId, companyGuid, asOf, 84500 - i * 2000, JSON.stringify({ '0-30': 30000, '31-60': 28000, '61-90': 15000, '90+': 11500 })]
     ).catch(() => {});
     await query(
-      `INSERT INTO kpi_loans_snapshots (company_guid, as_of, total, loan_total, od_total)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (company_guid, as_of) DO UPDATE SET
+      `INSERT INTO kpi_loans_snapshots (company_id, company_guid, as_of, total, loan_total, od_total)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (company_id, as_of) DO UPDATE SET
          total = EXCLUDED.total, loan_total = EXCLUDED.loan_total, od_total = EXCLUDED.od_total`,
-      [companyGuid, asOf, 503500, 425000, 78500]
+      [companyId, companyGuid, asOf, 503500, 425000, 78500]
     ).catch(() => {});
   }
 
@@ -730,11 +764,15 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
 
 /**
  * Ensures workspace has an active Demo Company with full sample data.
- * - Unpaired: create + full seed
- * - Connected: refresh existing Demo Company only (never overwrite real Tally companies)
+ * - Unpaired: create + full seed (once — skip if vouchers already present)
+ * - Connected: refresh existing Demo Company only when force=true
+ * - force: always reseed (reset / ops)
  */
 export async function ensureDemoCompany(userId, workspaceId, { force = false } = {}) {
   if (!userId || !workspaceId) return null;
+  // RBAC / unit harnesses set SKIP_DEMO_SEED to avoid multi-minute reseeds
+  // of accumulated local unpaired workspaces during initSchema backfill.
+  if (process.env.SKIP_DEMO_SEED === '1' && !force) return null;
 
   const { rows: wsRows } = await query(
     `SELECT id, tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
@@ -757,21 +795,37 @@ export async function ensureDemoCompany(userId, workspaceId, { force = false } =
   }
 
   const companyGuid = demoRows[0]?.guid || demoCompanyGuidForWorkspace(workspaceId);
+
+  // Already seeded → keep data (avoids wipe/race that blanks home KPI cards)
+  if (demoRows[0] && !force) {
+    const { rows: cnt } = await query(
+      `SELECT COUNT(*)::int AS n FROM vouchers WHERE company_id = $1`,
+      [demoRows[0].id]
+    );
+    if ((cnt[0]?.n || 0) > 0) {
+      await query(
+        `UPDATE companies SET is_active = TRUE, synced_at = $2 WHERE id = $1`,
+        [demoRows[0].id, now()]
+      ).catch(() => {});
+      return { guid: companyGuid, name: 'Demo Company', skipped: true };
+    }
+  }
+
   return seedFullDemoCompany(userId, workspaceId, companyGuid);
 }
 
 /** Reseed every Demo Company in the DB (ops / founder refresh). */
 export async function reseedAllDemoCompanies() {
   const { rows } = await query(
-    `SELECT guid, user_id, workspace_id, name FROM companies
+    `SELECT guid, workspace_id, name FROM companies
      WHERE name ILIKE 'Demo%' OR guid LIKE 'dddddddd%'
      ORDER BY created_at NULLS LAST`
   );
   const out = [];
   for (const c of rows) {
-    if (!c.user_id || !c.workspace_id) continue;
+    if (!c.workspace_id) continue;
     try {
-      const r = await seedFullDemoCompany(c.user_id, c.workspace_id, c.guid);
+      const r = await seedFullDemoCompany(null, c.workspace_id, c.guid);
       out.push({ guid: c.guid, ok: true, counts: r?.counts });
     } catch (e) {
       console.error('[demo] reseed failed', c.guid, e.message);

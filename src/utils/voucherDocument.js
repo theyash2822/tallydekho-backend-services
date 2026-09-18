@@ -136,33 +136,33 @@ export function round2(v) {
  * rendered an empty seller and buyer block. Column lists here are checked against
  * the live schema; PAN is derived from the GSTIN.
  */
-export async function loadDocumentContext(companyGuid, partyName, itemNames = []) {
+export async function loadDocumentContext(companyId, partyName, itemNames = []) {
   const [companyRes, profileRes, partyRes, stockRes] = await Promise.all([
     query(
       `SELECT name, formal_name, gstin, pan, phone, mobile, email, website,
               address, state, pincode, country, currency
-         FROM companies WHERE guid = $1 LIMIT 1`,
-      [companyGuid]
+         FROM companies WHERE id = $1 LIMIT 1`,
+      [companyId]
     ).catch(() => ({ rows: [] })),
     query(
-      `SELECT * FROM company_print_profile WHERE company_guid = $1 LIMIT 1`,
-      [companyGuid]
+      `SELECT * FROM company_print_profile WHERE company_id=$1 LIMIT 1`,
+      [companyId]
     ).catch(() => ({ rows: [] })),
     partyName
       ? query(
         `SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode,
                 gst_registration_type
            FROM ledgers
-          WHERE company_guid = $1 AND LOWER(name) = LOWER($2)
+          WHERE company_id=$1 AND LOWER(name) = LOWER($2)
           LIMIT 1`,
-        [companyGuid, partyName]
+        [companyId, partyName]
       ).catch(() => ({ rows: [] }))
       : Promise.resolve({ rows: [] }),
     itemNames.length
       ? query(
         `SELECT name, unit, hsn, tax_rate, type_of_supply FROM stocks
-          WHERE company_guid = $1 AND LOWER(name) = ANY($2::text[])`,
-        [companyGuid, itemNames.map((n) => String(n || '').toLowerCase())]
+          WHERE company_id=$1 AND LOWER(name) = ANY($2::text[])`,
+        [companyId, itemNames.map((n) => String(n || '').toLowerCase())]
       ).catch(() => ({ rows: [] }))
       : Promise.resolve({ rows: [] }),
   ]);

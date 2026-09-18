@@ -81,18 +81,16 @@ npm run dev            # starts on port 3001
 | GET | `/app/pairing-device` | Check pairing status |
 | DELETE | `/desktop/paired-device` | Unpair device |
 
-### Data (requires JWT)
+### Data (requires JWT) — canonical `/api/*` (Phase 5+)
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/app/companies` | List synced companies |
-| POST | `/app/ledgers` | List ledgers with search/pagination |
-| POST | `/app/ledger` | Single ledger detail |
-| POST | `/app/stocks` | List stock items |
-| POST | `/app/stock-dashboard` | Stock summary KPIs |
-| POST | `/app/vouchers` | List sales/purchase/expense vouchers |
-| POST | `/app/dashboard` | Dashboard KPI totals |
-| POST | `/app/reports/pl` | Profit & Loss |
-| POST | `/app/reports/balance-sheet` | Balance Sheet |
+| GET | `/api/companies` | List companies (workspace + scope) |
+| GET | `/api/stocks/dashboard` | Stock summary KPIs |
+| GET | `/api/vouchers` | Voucher lists |
+| GET | `/api/dashboard` | Dashboard KPIs |
+| GET | `/api/...` | Ledgers, reports, registers — see api-v1 |
+
+Legacy `/app` data/companies mounts were **deleted** in Phase 5. Remaining `/app` = auth compatibility only.
 
 ### Ingest (Desktop → Server)
 | Method | Path | Description |

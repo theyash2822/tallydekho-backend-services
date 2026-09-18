@@ -47,7 +47,7 @@ function daysBetween(asOfIso, dueIso) {
  * AR/AP outstanding ABS: Dr increases, Cr decreases (same sign convention as cash inflow/outflow).
  * @returns {Promise<{dr:number, cr:number, net:number, rowCount:number}>}
  */
-export async function partyLedgerMovesAfter(companyGuid, side, asOfIso) {
+export async function partyLedgerMovesAfter(companyId, side, asOfIso) {
   const partySql = PARTY_SQL[side] || PARTY_SQL.AR;
   const { rows } = await query(
     `SELECT
@@ -55,13 +55,13 @@ export async function partyLedgerMovesAfter(companyGuid, side, asOfIso) {
        COALESCE(SUM(CASE WHEN vle.dr_cr = 'Cr' THEN ABS(vle.amount) ELSE 0 END), 0) AS cr,
        COUNT(*)::int AS n
      FROM voucher_ledger_entries vle
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+     JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     WHERE vle.company_id=$1
        AND v.is_cancelled = FALSE
        AND v.date > $2
        AND ${partySql}`,
-    [companyGuid, asOfIso]
+    [companyId, asOfIso]
   );
   const dr = money(rows[0]?.dr);
   const cr = money(rows[0]?.cr);
@@ -72,9 +72,9 @@ export async function partyLedgerMovesAfter(companyGuid, side, asOfIso) {
  * Reconstruct total outstanding as-of prior date from current balance + VLE walkback.
  * prior ≈ current - Dr_after + Cr_after
  */
-export async function reconstructTotalAsOf(companyGuid, side, asOfIso, currentTotal) {
+export async function reconstructTotalAsOf(companyId, side, asOfIso, currentTotal) {
   const cur = money(currentTotal);
-  const moves = await partyLedgerMovesAfter(companyGuid, side, asOfIso);
+  const moves = await partyLedgerMovesAfter(companyId, side, asOfIso);
   const prior = money(cur - moves.dr + moves.cr);
   return {
     total: Math.max(0, prior),
@@ -87,7 +87,7 @@ export async function reconstructTotalAsOf(companyGuid, side, asOfIso, currentTo
  * Load settlement add-backs after asOf keyed by bill ref (+ party).
  * Prefers bill_ref_name (Agst Ref); also matches vouchers.reference to bill names when set.
  */
-async function loadSettlementAddBacks(companyGuid, side, asOfIso) {
+async function loadSettlementAddBacks(companyId, side, asOfIso) {
   const vtype = side === 'AR'
     ? `(v.voucher_type ILIKE '%Receipt%')`
     : `(v.voucher_type ILIKE '%Payment%')`;
@@ -97,7 +97,7 @@ async function loadSettlementAddBacks(companyGuid, side, asOfIso) {
        LOWER(COALESCE(v.party_name, '')) AS party_key,
        SUM(ABS(COALESCE(v.bill_allocated_amount, v.amount, 0))) AS settled
      FROM vouchers v
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.is_cancelled = FALSE
        AND v.date > $2
        AND ${vtype}
@@ -106,7 +106,7 @@ async function loadSettlementAddBacks(companyGuid, side, asOfIso) {
          OR NULLIF(v.reference, '') IS NOT NULL
        )
      GROUP BY 1, 2`,
-    [companyGuid, asOfIso]
+    [companyId, asOfIso]
   );
   const byRefParty = new Map();
   const byRef = new Map();
@@ -127,7 +127,7 @@ async function loadSettlementAddBacks(companyGuid, side, asOfIso) {
  * Invoices dated on/before asOf that are no longer open, with a bill-wise Agst Ref
  * settlement after asOf. Party-only matches are NOT used (would invent allocation).
  */
-async function loadClearedInvoicesAsOf(companyGuid, side, asOfIso, openRefs) {
+async function loadClearedInvoicesAsOf(companyId, side, asOfIso, openRefs) {
   const invType = side === 'AR'
     ? `(v.voucher_type ILIKE '%Sales%' AND v.voucher_type NOT ILIKE '%Order%' AND v.voucher_type NOT ILIKE '%Note%')`
     : `(v.voucher_type ILIKE '%Purchase%' AND v.voucher_type NOT ILIKE '%Order%' AND v.voucher_type NOT ILIKE '%Note%')`;
@@ -139,14 +139,14 @@ async function loadClearedInvoicesAsOf(companyGuid, side, asOfIso, openRefs) {
     `SELECT v.voucher_number, v.party_name, v.date::text AS bill_date, v.amount,
             v.reference, v.bill_ref_name
      FROM vouchers v
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.is_cancelled = FALSE
        AND v.date BETWEEN $2 AND $3
        AND ${invType}
        AND ABS(COALESCE(v.amount,0)) > 0.005
        AND EXISTS (
          SELECT 1 FROM vouchers s
-         WHERE s.company_guid = v.company_guid
+         WHERE s.company_id = v.company_id
            AND s.is_cancelled = FALSE
            AND s.date > $3
            AND ${settleType}
@@ -158,7 +158,7 @@ async function loadClearedInvoicesAsOf(companyGuid, side, asOfIso, openRefs) {
            )
        )
      LIMIT 3000`,
-    [companyGuid, windowFrom, asOfIso]
+    [companyId, windowFrom, asOfIso]
   );
   const out = [];
   for (const r of rows) {
@@ -181,8 +181,8 @@ async function loadClearedInvoicesAsOf(companyGuid, side, asOfIso, openRefs) {
  * Build bill rows as they would have appeared on asOfIso.
  * @param {Array<{pending_amount:number, due_date?:string, bill_date?:string, bill_name?:string, ledger_name?:string, amount?:number}>} currentBills
  */
-export async function reconstructBillsAsOf(companyGuid, side, asOfIso, currentBills) {
-  const { byRefParty, byRef } = await loadSettlementAddBacks(companyGuid, side, asOfIso);
+export async function reconstructBillsAsOf(companyId, side, asOfIso, currentBills) {
+  const { byRefParty, byRef } = await loadSettlementAddBacks(companyId, side, asOfIso);
   const openRefs = new Set();
   const out = [];
   for (const b of currentBills) {
@@ -206,7 +206,7 @@ export async function reconstructBillsAsOf(companyGuid, side, asOfIso, currentBi
     });
   }
   try {
-    const cleared = await loadClearedInvoicesAsOf(companyGuid, side, asOfIso, openRefs);
+    const cleared = await loadClearedInvoicesAsOf(companyId, side, asOfIso, openRefs);
     for (const c of cleared) out.push(c);
   } catch (e) {
     console.warn('[arApHistory] cleared-invoice prior skipped:', e.message);
@@ -264,7 +264,7 @@ export function dueTodayAmount(bills, asOfIso) {
  * Prefers reconstruction; uses snapshot only if reconstruction prior is unavailable (should not happen).
  */
 export async function computeArApTrends({
-  companyGuid,
+  companyId,
   side,
   asOf,
   currentTotal,
@@ -282,12 +282,12 @@ export async function computeArApTrends({
   const priorByLookback = new Map();
   for (const days of uniqueLookbacks) {
     const priorAsOf = addDays(asOf, -days);
-    const billsPrior = await reconstructBillsAsOf(companyGuid, side, priorAsOf, currentBillsRaw);
+    const billsPrior = await reconstructBillsAsOf(companyId, side, priorAsOf, currentBillsRaw);
     const agingPrior = buildAgingBucketsDueBased(billsPrior, priorAsOf);
     const agingMap = {};
     for (const b of agingPrior) agingMap[b.bucket] = b.amount;
     const duePrior = dueTodayAmount(billsPrior, priorAsOf);
-    const totalPrior = await reconstructTotalAsOf(companyGuid, side, priorAsOf, currentTotal);
+    const totalPrior = await reconstructTotalAsOf(companyId, side, priorAsOf, currentTotal);
     priorByLookback.set(days, {
       priorAsOf,
       agingMap,

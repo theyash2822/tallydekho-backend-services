@@ -58,13 +58,13 @@ function modeCaseSql(modeDrCr) {
         ELSE 'Other'
       END
       FROM voucher_ledger_entries vle
-      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-      WHERE vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
+      JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+      WHERE vle.voucher_guid = v.guid AND vle.company_id = v.company_id
         AND vle.dr_cr = '${modeDrCr}'
     ), 'Other')`;
 }
 
-async function sumWindow(companyGuid, voucherTypeLike, from, to, modeDrCr) {
+async function sumWindow(companyId, voucherTypeLike, from, to, modeDrCr) {
   const { rows } = await query(
     `SELECT
        COALESCE(SUM(ABS(amount)), 0) AS total,
@@ -74,12 +74,12 @@ async function sumWindow(companyGuid, voucherTypeLike, from, to, modeDrCr) {
        SELECT v.amount,
          ${modeCaseSql(modeDrCr)} AS mode
        FROM vouchers v
-       WHERE v.company_guid = $1
+       WHERE v.company_id=$1
          AND v.voucher_type ILIKE $2
          AND v.is_cancelled = FALSE
          AND v.date BETWEEN $3 AND $4
      ) t`,
-    [companyGuid, `%${voucherTypeLike}%`, from, to]
+    [companyId, `%${voucherTypeLike}%`, from, to]
   );
   const r = rows[0] || {};
   return {
@@ -89,30 +89,30 @@ async function sumWindow(companyGuid, voucherTypeLike, from, to, modeDrCr) {
   };
 }
 
-async function sumDay(companyGuid, voucherTypeLike, day) {
+async function sumDay(companyId, voucherTypeLike, day) {
   const { rows } = await query(
     `SELECT COALESCE(SUM(ABS(v.amount)), 0) AS total
      FROM vouchers v
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.voucher_type ILIKE $2
        AND v.is_cancelled = FALSE
        AND v.date = $3`,
-    [companyGuid, `%${voucherTypeLike}%`, day]
+    [companyId, `%${voucherTypeLike}%`, day]
   );
   return money(rows[0]?.total);
 }
 
-async function dailySeries(companyGuid, voucherTypeLike, from, to) {
+async function dailySeries(companyId, voucherTypeLike, from, to) {
   const { rows } = await query(
     `SELECT v.date::text AS day, COALESCE(SUM(ABS(v.amount)), 0) AS amount
      FROM vouchers v
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.voucher_type ILIKE $2
        AND v.is_cancelled = FALSE
        AND v.date BETWEEN $3 AND $4
      GROUP BY v.date
      ORDER BY v.date ASC`,
-    [companyGuid, `%${voucherTypeLike}%`, from, to]
+    [companyId, `%${voucherTypeLike}%`, from, to]
   );
   const map = new Map();
   for (const r of rows) {
@@ -124,18 +124,18 @@ async function dailySeries(companyGuid, voucherTypeLike, from, to) {
   }));
 }
 
-async function listTransactions(companyGuid, voucherTypeLike, from, to, modeDrCr, limit = 100) {
+async function listTransactions(companyId, voucherTypeLike, from, to, modeDrCr, limit = 100) {
   const { rows } = await query(
     `SELECT v.guid, v.voucher_number, v.party_name, v.amount, v.date, v.narration,
        ${modeCaseSql(modeDrCr)} AS mode
      FROM vouchers v
-     WHERE v.company_guid = $1
+     WHERE v.company_id=$1
        AND v.voucher_type ILIKE $2
        AND v.is_cancelled = FALSE
        AND v.date BETWEEN $3 AND $4
      ORDER BY v.date DESC, v.voucher_number DESC NULLS LAST
      LIMIT $5`,
-    [companyGuid, `%${voucherTypeLike}%`, from, to, limit]
+    [companyId, `%${voucherTypeLike}%`, from, to, limit]
   );
   return rows.map((r) => ({
     guid: r.guid,
@@ -151,7 +151,7 @@ async function listTransactions(companyGuid, voucherTypeLike, from, to, modeDrCr
 /**
  * @param {'Payment'|'Receipt'} kind
  */
-export async function buildPaymentReceiptPayload(companyGuid, { from, to, kind }) {
+export async function buildPaymentReceiptPayload(companyId, { from, to, kind }) {
   const voucherTypeLike = kind === 'Receipt' ? 'Receipt' : 'Payment';
   const modeDrCr = kind === 'Receipt' ? 'Dr' : 'Cr';
   const todayIso = new Date().toISOString().slice(0, 10);
@@ -172,12 +172,12 @@ export async function buildPaymentReceiptPayload(companyGuid, { from, to, kind }
   // Longer periods still get daily (capped 30).
 
   const [current, prior, todayTotal, yesterdayTotal, series, transactions] = await Promise.all([
-    sumWindow(companyGuid, voucherTypeLike, from, to, modeDrCr),
-    sumWindow(companyGuid, voucherTypeLike, priorFrom, priorTo, modeDrCr),
-    sumDay(companyGuid, voucherTypeLike, todayIso),
-    sumDay(companyGuid, voucherTypeLike, yesterdayIso),
-    dailySeries(companyGuid, voucherTypeLike, seriesFrom, seriesTo),
-    listTransactions(companyGuid, voucherTypeLike, from, to, modeDrCr, 100),
+    sumWindow(companyId, voucherTypeLike, from, to, modeDrCr),
+    sumWindow(companyId, voucherTypeLike, priorFrom, priorTo, modeDrCr),
+    sumDay(companyId, voucherTypeLike, todayIso),
+    sumDay(companyId, voucherTypeLike, yesterdayIso),
+    dailySeries(companyId, voucherTypeLike, seriesFrom, seriesTo),
+    listTransactions(companyId, voucherTypeLike, from, to, modeDrCr, 100),
   ]);
 
   const periodTrend = computeTrendPct(current.total, prior.total);

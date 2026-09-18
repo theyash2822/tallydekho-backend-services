@@ -1,7 +1,8 @@
 import { v4 as uuid } from 'uuid';
 import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
-import { membershipCount, isOwnerOrAdmin } from './workspaceService.js';
+import { membershipCount } from './workspaceService.js';
+import { assertCapability } from './authorizationService.js';
 import { purgeCompaniesForHardSync } from './companyPurge.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -49,7 +50,12 @@ export async function createHardSyncRequest({
 }
 
 export async function approveHardSync({ requestId, userId, workspaceId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';
@@ -86,7 +92,12 @@ export async function approveHardSync({ requestId, userId, workspaceId }) {
 }
 
 export async function rejectHardSync({ requestId, userId, workspaceId }) {
-  const allowed = await isOwnerOrAdmin(userId, workspaceId);
+  let allowed = true;
+  try {
+    await assertCapability(userId, workspaceId, 'tally.restore_replace');
+  } catch {
+    allowed = false;
+  }
   if (!allowed) {
     const err = new Error('Not authorized');
     err.code = 'WORKSPACE_ACCESS_DENIED';
@@ -137,18 +148,29 @@ export async function consumeApprovedHardSync(workspaceId, deviceId, companies, 
 
   const guids = (companies || []).map((c) => c.guid).filter(Boolean);
   if (reqRow?.operation === 'GUID_REPLACEMENT' && reqRow.old_guid) {
-    await purgeCompaniesForHardSync([reqRow.old_guid, ...guids]);
+    // CID-Q005: keep companies.id stable — remap external guid only within workspace
+    const { rows: before } = await query(
+      `SELECT id, guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+      [reqRow.old_guid, workspaceId]
+    );
+    await purgeCompaniesForHardSync([reqRow.old_guid, ...guids], workspaceId);
+    const newGuid = reqRow.new_guid || guids[0];
     await query(
       `UPDATE companies SET guid = $2 WHERE guid = $1 AND workspace_id = $3`,
-      [reqRow.old_guid, reqRow.new_guid || guids[0], workspaceId]
+      [reqRow.old_guid, newGuid, workspaceId]
     ).catch(() => {});
     await query(
       `UPDATE workspace_tally_lineage_companies SET status = 'REPLACED'
        WHERE workspace_id = $1 AND tally_company_guid = $2`,
       [workspaceId, reqRow.old_guid]
     );
+    await audit(workspaceId, null, 'COMPANY_GUID_REMAP', {
+      companyId: before[0]?.id ?? null,
+      oldGuid: reqRow.old_guid,
+      newGuid,
+    }).catch(() => {});
   } else if (guids.length) {
-    await purgeCompaniesForHardSync(guids);
+    await purgeCompaniesForHardSync(guids, workspaceId);
   }
 
   if (reqRow) {

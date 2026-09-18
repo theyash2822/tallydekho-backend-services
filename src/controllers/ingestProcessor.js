@@ -1,6 +1,17 @@
 // Ingest processor — PostgreSQL version
 // Handles: masters (ledgers, stocks), vouchers, stock transactions
-import { getClient, query as dbQuery } from '../db/schema.js';
+import { getClient, query as rawDbQuery } from '../db/schema.js';
+import {
+  ingestCompanyCtx,
+  currentCompanyId,
+  wrapIngestClient,
+} from '../utils/ingestCompanyDualWrite.js';
+export { ingestCompanyCtx };
+
+async function dbQuery(text, params) {
+  return rawDbQuery(text, params);
+}
+
 import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
 import { deriveVoucherTypeParent, REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 // Lazy import to avoid circular-dep at startup; emitVoucherRegularized is set after server init
@@ -139,9 +150,9 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
     const { rows: lines } = await dbQuery(
       `SELECT vle.ledger_name, vle.amount, vle.dr_cr, l.parent, l.nature
        FROM voucher_ledger_entries vle
-       LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-       WHERE vle.voucher_guid = $1 AND vle.company_guid = $2`,
-      [voucherGuid, companyGuid]
+       LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+       WHERE vle.voucher_guid = $1 AND vle.company_id = $2`,
+      [voucherGuid, currentCompanyId()]
     );
 
     for (const line of lines) {
@@ -155,16 +166,14 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
       const nature = inferTransactionNature(voucherRow.voucher_type || '', line.ledger_name);
 
       await dbQuery(`
-        INSERT INTO tax_transactions (
-          company_guid, voucher_guid, voucher_alter_id,
+        INSERT INTO tax_transactions (company_guid, voucher_guid, voucher_alter_id,
           voucher_number, voucher_type, voucher_date,
           party_ledger_name, tax_type, tax_ledger_name,
           tax_ledger_parent, tax_amount, transaction_nature,
-          financial_year, narration
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          financial_year, narration, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, $15)
         ON CONFLICT (company_guid, voucher_guid, tax_type, tax_ledger_name, voucher_alter_id)
         DO UPDATE SET
-          tax_amount   = EXCLUDED.tax_amount,
+          company_id = COALESCE(EXCLUDED.company_id, tax_transactions.company_id), tax_amount   = EXCLUDED.tax_amount,
           -- Never overwrite a real date with null (use COALESCE to keep existing date if new value is null)
           voucher_date = COALESCE(EXCLUDED.voucher_date, tax_transactions.voucher_date),
           synced_at    = NOW()
@@ -174,7 +183,7 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
         voucherRow.party_name, taxType, line.ledger_name,
         line.parent || null, Math.abs(parseFloat(line.amount) || 0),
         nature, voucherRow.financial_year, voucherRow.narration,
-      ]);
+      , currentCompanyId()]);
     }
   } catch (e) {
     // Never break sync on tax extraction failure
@@ -184,10 +193,15 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
 
 // Backfill all existing vouchers for a company → extract tax transactions.
 // Call once per company after deploying this feature.
-export async function backfillTaxTransactions(companyGuid) {
+export async function backfillTaxTransactions(companyGuid, companyId = null) {
+  const id = companyId != null ? Number(companyId) : currentCompanyId();
+  if (id == null) {
+    console.warn('[TaxBackfill] skipped — companyId required');
+    return 0;
+  }
   const { rows: vouchers } = await dbQuery(
-    'SELECT guid, voucher_number, voucher_type, date, party_name, financial_year, narration FROM vouchers WHERE company_guid=$1 AND is_cancelled=FALSE',
-    [companyGuid]
+    'SELECT guid, voucher_number, voucher_type, date, party_name, financial_year, narration FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE',
+    [id]
   );
   for (const v of vouchers) {
     await extractAndSaveTaxTransactions(v.guid, companyGuid, {
@@ -199,7 +213,7 @@ export async function backfillTaxTransactions(companyGuid) {
       narration:      v.narration,
     });
   }
-  console.log(`[TaxBackfill] Processed ${vouchers.length} vouchers for ${companyGuid}`);
+  console.log(`[TaxBackfill] Processed ${vouchers.length} vouchers for company_id=${id}`);
   return vouchers.length;
 }
 
@@ -283,16 +297,23 @@ function _collectObjects(obj, keys, results, depth) {
 // Extract name from Tally record — handles plain NAME, NAME.LIST (NATIVEMETHOD), and LANGUAGENAME.LIST multi-lang wrapper
 function tallyName(r) {
   // Guard: xml2js returns arrays when duplicate <Name> tags exist (e.g. item has alias in same field)
-  const pickFirst = (v) => Array.isArray(v) ? (v[0] || '') : v;
+  const pickFirst = (v) => {
+    if (!Array.isArray(v)) return v;
+    const first = v.find((x) => x != null && x !== '') ?? v[0];
+    if (first == null) return '';
+    if (typeof first === 'string' || typeof first === 'number') return String(first);
+    if (typeof first === 'object') return first.NAME || first.Name || first.name || '';
+    return String(first);
+  };
   if (r.NAME) return pickFirst(r.NAME);
   if (r.Name) return pickFirst(r.Name);
   if (r.name) return pickFirst(r.name);
-  if (r.LEDGERNAME) return r.LEDGERNAME;
+  if (r.LEDGERNAME) return pickFirst(r.LEDGERNAME);
   // NATIVEMETHOD format: Name field comes as <NAME.LIST><NAME>...</NAME></NAME.LIST>
   const nl = r['NAME.LIST'];
   if (nl) {
     const nameVal = Array.isArray(nl) ? nl[0]?.NAME : nl?.NAME;
-    if (nameVal) return typeof nameVal === 'string' ? nameVal : String(nameVal);
+    if (nameVal) return typeof nameVal === 'string' ? nameVal : pickFirst(nameVal);
   }
   const ll = r['LANGUAGENAME.LIST'];
   if (ll) {
@@ -300,7 +321,12 @@ function tallyName(r) {
     if (nll) {
       // Guard: always coerce to string — nll or nll[0] could be an object
       const raw = Array.isArray(nll) ? nll[0]?.NAME || nll[0] : nll.NAME || nll;
-      if (raw != null) return typeof raw === 'string' ? raw : (typeof raw === 'object' ? JSON.stringify(raw) : String(raw));
+      if (raw != null) {
+        if (typeof raw === 'string') return raw;
+        if (Array.isArray(raw)) return pickFirst(raw);
+        if (typeof raw === 'object') return raw.NAME || raw.Name || raw.name || '';
+        return String(raw);
+      }
     }
   }
   return '';
@@ -461,13 +487,13 @@ function _tallyAliasMayBeBarcode(val) {
 
 async function maybeStoreRaw(records, companyGuid, streamName) {
   if (!STORE_RAW || !records?.length) return;
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     for (const r of records.slice(0, 1000)) { // cap at 1000 per call to avoid overload
       await client.query(
-        `INSERT INTO raw_tally_records (upload_id, company_guid, financial_year, record_type, source_xml, payload, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
-        [r.UPLOAD_ID || null, companyGuid, r._FINANCIAL_YEAR || null, r._RECORD_TYPE || streamName, r.XML || null, JSON.stringify(r)]
+        `INSERT INTO raw_tally_records (upload_id, company_guid, financial_year, record_type, source_xml, payload, created_at, company_id)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(), $7)`,
+        [r.UPLOAD_ID || null, companyGuid, r._FINANCIAL_YEAR || null, r._RECORD_TYPE || streamName, r.XML || null, JSON.stringify(r), currentCompanyId()]
       );
     }
   } catch (err) {
@@ -477,11 +503,42 @@ async function maybeStoreRaw(records, companyGuid, streamName) {
   }
 }
 
-export async function processIngestedData(streamName, data, companyGuid, userId, deviceId) {
+export async function processIngestedData(streamName, data, companyGuid, userId, deviceId, opts = {}) {
   if (!data?.length || !companyGuid) return;
   // V2: optionally persist raw records for debugging/reprocessing
   await maybeStoreRaw(data, companyGuid, streamName);
 
+  // Company Identity Phase 3E: require company_id or device-scoped resolve — never guid-alone
+  let companyId = opts.companyId ?? null;
+  if (companyId == null) {
+    if (!deviceId) {
+      console.error('[ingest] company resolve failed: missing companyId and deviceId', companyGuid);
+      return;
+    }
+    try {
+      const { rows } = await dbQuery(
+        `SELECT c.id FROM companies c
+         JOIN devices d ON d.workspace_id = c.workspace_id
+         WHERE c.guid = $1 AND d.device_id = $2
+         LIMIT 1`,
+        [companyGuid, deviceId]
+      );
+      companyId = rows[0]?.id ?? null;
+    } catch (_) {
+      companyId = null;
+    }
+  }
+  if (companyId == null) {
+    console.error('[ingest] company resolve failed: no company in device workspace for', companyGuid);
+    return;
+  }
+
+  return ingestCompanyCtx.run({ companyId, companyGuid }, async () =>
+    processIngestedDataInner(streamName, data, companyGuid, userId, deviceId, companyId)
+  );
+}
+
+async function processIngestedDataInner(streamName, data, companyGuid, userId, deviceId, companyId) {
   const stream = streamName?.toLowerCase();
   const sample = data[0];
   const collectionName = sample?.COLLECTION_NAME?.toLowerCase() || '';
@@ -556,16 +613,28 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
       await processMasters(data, companyGuid);
     }
   }
+
 }
 
 async function processMasters(data, companyGuid) {
+  // Explicit company_id writers — no SQL rewrite needed on this path
   const client = await getClient();
   try {
     await client.query('BEGIN');
     let saved = 0;
 
     for (const r of data) {
-      const name = r.NAME || r.name || r.LEDGERNAME || '';
+      // Must use tallyName — raw NAME can be a string[] from xml2js / multi-lang Tally.
+      // Passing an array into TEXT made one ledger show as '["Motu Halve Wala","…"]' on Mobile.
+      let name = tallyName(r);
+      if (Array.isArray(name)) name = name[0] || '';
+      name = typeof name === 'string' ? name.trim() : String(name || '').trim();
+      if (name.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(name);
+          if (Array.isArray(parsed)) name = String(parsed.find((x) => typeof x === 'string' && x.trim()) || '').trim();
+        } catch (_) { /* keep */ }
+      }
       const guid = r.GUID || r.guid || name + '_' + companyGuid;
       const parent = r.PARENT || r.parent || '';
       if (!name || name.length === 0) continue;
@@ -586,24 +655,24 @@ async function processMasters(data, companyGuid) {
       const isCompanyPrefixedGuid = guid.startsWith(companyGuid);
       if (!isCompanyPrefixedGuid) {
         const existing = await client.query(
-          `SELECT 1 FROM ledgers WHERE company_guid=$1 AND name=$2 AND guid LIKE $3 LIMIT 1`,
-          [companyGuid, name, companyGuid + '%']
+          `SELECT 1 FROM ledgers WHERE company_id=$1 AND name=$2 AND guid LIKE $3 LIMIT 1`,
+          [currentCompanyId(), name, companyGuid + '%']
         );
         if (existing.rows.length > 0) { continue; } // proper row exists — skip ghost
       }
       try {
         // Remove any placeholder row (random UUID from immediate tally-write insert) before inserting real Tally row
         await client.query(
-          `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
-          [companyGuid, name, guid]
+          `DELETE FROM ledgers WHERE company_id = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
+          [currentCompanyId(), name, guid]
         );
         const bank = extractBankFields(r);
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate,
-            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, credit_limit)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
+            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, credit_limit, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25, $26)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, ledgers.company_id), name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
             email=EXCLUDED.email, address=EXCLUDED.address,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
@@ -636,6 +705,7 @@ async function processMasters(data, companyGuid) {
           extractLedgerTaxRate(r),
           bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
           bank.credit_limit,
+          currentCompanyId(),
         ]);
         saved++;
       } catch (e) {
@@ -645,24 +715,24 @@ async function processMasters(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Masters: saved ${saved}/${data.length} ledgers for ${companyGuid}`);
-
-    // Confirm app_masters (party/bank) after commit — Posted only when real Tally GUID exists
-    for (const r of data) {
-      const name = r.NAME || r.name || r.LEDGERNAME || '';
-      const guid = r.GUID || r.guid || '';
-      if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
-      await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
-    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Masters transaction failed:', e.message);
   } finally {
     client.release();
   }
+
+  // Confirm outside the checked-out client to avoid pool starvation/deadlock
+  for (const r of data) {
+    const name = r.NAME || r.name || r.LEDGERNAME || '';
+    const guid = r.GUID || r.guid || '';
+    if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
+    await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
+  }
 }
 
 async function processStocks(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   const confirmedStocks = [];
   try {
     await client.query('BEGIN');
@@ -690,10 +760,10 @@ async function processStocks(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, batch_enabled, expiry_enabled, synced_at, type_of_supply)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
+          INSERT INTO stocks (guid, company_guid, name, alias, sku, description, category, group_name, unit, hsn, tax_rate, closing_qty, closing_rate, closing_value, reorder_level, minimum_order_qty, alter_id, batch_enabled, expiry_enabled, synced_at, type_of_supply, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, $22)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, stocks.company_id), name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
             category=EXCLUDED.category,
             group_name=EXCLUDED.group_name, unit=EXCLUDED.unit, hsn=EXCLUDED.hsn,
             tax_rate=EXCLUDED.tax_rate,
@@ -727,6 +797,7 @@ async function processStocks(data, companyGuid) {
           (r.USEEXPIRYDATES    === 'Yes' || r.UseExpirydates    === 'Yes'),
           now(),
           r.GSTTYPEOFSUPPLY || r.Gsttypeofsupply || r.GstTypeOfSupply || null,
+          currentCompanyId(),
         ]);
         saved++;
 
@@ -735,10 +806,10 @@ async function processStocks(data, companyGuid) {
         if (aliasVal && _tallyAliasMayBeBarcode(String(aliasVal))) {
           try {
             await client.query(`
-              INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-              VALUES ($1, $2, $3, $4, 'CODE128', 'tally', 'active', TRUE, 'app_only', 'not_required')
-              ON CONFLICT (company_guid, barcode) DO NOTHING`,
-              [companyGuid, guid, name, String(aliasVal).trim()]);
+              INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status, company_id)
+              VALUES ($1, $2, $3, $4, 'CODE128', 'tally', 'active', TRUE, 'app_only', 'not_required', $5)
+              ON CONFLICT (company_id, barcode) DO NOTHING`,
+              [companyGuid, guid, name, String(aliasVal).trim(), currentCompanyId()]);
           } catch (_) { /* non-critical — skip silently */ }
         }
 
@@ -752,19 +823,19 @@ async function processStocks(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] Stocks: saved ${saved}/${data.length} for ${companyGuid}`);
-    for (const s of confirmedStocks) {
-      await confirmAppMasterFromIngest(companyGuid, s.name, ['item', 'alter_stock_item'], s.guid);
-    }
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Stocks transaction failed:', e.message);
   } finally {
     client.release();
   }
+  for (const s of confirmedStocks) {
+    await confirmAppMasterFromIngest(companyGuid, s.name, ['item', 'alter_stock_item'], s.guid);
+  }
 }
 
 async function processVouchers(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -817,10 +888,10 @@ async function processVouchers(data, companyGuid) {
         billAlloc = extractFirstBillAllocation(r);
 
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, $22)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, vouchers.company_id), -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             voucher_number        = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type          = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
             -- NULLIF: a stub's 'Voucher' placeholder must never flatten a resolved parent
@@ -874,6 +945,7 @@ async function processVouchers(data, companyGuid) {
           billAlloc?.bill_ref_name || null,
           billAlloc?.bill_type || null,
           billAlloc?.bill_allocated_amount ?? null,
+          currentCompanyId(),
         ]);
         saved++;
         voucherRowsForTax.push({
@@ -898,12 +970,12 @@ async function processVouchers(data, companyGuid) {
         const inventoryEntries = r.ALLINVENTORYENTRIES || r.AllInventoryEntries || [];
         if (Array.isArray(inventoryEntries)) {
           // Clear existing inventory items before re-inserting
-          await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_guid = $2 AND item_name IS NOT NULL', [guid, companyGuid]);
+          await client.query('DELETE FROM voucher_items WHERE voucher_guid = $1 AND company_id = $2 AND item_name IS NOT NULL', [guid, currentCompanyId()]);
           for (const entry of inventoryEntries) {
             try {
               await client.query(`
-                INSERT INTO voucher_items (voucher_guid, company_guid, amount, type, item_name, qty, unit, rate, tax_rate, hsn)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                INSERT INTO voucher_items (voucher_guid, company_guid, amount, type, item_name, qty, unit, rate, tax_rate, hsn, company_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, $11)
               `, [
                 guid, companyGuid,
                 parseFloat(entry.AMOUNT || entry.Amount || 0),
@@ -914,7 +986,7 @@ async function processVouchers(data, companyGuid) {
                 parseFloat(entry.RATE || entry.Rate || 0),
                 parseFloat(entry.GSTRATE || entry.GstRate || 0),
                 entry.HSNCODE || entry.HsnCode || null,
-              ]);
+              , currentCompanyId()]);
             } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
 
             // Gap 1: Extract nested Batchallocations from AllVoucher.xml inventory entries
@@ -964,13 +1036,13 @@ async function processVouchers(data, companyGuid) {
                    END,
                    updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                WHERE tdk_reference_no = $2
-                 AND company_guid     = $3
+                 AND company_id     = $3
                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced' OR tally_voucher_no IS DISTINCT FROM $1)
                RETURNING company_guid, tdk_reference_no, current_entry_type`,
-              [voucherNumber, ref, companyGuid]
+              [voucherNumber, ref, currentCompanyId()]
             );
             if (optSyncRows.length > 0) {
-              emitVoucherSynced(optSyncRows[0].company_guid, optSyncRows[0].tdk_reference_no, voucherNumber);
+              emitVoucherSynced(optSyncRows[0].company_guid, optSyncRows[0].tdk_reference_no, voucherNumber, { companyId: currentCompanyId() });
               console.log(`[reconcile] Optional TDK voucher synced: ${ref} → ${voucherNumber} (entry=${optSyncRows[0].current_entry_type})`);
             }
           }
@@ -984,8 +1056,8 @@ async function processVouchers(data, companyGuid) {
           ) {
             const { rows: avRows } = await dbQuery(
               `SELECT id, current_entry_type FROM app_vouchers
-               WHERE tdk_reference_no = $1 AND company_guid = $2`,
-              [ref, companyGuid]
+               WHERE tdk_reference_no = $1 AND company_id = $2`,
+              [ref, currentCompanyId()]
             );
             if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
               await dbQuery(`
@@ -999,7 +1071,7 @@ async function processVouchers(data, companyGuid) {
                 WHERE id = $2
               `, [voucherNumber, avRows[0].id]);
               console.log(`[reconcile] Optional→Regular: ${ref} → ${voucherNumber}`);
-              emitVoucherRegularized(companyGuid, ref, voucherNumber);
+              emitVoucherRegularized(companyGuid, ref, voucherNumber, { companyId: currentCompanyId() });
             }
           } else if (ref && !isOptional && isThinSimplified) {
             console.log(`[reconcile] Skip Optional→Regular for ${ref} (thin Simplified / untrusted isOptional=0)`);
@@ -1028,14 +1100,14 @@ async function processVouchers(data, companyGuid) {
                  books_impact_status = 'posted',
                  updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
              WHERE tdk_reference_no = $2
-               AND company_guid     = $3
+               AND company_id     = $3
                AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
              RETURNING company_guid, tdk_reference_no`,
-            [voucherNumber, ref2, companyGuid]
+            [voucherNumber, ref2, currentCompanyId()]
           );
           if (avRegRows.length > 0) {
             const { company_guid: cg, tdk_reference_no: tRef } = avRegRows[0];
-            emitVoucherSynced(cg, tRef, voucherNumber);
+            emitVoucherSynced(cg, tRef, voucherNumber, { companyId: currentCompanyId() });
             console.log(`[reconcile] Regular TDK voucher synced: ${tRef} → ${voucherNumber}`);
           }
         }
@@ -1065,14 +1137,14 @@ async function processVouchers(data, companyGuid) {
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
-                WHERE av.company_guid    = $1
+                WHERE av.company_id    = $1
                   AND av.voucher_type    = 'payment'
                   AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $3
                   AND ABS(av.total_amount - $4) < 1
                   AND av.voucher_date    = $5::date`,
-              [companyGuid, billAlloc.bill_ref_name, partyName, payAmt, date]
+              [currentCompanyId(), billAlloc.bill_ref_name, partyName, payAmt, date]
             ).catch(() => ({ rows: [] }));
 
             if (candidateRows.length === 1) {
@@ -1087,13 +1159,13 @@ async function processVouchers(data, companyGuid) {
             const { rows: candidateRows2 } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
-                WHERE av.company_guid    = $1
+                WHERE av.company_id    = $1
                   AND av.voucher_type    = 'payment'
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $2
                   AND ABS(av.total_amount - $3) < 1
                   AND av.voucher_date    = $4::date`,
-              [companyGuid, partyName, payAmt, date]
+              [currentCompanyId(), partyName, payAmt, date]
             ).catch(() => ({ rows: [] }));
 
             if (candidateRows2.length === 1) {
@@ -1112,14 +1184,14 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_guid     = $3
+                  AND company_id     = $3
                   AND voucher_type     = 'payment'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
-              [voucherNumber, payRef, companyGuid]
+              [voucherNumber, payRef, currentCompanyId()]
             );
             if (payRows[0]) {
-              emitVoucherSynced(payRows[0].company_guid, payRows[0].tdk_reference_no, voucherNumber);
+              emitVoucherSynced(payRows[0].company_guid, payRows[0].tdk_reference_no, voucherNumber, { companyId: currentCompanyId() });
               console.log(`[reconcile] Payment synced: ${payRef} → ${voucherNumber}`);
             }
           } else if (ambiguousRefs && ambiguousRefs.length > 1) {
@@ -1130,9 +1202,9 @@ async function processVouchers(data, companyGuid) {
                       sync_error        = $1,
                       updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = ANY($2::text[])
-                  AND company_guid     = $3
+                  AND company_id     = $3
                   AND tally_voucher_no IS NULL`,
-              [`Ambiguous payment match for party '${partyName}' (date=${date}, amount=${payAmt}) (${ambiguousRefs.length} candidates)`, ambiguousRefs, companyGuid]
+              [`Ambiguous payment match for party '${partyName}' (date=${date}, amount=${payAmt}) (${ambiguousRefs.length} candidates)`, ambiguousRefs, currentCompanyId()]
             ).catch(() => {});
           }
         }
@@ -1154,14 +1226,14 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_guid     = $3
+                  AND company_id     = $3
                   AND voucher_type     = 'journal'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
-              [voucherNumber, m[1], companyGuid]
+              [voucherNumber, m[1], currentCompanyId()]
             );
             if (jorRows[0]) {
-              emitVoucherSynced(jorRows[0].company_guid, jorRows[0].tdk_reference_no, voucherNumber);
+              emitVoucherSynced(jorRows[0].company_guid, jorRows[0].tdk_reference_no, voucherNumber, { companyId: currentCompanyId() });
               console.log(`[reconcile] Journal synced: ${m[1]} → ${voucherNumber}`);
             }
           }
@@ -1184,14 +1256,14 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_guid     = $3
+                  AND company_id     = $3
                   AND voucher_type     = 'contra'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
-              [voucherNumber, m[1], companyGuid]
+              [voucherNumber, m[1], currentCompanyId()]
             );
             if (conRows[0]) {
-              emitVoucherSynced(conRows[0].company_guid, conRows[0].tdk_reference_no, voucherNumber);
+              emitVoucherSynced(conRows[0].company_guid, conRows[0].tdk_reference_no, voucherNumber, { companyId: currentCompanyId() });
               console.log(`[reconcile] Contra synced: ${m[1]} → ${voucherNumber}`);
             }
           }
@@ -1228,14 +1300,14 @@ async function processVouchers(data, companyGuid) {
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
-                WHERE av.company_guid    = $1
+                WHERE av.company_id    = $1
                   AND av.voucher_type    = 'receipt'
                   AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $3
                   AND ABS(av.total_amount - $4) < 1
                   AND av.voucher_date    = $5::date`,
-              [companyGuid, billAlloc.bill_ref_name, partyName, recAmt, date]
+              [currentCompanyId(), billAlloc.bill_ref_name, partyName, recAmt, date]
             );
             if (candidateRows.length === 1) {
               rcpRef = candidateRows[0].tdk_reference_no;
@@ -1249,10 +1321,10 @@ async function processVouchers(data, companyGuid) {
                           sync_error        = $1,
                           updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
                     WHERE tdk_reference_no = ANY($2::text[])
-                      AND company_guid     = $3
+                      AND company_id     = $3
                       AND tally_voucher_no IS NULL`,
                   [`Ambiguous bill-allocation match for parent ${billAlloc.bill_ref_name} (${candidateRows.length} candidates)`,
-                   candidateRows.map(c => c.tdk_reference_no), companyGuid]
+                   candidateRows.map(c => c.tdk_reference_no), currentCompanyId()]
                 );
               } catch (markErr) {
                 console.warn('[reconcile] Could not mark ambiguous receipts:', markErr.message);
@@ -1266,13 +1338,13 @@ async function processVouchers(data, companyGuid) {
             const { rows: candidateRows2 } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
-                WHERE av.company_guid    = $1
+                WHERE av.company_id    = $1
                   AND av.voucher_type    = 'receipt'
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $2
                   AND ABS(av.total_amount - $3) < 1
                   AND av.voucher_date    = $4::date`,
-              [companyGuid, partyName, recAmt, date]
+              [currentCompanyId(), partyName, recAmt, date]
             );
             if (candidateRows2.length === 1) {
               rcpRef = candidateRows2[0].tdk_reference_no;
@@ -1289,14 +1361,14 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_guid     = $3
+                  AND company_id     = $3
                   AND voucher_type     = 'receipt'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
-              [voucherNumber, rcpRef, companyGuid]
+              [voucherNumber, rcpRef, currentCompanyId()]
             );
             if (recRows.length > 0) {
-              emitVoucherSynced(recRows[0].company_guid, recRows[0].tdk_reference_no, voucherNumber);
+              emitVoucherSynced(recRows[0].company_guid, recRows[0].tdk_reference_no, voucherNumber, { companyId: currentCompanyId() });
               console.log(`[reconcile] Receipt synced: ${rcpRef} → ${voucherNumber}`);
             }
           }
@@ -1329,14 +1401,14 @@ async function processVouchers(data, companyGuid) {
         FROM vouchers v
         WHERE v.reference      = av.tdk_reference_no
           AND v.company_guid   = av.company_guid
-          AND av.company_guid  = $1
+          AND av.company_id  = $1
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of reconRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Batch JOIN reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (batchReconErr) {
@@ -1357,14 +1429,14 @@ async function processVouchers(data, companyGuid) {
         WHERE v.bill_ref_name  = av.tdk_reference_no
           AND v.bill_type      = 'New Ref'
           AND v.company_guid   = av.company_guid
-          AND av.company_guid  = $1
+          AND av.company_id  = $1
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of salesBillRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Sales bill-ref reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (salesBillErr) {
@@ -1389,16 +1461,16 @@ async function processVouchers(data, companyGuid) {
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
         WHERE v.company_guid   = av.company_guid
-          AND av.company_guid  = $1
+          AND av.company_id  = $1
           AND av.voucher_type  = 'receipt'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
           AND v.narration ~ ('TDK Receipt:\\s*' || av.tdk_reference_no)
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of rcpNarrRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Receipt narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (rcpNarrErr) {
@@ -1417,16 +1489,16 @@ async function processVouchers(data, companyGuid) {
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
         WHERE v.company_guid   = av.company_guid
-          AND av.company_guid  = $1
+          AND av.company_id  = $1
           AND av.voucher_type  = 'payment'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
           AND v.narration ~ ('TDK Payment:\\s*' || av.tdk_reference_no)
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of payNarrRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Payment narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (payNarrErr) {
@@ -1443,16 +1515,16 @@ async function processVouchers(data, companyGuid) {
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
         WHERE v.company_guid   = av.company_guid
-          AND av.company_guid  = $1
+          AND av.company_id  = $1
           AND av.voucher_type  = 'journal'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
           AND v.narration ~ ('TDK Journal:\\s*' || av.tdk_reference_no)
         RETURNING av.company_guid, av.tdk_reference_no, v.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of jorNarrRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Journal narration reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (jorNarrErr) {
@@ -1471,7 +1543,7 @@ async function processVouchers(data, companyGuid) {
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
           JOIN app_vouchers parent  ON parent.invoice_uuid = av.parent_invoice_uuid
-          JOIN vouchers v ON v.company_guid = av.company_guid
+          JOIN vouchers v ON v.company_id = av.company_id
                           AND v.bill_type = 'Agst Ref'
                           AND (v.bill_ref_name = parent.tdk_reference_no
                                OR v.bill_ref_name = parent.tally_voucher_no)
@@ -1480,7 +1552,7 @@ async function processVouchers(data, companyGuid) {
                           AND v.party_name = av.party_name
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
-          WHERE av.company_guid    = $1
+          WHERE av.company_id    = $1
             AND av.voucher_type    = 'receipt'
             AND av.tally_voucher_no IS NULL
         )
@@ -1495,9 +1567,9 @@ async function processVouchers(data, companyGuid) {
           AND c.match_count       = 1
           AND av.tally_voucher_no IS NULL
         RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of rcpBillRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Receipt bill-alloc reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (rcpBillErr) {
@@ -1515,14 +1587,14 @@ async function processVouchers(data, companyGuid) {
             v.voucher_number,
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
-          JOIN vouchers v ON v.company_guid = av.company_guid
+          JOIN vouchers v ON v.company_id = av.company_id
                           AND v.party_name = av.party_name
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
                           AND v.voucher_type ILIKE 'Receipt%'
                           AND v.voucher_number IS NOT NULL
                           AND v.voucher_number != ''
-          WHERE av.company_guid    = $1
+          WHERE av.company_id    = $1
             AND av.voucher_type    = 'receipt'
             AND av.tally_voucher_no IS NULL
         )
@@ -1537,9 +1609,9 @@ async function processVouchers(data, companyGuid) {
           AND c.match_count       = 1
           AND av.tally_voucher_no IS NULL
         RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of rcpPartyRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Receipt party/date reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (rcpPartyErr) {
@@ -1557,7 +1629,7 @@ async function processVouchers(data, companyGuid) {
             v.voucher_number,
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
-          JOIN vouchers v ON v.company_guid = av.company_guid
+          JOIN vouchers v ON v.company_id = av.company_id
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
                           AND v.voucher_number IS NOT NULL
@@ -1568,7 +1640,7 @@ async function processVouchers(data, companyGuid) {
                             OR (av.voucher_type = 'journal' AND v.voucher_type ILIKE 'Journal%')
                             OR (av.voucher_type = 'contra'  AND v.voucher_type ILIKE 'Contra%')
                           )
-          WHERE av.company_guid = $1
+          WHERE av.company_id = $1
             AND av.voucher_type IN ('payment', 'journal', 'contra')
             AND av.tally_voucher_no IS NULL
         )
@@ -1583,9 +1655,9 @@ async function processVouchers(data, companyGuid) {
           AND c.match_count       = 1
           AND av.tally_voucher_no IS NULL
         RETURNING av.company_guid, av.tdk_reference_no, c.voucher_number
-      `, [companyGuid]);
+      `, [currentCompanyId()]);
       for (const row of otherPartyRows) {
-        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number);
+        emitVoucherSynced(row.company_guid, row.tdk_reference_no, row.voucher_number, { companyId: currentCompanyId() });
         console.log(`[reconcile] Voucher type/date reconciled: ${row.tdk_reference_no} → ${row.voucher_number}`);
       }
     } catch (otherPartyErr) {
@@ -1606,7 +1678,7 @@ async function processVouchers(data, companyGuid) {
 }
 
 async function processStockTransactions(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -1616,8 +1688,8 @@ async function processStockTransactions(data, companyGuid) {
     const uniqueVoucherGuids = [...new Set(data.map(r => r.GUID || r.Guid).filter(Boolean))];
     if (uniqueVoucherGuids.length > 0) {
       await client.query(
-        `DELETE FROM stock_transactions WHERE company_guid=$1 AND voucher_guid = ANY($2::text[])`,
-        [companyGuid, uniqueVoucherGuids]
+        `DELETE FROM stock_transactions WHERE company_id=$1 AND voucher_guid = ANY($2::text[])`,
+        [currentCompanyId(), uniqueVoucherGuids]
       );
     }
 
@@ -1688,10 +1760,10 @@ async function processStockTransactions(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO UPDATE SET
-            qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
+          INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
+          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, stock_transactions.company_id), qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
         `, [
           stockName,
           companyGuid,
@@ -1704,7 +1776,7 @@ async function processStockTransactions(data, companyGuid) {
           type,
           warehouse,
           now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
@@ -1724,15 +1796,15 @@ async function processStockTransactions(data, companyGuid) {
         END
         FROM vouchers v
         WHERE st.voucher_guid = v.guid
-          AND st.company_guid = v.company_guid
-          AND st.company_guid = $1
+          AND st.company_id = v.company_id
+          AND st.company_id = $1
           AND st.voucher_guid = ANY($2::text[])
           AND v.voucher_type IN ('Purchase','Receipt','Credit Note','Sales','Delivery Note','Debit Note')
           AND (
             (v.voucher_type IN ('Purchase','Receipt','Credit Note') AND st.type = 'outward') OR
             (v.voucher_type IN ('Sales','Delivery Note','Debit Note') AND st.type = 'inward')
           )
-      `, [companyGuid, uniqueVoucherGuids]);
+      `, [currentCompanyId(), uniqueVoucherGuids]);
     }
     // Backfill voucher_type from vouchers table where NULL.
     // SimplifiedVoucher.xml omits VOUCHERTYPENAME, leaving stock_transactions.voucher_type = NULL.
@@ -1743,12 +1815,12 @@ async function processStockTransactions(data, companyGuid) {
         SET voucher_type = v.voucher_type
         FROM vouchers v
         WHERE st.voucher_guid = v.guid
-          AND st.company_guid = v.company_guid
-          AND st.company_guid = $1
+          AND st.company_id = v.company_id
+          AND st.company_id = $1
           AND st.voucher_guid = ANY($2::text[])
           AND (st.voucher_type IS NULL OR st.voucher_type = '')
           AND v.voucher_type IS NOT NULL AND v.voucher_type != ''
-      `, [companyGuid, uniqueVoucherGuids]);
+      `, [currentCompanyId(), uniqueVoucherGuids]);
     }
 
     await client.query('COMMIT');
@@ -1776,16 +1848,16 @@ async function processStockTransactions(data, companyGuid) {
           SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty,
           -- Use latest inward rate as the current rate
           (SELECT rate FROM stock_transactions t2
-           WHERE t2.stock_guid = t1.stock_guid AND t2.company_guid = t1.company_guid
+           WHERE t2.stock_guid = t1.stock_guid AND t2.company_id = t1.company_id
              AND t2.type = 'inward' AND t2.rate > 0
            ORDER BY t2.date DESC, t2.id DESC LIMIT 1) as last_rate
         FROM stock_transactions t1
-        WHERE company_guid = $1 AND qty IS NOT NULL
+        WHERE company_id = $1 AND qty IS NOT NULL
         GROUP BY stock_guid, company_guid
       ) sub
       WHERE s.name = sub.stock_guid
-        AND s.company_guid = sub.company_guid
-    `, [companyGuid]);
+        AND s.company_id = sub.company_id
+    `, [currentCompanyId()]);
     console.log(`[DB] StockTx: updated ${result.rowCount} stock closing_qty for ${companyGuid}`);
   } catch (e) {
     console.error('[DB] Stock closing_qty update failed:', e.message);
@@ -1798,7 +1870,7 @@ async function processStockTransactions(data, companyGuid) {
 }
 
 async function processGroupMasters(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -1808,10 +1880,10 @@ async function processGroupMasters(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO groups (guid, company_guid, name, parent, nature, is_revenue, is_debit_positive, is_primary, reorder_level, minimum_order_qty, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            name=EXCLUDED.name, parent=EXCLUDED.parent, nature=EXCLUDED.nature,
+          INSERT INTO groups (guid, company_guid, name, parent, nature, is_revenue, is_debit_positive, is_primary, reorder_level, minimum_order_qty, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, $13)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, groups.company_id), name=EXCLUDED.name, parent=EXCLUDED.parent, nature=EXCLUDED.nature,
             is_revenue=EXCLUDED.is_revenue, is_debit_positive=EXCLUDED.is_debit_positive,
             is_primary=EXCLUDED.is_primary, reorder_level=EXCLUDED.reorder_level,
             minimum_order_qty=EXCLUDED.minimum_order_qty,
@@ -1826,7 +1898,7 @@ async function processGroupMasters(data, companyGuid) {
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
           parseInt(r.AlterId || r.ALTERID || 0), now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] Group insert failed:', e.message); }
     }
@@ -1838,7 +1910,8 @@ async function processGroupMasters(data, companyGuid) {
 
 async function processFullLedger(data, companyGuid) {
   // Same as processMasters but with extended fields
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
+  let expandedData = data;
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -1848,7 +1921,7 @@ async function processFullLedger(data, companyGuid) {
     // LedgerFull.xml — Collection: normalizeEnvelope returns 1-2 rows wrapping all ledger data.
     // Use recursive search to find LEDGER[] regardless of nesting depth.
     console.log('[INGEST] processFullLedger called, records:', data.length, 'sample keys:', Object.keys(data[0] || {}).join(', '));
-    let expandedData = data;
+    expandedData = data;
     if (data.length <= 3) {
       let found = [];
 
@@ -1919,17 +1992,17 @@ async function processFullLedger(data, companyGuid) {
       try {
         // Remove any placeholder row (random UUID from immediate tally-write insert) before inserting real Tally row
         await client.query(
-          `DELETE FROM ledgers WHERE company_guid = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
-          [companyGuid, name, guid]
+          `DELETE FROM ledgers WHERE company_id = $1 AND LOWER(name) = LOWER($2) AND guid != $3`,
+          [currentCompanyId(), name, guid]
         );
         const bank = extractBankFields(r);
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
             opening_balance, closing_balance, balance_type, is_revenue, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate,
-            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, credit_limit)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
+            bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, credit_limit, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26, $27)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, ledgers.company_id), name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
             gstin=EXCLUDED.gstin, pan=EXCLUDED.pan, phone=EXCLUDED.phone,
             email=EXCLUDED.email, address=EXCLUDED.address,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
@@ -1963,6 +2036,7 @@ async function processFullLedger(data, companyGuid) {
           extractLedgerTaxRate(r),
           bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
           bank.credit_limit,
+          currentCompanyId(),
         ]);
         saved++;
         // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction
@@ -1979,22 +2053,21 @@ async function processFullLedger(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] FullLedger: saved ${saved}/${data.length} for ${companyGuid}`);
-
-    // Confirm app_masters (party/bank) — LedgerFull is the primary ledger sync path;
-    // processMasters alone is not enough for Posted badges after master create.
-    for (const raw of expandedData) {
-      let r = raw;
-      const ledgerVal = raw.LEDGER ?? raw.Ledger;
-      if (ledgerVal) {
-        try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
-      }
-      const name = tallyName(r);
-      const guid = r.GUID || r.Guid || r.guid || '';
-      if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
-      await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
-    }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message); }
   finally { client.release(); }
+
+  // Confirm after release — avoid holding a pool client across pool.query calls
+  for (const raw of expandedData) {
+    let r = raw;
+    const ledgerVal = raw.LEDGER ?? raw.Ledger;
+    if (ledgerVal) {
+      try { r = typeof ledgerVal === 'string' ? JSON.parse(ledgerVal) : ledgerVal; } catch { r = raw; }
+    }
+    const name = tallyName(r);
+    const guid = r.GUID || r.Guid || r.guid || '';
+    if (!name || !guid || !String(guid).startsWith(companyGuid)) continue;
+    await confirmAppMasterFromIngest(companyGuid, name, ['party', 'bank'], guid);
+  }
 }
 
 // Parse AllLedgerEntries from a voucher record — handles JSON string or array
@@ -2088,14 +2161,14 @@ function parseLedgerEntries(r) {
 async function saveLedgerEntries(client, voucherGuid, companyGuid, entries, financialYear) {
   if (!entries || entries.length === 0) return;
   // Delete existing entries for this voucher (idempotent re-sync)
-  await client.query('DELETE FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_guid=$2', [voucherGuid, companyGuid]);
+  await client.query('DELETE FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_id=$2', [voucherGuid, currentCompanyId()]);
   for (const e of entries) {
     try {
       await client.query(
-        `INSERT INTO voucher_ledger_entries (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index, financial_year)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `INSERT INTO voucher_ledger_entries (voucher_guid, company_guid, ledger_name, ledger_guid, amount, dr_cr, line_index, financial_year, company_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
          ON CONFLICT DO NOTHING`,
-        [voucherGuid, companyGuid, e.name, e.guid, e.amount, e.drCr, e.index, financialYear || null]
+        [voucherGuid, companyGuid, e.name, e.guid, e.amount, e.drCr, e.index, financialYear || null, currentCompanyId()]
       );
     } catch (err) {
       console.warn('[DB] LedgerEntry insert failed:', err.message, e.name);
@@ -2107,7 +2180,7 @@ async function saveLedgerEntries(client, voucherGuid, companyGuid, entries, fina
 // Previously this was skipped. Now it populates ledger_fy_balances table.
 async function processLedgerFyBalances(data, companyGuid) {
   if (!data || data.length === 0) return;
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -2125,14 +2198,14 @@ async function processLedgerFyBalances(data, companyGuid) {
 
       try {
         await client.query(`
-          INSERT INTO ledger_fy_balances (ledger_guid, ledger_name, company_guid, financial_year, opening_balance, balance_type, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,NOW())
-          ON CONFLICT (company_guid, ledger_name, financial_year) DO UPDATE SET
-            opening_balance = EXCLUDED.opening_balance,
+          INSERT INTO ledger_fy_balances (ledger_guid, ledger_name, company_guid, financial_year, opening_balance, balance_type, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,NOW(), $7)
+          ON CONFLICT (company_id, ledger_name, financial_year) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, ledger_fy_balances.company_id), opening_balance = EXCLUDED.opening_balance,
             balance_type    = EXCLUDED.balance_type,
             ledger_guid     = COALESCE(EXCLUDED.ledger_guid, ledger_fy_balances.ledger_guid),
             synced_at       = NOW()
-        `, [guid, name, companyGuid, fy, balAbs, balType]);
+        `, [guid, name, companyGuid, fy, balAbs, balType, currentCompanyId()]);
         saved++;
       } catch (err) {
         console.warn('[DB] LedgerFyBalance insert failed:', err.message, name, fy);
@@ -2183,7 +2256,7 @@ function parseExpiryPeriod(period) {
 }
 
 async function processVoucherInventoryItems(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -2205,11 +2278,10 @@ async function processVoucherInventoryItems(data, companyGuid) {
       const batchName  = r.BATCHNAME  || r.BatchName  || '';
       try {
         await client.query(`
-          INSERT INTO voucher_inventory_items
-            (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-          ON CONFLICT (voucher_guid, company_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
-            actual_qty=EXCLUDED.actual_qty, billed_qty=EXCLUDED.billed_qty,
+          INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, $15)
+          ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, voucher_inventory_items.company_id), actual_qty=EXCLUDED.actual_qty, billed_qty=EXCLUDED.billed_qty,
             rate=EXCLUDED.rate, amount=EXCLUDED.amount,
             discount=EXCLUDED.discount, alter_id=EXCLUDED.alter_id
         `, [
@@ -2222,7 +2294,7 @@ async function processVoucherInventoryItems(data, companyGuid) {
           r.UNIT       || r.Unit       || null,
           r.HSN        || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] VoucherInvItem insert failed:', e.message); }
     }
@@ -2233,7 +2305,7 @@ async function processVoucherInventoryItems(data, companyGuid) {
 }
 
 async function processGSTDetails(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -2255,11 +2327,10 @@ async function processGSTDetails(data, companyGuid) {
         const isNonGst       = r.IsNonGST === 'Yes' || r.ISNONGST === 'Yes';
         const gstReturnDate  = r.GSTReturnDate || r.GSTRETURNDATE || null;
         await client.query(`
-          INSERT INTO gst_voucher_details
-            (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez, party_gstin, is_nil_rated, is_exempt, itc_eligibility, cess_amount, is_non_gst, gst_return_effective_date)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
-          ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
-            voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
+          INSERT INTO gst_voucher_details (voucher_guid, company_guid, voucher_number, voucher_type, date, party_name, gst_reg_type, place_of_supply, taxable_amount, cgst_amount, sgst_amount, igst_amount, irn, alter_id, synced_at, is_interstate, is_rcm, export_type, is_sez, party_gstin, is_nil_rated, is_exempt, itc_eligibility, cess_amount, is_non_gst, gst_return_effective_date, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26, $27)
+          ON CONFLICT (company_id, voucher_guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, gst_voucher_details.company_id), voucher_number=EXCLUDED.voucher_number, voucher_type=EXCLUDED.voucher_type,
             taxable_amount=EXCLUDED.taxable_amount, cgst_amount=EXCLUDED.cgst_amount,
             sgst_amount=EXCLUDED.sgst_amount, igst_amount=EXCLUDED.igst_amount,
             irn=EXCLUDED.irn, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
@@ -2287,6 +2358,7 @@ async function processGSTDetails(data, companyGuid) {
           partyGstin, isNilRated, isExempt,
           itcEligibility, cessAmount, isNonGst,
           gstReturnDate ? new Date(gstReturnDate) : null,
+          currentCompanyId(),
         ]);
         saved++;
       } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
@@ -2299,38 +2371,38 @@ async function processGSTDetails(data, companyGuid) {
       // a thin stream left on the 'Voucher' placeholder before they run.
       await dbQuery(REPAIR_VOUCHER_TYPE_PARENT_SQL, [companyGuid]);
       // Mark is_interstate on gst_voucher_details (IGST only = interstate)
-      await dbQuery(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_guid = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [companyGuid]);
+      await dbQuery(`UPDATE gst_voucher_details SET is_interstate = true WHERE company_id = $1 AND igst_amount > 0 AND cgst_amount = 0 AND is_interstate = false`, [currentCompanyId()]);
       // Mark is_rcm on gst_voucher_details from Tally data
       // (already set during insert from r.IsRCMApplicable)
       // Populate vouchers.is_export
       await dbQuery(`UPDATE vouchers v SET is_export = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-        AND g.igst_amount > 0 AND v.voucher_type_parent = 'Sales' AND v.company_guid = $1
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
+        AND g.igst_amount > 0 AND v.voucher_type_parent = 'Sales' AND v.company_id = $1
         AND NOT EXISTS (
-          SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_guid = v.company_guid
+          SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_id = v.company_id
           AND l.gstin IS NOT NULL AND l.gstin != ''
-        )`, [companyGuid]);
+        )`, [currentCompanyId()]);
       // Populate vouchers.is_sez from gst_voucher_details.is_sez
       await dbQuery(`UPDATE vouchers v SET is_sez = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-        AND g.is_sez = true AND v.company_guid = $1`, [companyGuid]);
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
+        AND g.is_sez = true AND v.company_id = $1`, [currentCompanyId()]);
       // Populate vouchers.is_reverse_charge from gst_voucher_details.is_rcm
       await dbQuery(`UPDATE vouchers v SET is_reverse_charge = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-        AND g.is_rcm = true AND v.company_guid = $1`, [companyGuid]);
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
+        AND g.is_rcm = true AND v.company_id = $1`, [currentCompanyId()]);
       // Update gst_section for sales
       await dbQuery(`UPDATE vouchers v SET gst_section =
         CASE
           WHEN v.is_export THEN 'Export'
           WHEN v.is_sez THEN 'SEZ'
-          WHEN EXISTS (SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_guid = v.company_guid AND l.gstin IS NOT NULL AND l.gstin != '') THEN
+          WHEN EXISTS (SELECT 1 FROM ledgers l WHERE l.name = v.party_name AND l.company_id = v.company_id AND l.gstin IS NOT NULL AND l.gstin != '') THEN
             CASE WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.igst_amount > 0 AND g.cgst_amount = 0) THEN 'B2B Interstate' ELSE 'B2B' END
           ELSE 'B2C'
         END
-        WHERE v.company_guid = $1 AND v.voucher_type_parent IN ('Sales', 'Credit Note', 'Debit Note') AND v.is_cancelled = false`, [companyGuid]);
+        WHERE v.company_id = $1 AND v.voucher_type_parent IN ('Sales', 'Credit Note', 'Debit Note') AND v.is_cancelled = false`, [currentCompanyId()]);
       // Update gst_section for purchases
       await dbQuery(`UPDATE vouchers v SET gst_section =
         CASE
@@ -2339,17 +2411,17 @@ async function processGSTDetails(data, companyGuid) {
           WHEN EXISTS (SELECT 1 FROM gst_voucher_details g WHERE g.voucher_guid = v.guid AND g.cgst_amount > 0) THEN 'ITC'
           ELSE 'ITC'
         END
-        WHERE v.company_guid = $1 AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false`, [companyGuid]);
+        WHERE v.company_id = $1 AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false`, [currentCompanyId()]);
       console.log(`[DB] GSTDetails: voucher gst_section updated for ${companyGuid}`);
       // Populate vouchers.party_gstin from gst_voucher_details
       await dbQuery(`
         UPDATE vouchers v SET party_gstin = g.party_gstin
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
         AND g.party_gstin IS NOT NULL AND g.party_gstin != ''
         AND (v.party_gstin IS NULL OR v.party_gstin = '')
-        AND v.company_guid = $1
-      `, [companyGuid]);
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
       // Update gstr3b_section on vouchers
       await dbQuery(`
         UPDATE vouchers v SET gstr3b_section =
@@ -2366,61 +2438,61 @@ async function processGSTDetails(data, companyGuid) {
             ELSE NULL
           END
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-        AND v.company_guid = $1 AND v.is_cancelled = false
-      `, [companyGuid]);
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
+        AND v.company_id = $1 AND v.is_cancelled = false
+      `, [currentCompanyId()]);
       console.log(`[DB] GSTDetails: party_gstin + gstr3b_section updated for ${companyGuid}`);
       // Derive is_import from place_of_supply
       await dbQuery(`
         UPDATE vouchers v SET is_import = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
         AND (g.place_of_supply = 'Outside India' OR g.place_of_supply = 'Other')
         AND v.voucher_type_parent = 'Purchase' AND v.is_cancelled = false
-        AND v.company_guid = $1
-      `, [companyGuid]);
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
       // Also: Purchase with IGST and no party GSTIN = likely import from unregistered foreign supplier
       await dbQuery(`
         UPDATE vouchers v SET is_import = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
         AND g.igst_amount > 0 AND g.cgst_amount = 0
         AND NOT EXISTS (
           SELECT 1 FROM ledgers l
-          WHERE l.name = v.party_name AND l.company_guid = v.company_guid
+          WHERE l.name = v.party_name AND l.company_id = v.company_id
           AND l.gstin IS NOT NULL AND l.gstin != ''
         )
         AND v.voucher_type_parent = 'Purchase'
         AND v.is_import = false AND v.is_cancelled = false
-        AND v.company_guid = $1
-      `, [companyGuid]);
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
       // Populate vouchers.itc_eligibility from gst_voucher_details
       await dbQuery(`
         UPDATE vouchers v SET itc_eligibility = g.itc_eligibility
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
         AND g.itc_eligibility IS NOT NULL AND g.itc_eligibility != ''
-        AND v.company_guid = $1
-      `, [companyGuid]);
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
       // Populate cess_amount + is_non_gst from gst_voucher_details
       await dbQuery(`
         UPDATE vouchers v SET
           cess_amount = g.cess_amount,
           is_non_gst  = g.is_non_gst
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
-        AND v.company_guid = $1
-      `, [companyGuid]);
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
       // Populate is_gst_relevant
       await dbQuery(`
         UPDATE vouchers v SET is_gst_relevant = true
         FROM gst_voucher_details g
-        WHERE g.voucher_guid = v.guid AND g.company_guid = v.company_guid
+        WHERE g.voucher_guid = v.guid AND g.company_id = v.company_id
         AND (g.cgst_amount > 0 OR g.sgst_amount > 0 OR g.igst_amount > 0 OR g.cess_amount > 0
           OR g.is_nil_rated OR g.is_exempt OR g.gst_reg_type IS NOT NULL)
-        AND v.company_guid = $1
-      `, [companyGuid]);
-      await dbQuery(`UPDATE vouchers SET is_gst_relevant = true WHERE party_gstin IS NOT NULL AND party_gstin != '' AND company_guid = $1`, [companyGuid]);
+        AND v.company_id = $1
+      `, [currentCompanyId()]);
+      await dbQuery(`UPDATE vouchers SET is_gst_relevant = true WHERE party_gstin IS NOT NULL AND party_gstin != '' AND company_id = $1`, [currentCompanyId()]);
       // Populate gst_transaction_nature
       await dbQuery(`
         UPDATE vouchers SET gst_transaction_nature =
@@ -2436,8 +2508,8 @@ async function processGSTDetails(data, companyGuid) {
             WHEN gst_section = 'ITC Interstate' THEN 'ITC Interstate'
             ELSE gst_section
           END
-        WHERE company_guid = $1 AND (gst_section IS NOT NULL OR is_export OR is_sez OR is_reverse_charge OR is_non_gst)
-      `, [companyGuid]);
+        WHERE company_id = $1 AND (gst_section IS NOT NULL OR is_export OR is_sez OR is_reverse_charge OR is_non_gst)
+      `, [currentCompanyId()]);
       // Populate gst_tabs_json using classifier logic (stored for performance)
       await dbQuery(`
         UPDATE vouchers SET gst_tabs_json =
@@ -2447,8 +2519,8 @@ async function processGSTDetails(data, companyGuid) {
             WHEN voucher_type_parent = 'Purchase' THEN '["GSTR-3B","GSTR-9"]'::jsonb
             ELSE '[]'::jsonb
           END
-        WHERE company_guid = $1 AND is_cancelled = false
-      `, [companyGuid]);
+        WHERE company_id = $1 AND is_cancelled = false
+      `, [currentCompanyId()]);
       // Populate gst_sections_json
       await dbQuery(`
         UPDATE vouchers SET gst_sections_json =
@@ -2456,8 +2528,8 @@ async function processGSTDetails(data, companyGuid) {
             'GSTR-1', COALESCE(gst_section, 'Other'),
             'GSTR-3B', COALESCE(gstr3b_section, '')
           )
-        WHERE company_guid = $1 AND (gst_section IS NOT NULL OR gstr3b_section IS NOT NULL)
-      `, [companyGuid]);
+        WHERE company_id = $1 AND (gst_section IS NOT NULL OR gstr3b_section IS NOT NULL)
+      `, [currentCompanyId()]);
       console.log(`[DB] GSTDetails: is_import + itc_eligibility + all derived fields propagated for ${companyGuid}`);
     } catch (pe) { console.warn('[DB] GSTDetails post-process voucher update failed:', pe.message); }
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
@@ -2465,7 +2537,7 @@ async function processGSTDetails(data, companyGuid) {
 }
 
 async function processBillOutstanding(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   const parseAmt = (v) => {
     if (v == null || v === '') return 0;
     const n = parseFloat(String(v).replace(/,/g, '').trim());
@@ -2473,7 +2545,7 @@ async function processBillOutstanding(data, companyGuid) {
   };
   try {
     await client.query('BEGIN');
-    await client.query('DELETE FROM bill_outstanding WHERE company_guid=$1', [companyGuid]);
+    await client.query('DELETE FROM bill_outstanding WHERE company_id=$1', [currentCompanyId()]);
     let saved = 0;
     let skipped = 0;
     for (const r of data) {
@@ -2486,15 +2558,14 @@ async function processBillOutstanding(data, companyGuid) {
       const drCr = String(r.DrCr || r.DRCR || r.BillType || r.BILLTYPE || '').trim() || null;
       try {
         await client.query(`
-          INSERT INTO bill_outstanding
-            (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          INSERT INTO bill_outstanding (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
         `, [
           r.VoucherGuid || null, companyGuid, ledgerName, billName,
           normalizeDate(r.BillDate), normalizeDate(r.DueDate),
           amount, pending,
           drCr, parseInt(r.AlterId || 0) || 0, now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
@@ -2511,7 +2582,7 @@ async function processStockOpeningBalance(data, companyGuid) {
   //   1. Aggregate total opening_qty per stock → UPDATE stocks
   //   2. Insert per-warehouse rows into stock_transactions (type=inward, voucher_guid='opening_balance')
   //      so warehouse breakdown works for items with no voucher movements
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let updated = 0;
@@ -2534,8 +2605,8 @@ async function processStockOpeningBalance(data, companyGuid) {
     for (const [name, { qty, rate }] of Object.entries(totals)) {
       try {
         const result = await client.query(
-          `UPDATE stocks SET opening_qty = $1, opening_rate = $2 WHERE name = $3 AND company_guid = $4`,
-          [qty, rate, name, companyGuid]
+          `UPDATE stocks SET opening_qty = $1, opening_rate = $2 WHERE name = $3 AND company_id = $4`,
+          [qty, rate, name, currentCompanyId()]
         );
         if (result.rowCount > 0) updated++;
       } catch (e) { console.warn('[DB] StockOpening stocks update failed:', e.message); }
@@ -2556,12 +2627,12 @@ async function processStockOpeningBalance(data, companyGuid) {
       const syntheticGuid = `opening_balance_${warehouse}`;
       try {
         await client.query(`
-          INSERT INTO stock_transactions
-            (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, financial_year, synced_at)
-          VALUES ($1,$2,$3,'Opening Balance','2000-01-01',$4,$5,$6,'inward',$7,NULL,${now()})
-          ON CONFLICT (stock_guid, company_guid, voucher_guid, warehouse, type) DO UPDATE SET
-            qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
-        `, [name, companyGuid, syntheticGuid, Math.abs(qty), rate, Math.abs(value), warehouse]);
+          INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, financial_year, synced_at, company_id)
+          VALUES ($1,$2,$3,'Opening Balance','2000-01-01',$4,$5,$6,'inward',$7,NULL,${now()},$8)
+          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
+            qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at,
+            company_id=COALESCE(EXCLUDED.company_id, stock_transactions.company_id)
+        `, [name, companyGuid, syntheticGuid, Math.abs(qty), rate, Math.abs(value), warehouse, currentCompanyId()]);
         txInserted++;
       } catch (e) { console.warn('[DB] StockOpening tx insert failed:', e.message, name, warehouse); }
     }
@@ -2589,17 +2660,17 @@ async function processStockOpeningBalance(data, companyGuid) {
         SELECT stock_guid, company_guid,
                SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
         FROM stock_transactions
-        WHERE company_guid = $1 AND ${OB_EXCL}
+        WHERE company_id = $1 AND ${OB_EXCL}
         GROUP BY stock_guid, company_guid
       ) sub
-      WHERE s.name = sub.stock_guid AND s.company_guid = sub.company_guid AND s.company_guid = $1
-    `, [companyGuid]);
+      WHERE s.name = sub.stock_guid AND s.company_id = sub.company_id AND s.company_id = $1
+    `, [currentCompanyId()]);
 
     // Stocks with opening but no real transactions: closing = opening
     await dbQuery(
       `UPDATE stocks SET closing_qty = opening_qty
-       WHERE company_guid = $1 AND closing_qty = 0 AND opening_qty > 0`,
-      [companyGuid]
+       WHERE company_id = $1 AND closing_qty = 0 AND opening_qty > 0`,
+      [currentCompanyId()]
     );
 
     // Stocks with real transactions but no opening: closing = net movements only
@@ -2610,14 +2681,14 @@ async function processStockOpeningBalance(data, companyGuid) {
          SELECT stock_guid, company_guid,
                 SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
          FROM stock_transactions
-         WHERE company_guid = $1 AND ${OB_EXCL}
+         WHERE company_id = $1 AND ${OB_EXCL}
          GROUP BY stock_guid, company_guid
        ) sub
        WHERE s.name = sub.stock_guid
-         AND s.company_guid = sub.company_guid
+         AND s.company_id = sub.company_id
          AND s.opening_qty = 0
          AND sub.net_qty != 0`,
-      [companyGuid]
+      [currentCompanyId()]
     );
 
     console.log(`[DB] StockOpening: closing_qty recomputed for ${companyGuid}`);
@@ -2644,15 +2715,15 @@ async function applyCurrentFyClosingQty(companyGuid) {
         SELECT DISTINCT ON (stock_name)
           stock_name, closing_qty, closing_rate, closing_value
         FROM stock_fy_valuation
-        WHERE company_guid = $1
+        WHERE company_id = $1
           AND closing_qty IS NOT NULL
         ORDER BY stock_name, financial_year DESC
       ) fv
       WHERE s.name = fv.stock_name
-        AND s.company_guid = $1
+        AND s.company_id = $1
         -- Do not replace a nonzero txn-computed qty with a FY default of 0
         AND NOT (COALESCE(fv.closing_qty, 0) = 0 AND COALESCE(s.closing_qty, 0) <> 0)
-    `, [companyGuid]);
+    `, [currentCompanyId()]);
     console.log(`[DB] applyCurrentFyClosingQty: updated ${result.rowCount} stocks for ${companyGuid}`);
   } catch (e) {
     console.error('[DB] applyCurrentFyClosingQty failed:', e.message);
@@ -2678,7 +2749,7 @@ async function processStockFyBalance(data, companyGuid) {
   const isOpeningQuery = (fromDate !== fyEnd); // any date before FY start
 
   const now = Math.floor(Date.now() / 1000);
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -2697,31 +2768,29 @@ async function processStockFyBalance(data, companyGuid) {
         if (isClosingQuery) {
           // Update or insert closing_value for this FY
           await client.query(`
-            INSERT INTO stock_fy_valuation
-              (company_guid, financial_year, stock_name, stock_guid, closing_qty, closing_rate, closing_value, synced_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            ON CONFLICT (company_guid, financial_year, stock_name)
+            INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, closing_qty, closing_rate, closing_value, synced_at, company_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+            ON CONFLICT (company_id, financial_year, stock_name)
             DO UPDATE SET
-              closing_qty   = EXCLUDED.closing_qty,
+              company_id = COALESCE(EXCLUDED.company_id, stock_fy_valuation.company_id), closing_qty   = EXCLUDED.closing_qty,
               closing_rate  = EXCLUDED.closing_rate,
               closing_value = EXCLUDED.closing_value,
               synced_at     = EXCLUDED.synced_at`,
-            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now]
+            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
           );
         } else {
           // Opening query: store as NEXT FY's opening
           // date = FY_start - 1 day → this is the opening of financialYear
           await client.query(`
-            INSERT INTO stock_fy_valuation
-              (company_guid, financial_year, stock_name, stock_guid, opening_qty, opening_rate, opening_value, synced_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            ON CONFLICT (company_guid, financial_year, stock_name)
+            INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, opening_qty, opening_rate, opening_value, synced_at, company_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+            ON CONFLICT (company_id, financial_year, stock_name)
             DO UPDATE SET
               opening_qty   = EXCLUDED.opening_qty,
               opening_rate  = EXCLUDED.opening_rate,
               opening_value = EXCLUDED.opening_value,
               synced_at     = EXCLUDED.synced_at`,
-            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now]
+            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
           );
         }
         saved++;
@@ -2774,7 +2843,7 @@ async function processStockFyValuation(data, companyGuid) {
   if (!data || data.length === 0) return;
 
   const now = Math.floor(Date.now() / 1000);
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   // Group by financial_year so each FY is handled correctly
   // (multiple FYs may arrive in one batch when several years are synced together)
   const fyGroups = {};
@@ -2807,14 +2876,13 @@ async function processStockFyValuation(data, companyGuid) {
 
       try {
         await client.query(
-          `INSERT INTO stock_fy_valuation
-            (company_guid, financial_year, stock_name, stock_guid,
+          `INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid,
              opening_qty, opening_rate, opening_value,
-             closing_qty, closing_rate, closing_value, synced_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-           ON CONFLICT (company_guid, financial_year, stock_name)
+             closing_qty, closing_rate, closing_value, synced_at, company_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
+           ON CONFLICT (company_id, financial_year, stock_name)
            DO UPDATE SET
-             stock_guid    = EXCLUDED.stock_guid,
+             company_id = COALESCE(EXCLUDED.company_id, stock_fy_valuation.company_id), stock_guid    = EXCLUDED.stock_guid,
              opening_qty   = EXCLUDED.opening_qty,
              opening_rate  = EXCLUDED.opening_rate,
              opening_value = EXCLUDED.opening_value,
@@ -2847,7 +2915,7 @@ async function processStockFyValuation(data, companyGuid) {
 async function processLedgerTransactions(data, companyGuid) {
   // LedgerTransaction.xml: each record is a ledger line item for a voucher
   // Fields: Guid (voucher GUID), LedgerName, LedgerGuid, Amount, Date, AlterId
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
 
@@ -2855,8 +2923,8 @@ async function processLedgerTransactions(data, companyGuid) {
     const uniqueGuids = [...new Set(data.map(r => r.Guid || r.GUID).filter(Boolean))];
     if (uniqueGuids.length > 0) {
       await client.query(
-        `DELETE FROM voucher_items WHERE company_guid=$1 AND voucher_guid = ANY($2::text[])`,
-        [companyGuid, uniqueGuids]
+        `DELETE FROM voucher_items WHERE company_id=$1 AND voucher_guid = ANY($2::text[])`,
+        [currentCompanyId(), uniqueGuids]
       );
     }
 
@@ -2875,15 +2943,15 @@ async function processLedgerTransactions(data, companyGuid) {
       // Insert into voucher_items
       try {
         await client.query(`
-          INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, ledger_guid, amount, type)
-          VALUES ($1, $2, $3, $4, $5, $6)
+          INSERT INTO voucher_items (voucher_guid, company_guid, ledger_name, ledger_guid, amount, type, company_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
         `, [
           voucherGuid, companyGuid,
           ledgerName,
           r.LedgerGuid || r.LEDGERGUID || null,
           Math.abs(amount),
           amount >= 0 ? 'Cr' : 'Dr',
-        ]);
+        , currentCompanyId()]);
         itemsSaved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
 
@@ -2914,16 +2982,16 @@ async function processLedgerTransactions(data, companyGuid) {
         SELECT voucher_guid, company_guid,
                SUM(CASE WHEN type = 'Cr' THEN amount ELSE 0 END) as total
         FROM voucher_items
-        WHERE company_guid = $1
+        WHERE company_id = $1
           AND amount IS NOT NULL
           AND amount::text != 'NaN'
           AND amount > 0
         GROUP BY voucher_guid, company_guid
       ) sub
       WHERE v.guid = sub.voucher_guid
-        AND v.company_guid = sub.company_guid
+        AND v.company_id = sub.company_id
         AND sub.total > 0
-    `, [companyGuid]);
+    `, [currentCompanyId()]);
     console.log(`[DB] LedgerTx: updated ${result.rowCount} voucher amounts for ${companyGuid}`);
   } catch (e) {
     console.error('[DB] Voucher amount update failed:', e.message);
@@ -3014,7 +3082,7 @@ async function processAllVoucher(data, companyGuid) {
   // Each record has: guid, Date, VoucherType, VoucherNumber, PartyName, AllInventoryentries, AllLedgerEntries, Billallocations
   // NOTE: AllVoucher.xml LINE has <XMLTAG>Voucher</XMLTAG> so Tally wraps each row in <Voucher>
   // normalizeEnvelope returns { Voucher: { guid, Date, ... } } — we must unwrap it
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3054,10 +3122,10 @@ async function processAllVoucher(data, companyGuid) {
       try {
         const dispatchDetails2 = extractDispatchDetails(r);
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year, dispatch_details)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-          ON CONFLICT (guid, company_guid) DO UPDATE SET
-            voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, alter_id, raw_data, synced_at, financial_year, dispatch_details, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, $18)
+          ON CONFLICT (company_id, guid) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, vouchers.company_id), voucher_number      = COALESCE(EXCLUDED.voucher_number, vouchers.voucher_number),
             voucher_type        = CASE WHEN EXCLUDED.voucher_type = 'Voucher' THEN COALESCE(vouchers.voucher_type, 'Voucher') ELSE EXCLUDED.voucher_type END,
             -- NULLIF: a stub's 'Voucher' placeholder must never flatten a resolved parent
             voucher_type_parent = COALESCE(NULLIF(EXCLUDED.voucher_type_parent, 'Voucher'), vouchers.voucher_type_parent),
@@ -3088,6 +3156,7 @@ async function processAllVoucher(data, companyGuid) {
           now(),
           r._FINANCIAL_YEAR || null,
           dispatchDetails2 ? JSON.stringify(dispatchDetails2) : null,
+          currentCompanyId(),
         ]);
         saved++;
         // Save AllLedgerEntries to voucher_ledger_entries (proper Dr/Cr from amount sign)
@@ -3113,12 +3182,12 @@ async function processAllVoucher(data, companyGuid) {
           GREATEST(0, COALESCE(SUM(CASE WHEN vle.dr_cr='Dr' THEN ABS(vle.amount) ELSE 0 END),0) -
             COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0)) as taxable
         FROM vouchers v JOIN voucher_ledger_entries vle ON vle.voucher_guid=v.guid AND vle.company_guid=v.company_guid
-        WHERE v.company_guid=$1
+        WHERE v.company_id=$1
         GROUP BY v.guid, v.company_guid
         HAVING SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END) > 0
       ) sub
       WHERE gvd.voucher_guid=sub.vg AND gvd.company_guid=sub.cg AND gvd.cgst_amount=0
-    `, [companyGuid]).catch(e => console.warn('[DB] GST backfill warning:', e.message));
+    `, [currentCompanyId()]).catch(e => console.warn('[DB] GST backfill warning:', e.message));
 
     // Backfill VLE financial_year from parent voucher where NULL (handles legacy + re-sync gaps)
     await client.query(`
@@ -3126,18 +3195,18 @@ async function processAllVoucher(data, companyGuid) {
       SET financial_year = v.financial_year
       FROM vouchers v
       WHERE vle.voucher_guid = v.guid
-        AND vle.company_guid = v.company_guid
-        AND vle.company_guid = $1
+        AND vle.company_id = v.company_id
+        AND vle.company_id = $1
         AND vle.financial_year IS NULL
         AND v.financial_year IS NOT NULL
-    `, [companyGuid]).catch(e => console.warn('[DB] VLE FY backfill warning:', e.message));
+    `, [currentCompanyId()]).catch(e => console.warn('[DB] VLE FY backfill warning:', e.message));
 
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] AllVoucher failed:', e.message); }
   finally { client.release(); }
 }
 
 async function processWarehouses(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   const confirmedWarehouses = [];
   try {
     await client.query('BEGIN');
@@ -3147,10 +3216,10 @@ async function processWarehouses(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO warehouses (guid, company_guid, name, parent, parent_guid, address, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-          ON CONFLICT (name, company_guid) DO UPDATE SET
-            guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
+          INSERT INTO warehouses (guid, company_guid, name, parent, parent_guid, address, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+          ON CONFLICT (company_id, name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, warehouses.company_id), guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
             address=EXCLUDED.address, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           r.Guid || r.GUID || null, companyGuid, name,
@@ -3158,7 +3227,7 @@ async function processWarehouses(data, companyGuid) {
           r.ParentGuid || null,
           r.Address || null,
           parseInt(r.AlterId || r.ALTERID || 0), now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
         const whGuid = r.Guid || r.GUID || null;
         if (whGuid) confirmedWarehouses.push({ name, guid: whGuid });
@@ -3174,7 +3243,7 @@ async function processWarehouses(data, companyGuid) {
 }
 
 async function processUnits(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3183,10 +3252,10 @@ async function processUnits(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO units (guid, company_guid, name, formal_name, is_simple_unit, base_units, additional_units, conversion, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-          ON CONFLICT (name, company_guid) DO UPDATE SET
-            formal_name=EXCLUDED.formal_name, is_simple_unit=EXCLUDED.is_simple_unit,
+          INSERT INTO units (guid, company_guid, name, formal_name, is_simple_unit, base_units, additional_units, conversion, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, $11)
+          ON CONFLICT (company_id, name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, units.company_id), formal_name=EXCLUDED.formal_name, is_simple_unit=EXCLUDED.is_simple_unit,
             base_units=EXCLUDED.base_units, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           r.Guid || null, companyGuid, name,
@@ -3196,7 +3265,7 @@ async function processUnits(data, companyGuid) {
           r.ADDITIONAL_UNITS || null,
           r.CONVERSION || null,
           parseInt(r.ALTERID || r.AlterId || 0), now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] Unit insert failed:', e.message); }
     }
@@ -3207,7 +3276,7 @@ async function processUnits(data, companyGuid) {
 }
 
 async function processVoucherTypes(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3216,10 +3285,10 @@ async function processVoucherTypes(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO voucher_types (guid, company_guid, name, parent, parent_guid, numbering_method, is_deemed_positive, affects_stock, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-          ON CONFLICT (name, company_guid) DO UPDATE SET
-            guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
+          INSERT INTO voucher_types (guid, company_guid, name, parent, parent_guid, numbering_method, is_deemed_positive, affects_stock, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, $11)
+          ON CONFLICT (company_id, name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, voucher_types.company_id), guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
             numbering_method=EXCLUDED.numbering_method, is_deemed_positive=EXCLUDED.is_deemed_positive,
             affects_stock=EXCLUDED.affects_stock, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
@@ -3230,7 +3299,7 @@ async function processVoucherTypes(data, companyGuid) {
           !!(r.ISDEEMEDPOSITIVE === 'Yes' || r.ISDEEMEDPOSITIVE === '1'),
           !!(r.AFFECTSSTOCK === 'Yes' || r.AFFECTSSTOCK === '1'),
           parseInt(r.ALTERID || r.AlterId || 0), now(),
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] VoucherType insert failed:', e.message); }
     }
@@ -3248,7 +3317,7 @@ async function processStockGroups(data, companyGuid) {
 // CTO Spec: stock_categories table — dedicated stock category master from StockCategory.xml
 async function processStockCategories(data, companyGuid) {
   if (!data?.length) return;
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3259,12 +3328,12 @@ async function processStockCategories(data, companyGuid) {
       const parent = r.PARENT || r.Parent || null;
       try {
         await client.query(`
-          INSERT INTO stock_categories (guid, company_guid, name, parent, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5,NOW())
-          ON CONFLICT (company_guid, name) DO UPDATE SET
-            guid=COALESCE(EXCLUDED.guid, stock_categories.guid),
+          INSERT INTO stock_categories (guid, company_guid, name, parent, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,NOW(), $6)
+          ON CONFLICT (company_id, name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, stock_categories.company_id), guid=COALESCE(EXCLUDED.guid, stock_categories.guid),
             parent=EXCLUDED.parent, alter_id=EXCLUDED.alter_id, synced_at=NOW()
-        `, [guid, companyGuid, name, parent, parseInt(r.ALTERID || r.AlterId || 0)]);
+        `, [guid, companyGuid, name, parent, parseInt(r.ALTERID || r.AlterId || 0), currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] StockCategory insert failed:', e.message, name); }
     }
@@ -3277,7 +3346,7 @@ async function processStockCategories(data, companyGuid) {
 // CTO Spec: batch_allocations table — batch/expiry tracking per voucher line item
 async function processBatchAllocations(data, companyGuid) {
   if (!data?.length) return;
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3299,12 +3368,11 @@ async function processBatchAllocations(data, companyGuid) {
       const expiryDate  = rawExpiry || parseExpiryPeriod(rawPeriod) || null;
       try {
         await client.query(`
-          INSERT INTO batch_allocations
-            (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
-             expiry_date, mfg_date, qty, rate, godown_name, financial_year, synced_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-          ON CONFLICT (voucher_guid, company_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
-            qty=EXCLUDED.qty, rate=EXCLUDED.rate, expiry_date=EXCLUDED.expiry_date,
+          INSERT INTO batch_allocations (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
+             expiry_date, mfg_date, qty, rate, godown_name, financial_year, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(), $12)
+          ON CONFLICT (company_id, voucher_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
+            company_id = COALESCE(EXCLUDED.company_id, batch_allocations.company_id), qty=EXCLUDED.qty, rate=EXCLUDED.rate, expiry_date=EXCLUDED.expiry_date,
             mfg_date=EXCLUDED.mfg_date, financial_year=EXCLUDED.financial_year, synced_at=NOW()
         `, [
           voucherGuid, companyGuid, itemName,
@@ -3315,7 +3383,7 @@ async function processBatchAllocations(data, companyGuid) {
           qty, rate,
           godownName,
           fy,
-        ]);
+        , currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] BatchAllocation insert failed:', e.message, batchName); }
     }
@@ -3326,7 +3394,7 @@ async function processBatchAllocations(data, companyGuid) {
 }
 
 async function processCurrencies(data, companyGuid) {
-  const client = await getClient();
+  const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3335,10 +3403,10 @@ async function processCurrencies(data, companyGuid) {
       if (!name) continue;
       try {
         await client.query(`
-          INSERT INTO currencies (guid, company_guid, name, alter_id, synced_at)
-          VALUES ($1,$2,$3,$4,$5)
-          ON CONFLICT (name, company_guid) DO UPDATE SET guid=EXCLUDED.guid, synced_at=EXCLUDED.synced_at
-        `, [r.Guid || null, companyGuid, name, parseInt(r.ALTERID || 0), now()]);
+          INSERT INTO currencies (guid, company_guid, name, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5, $6)
+          ON CONFLICT (company_id, name) DO UPDATE SET company_id = COALESCE(EXCLUDED.company_id, currencies.company_id), guid=EXCLUDED.guid, synced_at=EXCLUDED.synced_at
+        `, [r.Guid || null, companyGuid, name, parseInt(r.ALTERID || 0), now(), currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }

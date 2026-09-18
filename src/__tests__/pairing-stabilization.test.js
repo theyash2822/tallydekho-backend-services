@@ -42,7 +42,7 @@ function auth(token) {
 
 async function backendUp() {
   try {
-    const res = await http.get('/app/ping');
+    const res = await http.get('/health');
     return res.status < 500;
   } catch {
     return false;

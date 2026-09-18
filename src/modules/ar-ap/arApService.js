@@ -65,29 +65,33 @@ function agingToMap(aging) {
   return map;
 }
 
-async function upsertArApSnapshot(companyGuid, side, asOf, total, agingMap) {
+async function upsertArApSnapshot(companyId, side, asOf, total, agingMap) {
   await query(
-    `INSERT INTO kpi_ar_ap_snapshots (company_guid, side, as_of, total, aging, created_at)
-     VALUES ($1, $2, $3::date, $4, $5::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT)
-     ON CONFLICT (company_guid, side, as_of)
-     DO UPDATE SET total = EXCLUDED.total, aging = EXCLUDED.aging,
+    `INSERT INTO kpi_ar_ap_snapshots (company_id, company_guid, side, as_of, total, aging, created_at)
+     VALUES (
+       $1,
+       (SELECT guid FROM companies WHERE id = $1),
+       $2, $3::date, $4, $5::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT
+     )
+     ON CONFLICT (company_id, side, as_of)
+     DO UPDATE SET company_id = EXCLUDED.company_id, total = EXCLUDED.total, aging = EXCLUDED.aging,
                    created_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
-    [companyGuid, side, asOf, total, JSON.stringify(agingMap)]
+    [companyId, side, asOf, total, JSON.stringify(agingMap)]
   );
 }
 
-async function loadPriorArApSnapshot(companyGuid, side, asOf) {
+async function loadPriorArApSnapshot(companyId, side, asOf) {
   const target = addDays(asOf, -TREND_LOOKBACK_DAYS);
   const from = addDays(target, -3);
   const to = addDays(target, 3);
   const { rows } = await query(
     `SELECT as_of::text AS as_of, total, aging
      FROM kpi_ar_ap_snapshots
-     WHERE company_guid = $1 AND side = $2
+     WHERE company_id=$1 AND side = $2
        AND as_of BETWEEN $3::date AND $4::date
        AND as_of <> $5::date
      ORDER BY as_of DESC`,
-    [companyGuid, side, from, to, asOf]
+    [companyId, side, from, to, asOf]
   );
   return pickPriorSnapshot(rows, target, 3);
 }
@@ -186,14 +190,14 @@ function aggregateParties(debtors, bills, asOfIso, side = 'AR') {
     .sort((a, b) => b.amount - a.amount);
 }
 
-async function loadSettlementActivity(companyGuid, {
+async function loadSettlementActivity(companyId, {
   side, from, to, limit = 40,
 }) {
   const partyParent = side === 'AR'
     ? `(l.parent ILIKE '%Sundry Debtor%' OR l.parent = 'Sundry Debtors')`
     : `(l.parent ILIKE '%Sundry Creditor%' OR l.parent = 'Sundry Creditors')`;
   const vtype = side === 'AR' ? `v.voucher_type ILIKE '%Receipt%'` : `v.voucher_type ILIKE '%Payment%'`;
-  const params = [companyGuid];
+  const params = [companyId];
   let dateClause = '';
   if (from) { params.push(from); dateClause += ` AND v.date >= $${params.length}`; }
   if (to) { params.push(to); dateClause += ` AND v.date <= $${params.length}`; }
@@ -204,9 +208,9 @@ async function loadSettlementActivity(companyGuid, {
          v.guid, v.voucher_number, v.party_name, v.voucher_type, v.date, v.amount,
          vle.ledger_name AS party_ledger
        FROM vouchers v
-       JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_guid = v.company_guid
-       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = v.company_guid
-       WHERE v.company_guid = $1 AND v.is_cancelled = FALSE
+       JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_id = v.company_id
+       JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = v.company_id
+       WHERE v.company_id=$1 AND v.is_cancelled = FALSE
          AND ${vtype}
          AND ${partyParent}
          ${dateClause}
@@ -229,7 +233,7 @@ async function loadSettlementActivity(companyGuid, {
 /**
  * @param {'AR'|'AP'} side
  */
-export async function buildArApPayload(companyGuid, side, opts = {}) {
+export async function buildArApPayload(companyId, side, opts = {}) {
   const asOf = isoDay(opts.asOf) || new Date().toISOString().slice(0, 10);
   const from = isoDay(opts.from);
   const to = isoDay(opts.to);
@@ -245,21 +249,21 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   const { rows: partiesRaw } = await query(
     `SELECT name, closing_balance, COALESCE(mobile, phone) AS mobile
      FROM ledgers
-     WHERE company_guid = $1 AND ${partyClause}
+     WHERE company_id=$1 AND ${partyClause}
        AND ABS(closing_balance) > 0.005
      ORDER BY ABS(closing_balance) DESC
      LIMIT 200`,
-    [companyGuid]
+    [companyId]
   );
 
   const { rows: billsRaw } = await query(
     `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type, voucher_guid
      FROM bill_outstanding
-     WHERE company_guid = $1 AND ABS(COALESCE(pending_amount,0)) > 0.005
+     WHERE company_id=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
        AND ${billTypeClause}
      ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
      LIMIT 5000`,
-    [companyGuid]
+    [companyId]
   );
 
   let bills = billsRaw.map((b) => mapBillRow(b, asOf, side));
@@ -270,11 +274,11 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
     const { rows: vrows } = await query(
       `SELECT guid, voucher_number, party_name, voucher_type, date
        FROM vouchers
-       WHERE company_guid = $1
+       WHERE company_id=$1
          AND is_cancelled = FALSE
          AND voucher_number = ANY($2::text[])
        ORDER BY date DESC NULLS LAST`,
-      [companyGuid, missingRefs]
+      [companyId, missingRefs]
     );
     const byRefParty = new Map();
     const byRef = new Map();
@@ -305,7 +309,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   const agingMap = agingToMap(unfilteredAging);
 
   try {
-    await upsertArApSnapshot(companyGuid, side, asOf, snapshotTotal, agingMap);
+    await upsertArApSnapshot(companyId, side, asOf, snapshotTotal, agingMap);
   } catch (e) {
     console.warn('[arAp] snapshot upsert skipped:', e.message);
   }
@@ -361,7 +365,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   if (!filteredView) {
     try {
       const trends = await computeArApTrends({
-        companyGuid,
+        companyId,
         side,
         asOf,
         currentTotal: snapshotTotal,
@@ -392,7 +396,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
       aging = blankAgingTrends(aging);
       // Snapshot fallback only if reconstruction threw
       try {
-        const prior = await loadPriorArApSnapshot(companyGuid, side, asOf);
+        const prior = await loadPriorArApSnapshot(companyId, side, asOf);
         if (prior) {
           trend_pct = computeTrendPct(snapshotTotal, prior.total);
           trend_positive = trend_pct == null ? null : trend_pct >= 0;
@@ -426,7 +430,7 @@ export async function buildArApPayload(companyGuid, side, opts = {}) {
   const openBillOutstanding = money(bills.reduce((s, b) => s + b.amount, 0));
   const total = filteredView ? openBillOutstanding : accountingBalance;
 
-  const activity = await loadSettlementActivity(companyGuid, {
+  const activity = await loadSettlementActivity(companyId, {
     side,
     from: from || undefined,
     to: to || asOf,

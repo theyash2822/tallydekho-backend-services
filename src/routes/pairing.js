@@ -1,7 +1,7 @@
 // Pairing routes
 import { Router } from 'express';
 import { query } from '../db/schema.js';
-import { authMiddleware, desktopAuth, generateToken, requireDeviceCredential } from '../middleware/auth.js';
+import { authMiddleware, generateToken, requireDeviceCredential } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
 import { pairDeviceToWorkspace, unpairDevice, BindingError } from '../services/deviceBinding.js';
 import { generateDeviceSecret, hashSecret } from '../services/deviceCredential.js';
@@ -363,25 +363,21 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// GET /desktop/company-sync-status — used by desktop for multi-device conflict detection
-// Returns when the company was last synced and from which device
-// Uses desktopAuth (device-id header only, no JWT needed)
-router.get('/company-sync-status', desktopAuth, async (req, res) => {
+// GET /desktop/company-sync-status — device secret + company in device workspace
+router.get('/company-sync-status', requireDeviceCredential, async (req, res) => {
   const { companyGuid } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   try {
     const deviceId = req.deviceId;
-    // Get the device's owner (user_id)
-    const { rows: devices } = await query(
-      'SELECT user_id FROM devices WHERE device_id = $1 LIMIT 1',
-      [deviceId]
-    );
-    if (!devices[0]) return res.status(403).json({ status: false, message: 'Device not registered' });
+    const workspaceId = req.device?.workspace_id || req.workspaceId;
+    if (!workspaceId) {
+      return res.status(403).json({ status: false, code: 'DEVICE_NOT_BOUND', message: 'Device has no workspace binding' });
+    }
 
-    // Get when this company was last synced and from which device
     const { rows: companies } = await query(
-      'SELECT synced_at, device_id FROM companies WHERE guid = $1 AND user_id = $2 LIMIT 1',
-      [companyGuid, devices[0].user_id]
+      `SELECT synced_at, device_id FROM companies
+       WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+      [companyGuid, workspaceId]
     );
 
     const company = companies[0];
