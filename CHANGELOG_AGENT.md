@@ -1,3 +1,305 @@
+## 2026-09-18 (later) — Staging provisioning prep, RBAC telemetry, operator script coverage
+
+### Why
+Close the RBAC production ops tail and make a real staging path possible. No AWS
+or production access here, so infrastructure is documented and scripted, never
+claimed as provisioned.
+
+### P0 fixed — plaintext OTPs in logs
+Six auth paths printed live OTPs to stdout (`auth.js`, `api-v1.js`, `sms.js`).
+Added `src/utils/otpLogging.js`; `devOtpSuffix()` returns an empty string when
+`NODE_ENV=production`. Asserted by test.
+
+### RBAC observation telemetry (new)
+`legacy_auth_events` table + `src/services/legacyAuthTelemetry.js` +
+`scripts/report-legacy-auth-usage.mjs`. Aggregates hits by
+`(day, event_type, route_class, platform, app_version, identified_client)`.
+Stores no JWT, header, token, OTP, password, device secret, IP, or user id — a
+test asserts the forbidden set stays absent. Writes are fire-and-forget so
+telemetry cannot break authentication.
+
+**This revealed the 7-day clock had never started**: no persistent production
+signal existed before today, so 2026-09-24 is void as a cutover target.
+
+### Environment identity
+- `src/config/appEnv.js` — `APP_ENV` separate from `NODE_ENV`; staging must run
+  `NODE_ENV=production` + `APP_ENV=staging`, asserted at boot.
+- `src/db/deploymentIdentity.js` — stamps the database with its environment and
+  refuses to boot on a cross-environment mismatch. Re-stamp a restored snapshot
+  with `RESTAMP_DEPLOYMENT_ENV=1`.
+- `.env.staging.example` — variable names only, no secrets, and deliberately no
+  `CID_ALLOW_DESTRUCTIVE_MIGRATION`.
+
+### Operator scripts (destructive-step coverage now complete)
+- `cid-child-constraint-cutover.mjs` — child `company_id` backfill (online,
+  batched) then `NOT NULL`/FK/UNIQUE via safe patterns. Two stages.
+- `cid-config-master-cutover.mjs` — config/master/MCA ownership: composite
+  uniques, PK swaps, `company_guid` drop. `CONFIRM_DELETE=1` for row removal.
+  Caught a real SQL fault on first run that the boot path had been swallowing.
+- `lib/cidChildMigration.mjs` — shared DDL so production runs exactly what the
+  rehearsal timed.
+- `db-backup.mjs`, `db-restore-check.mjs` — the restore check caught a genuine
+  silent failure: `pg_restore` skipped `kb_chunks` for a missing `vector`
+  extension while verification passed. Now pre-creates extensions and compares
+  archive tables against restored tables.
+- `sanitize-staging-db.mjs` — scrubs secrets from a staging copy; discovers
+  secret columns from the live schema rather than a hardcoded list, refuses
+  production-stamped databases, verifies no residue.
+- `collect-deployment-facts.sh`, `collect-table-sizes.mjs` — operator fact
+  collection. No secret values printed (`pm2 jlist` deliberately avoided), no
+  business data read.
+
+### Child constraint timing — the outstanding unknown, now measured
+Measured by synthesising the pre-Phase-3D shape on a 386 MB clone:
+
+| | naive | safe |
+|---|---:|---:|
+| DDL total | 3.52 s | 6.23 s |
+| Worst single DDL step | 997 ms (`ACCESS EXCLUSIVE`) | 1299 ms (`CONCURRENTLY`, non-blocking) |
+
+Naive looks cheaper but all of its DDL time is a blocking lock. Backfill
+dominates wall clock (42 s, ~8.3k rows/s) and is fully online; batched is both
+faster and safer than one statement (18.9 s vs 43.4 s on
+`voucher_ledger_entries`). Production therefore splits into an online backfill
+stage and a short DDL stage.
+
+### Tests
+`company-identity-migration-gate.test.js` extended: every destructive boot step
+must have an operator script, row-destroying steps must be gated by
+`CONFIRM_DELETE`, and the staging template must not enable the boot flag.
+`MODE` typos in the rehearsal harness now fail closed instead of silently
+running the safe path.
+
+Suites: unit 192/192, RBAC 43/43.
+
+### Cleanup
+Dropped `td_cid_rollback` and `td_restore_check`. Kept `td_cid_rehearsal` — the
+only venue able to regenerate the pre-3D shape — now sanitised.
+
+### Risks
+Timings come from 386 MB, not production volume. Production versions are still
+unknown until `collect-deployment-facts.sh` is run, so staging parity is
+unverified.
+
+---
+
+## 2026-09-18 — Staging readiness + migration rehearsal (P0 deploy-safety fix)
+
+### Why
+Prepare the Company Identity production cutover. Determine whether staging exists,
+rehearse the exact migration outside plain dev usage, and prove the runbook.
+
+### P0 fixed
+`initSchema()` runs on every boot and unconditionally executed the destructive
+Phase 3D/3E cutover — dropping global `UNIQUE(companies.guid)`, dropping
+`member_company_access.company_guid`, deleting rows without an internal owner —
+with errors swallowed. A production deploy/restart would have silently performed the
+operator-gated migration. Now isolated in `applyCidConstraintCutover()` behind
+`cidDestructiveMigrationsAllowed()`: skipped in production unless
+`CID_ALLOW_DESTRUCTIVE_MIGRATION=1`. Regression test added (6 checks).
+
+### P1 fixed
+- `/ingest/chunk` never wrote `ingest_uploads.company_id` despite holding
+  `resolvedCompany.id`; 17 existing rows backfilled workspace-scoped.
+- `verify-company-id-backfill.mjs`: resolved ownership by `guid` alone (invalid once
+  a GUID may exist in two workspaces) and **silently `SKIP`ped any table whose check
+  threw** — that is how `member_company_access` passed unnoticed. Now workspace /
+  device / upload-scoped, reports `ambiguous_guid_no_owner`, `ABSENT` vs `ERROR`,
+  non-zero exit on error; added dangling-FK and duplicate `(workspace_id, guid)` checks.
+- `remediate-company-identity-orphans.mjs`: orphans now defined by missing internal
+  owner rather than "no company with this guid"; ambiguous rows escalate.
+
+### Added (operator tooling)
+- `scripts/cid-guid-unique-cutover.mjs` — constraint swap with preflight, `lock_timeout`,
+  timings, idempotency, `ROLLBACK=1` reverse
+- `scripts/cid-duplicate-guid-smoke.mjs` — real duplicate-GUID isolation smoke, self-cleaning
+
+### Rehearsal (disposable clone, not staging)
+Forward cutover 10ms; rollback direction 39ms; `pg_dump -Fc` 2.8s; restore 33s;
+smoke 14/14; lock contention proven (55P03 at 3150ms behind an open transaction).
+Staging does not exist — see `COMPANY_IDENTITY_STAGING_REHEARSAL.md`.
+
+### Tests
+Unit 180/180; RBAC 43/43; identity 33/33; preflight scripts EXIT 0.
+
+---
+
+## 2026-09-17 — Company Identity Phase 3E (duplicate-GUID proven locally)
+
+### Why
+Remove every remaining assumption that `companies.guid` is globally unique, then prove two workspaces can share one Tally GUID safely.
+
+### What
+- Removed guid→id LIMIT 1 fallbacks (socket, ingest, TDK, ownership clause legacy, disabled-flag companyAccess bypass)
+- `assertCompanyGuidAvailableForWorkspace` is workspace-scoped (cross-workspace same GUID allowed)
+- init-sync `ON CONFLICT (workspace_id, guid)`; never steals workspace ownership
+- Ingest joins/filters → `company_id`
+- Local: `UNIQUE(workspace_id, guid)`; global `UNIQUE(guid)` dropped
+- Real DB duplicate-GUID isolation suite (purge/cache/queue/HTTP/socket)
+- Harness: `SKIP_WORKSPACE_BACKFILL` + `SKIP_DEMO_SEED` (dirty local DB was timing out on demo reseed)
+- `npm test` / `test:rbac` load dotenv so `DATABASE_URL` is present
+
+### Tests
+- Unit 174/174; RBAC 43/43 EXIT 0; identity 27/27; containment+duplicate 13/13
+- Production CID cutover still blocked (RBAC ops tail OPEN)
+
+---
+
+
+### What
+- Child business UNIQUEs → `company_id`; NOT NULL + FK RESTRICT after backfill
+- MCA: PK `(membership_id, company_id)`; **`company_guid` DROPPED locally**
+- Config/cache/TDK/company_years ownership → `company_id` PKs/UNIQUEs; GUID uniques dropped
+- Hard-sync purge by `company_id` (workspace-scoped)
+- Ingest ownership filters → `company_id`; `rewriteInsertWithCompanyId` DELETED
+- tally-write / write_queue ownership via `company_id`; Desktop still receives Tally GUID
+- Docs: `COMPANY_GUID_REMAINING_USAGE_AUDIT.md`, retirement matrix, production cutover runbook
+
+### Gate
+`GUID UNIQUE CUTOVER ELIGIBLE: NO` — residual LIMIT-1 fallbacks, `assertCompanyGuidAvailableForWorkspace`, tally_*_master GUID PKs, global UNIQUE(guid) retained; no real duplicate-GUID fixture yet.
+
+### Tests
+- Unit 174/174 PASS; RBAC 38/38 PASS clean EXIT 0
+
+
+### Why
+Prefer workspace-scoped company resolve and `company_id` ownership on DELETE/UPDATE/SELECT; keep `company_guid` dual-write on INSERT/SET only.
+
+### What
+- `processIngestedData`: when `opts.companyId` null, resolve via device workspace join; global `guid` fallback only if no `deviceId` (warn)
+- Migrated ownership filters (DELETEs, GST backfills, stocks/VLE/voucher_items/bill_outstanding, app_vouchers reconcile, tax extract SELECTs) to `company_id` + `currentCompanyId()`
+- Left GUID: INSERT dual-write columns, cross-table JOIN correlations, `REPAIR_VOUCHER_TYPE_PARENT_SQL`, `companies.guid` identity lookup, Tally guid-prefix LIKE
+
+### How to test
+- Ingest with deviceId + companyGuid → companyId resolves via workspace
+- Re-sync ledgers/vouchers/stocks/bill_outstanding; confirm deletes scoped correctly
+- GST details post-process updates vouchers for one company only
+
+### Risks
+- Rows with null `company_id` (pre-backfill) won't match new ownership filters until stamped
+
+## 2026-09-17 — Demo/KPI/AI upserts use company_id ON CONFLICT
+
+### Why
+Phase 3D dropped GUID ownership uniques; writers still targeting `ON CONFLICT (…, company_guid)` fail or no-op.
+
+### What
+- `demoDataService.js` — resolve `company_id` after company upsert; dual-write `company_id` on inserts; all child ON CONFLICT / DELETEs use `company_id` compounds (ledgers/vouchers/stocks/groups/units/warehouses/VLE/VII/stock_tx/batch/fy/kpi/inventory_settings)
+- `arApService.js` / `loansOdsService.js` — KPI snapshot upserts `ON CONFLICT (company_id, …)`
+- `aiInsights.js` — CREATE TABLE uniques prefer `(company_id, month_key)` / `(company_id, financial_year)`; ensure constraints; INSERT ON CONFLICT already company_id
+
+### Remaining GUID ON CONFLICT (intentional)
+- `demoDataService`: `companies ON CONFLICT (guid)`; `company_years ON CONFLICT (company_guid, fin_year)` (Phase 3D did not cut over that unique)
+
+### How to test
+- Reseed demo company; confirm no unique-violation / missing-constraint errors on seed
+- Hit AR/AP and loans KPI paths; confirm snapshot upsert
+- AI insights cache write path
+
+### Risks
+- `voucher_ledger_entries` / `batch_allocations` company_id uniques must exist (ingest already expects batch compound); if VLE unique missing, demo VLE upsert may error
+
+## 2026-09-17 — Company Identity Phase 3B (runtime convergence)
+
+### Why
+Make `companies.id` authoritative for ingest writes, scopes, and priority reads; delete post-stamp; keep UNIQUE(guid) until gate green.
+
+### What
+- `ingestCompanyDualWrite.js` wrapIngestClient — same-statement company_id dual-write; stamp DELETED
+- `req.company` on verifyCompanyAccess; MCA auth company_id-only; payment map by company_id
+- Dashboard kpi-strip reads company_id; sync_runs/sync_log/write_queue dual-write
+- Duplicate-GUID isolation test prepared (gated); docs PHASE3_LOG / deletion register
+
+### Status
+RUNTIME CUTOVER IN PROGRESS · UNIQUE cutover ELIGIBLE: NO · Production: NOT EXECUTED
+
+## 2026-09-17 — Company Identity Phase 3 (runtime cutover prep)
+
+### Why
+Move ownership toward `companies.id`, WS tenant-safe rooms, fix disconnect nulling, strict orphans, delete duplicate resolvers — without relaxing global UNIQUE(guid) or claiming production migration.
+
+### What
+- Baseline: critical dashboard test → `/api/dashboard/metrics` 401
+- Orphan remediate script; strict backfill PASS locally
+- Ingest ALS + ledgers true dual-write; stamp retained as LEGACY-BLOCK
+- `resolveCompanyInWorkspace`; deleted `assertCompanyInWorkspace`
+- member_company_access dual-write company_id; scope checks prefer company_id
+- WS rooms `company:{id}`; removed guid rooms + user_id OR
+- Reset/close keep workspace_id; hard-sync GUID remap audits, keeps id
+- Chunk sync-authority conflict; web draft keys workspace-scoped
+- Docs: PHASE3_LOG, PRODUCTION_CUTOVER, deletion register
+
+### Not done
+- Production migrate; DROP UNIQUE(guid); drop child company_guid; full dual-write all streams; public_id
+
+## 2026-09-17 — Company Identity Phase 2 (containment + additive company_id)
+
+### Why
+Cross-workspace GUID takeover and ingest company spoof were live tenant-isolation bugs. Adopt existing `companies.id` as internal relational key additively without breaking clients or relaxing `UNIQUE(guid)`.
+
+### What
+- `deviceCompanyResolution.js`: `resolveCompanyForDevice` + `assertCompanyGuidAvailableForWorkspace`
+- init-sync: DENY `COMPANY_GUID_WORKSPACE_CONFLICT`; removed forced `workspace_id` reassignment
+- chunk / sync-run/start / complete / writeback filter: device workspace ∩ company
+- Payment-map: removed `user_id` ownership OR fallback
+- Schema: `idx_companies_workspace`; nullable `company_id` on 50 child tables; ingest dual-stamp
+- Scripts: `migrate-company-id-additive.mjs`, `verify-company-id-backfill.mjs`
+- Tests: `company-identity-phase2.test.js` + `rbac/company-identity-containment.test.js`
+- Docs (workspace root): matrix, orphan report, schema plan, phase2 log, deletion register
+
+### Not done
+- Production company_id migration (RBAC ops tail OPEN)
+- DROP UNIQUE(guid) / duplicate GUID rows / client contract break
+
+## 2026-09-17 — Phase 4 RBAC production cutover
+
+### Why
+Mandatory CI A/B security suite; delete rbas kill-switch; stop legacy ownership writes; delete unused `/app/integrations` + dual WS register.
+
+### What
+- Deleted `rbas_enabled`; authorize always on
+- Stopped `companies.user_id` / `devices.user_id` writes (Deployment A); verify script + DROP prep doc
+- Deleted `/app/integrations` route+middleware; deleted WS `register_desktop` (canonical: `register` type=desktop)
+- Legacy JWT telemetry + `LEGACY_JWT_CUTOVER.md` (7-day window before branch delete)
+- `src/__tests__/rbac/*` auto-fixture HTTP/session/device/WS suite; CI workflow; `createApp.js`
+- Static guards in `rbac-phase4-static.test.js`
+
+### Tests
+`npm run test:unit` + `npm run test:rbac` (17/17 integration)
+
+## 2026-09-17 — Phase 3 RBAC convergence (delete + harden)
+
+
+### Why
+End with one authorization system; remove superseded implementations (FIX→MIGRATE→DELETE). Apply Q021 invite NONE + Q022 fail-closed legacy JWT.
+
+### What
+- Deleted: `inviteService.js`, `GET /ingest/sync-run/history`, `isOwnerOrAdmin*`, capability aliases, soft `desktopAuth` / `optionalWorkspaceContext`
+- Pair/unpair/members → `requireCapability` / `assertCapability`; custom-role nonDelegable + actor anti-escalation
+- Invite + scopes default `company_mode=NONE`; Web Team Access company-access step; print-profile / credit-debit company auth via `workspace_id`
+- JWT: sessionless denied unless explicit `ALLOW_LEGACY_JWT=1`; `rbas_enabled=false` → DENY
+- Docs: `RBAC_DELETION_REGISTER.md`, `LEGACY_APP_USAGE_MATRIX.md`, `LEGACY_JWT_USAGE.md`, regenerated route matrix / remediation / migration plans
+- Tests: `rbac-phase3-convergence.test.js` (15 pass with phase2)
+
+### Remaining LEGACY-BLOCKs
+See `RBAC_DELETION_REGISTER.md` (`/app` mount, column writes, JWT flag, membership ADMIN, dual WS register).
+
+## 2026-09-17 — Invitees promoted to OWNER (ensurePersonalWorkspace)
+
+
+### Why
+Accepted invites (Admin / Auditor) later showed as OWNER on the host workspace and could pair/unpair.
+
+### Root cause
+`ensurePersonalWorkspace` matched any `is_base` workspace the user was a member of (including the inviter’s personal WS), then `ensureOwnerSeat` forced OWNER + cleared role_id + stole OWNER seat.
+
+### Fix
+- Personal WS lookup requires `owner_user_id = userId`
+- `ensureOwnerSeat` no-ops unless caller is workspace owner
+- Repaired live data: 9024466791 OWNER, 9078802278 ADMIN, 9928522822 MEMBER+Auditor
+
+---
+
 ## 2026-09-17 — Unpair session cancel + stale pairing-code fix
 
 ### Why
