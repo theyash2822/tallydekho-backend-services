@@ -1,3 +1,46 @@
+## 2026-09-18 (local E2E regression) — Legacy /app removed from web, verifier fixed
+
+### P2 fixed — a verification gate that failed on correct data
+`verify-rbac-legacy-column-removal.mjs` grouped companies by `guid` alone and
+reported `duplicate company guids: 42` as corruption. Post-Phase-3E a GUID shared
+across workspaces is precisely what the architecture supports, which is why
+`UNIQUE(guid)` became `UNIQUE(workspace_id, guid)`. The script still encoded the
+old model, so it would have failed forever and blocked Deployment B for a
+condition the design now requires. Locally all 42 are cross-workspace and 0 are
+within-workspace. Now grouped by `(workspace_id, guid)`, which still catches real
+corruption. Test rejects a return to the old grouping.
+
+### Legacy /app surface removed from the web portal
+`SettingsContext` still called `/app/user-settings`; migrated to the existing
+`/api/auth/user-settings`, which is a superset. `api.js` also carried `request()`
+and `get/post/put/del` on the `/app` base with **zero call sites**, never
+exported — deleted, along with the then-unreferenced `APP_URL`/`BASE_URL`.
+
+This is not tidiness: while a supported client keeps the legacy surface warm, a
+completed login there records as real legacy usage and the observation window can
+never go clean.
+
+### Deployment B prerequisites, now with evidence
+Two reads of `devices.user_id` remain and the column is dropped in Deployment B:
+
+- `socketHandler.js` — write-queue fallback for rows predating `workspace_id`.
+  Local: 44 rows, **2 with NULL workspace_id**, so still reachable.
+- `pairing.js` — joins `users` for pairing-panel display only, not authorization.
+  Local: 583 devices, **1 with user_id set**, so it already yields null for 582.
+
+Also 72 of 583 devices have NULL `workspace_id` — unpaired leftovers to review.
+
+### Verified locally
+All clients resolve to the local backend (verified by executing the resolvers).
+Integrity: company_id backfill, orphan dry run and admin convergence all exit 0.
+Performance: every migration-critical table has a `company_id` index; scoped
+counts on the busiest company run under 1 ms with no sequential scan.
+
+### Tests
+201 backend unit (was 200), 43 RBAC, 22 web (was 20), mobile config, 12 desktop.
+
+---
+
 ## 2026-09-18 (telemetry hardening) — Evidence replaces headers entirely
 
 ### Why
