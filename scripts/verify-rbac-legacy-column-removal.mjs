@@ -41,12 +41,22 @@ async function main() {
     console.log('OK: paired devices have workspace_id');
   }
 
-  // Ambiguity: same guid claimed by multiple workspaces should be impossible (guid UNIQUE)
+  // Ownership must be unambiguous WITHIN a workspace. It is deliberately not
+  // unique across workspaces: two tenants may each connect a Tally company
+  // carrying the same GUID, which is the whole point of Company Identity Phase 3E
+  // (UNIQUE(guid) was replaced by UNIQUE(workspace_id, guid)).
+  //
+  // This check previously grouped by guid alone. Post-3E that reports every
+  // legitimately shared GUID as corruption — 42 of them locally — and would have
+  // blocked Deployment B for a condition the architecture now requires.
   const { rows: dup } = await pool.query(
-    `SELECT guid, count(*)::int AS n FROM companies GROUP BY guid HAVING count(*) > 1`
+    `SELECT workspace_id, guid, count(*)::int AS n
+       FROM companies
+      GROUP BY workspace_id, guid
+     HAVING count(*) > 1`
   );
-  if (dup.length) fail(`duplicate company guids: ${dup.length}`);
-  else console.log('OK: company guid uniqueness holds');
+  if (dup.length) fail(`duplicate (workspace_id, guid) pairs: ${dup.length}`);
+  else console.log('OK: company identity is unique within each workspace');
 
   await pool.end();
   if (failed) process.exit(1);

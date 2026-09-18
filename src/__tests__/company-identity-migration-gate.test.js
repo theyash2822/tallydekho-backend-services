@@ -115,6 +115,27 @@ describe('Company Identity destructive migration gate', () => {
     }
   });
 
+  it('legacy-column verification treats a shared GUID as normal, not corruption', () => {
+    const src = fs.readFileSync(
+      path.join(root, '..', 'scripts', 'verify-rbac-legacy-column-removal.mjs'),
+      'utf8'
+    );
+
+    // Two tenants may each connect a Tally company carrying the same GUID; that
+    // is what Phase 3E exists to support. Grouping by guid alone reported every
+    // shared GUID as a failure — 42 locally — and would have blocked Deployment B
+    // on a condition the architecture now requires.
+    assert.match(
+      src,
+      /GROUP BY workspace_id, guid/,
+      'uniqueness must be scoped to the workspace'
+    );
+    assert.ok(
+      !/GROUP BY guid\b/.test(src),
+      'grouping by guid alone reinstates the pre-3E global-uniqueness assumption'
+    );
+  });
+
   it('the ADMIN membership migration inspects unless CONFIRM=1', () => {
     const src = fs.readFileSync(
       path.join(root, '..', 'scripts', 'migrate-admin-membership-to-role.mjs'),
