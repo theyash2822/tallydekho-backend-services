@@ -136,10 +136,6 @@ export async function requireDeviceCredential(req, res, next) {
   }
 }
 
-export function generateToken(payload) {
-  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '30d' });
-}
-
 /**
  * requirePaired — Workspace-binding gate for /app data routes.
  * Ownership is Workspace ↔ Desktop binding, NEVER devices.user_id.

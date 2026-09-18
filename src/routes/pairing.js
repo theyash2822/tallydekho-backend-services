@@ -1,7 +1,7 @@
 // Pairing routes
 import { Router } from 'express';
 import { query } from '../db/schema.js';
-import { authMiddleware, generateToken, requireDeviceCredential } from '../middleware/auth.js';
+import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
 import { v4 as uuid } from 'uuid';
 import { pairDeviceToWorkspace, unpairDevice, BindingError } from '../services/deviceBinding.js';
 import { generateDeviceSecret, hashSecret } from '../services/deviceCredential.js';

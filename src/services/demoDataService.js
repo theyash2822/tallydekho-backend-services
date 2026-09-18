@@ -957,24 +957,3 @@ export async function ensureSystemDemoWorkspace() {
   );
   return SYSTEM_DEMO_WORKSPACE_ID;
 }
-
-/** Reseed every Demo Company in the DB (ops / founder refresh). */
-export async function reseedAllDemoCompanies() {
-  const { rows } = await query(
-    `SELECT guid, workspace_id, name FROM companies
-     WHERE name ILIKE 'Demo%' OR guid LIKE 'dddddddd%'
-     ORDER BY created_at NULLS LAST`
-  );
-  const out = [];
-  for (const c of rows) {
-    if (!c.workspace_id) continue;
-    try {
-      const r = await seedFullDemoCompany(null, c.workspace_id, c.guid);
-      out.push({ guid: c.guid, ok: true, counts: r?.counts });
-    } catch (e) {
-      console.error('[demo] reseed failed', c.guid, e.message);
-      out.push({ guid: c.guid, ok: false, error: e.message });
-    }
-  }
-  return out;
-}

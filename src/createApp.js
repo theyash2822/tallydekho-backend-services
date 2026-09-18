@@ -21,6 +21,7 @@ import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
 import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler, setDesktopWorkspaceSocket } from './routes/desktopWorkspace.js';
 import { setWorkspaceApiSocket } from './routes/workspaceApi.js';
 import { setWorkspaceSocket } from './socket/workspaceEmit.js';
+import { requestContext, internalErrorShield, INTERNAL_ERROR_MESSAGE } from './middleware/internalErrorShield.js';
 
 export function createApp() {
   const app = express();
@@ -34,6 +35,8 @@ export function createApp() {
 
   app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(cors({ origin: '*', credentials: true }));
+  app.use(requestContext);
+  app.use(internalErrorShield);
   app.use(compression());
   app.use('/ingest/chunk', express.raw({ type: '*/*', limit: '50mb' }));
   app.use('/desktop/backup/objects/:token', express.raw({ type: '*/*', limit: '2gb' }));
@@ -63,8 +66,8 @@ export function createApp() {
 
   app.use((req, res) => res.status(404).json({ status: false, message: `Route ${req.path} not found` }));
   app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ status: false, message: err.message });
+    console.error('[unhandled]', { requestId: req.requestId, path: req.originalUrl }, err.stack);
+    res.status(500).json({ status: false, message: INTERNAL_ERROR_MESSAGE, requestId: req.requestId });
   });
 
   setSocketService(socketService);

@@ -8,6 +8,7 @@ import { getEffectiveAccess, loadMembership, assertCapability } from './authoriz
 import {
   ensureDemoCompany,
   filterCompaniesByPairingStatus,
+  isDemoCompany,
   isDemoEligible,
   CANONICAL_DEMO_GUID,
 } from './demoDataService.js';
@@ -1965,14 +1966,15 @@ export async function executeWorkspaceReset(actorUserId, workspaceId, { system =
     [workspaceId]
   ).catch(() => {});
 
-  // Detach non-demo companies: purge tally data + clear workspace binding
+  // Detach non-demo companies: purge tally data + clear workspace binding.
+  // is_demo is the only Demo classifier — a real Tally company named
+  // "Demo Traders" must be reset like any other real company.
   const { rows: companies } = await query(
-    `SELECT id, guid, name FROM companies WHERE workspace_id = $1`,
+    `SELECT id, guid, name, is_demo FROM companies WHERE workspace_id = $1`,
     [workspaceId]
   );
   for (const c of companies) {
-    const isDemo = /demo/i.test(c.name || '') || String(c.guid || '').startsWith('DEMO');
-    if (!isDemo) {
+    if (!isDemoCompany(c)) {
       await purgeCompanyTallyData(c.guid, { workspaceId, companyId: c.id }).catch((e) => {
         console.warn('[reset] purgeCompanyTallyData:', e.message);
       });

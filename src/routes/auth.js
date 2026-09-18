@@ -3,13 +3,36 @@ import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
-import { authMiddleware, generateToken } from '../middleware/auth.js';
+import { authMiddleware } from '../middleware/auth.js';
+import { createAuthSession } from '../services/authSessionService.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendEmailVerificationOTP } from '../services/notifications.js';
 import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { getUserPairingHints } from '../services/userPairingHints.js';
 import { devOtpSuffix } from '../utils/otpLogging.js';
 import { recordLegacyAuthEvent, LEGACY_EVENTS } from '../services/legacyAuthTelemetry.js';
+
+/**
+ * LEGACY-BLOCK-APP-AUTH — credential issued by the legacy /app login surface.
+ *
+ * caller:      td-source/mobile (React Native), whose API base is `<host>/app`
+ *              and which posts /app/send-otp + /app/verify-otp.
+ * reason:      that client has no /api/auth/* or refresh-token support, so the
+ *              route shape has to stay until it is migrated or retired.
+ * prerequisite for deletion:
+ *              migrate td-source/mobile to /api/auth/* (or confirm retirement),
+ *              then seven clean days of zero identified LEGACY_APP_AUTH_HIT.
+ *
+ * What changed: this used to mint a sessionless 30-day bearer via
+ * generateToken(). Since authMiddleware rejects sessionless JWTs outside
+ * ALLOW_LEGACY_JWT=1, that token could not authenticate anything — it was a
+ * long-lived credential with no purpose. The legacy surface now issues exactly
+ * the same short-lived, server-backed session as /api/auth, so there is one
+ * auth architecture and no 30-day bearer.
+ */
+async function issueLegacyAppSession(userId, mobile) {
+  return createAuthSession(userId, { mobile, clientType: 'legacy-app' });
+}
 
 /** Bootstrap Personal Workspace + billing/roles; never fail the auth response. */
 async function bootstrapWorkspaceSafe(userId) {
@@ -143,10 +166,11 @@ router.post('/verify-otp', async (req, res) => {
     // ── No 2FA — issue full token ───────────────────────────────────────────
     // Same reasoning as the 2FA branch: OTP verified, credential being issued.
     void recordLegacyAuthEvent(LEGACY_EVENTS.LOGIN_SUCCESS, req, { serverVerified: true });
-    const token = generateToken({ userId: user.id, mobile: cleanMobile });
+    const session = await issueLegacyAppSession(user.id, cleanMobile);
+    const token = session.accessToken;
 
-    await query(`UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3`,
-      [token, now(), user.id]);
+    await query(`UPDATE users SET otp = NULL, otp_expires = NULL, updated_at = $1 WHERE id = $2`,
+      [now(), user.id]);
 
     await bootstrapWorkspaceSafe(user.id);
 
@@ -162,6 +186,8 @@ router.post('/verify-otp', async (req, res) => {
       message: 'OTP verified successfully',
       data: {
         token,
+        refresh_token: session.refreshToken,
+        expires_in: session.accessExpiresIn,
         isPaired,
         isNewUser,
         requires2FA: false,
@@ -374,8 +400,9 @@ router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
     const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
     if (!match) return res.status(401).json({ status: false, message: 'Incorrect PIN. Try again.' });
 
-    const token = generateToken({ userId: user.id, mobile: user.mobile });
-    await query('UPDATE users SET token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
+    const session = await issueLegacyAppSession(user.id, user.mobile);
+    const token = session.accessToken;
+    await query('UPDATE users SET updated_at = $1 WHERE id = $2', [now(), user.id]);
 
     await bootstrapWorkspaceSafe(user.id);
 
@@ -388,6 +415,8 @@ router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
       message: 'PIN verified successfully',
       data: {
         token,
+        refresh_token: session.refreshToken,
+        expires_in: session.accessExpiresIn,
         isPaired,
         isNewUser,
         user: { id: user.id, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },
@@ -436,8 +465,8 @@ router.post('/reset-pin', preAuthMiddleware, async (req, res) => {
     // After reset, issue a full token so user can log in
     const { rows } = await query('SELECT mobile, name, language FROM users WHERE id=$1', [req.user.userId]);
     const user = rows[0];
-    const token = generateToken({ userId: req.user.userId, mobile: user.mobile });
-    await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
+    const session = await issueLegacyAppSession(req.user.userId, user.mobile);
+    const token = session.accessToken;
 
     const { isPaired } = await getUserPairingHints(req.user.userId);
     console.log(`[2FA] PIN reset for user ${req.user.userId}`);
@@ -446,6 +475,8 @@ router.post('/reset-pin', preAuthMiddleware, async (req, res) => {
       message: 'PIN reset successfully',
       data: {
         token,
+        refresh_token: session.refreshToken,
+        expires_in: session.accessExpiresIn,
         isPaired,
         isNewUser: !user.name,
         user: { id: req.user.userId, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },

@@ -81,14 +81,71 @@ export function cidDestructiveMigrationsAllowed() {
   );
 }
 
+/**
+ * Anchor table whose owner defines who should own every application object.
+ * `users` is in the first CREATE batch below, so it exists in any database that
+ * has ever been bootstrapped.
+ */
+const SCHEMA_OWNER_ANCHOR = 'users';
+
+/**
+ * Adopt the role that already owns the schema, for the duration of this client.
+ *
+ * Postgres assigns ownership to whoever executes CREATE, and `initSchema` issues
+ * `CREATE TABLE IF NOT EXISTS` on every boot. So a maintenance script run as a
+ * superuser (`postgresql://mac@…`) silently created new tables owned by that
+ * superuser, while the app connects as `tallydekho` — and the app could then no
+ * longer ALTER its own table. That surfaced as RBAC tests failing with
+ * "must be owner of table demo_simulated_entries", repaired by hand each time.
+ *
+ * Adopting the established owner makes it self-correcting: the first bootstrap
+ * of an empty database sets the owner, and every later bootstrap — whoever runs
+ * it — creates objects as that same role.
+ */
+async function adoptSchemaOwner(client) {
+  const configured = process.env.DB_APP_ROLE?.trim();
+  const { rows } = await client.query(
+    `SELECT current_user AS me,
+            (SELECT tableowner FROM pg_tables
+              WHERE schemaname = current_schema() AND tablename = $1) AS owner`,
+    [SCHEMA_OWNER_ANCHOR]
+  );
+  const me = rows[0]?.me;
+  // No anchor table yet = fresh database; whoever bootstraps it becomes owner.
+  const target = configured || rows[0]?.owner;
+  if (!target || target === me) return null;
+
+  const { rows: member } = await client.query(`SELECT pg_has_role($1, 'MEMBER') AS ok`, [target]);
+  if (!member[0]?.ok) {
+    // Not fatal on its own — DDL against existing objects will fail loudly with
+    // a far clearer error than a silently mis-owned new table.
+    console.warn(
+      `[DB] schema is owned by "${target}" but this connection is "${me}", which is not a member of it. ` +
+        'New objects will be mis-owned; run scripts/verify-db-ownership.mjs.'
+    );
+    return null;
+  }
+  await client.query(`SET ROLE ${quoteIdent(target)}`);
+  if (target !== me) console.log(`[DB] bootstrapping as schema owner "${target}" (connected as "${me}")`);
+  return target;
+}
+
+/** Identifier quoting for a role name that never reaches SQL as a parameter. */
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
 // Initialize schema — create all tables if they don't exist
 export async function initSchema() {
   const client = await pool.connect();
+  let adoptedRole = null;
   try {
     assertAppEnvConsistency();
-    // Fail closed before any DDL if this app is pointed at another
-    // environment's database (e.g. a staging deploy still holding the
-    // production DATABASE_URL).
+    // Before any DDL: ensureDeploymentIdentity creates a table of its own, so
+    // it has to run as the schema owner like everything else.
+    adoptedRole = await adoptSchemaOwner(client);
+    // Fail closed if this app is pointed at another environment's database
+    // (e.g. a staging deploy still holding the production DATABASE_URL).
     await ensureDeploymentIdentity(client);
 
     await client.query(`
@@ -1260,6 +1317,8 @@ export async function initSchema() {
 
     console.log('✅ PostgreSQL schema initialized');
   } finally {
+    // The client goes back to a shared pool, so the role change must not.
+    if (adoptedRole) await client.query('RESET ROLE').catch(() => {});
     client.release();
   }
 }

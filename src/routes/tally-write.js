@@ -359,17 +359,26 @@ const updateWriteQueue = async (id, result, error) => {
     let resolvedVoucherNumber = result?.voucherNumber || null;
     const tallyId = result?.tallyId || null;
 
+    // This runs after the HTTP response and again inside setImmediate, so there
+    // is no request in scope. write_queue is the authoritative tenant context:
+    // company_id (internal), company_guid (Tally-facing) and the owning user.
+    const { rows: wqCtxRows } = await query(
+      `SELECT user_id, company_guid, company_id, workspace_id FROM write_queue WHERE id = $1`,
+      [id]
+    ).catch(() => ({ rows: [] }));
+    const wqCtx = wqCtxRows[0] || null;
+    const wqCompanyId = wqCtx?.company_id ?? null;
+
     // When Tally Series is used, import ack often returns LASTVCHID only (no VOUCHERNUMBER).
     // Backfill number from vouchers table via TDK narration/reference anchor when available.
-    if (!resolvedVoucherNumber) {
+    if (!resolvedVoucherNumber && wqCompanyId != null) {
       try {
         const { rows: avLookup } = await query(
           `SELECT company_guid, tdk_reference_no FROM app_vouchers WHERE write_queue_id = $1 LIMIT 1`,
           [id]
         );
         const tdkRef = avLookup[0]?.tdk_reference_no;
-        const companyGuid = avLookup[0]?.company_guid;
-        if (tdkRef && companyGuid) {
+        if (tdkRef) {
           const { rows: vRows } = await query(
             `SELECT voucher_number FROM vouchers
               WHERE company_id = $1
@@ -380,7 +389,7 @@ const updateWriteQueue = async (id, result, error) => {
                 AND COALESCE(is_cancelled, false) = false
               ORDER BY date DESC NULLS LAST, alter_id DESC NULLS LAST
               LIMIT 1`,
-            [req.company?.id, tdkRef]
+            [wqCompanyId, tdkRef]
           );
           if (vRows[0]?.voucher_number) resolvedVoucherNumber = String(vRows[0].voucher_number);
         }
@@ -419,12 +428,8 @@ const updateWriteQueue = async (id, result, error) => {
       // Auto-IRN: if e_invoice_mode = 'auto' and e_invoice_applicable = 'applicable_configured', trigger IRN
       setImmediate(async () => {
         try {
-          // Get companyGuid and userId from write_queue entry
-          const { rows: wqRows } = await query(
-            `SELECT user_id, company_guid, company_id FROM write_queue WHERE id = $1`, [id]
-          ).catch(() => ({ rows: [] }));
-          if (!wqRows[0]) return;
-          const { user_id: userId, company_guid: companyGuid, company_id: wqCompanyId } = wqRows[0];
+          if (!wqCtx || wqCompanyId == null) return;
+          const { user_id: userId, company_guid: companyGuid } = wqCtx;
 
           // Check if auto-IRN is configured for this company
           const { rows: cfgRows } = await query(
@@ -450,8 +455,11 @@ const updateWriteQueue = async (id, result, error) => {
           const { rows: coRows } = await query(
             `SELECT gstin, name FROM companies WHERE id = $1`, [wqCompanyId]
           ).catch(() => ({ rows: [] }));
+          // A Tally GUID is unique only inside one workspace, so the reload must
+          // stay pinned to the company that owns this queue entry.
           const { rows: voucherRows } = await query(
-            `SELECT * FROM vouchers WHERE guid = $1`, [vRows[0].guid]
+            `SELECT * FROM vouchers WHERE guid = $1 AND company_id = $2`,
+            [vRows[0].guid, wqCompanyId]
           ).catch(() => ({ rows: [] }));
 
           if (einvoiceCreds?.gstin && coRows[0] && voucherRows[0]) {
@@ -471,12 +479,8 @@ const updateWriteQueue = async (id, result, error) => {
       // Auto-EWB: if e_way_bill_mode = 'auto' and e_way_bill_applicable = 'applicable_configured'
       setImmediate(async () => {
         try {
-          // Get companyGuid and userId from write_queue entry
-          const { rows: wqRowsEWB } = await query(
-            `SELECT user_id, company_guid, company_id FROM write_queue WHERE id = $1`, [id]
-          ).catch(() => ({ rows: [] }));
-          if (!wqRowsEWB[0]) return;
-          const { user_id: userId, company_guid: companyGuid, company_id: wqCompanyId } = wqRowsEWB[0];
+          if (!wqCtx || wqCompanyId == null) return;
+          const { user_id: userId, company_guid: companyGuid } = wqCtx;
 
           // Check if auto-EWB is configured for this company
           const { rows: ewbCfgRows } = await query(
@@ -500,7 +504,7 @@ const updateWriteQueue = async (id, result, error) => {
              WHERE v.company_id = $1 AND v.voucher_number = $2
              ORDER BY (av.payload IS NOT NULL) DESC, v.date DESC
              LIMIT 1`,
-            [req.company?.id, resolvedVoucherNumber, id]
+            [wqCompanyId, resolvedVoucherNumber, id]
           ).catch(() => ({ rows: [] }));
           if (!vRowsEWB[0]) return;
 
@@ -1633,56 +1637,6 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
   } catch (e) {
     await updateWriteQueue(queueId, null, e.message);
     res.status(500).json({ status: false, message: e.message });
-  }
-});
-
-// ── POST /tally/debug/alter-probe ─────────────────────────────────────────────
-// One-shot: narration-only Alter by DATE + TAGNAME + MASTERID. Does not convert,
-// does not cancel, does not update app_vouchers.
-router.post('/debug/alter-probe', authMiddleware, async (req, res) => {
-  const {
-    companyGuid,
-    companyName,
-    masterId,
-    date,
-    tagName = 'MASTER ID',
-    vchType = 'Sales',
-    narration = 'Edited from TallyDekho using Master ID probe',
-  } = req.body || {};
-  if (!companyGuid || !companyName || !masterId || !date) {
-    return res.status(400).json({ status: false, message: 'companyGuid, companyName, masterId, date required' });
-  }
-  const dt = tallyDate(date);
-  const xml = buildMinimalVoucherAlterXml({
-    companyName, vchType, dt, masterId: String(masterId), tagName, narration,
-  });
-  const queueId = await logWriteQueue(
-    req.user.userId, req.company?.id, 'alter_probe',
-    `Alter probe MASTERID ${masterId}`, 0,
-    { probe: true, masterId, date: dt, tagName, narration }, xml
-  ).catch(() => null);
-  try {
-    const result = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id });
-    await updateWriteQueue(queueId, result, null);
-    console.log('[alter-probe]', {
-      masterId, dt, tagName,
-      created: result?.created, altered: result?.altered,
-      tallyId: result?.tallyId, voucherNumber: result?.voucherNumber,
-      status: result?.status, message: result?.message,
-    });
-    return res.json({
-      status: true,
-      probe: true,
-      xml,
-      created: Number(result?.created || 0),
-      altered: Number(result?.altered || 0),
-      tallyId: result?.tallyId || null,
-      voucherNumber: result?.voucherNumber || null,
-      data: result,
-    });
-  } catch (e) {
-    await updateWriteQueue(queueId, null, e.message);
-    return res.status(500).json({ status: false, message: e.message, xml });
   }
 });
 
@@ -3007,45 +2961,6 @@ router.get('/write-queue/:deviceId', async (req, res) => {
   res.json({ status: true, data: { queue: [] } });
 });
 
-
-// GET /tally/report/:type - Request report from Tally via desktop
-// type: profit-loss | balance-sheet | trial-balance | day-book | stock-summary | bills-receivable | bills-payable
-router.post('/report', authMiddleware, async (req, res) => {
-  const { companyGuid, companyName, reportType, fromDate, toDate } = req.body;
-  if (!companyGuid || !reportType) return res.status(400).json({ status: false, message: 'companyGuid and reportType required' });
-
-  const reportMap = {
-    'profit-loss':      'Profit and Loss',
-    'balance-sheet':    'Balance Sheet',
-    'trial-balance':    'Trial Balance',
-    'day-book':         'Daybook',
-    'stock-summary':    'Stock Summary',
-    'bills-receivable': 'Bills Receivable',
-    'bills-payable':    'Bills Payable',
-  };
-
-  const tallyReport = reportMap[reportType];
-  if (!tallyReport) return res.status(400).json({ status: false, message: `Unknown report type: ${reportType}` });
-
-  const fd = fromDate ? fromDate.split('-').reverse().join('-') : '01-04-2024';
-  const td = toDate ? toDate.split('-').reverse().join('-') : '31-03-2025';
-
-  // This is an export request — desktop will call Tally and return data
-  const requestPayload = {
-    type: 'report',
-    reportName: tallyReport,
-    companyName,
-    fromDate: fd,
-    toDate: td,
-  };
-
-  try {
-    const result = await forwardToTally(companyGuid, req.user.userId, JSON.stringify(requestPayload, { companyId: req.company?.id }));
-    res.json({ status: true, message: `${tallyReport} report requested`, data: result });
-  } catch (e) {
-    res.status(500).json({ status: false, message: e.message });
-  }
-});
 
 // POST /tally/master/warehouse - Create Godown/Warehouse in Tally
 router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/master/warehouse'), async (req, res) => {
@@ -5689,6 +5604,12 @@ const RETRY_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 const RETRY_MAX_PER_RUN  = 25; // cap per startup/reconnect
 
 export async function retryOfflineEntries(userId, companyGuid, workspaceId = null) {
+  // A Tally GUID is unique only inside one workspace, so narrowing the retry set
+  // by GUID alone could re-push another tenant's queued XML. Callers that want a
+  // company filter must say which workspace it belongs to.
+  if (companyGuid && !workspaceId) {
+    throw new Error('retryOfflineEntries: workspaceId is required when filtering by companyGuid');
+  }
   // Debounce: skip if already ran within the last 5 minutes for this workspace/user
   const debounceKey = workspaceId || userId;
   const lastRun = _retryDebounce.get(debounceKey) || 0;
@@ -5721,15 +5642,13 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
     if (companyGuid) {
       params.push(companyGuid);
       const gIdx = params.length;
-      if (workspaceId) {
-        params.push(workspaceId);
-        const wsForCo = params.length;
-        clauses.push(
-          `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
-        );
-      } else {
-        clauses.push(`company_id IN (SELECT id FROM companies WHERE guid = $${gIdx}) OR company_guid = $${gIdx}`);
-      }
+      params.push(workspaceId);
+      const wsForCo = params.length;
+      // company_guid is only trusted on rows that predate company_id, and only
+      // within the workspace already pinned by the clause above.
+      clauses.push(
+        `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
+      );
     }
     const { rows } = await query(
       `SELECT * FROM write_queue WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${RETRY_MAX_PER_RUN}`,

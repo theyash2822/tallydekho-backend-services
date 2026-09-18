@@ -8,7 +8,7 @@ import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
-import { authMiddleware, generateToken } from '../middleware/auth.js';
+import { authMiddleware } from '../middleware/auth.js';
 import { resolveWorkspaceMiddleware } from '../middleware/workspaceContext.js';
 import {
   createDemoEntry,
@@ -381,7 +381,7 @@ router.post('/auth/verify-otp', async (req, res) => {
     const { createAuthSession } = await import('../services/authSessionService.js');
     const session = await createAuthSession(user.id, { mobile: cleanMobile, clientType: 'app' });
     const token = session.accessToken;
-    await query('UPDATE users SET otp = NULL, otp_expires = NULL, token = $1, updated_at = $2 WHERE id = $3', [token, now(), user.id]);
+    await query('UPDATE users SET otp = NULL, otp_expires = NULL, updated_at = $1 WHERE id = $2', [now(), user.id]);
 
     const { isPaired, company } = await getUserPairingHints(user.id);
 
@@ -437,7 +437,6 @@ router.post('/auth/register', authMiddleware, async (req, res) => {
     const { createAuthSession } = await import('../services/authSessionService.js');
     const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
     const token = session.accessToken;
-    await query('UPDATE users SET token = $1 WHERE id = $2', [token, user.id]);
 
     try {
       await ensurePersonalWorkspace(user.id);
@@ -511,7 +510,6 @@ router.post('/auth/logout', authMiddleware, async (req, res) => {
     if (pushToken) {
       await query('DELETE FROM push_tokens WHERE user_id=$1 AND token=$2', [req.user.userId, pushToken]).catch(() => {});
     }
-    await query('UPDATE users SET token = NULL WHERE id = $1', [req.user.userId]);
     try {
       const { revokeSession, revokeAllSessionsForUser } = await import('../services/authSessionService.js');
       if (req.user.sessionId) {
@@ -603,6 +601,38 @@ router.post('/tally-sync/pair', authMiddleware, async (_req, res) => {
   });
 });
 
+/**
+ * Headline company for the legacy tally-sync status payload.
+ *
+ * Demo-ness comes from `companies.is_demo` only. Classifying by a `demo%` name
+ * prefix used to hide a real Tally company called e.g. "Demo Traders" from a
+ * paired workspace and surface it as the Demo fixture when unpaired.
+ */
+async function resolveStatusCompany(workspaceId, pairingStatus) {
+  const { isDemoEligible, CANONICAL_DEMO_GUID } = await import('../services/demoDataService.js');
+  if (isDemoEligible(pairingStatus)) {
+    // The canonical Demo lives in the reserved system workspace and is
+    // projected into every unpaired workspace.
+    const { rows } = await query(
+      `SELECT guid, name, gstin FROM companies
+       WHERE guid = $1 AND is_demo = TRUE LIMIT 1`,
+      [CANONICAL_DEMO_GUID]
+    );
+    if (!rows[0]) return null;
+    return { guid: rows[0].guid, name: rows[0].name, gstin: rows[0].gstin || null };
+  }
+  // Paired in any state — including Desktop offline — means real books only.
+  const { rows } = await query(
+    `SELECT guid, name, gstin FROM companies
+     WHERE workspace_id = $1 AND is_active = TRUE AND COALESCE(is_demo, FALSE) = FALSE
+     ORDER BY synced_at DESC NULLS LAST, name ASC
+     LIMIT 1`,
+    [workspaceId]
+  );
+  if (!rows[0]) return null;
+  return { guid: rows[0].guid, name: rows[0].name, gstin: rows[0].gstin || null };
+}
+
 // GET /api/tally-sync/status
 // Workspace-aware: invited members inherit CONNECTED status from the workspace desktop,
 // not from their personal device pairing.
@@ -648,35 +678,7 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
           desktopOnline = !!(device && Number.isFinite(lastSeenSecs) && lastSeenSecs > 0
             && (nowSecs - lastSeenSecs) < ONLINE_THRESHOLD_SECS);
         }
-        let company = null;
-        if (status === 'CONNECTED') {
-          // CONNECTED: never return Demo Company (Mobile must not flicker Demo ↔ empty)
-          const { rows: companies } = await query(
-            `SELECT guid, name, gstin FROM companies
-             WHERE workspace_id = $1 AND is_active = TRUE
-               AND LOWER(COALESCE(name,'')) NOT LIKE 'demo%'
-               AND guid NOT LIKE 'dddddddd-dddd-4ddd-8ddd-%'
-             ORDER BY synced_at DESC NULLS LAST, name ASC
-             LIMIT 1`,
-            [workspaceId]
-          );
-          if (companies[0]) {
-            company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-          }
-          // If only Demo exists while CONNECTED, leave company=null (paired empty state)
-        } else {
-          // UNPAIRED + RECONNECTING: Demo only (same as companies list)
-          const { rows: demoCos } = await query(
-            `SELECT guid, name, gstin FROM companies
-             WHERE workspace_id = $1 AND is_active = TRUE
-               AND (LOWER(COALESCE(name,'')) LIKE 'demo%' OR guid LIKE 'dddddddd-dddd-4ddd-8ddd-%')
-             ORDER BY name ASC LIMIT 1`,
-            [workspaceId]
-          );
-          if (demoCos[0]) {
-            company = { guid: demoCos[0].guid, name: demoCos[0].name, gstin: demoCos[0].gstin || null };
-          }
-        }
+        const company = await resolveStatusCompany(workspaceId, status);
         const lastSeenSecs = Number(device?.last_seen);
         return res.json({
           success: true,
@@ -704,32 +706,7 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
         const status = await getConnectionStatus(personal.id);
         const payload = await buildTallyStatusPayload(personal.id, req.user.userId);
         const isPaired = status === 'CONNECTED' || status === 'RECONNECTING';
-        let company = null;
-        if (status === 'CONNECTED') {
-          const { rows: companies } = await query(
-            `SELECT guid, name, gstin FROM companies
-             WHERE workspace_id = $1 AND is_active = TRUE
-               AND LOWER(COALESCE(name,'')) NOT LIKE 'demo%'
-               AND guid NOT LIKE 'dddddddd-dddd-4ddd-8ddd-%'
-             ORDER BY synced_at DESC NULLS LAST, name ASC
-             LIMIT 1`,
-            [personal.id]
-          );
-          if (companies[0]) {
-            company = { guid: companies[0].guid, name: companies[0].name, gstin: companies[0].gstin || null };
-          }
-        } else {
-          const { rows: demoCos } = await query(
-            `SELECT guid, name, gstin FROM companies
-             WHERE workspace_id = $1 AND is_active = TRUE
-               AND (LOWER(COALESCE(name,'')) LIKE 'demo%' OR guid LIKE 'dddddddd-dddd-4ddd-8ddd-%')
-             ORDER BY name ASC LIMIT 1`,
-            [personal.id]
-          );
-          if (demoCos[0]) {
-            company = { guid: demoCos[0].guid, name: demoCos[0].name, gstin: demoCos[0].gstin || null };
-          }
-        }
+        const company = await resolveStatusCompany(personal.id, status);
         return res.json({
           success: true,
           data: {
@@ -6077,7 +6054,8 @@ router.post('/einvoice/cancel', authMiddleware, async (req, res) => {
     await query(`UPDATE vouchers SET irn_cancelled=TRUE WHERE guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     await query(
-      `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2)`,
+      `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
       [companyId, voucherGuid]
     ).catch(() => {});
     res.json({ success: true, message: 'IRN cancelled successfully' });
@@ -6981,62 +6959,6 @@ router.get('/ai/insights/history/:fy', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } }); }
 });
 
-// POST /api/admin/backfill-stock-voucher-types — One-time fix: populate NULL voucher_type in stock_transactions from vouchers table
-// Root cause: SimplifiedVoucher.xml omits VOUCHERTYPENAME, leaving voucher_type = NULL — breaks transaction type filter
-router.post('/admin/backfill-stock-voucher-types', authMiddleware, async (req, res) => {
-  const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
-  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
-  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const companyId = requireResolvedCompanyId(req);
-  try {
-    const { rowCount } = await query(`
-      UPDATE stock_transactions st
-      SET voucher_type = v.voucher_type
-      FROM vouchers v
-      WHERE st.voucher_guid = v.guid
-        AND st.company_id = v.company_id
-        AND st.company_id=$1
-        AND (st.voucher_type IS NULL OR st.voucher_type = '')
-        AND v.voucher_type IS NOT NULL AND v.voucher_type != ''
-    `, [companyId]);
-    res.json({ success: true, data: { updated: rowCount, message: `Backfilled voucher_type for ${rowCount} stock_transactions` } });
-  } catch (e) {
-    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: e.message } });
-  }
-});
-
-// POST /api/admin/backfill-gst — Recompute gst_voucher_details from ledger entries (CGST/SGST/IGST)
-router.post('/admin/backfill-gst', authMiddleware, async (req, res) => {
-  const companyGuid = req.body?.companyGuid || req.query.companyGuid || req.user.companyGuid;
-  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
-  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
-  const companyId = requireResolvedCompanyId(req);
-  try {
-    const { rowCount } = await query(`
-      UPDATE gst_voucher_details gvd
-      SET cgst_amount=sub.cgst, sgst_amount=sub.sgst, igst_amount=sub.igst, taxable_amount=sub.taxable
-      FROM (
-        SELECT v.guid as voucher_guid, v.company_id,
-          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' THEN ABS(vle.amount) ELSE 0 END),0) as cgst,
-          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%UTGST%' THEN ABS(vle.amount) ELSE 0 END),0) as sgst,
-          COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0) as igst,
-          GREATEST(0, COALESCE(SUM(CASE WHEN vle.dr_cr='Dr' THEN ABS(vle.amount) ELSE 0 END),0) -
-            COALESCE(SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END),0)) as taxable
-        FROM vouchers v
-        JOIN voucher_ledger_entries vle ON vle.voucher_guid = v.guid AND vle.company_id = v.company_id
-        WHERE v.company_id=$1
-        GROUP BY v.guid, v.company_id
-        HAVING SUM(CASE WHEN vle.ledger_name ILIKE '%CGST%' OR vle.ledger_name ILIKE '%SGST%' OR vle.ledger_name ILIKE '%IGST%' THEN ABS(vle.amount) ELSE 0 END) > 0
-      ) sub
-      WHERE gvd.voucher_guid = sub.voucher_guid AND gvd.company_id = sub.company_id`,
-      [companyId]
-    );
-    res.json({ success: true, data: { updated: rowCount } });
-  } catch (err) {
-    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
-});
-
 // ── Company Profile — GET + PUT ────────────────────────────────────────────────
 router.get('/company/profile', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -7327,7 +7249,7 @@ router.post('/auth/verify-pin', preAuthMiddleware, async (req, res) => {
     const { createAuthSession } = await import('../services/authSessionService.js');
     const session = await createAuthSession(user.id, { mobile: user.mobile, clientType: 'app' });
     const token = session.accessToken;
-    await query('UPDATE users SET token=$1, updated_at=$2 WHERE id=$3', [token, now(), user.id]);
+    await query('UPDATE users SET updated_at=$1 WHERE id=$2', [now(), user.id]);
     const { isPaired, company } = await getUserPairingHints(user.id);
     console.log(`[API 2FA] PIN verified for user ${user.id}`);
     res.json({
@@ -7372,7 +7294,6 @@ router.post('/auth/reset-pin', preAuthMiddleware, async (req, res) => {
     const { createAuthSession } = await import('../services/authSessionService.js');
     const session = await createAuthSession(req.user.userId, { mobile: u.mobile, clientType: 'app' });
     const token = session.accessToken;
-    await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
     const { isPaired } = await getUserPairingHints(req.user.userId);
     res.json({
       success: true,

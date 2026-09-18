@@ -1212,7 +1212,7 @@ router.get('/workspaces/:id/company-years', authMiddleware, bindWorkspaceParam, 
       return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'companyGuid required' } });
     }
     const { rows: owned } = await query(
-      `SELECT guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+      `SELECT id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
       [companyGuid, req.params.id]
     );
     if (!owned[0]) {
@@ -1220,8 +1220,8 @@ router.get('/workspaces/:id/company-years', authMiddleware, bindWorkspaceParam, 
     }
     const { rows } = await query(
       `SELECT fin_year AS financial_year, begin_date AS start_date, end_date
-       FROM company_years WHERE company_guid = $1 ORDER BY begin_date DESC`,
-      [companyGuid]
+       FROM company_years WHERE company_id = $1 ORDER BY begin_date DESC`,
+      [owned[0].id]
     );
     res.json({ success: true, data: rows });
   } catch (err) {

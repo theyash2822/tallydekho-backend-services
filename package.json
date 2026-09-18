@@ -11,7 +11,8 @@
     "test:rbac": "RBAC_INTEGRATION=1 node --import dotenv/config --test --test-concurrency=1 \"src/__tests__/rbac/*.test.js\"",
     "test": "npm run test:unit && npm run test:rbac",
     "test:ci": "npm test",
-    "verify:legacy-columns": "node scripts/verify-rbac-legacy-column-removal.mjs"
+    "verify:legacy-columns": "node scripts/verify-rbac-legacy-column-removal.mjs",
+    "verify:db-ownership": "node scripts/verify-db-ownership.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1042.0",
