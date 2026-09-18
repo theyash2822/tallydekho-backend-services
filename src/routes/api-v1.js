@@ -9,6 +9,14 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/schema.js';
 import { authMiddleware, generateToken } from '../middleware/auth.js';
+import { resolveWorkspaceMiddleware } from '../middleware/workspaceContext.js';
+import {
+  createDemoEntry,
+  listDemoEntries,
+  deleteDemoEntry,
+  clearDemoEntries,
+  toMyEntriesRow,
+} from '../services/demoSimulatedEntryService.js';
 import { pairDeviceToWorkspace, BindingError, unpairDevice } from '../services/deviceBinding.js';
 import workspaceApi from './workspaceApi.js';
 import { ensurePersonalWorkspace, getMemberScopes } from '../services/workspaceService.js';
@@ -2797,11 +2805,70 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       });
     }
 
+    // The caller's own simulated Demo entries, listed alongside real ones and
+    // never mixed into them. They carry no Tally status because they were never
+    // sent anywhere.
+    const demoRows = (await listDemoEntries({ userId: req.user.userId, workspaceId: req.workspaceId }))
+      .map(toMyEntriesRow);
+
     res.json({
       success: true,
       data: allRows.filter(r => r._queue_status === 'posted'),
       pending: allRows.filter(r => r._queue_status !== 'posted'),
+      simulated: demoRows,
     });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ─── Private simulated Demo entries ──────────────────────────────────────────
+// Demo is a shared immutable fixture, so practice entries live beside it rather
+// than inside it. Ownership is the authenticated user in every statement; there
+// is no path that reads or deletes another user's rows.
+
+router.post('/demo/entries', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+  try {
+    const { entryType, payload } = req.body || {};
+    const row = await createDemoEntry({
+      userId: req.user.userId,
+      workspaceId: req.workspaceId,
+      companyId: req.company?.id ?? null,
+      entryType,
+      payload,
+    });
+    res.status(201).json({ success: true, data: toMyEntriesRow(row) });
+  } catch (err) {
+    res.status(err.httpStatus || 500).json({
+      success: false,
+      error: { code: err.httpStatus === 400 ? 'VALIDATION_ERROR' : 'SERVER_ERROR', message: err.message },
+    });
+  }
+});
+
+router.get('/demo/entries', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+  try {
+    const rows = await listDemoEntries({ userId: req.user.userId, workspaceId: req.workspaceId });
+    res.json({ success: true, data: rows.map(toMyEntriesRow) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.delete('/demo/entries/:id', authMiddleware, async (req, res) => {
+  try {
+    const ok = await deleteDemoEntry({ userId: req.user.userId, entryId: Number(req.params.id) });
+    if (!ok) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Entry not found' } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+router.delete('/demo/entries', authMiddleware, resolveWorkspaceMiddleware, async (req, res) => {
+  try {
+    const removed = await clearDemoEntries({ userId: req.user.userId, workspaceId: req.workspaceId });
+    res.json({ success: true, data: { removed } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }

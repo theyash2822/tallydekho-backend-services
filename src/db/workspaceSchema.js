@@ -495,4 +495,36 @@ export async function applyWorkspaceSchema(client) {
     );
     CREATE INDEX IF NOT EXISTS idx_legacy_auth_events_day ON legacy_auth_events(day DESC);
   `);
+
+  // Private simulated Demo entries.
+  //
+  // Demo is a shared, immutable fixture, so a user practising data entry cannot
+  // write into it. These rows are that practice: private to their author,
+  // surfaced in My Entries, and invisible to the accounting tables.
+  //
+  // A separate table rather than write_queue. write_queue couples workspace and
+  // company — the Desktop claim resolves `companies WHERE guid = ? AND
+  // workspace_id = ?` — and the canonical Demo company belongs to the reserved
+  // system workspace, not to the user's. Reusing it would mean rows whose
+  // workspace and company disagree, and the safety of Demo never reaching a
+  // Desktop would rest on a status string rather than on the schema.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS demo_simulated_entries (
+      id            BIGSERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      workspace_id  TEXT NOT NULL,
+      company_id    BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+      entry_type    TEXT NOT NULL,
+      title         TEXT,
+      amount        NUMERIC(18,2),
+      entry_date    DATE,
+      payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status        TEXT NOT NULL DEFAULT 'DEMO_SIMULATED',
+      created_at    BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      updated_at    BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      CONSTRAINT demo_simulated_entries_status_chk CHECK (status = 'DEMO_SIMULATED')
+    );
+    CREATE INDEX IF NOT EXISTS idx_demo_sim_user ON demo_simulated_entries (user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_demo_sim_user_ws ON demo_simulated_entries (user_id, workspace_id);
+  `);
 }
