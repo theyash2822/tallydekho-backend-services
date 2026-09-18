@@ -7,6 +7,9 @@ import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendEmailVerificationOTP } from '../services/notifications.js';
 import { ensurePersonalWorkspace } from '../services/workspaceService.js';
+import { getUserPairingHints } from '../services/userPairingHints.js';
+import { devOtpSuffix } from '../utils/otpLogging.js';
+import { recordLegacyAuthEvent, LEGACY_EVENTS } from '../services/legacyAuthTelemetry.js';
 
 /** Bootstrap Personal Workspace + billing/roles; never fail the auth response. */
 async function bootstrapWorkspaceSafe(userId) {
@@ -65,15 +68,15 @@ router.post('/send-otp', async (req, res) => {
     `, [cleanMobile, otp, expires, now()]);
 
     // Skip WhatsApp for test/bypass numbers
-    const isBypass = ['9078802278'].includes(cleanMobile);
+    const isBypass = BYPASS_NUMBERS.includes(cleanMobile);
 
-    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region} | OTP: ${otp} ${isBypass ? '(BYPASS)' : ''}`);
+    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region}${isBypass ? ' (BYPASS)' : ''}${devOtpSuffix(otp)}`);
     const waResult = isBypass
       ? { success: true }
       : await sendWhatsAppOTP(countryCode, cleanMobile, otp);
 
     if (!waResult.success) {
-      console.warn(`[OTP] WhatsApp failed — OTP: ${otp}`);
+      console.warn(`[OTP] WhatsApp send failed${devOtpSuffix(otp)}`);
       if (process.env.NODE_ENV !== 'production') {
         return res.json({ status: true, message: 'OTP generated (WhatsApp failed)', data: { otp } });
       }

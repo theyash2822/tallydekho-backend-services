@@ -40,6 +40,8 @@ import {
 } from '../utils/notificationAlerts.js';
 import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.js';
 import { resolveViewCapability } from '../middleware/viewCapability.js';
+import { requireResolvedCompanyId } from '../utils/companyOwnership.js';
+import { devOtpSuffix } from '../utils/otpLogging.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -312,7 +314,7 @@ router.post('/auth/send-otp', async (req, res) => {
 
     const isBypass = BYPASS_NUMBERS.includes(cleanMobile);
     const region = getRegion(countryCode);
-    console.log(`[API OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region} | OTP: ${otp} ${isBypass ? '(BYPASS)' : ''}`);
+    console.log(`[API OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region}${isBypass ? ' (BYPASS)' : ''}${devOtpSuffix(otp)}`);
 
     const waResult = isBypass ? { success: true } : await sendWhatsAppOTP(countryCode, cleanMobile, otp);
 
@@ -321,7 +323,7 @@ router.post('/auth/send-otp', async (req, res) => {
     if (process.env.NODE_ENV !== 'production') response.data.otp = otp;
 
     if (!waResult.success && !isBypass) {
-      console.warn(`[API OTP] WhatsApp failed — OTP: ${otp}`);
+      console.warn(`[API OTP] WhatsApp send failed${devOtpSuffix(otp)}`);
     }
 
     res.json(response);
@@ -7117,7 +7119,7 @@ router.post('/auth/change-phone', authMiddleware, async (req, res) => {
         [otp4, expires, now(), userId]);
 
       const waResult = await sendWhatsAppOTP('+91', cleanPhone, otp4);
-      console.log(`[CHANGE-PHONE S1] OTP ${otp4} → +91${cleanPhone}`);
+      console.log(`[CHANGE-PHONE S1] OTP sent → +91${cleanPhone}${devOtpSuffix(otp4)}`);
       const r = { success: true, data: { message: 'OTP sent to current phone via WhatsApp' } };
       if (process.env.NODE_ENV !== 'production') r.data.otp = otp4;
       return res.json(r);
@@ -7203,7 +7205,7 @@ router.post('/auth/change-email', authMiddleware, async (req, res) => {
         [otp4, expires, now(), userId]);
 
       await sendOTPEmail(currentEmail, otp4);
-      console.log(`[CHANGE-EMAIL S1] OTP ${otp4} → ${currentEmail}`);
+      console.log(`[CHANGE-EMAIL S1] OTP sent → ${currentEmail}${devOtpSuffix(otp4)}`);
       const r = { success: true, data: { message: 'OTP sent to your email' } };
       if (process.env.NODE_ENV !== 'production') r.data.otp = otp4;
       return res.json(r);

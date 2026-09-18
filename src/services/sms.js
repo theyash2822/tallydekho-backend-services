@@ -1,6 +1,7 @@
 // SMS Service — Proactive SMS
 // Used for: SMS OTP, Payment Reminders
 import axios from 'axios';
+import { devOtpSuffix } from '../utils/otpLogging.js';
 
 const BASE_URL    = process.env.PROACTIVE_SMS_BASE_URL       || 'https://api.proactivesms.in/api';
 const API_KEY     = process.env.PROACTIVE_SMS_API_KEY        || '';
@@ -15,7 +16,7 @@ function isDummy() {
 // ─── Send OTP SMS ─────────────────────────────────────────────────────────────
 export async function sendOTPSms(mobileNumber, otp, countryCode = '+91') {
   if (isDummy()) {
-    console.log(`[SMS MOCK] OTP ${otp} → ${countryCode}${mobileNumber}`);
+    console.log(`[SMS MOCK] → ${countryCode}${mobileNumber}${devOtpSuffix(otp)}`);
     return { success: true, mock: true };
   }
 
