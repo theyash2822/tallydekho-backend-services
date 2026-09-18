@@ -1,3 +1,56 @@
+## 2026-09-18 (telemetry hardening) — Evidence replaces headers entirely
+
+### Why
+The previous model let headers alone mark an event blocking. That could not
+falsely certify a clean day, but it let anyone on the internet hold the RBAC
+cutover open with two header lines. Before rewriting anything, traced the legacy
+auth surface to see whether stronger evidence was actually available.
+
+### Forensic result
+`/app/*` has five unauthenticated routes. Two have clean, server-verifiable
+success points:
+
+- `/app/verify-otp` — OTP matched and not expired, then the server issues a full
+  token or a 2FA pre-auth token. An outsider cannot pass the OTP check.
+- `/app/verify` — a token the server minted verifies and the user exists.
+
+`/app/verify-pin` and `/app/reset-pin` already run behind `preAuthMiddleware`,
+which verifies a scoped token from the Authorization header, so they were already
+covered. `/app/send-otp` has no success point: anyone can request an OTP, so it
+stays an attempt.
+
+Also found a real gap: `/app/verify` takes its token in the **request body**, so
+the Authorization-header check saw nothing and a genuine client would have scored
+unattributable.
+
+### What changed
+`LEGACY_LOGIN_SUCCESS` records a legacy authentication that actually completed.
+`isLegitimateLegacyUse()` now takes only the evidence state — no platform or
+version parameter exists, so neither past failure can return by accident.
+
+Blocking is now exactly two things, both established by the server: a token our
+`JWT_SECRET` validated, and a login that completed. Headers are attribution only.
+
+Initial-login detection is preserved, which was the trap to avoid: requiring a
+credential on every event would have recreated the false-clean problem, since a
+client at the OTP stage has no token yet.
+
+### Behaviour unchanged
+Hooks are `void` fire-and-forget past the existing checks. No change to OTP
+handling, login, JWT issuance, session semantics, or any client flow. A test
+asserts every call site is fire-and-forget and that the recorder swallows its own
+failures.
+
+### Verified against a real database
+Scanner noise and spoofed headers: `blocking=0`, STRICT exit 0. Completed legacy
+login with no headers: `blocking=4`, STRICT exit 1. Verified legacy JWT with
+headers: attributed to `ios v4.1.0`, STRICT exit 1.
+
+### Tests
+200 backend unit (was 199), 43 RBAC, 20 web, mobile config, 12 desktop config.
+
+---
+
 ## 2026-09-18 (final handoff correction) — Gate hardening, operator doc accuracy
 
 ### Forged tokens could be laundered into "legitimate legacy usage"
