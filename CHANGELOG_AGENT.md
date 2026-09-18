@@ -1,3 +1,51 @@
+## 2026-09-18 (Demo + pairing hardening) — One canonical Demo, workspace-scoped pairing
+
+### Universal Demo
+Demo was 484 per-workspace copies of the same fixture (74,022 vouchers). There is
+now one Demo company owned by a reserved system workspace with no owner and no
+memberships — invisible to users by construction, since workspace listing joins
+memberships. Keeping it in a real workspace preserves `workspace_id NOT NULL`,
+every `company_id` FK and all report queries.
+
+`companies.is_demo` replaces name and GUID-prefix heuristics. Backfill matched the
+legacy generator's reserved prefix only, never the name, landing on exactly 484 of
+1374 rows. A real company called "Demo Traders" now stays real.
+
+`ensureCanonicalDemoCompany` is genuinely idempotent. The old guard selected
+`guid, name` then read `demoRows[0].id` — undefined — so its count was always zero
+and it reseeded on every company-list fetch. Three forced runs now leave identical
+counts. The fixture spans two financial years.
+
+### Demo eligibility follows pairing, not connectivity
+`RECONNECTING` no longer routes to Demo, and `companyAccess` no longer 403s a
+customer's own synced history because their Desktop is closed. Connectivity governs
+sync, writeback and live Tally mutations — not reads of data already stored.
+
+### Private simulated Demo entries
+New `demo_simulated_entries` table, chosen after checking the invariant:
+`write_queue` couples workspace and company (the Desktop claim resolves
+`companies WHERE guid = ? AND workspace_id = ?`) while canonical Demo belongs to the
+system workspace. Reusing it would have left "Demo never reaches Tally" resting on a
+status string; it now rests on the schema. No billing code reads the table, so zero
+credits is structural. Ownership is the authenticated user in every statement.
+
+### Pairing
+All pairing events carry `workspaceId` and prefer room delivery — `notifyPaired` sent
+no workspace at all and `notifyUnpaired` sent a bare `{}`. The second-Desktop claim
+race returns 409 `WORKSPACE_ALREADY_HAS_DESKTOP` instead of a raw Postgres 500.
+
+### Cleanup
+`cleanup-legacy-demo-companies.mjs`: inspect by default, `CONFIRM=1` to delete,
+candidates identified by legacy GUID scheme and `is_demo` rather than name, refuses
+on any user-created data, deletes by `company_id` in one transaction. Executed:
+484 companies and 415,128 child rows removed, real companies unchanged at 890, both
+Company Identity verifiers exit 0.
+
+### Tests
+229 backend unit (was 209), 43 RBAC.
+
+---
+
 ## 2026-09-18 (local E2E regression) — Legacy /app removed from web, verifier fixed
 
 ### P2 fixed — a verification gate that failed on correct data
