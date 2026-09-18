@@ -1,3 +1,41 @@
+## 2026-09-18 (final handoff correction) — Gate hardening, operator doc accuracy
+
+### Forged tokens could be laundered into "legitimate legacy usage"
+Identification treated "token presented and failed" the same as "no token".
+Headers alone could mark an event identified, so a forged token plus two header
+lines counted as a real client depending on legacy auth — blocking the clean day,
+repeatable for free, a denial of progress against our own release.
+
+Requiring a credential outright would have been wrong too: legacy login routes are
+unauthenticated, so a real client calling `/app/auth/send-otp` has no token to
+offer. `credentialState()` now distinguishes verified / invalid / absent, and the
+resulting truth table is pinned exhaustively in tests because it defines what
+"seven clean days" means.
+
+### Ordering dependency found in source
+The ADMIN migration installs `CHECK (membership_type IN ('OWNER','MEMBER'))`, and
+the **deployed** build still writes `membership_type = 'ADMIN'`
+(`workspaceService.js` lines 766 and 993 in `origin/cursor`). Running the migration
+before deploying the new build would make a normal admin workflow start throwing
+constraint violations. Reproduced in rehearsal. Operator order corrected: deploy
+first, migrate second.
+
+### Operator doc accuracy
+`OPS_NEXT_ACTIONS.md` had described the ADMIN migration step as read-only when it
+contains a production write. Every step is now labelled with what it actually does,
+and the write steps are called out separately from the read-only prechecks.
+
+### Verified behaviourally, not just statically
+- ADMIN migration: bare run and `DRY_RUN=1` both left a seeded ADMIN row untouched;
+  `CONFIRM=1` migrated it and restored the CHECK constraint
+- boot guard: production without the flag returns false, with it true, test env true
+- 0 plaintext OTP log sites; restore verifier retains all five checks
+
+### Tests
+199 backend unit (was 195), 43 RBAC, 20 web, mobile and desktop config checks.
+
+---
+
 ## 2026-09-18 (git hygiene pass) — Telemetry classification fix, operator command pack
 
 ### Why
