@@ -1,0 +1,40 @@
+name: RBAC security CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rbac-security:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rbac
+          POSTGRES_PASSWORD: rbac
+          POSTGRES_DB: rbac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rbac -d rbac_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CI: "true"
+      DATABASE_URL: postgresql://rbac:rbac@localhost:5432/rbac_test
+      JWT_SECRET: ci-rbac-jwt-secret
+      RBAC_INTEGRATION: "1"
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci || npm install
+      - name: Unit tests
+        run: npm run test:unit
+      - name: RBAC integration (mandatory)
+        run: npm run test:rbac

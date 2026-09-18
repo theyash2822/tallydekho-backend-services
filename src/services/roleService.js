@@ -169,7 +169,7 @@ export async function getEntryModeForMembership(membership) {
 }
 
 /**
- * Update capability grants. Admin system_key always forces OWNER_ADMIN protected keys granted.
+ * Update capability grants. Admin system_key always forces OWNER_OR_ADMIN_ROLE protected keys granted.
  * Anti-escalation: actor may only grant capabilities they themselves hold (OWNER exempt).
  */
 export async function updateRoleCapabilities(roleId, grantsMap = {}, { actorUserId, workspaceId } = {}) {

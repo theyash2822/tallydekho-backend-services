@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import { getDb, query } from '../db/schema.js';
 import { verifySecret } from '../services/deviceCredential.js';
+import { recordLegacyAuthEvent, LEGACY_EVENTS } from '../services/legacyAuthTelemetry.js';
 
 export function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
@@ -24,11 +25,15 @@ export function authMiddleware(req, res, next) {
             });
           }
         } else if (process.env.ALLOW_LEGACY_JWT !== '1') {
+          // Q023 telemetry — counters only; never tokens/headers
+          void recordLegacyAuthEvent(LEGACY_EVENTS.JWT_REJECTED, req);
           return res.status(401).json({
             status: false,
             code: 'SESSION_REQUIRED',
             message: 'Please sign in again to continue.',
           });
+        } else {
+          void recordLegacyAuthEvent(LEGACY_EVENTS.JWT_ACCEPTED, req);
         }
         next();
       } catch (err) {

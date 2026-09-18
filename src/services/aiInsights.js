@@ -41,7 +41,7 @@ export function currentMonthKey() {
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 1 — SQL Analytics Engine (deterministic, runs always)
 // ─────────────────────────────────────────────────────────────────────────────
-export async function computeInsightMetrics(companyGuid, from, to, financialYear = '') {
+export async function computeInsightMetrics(companyId, from, to, financialYear = '') {
   const nowStr = new Date().toISOString().split('T')[0];
 
   const [monthlyRows, topSuppliersRows, topCustomersRows, stockoutRows, receivablesRows] =
@@ -58,43 +58,43 @@ export async function computeInsightMetrics(companyGuid, from, to, financialYear
             AND voucher_type NOT ILIKE '%Purchase%' THEN ABS(amount) ELSE 0 END), 0) AS revenue,
           COALESCE(SUM(CASE WHEN voucher_type ILIKE '%Purchase%' THEN ABS(amount) ELSE 0 END), 0) AS expenses
         FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
+        WHERE company_id=$1 AND is_cancelled=FALSE
           AND date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
           AND date BETWEEN $2 AND $3
         GROUP BY lbl, yr, mn ORDER BY yr, mn
-      `, [companyGuid, from, to]),
+      `, [companyId, from, to]),
 
       // Top 5 suppliers
       query(`
         SELECT party_name, SUM(ABS(amount)) AS total_spend, COUNT(*) AS txns
         FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
+        WHERE company_id=$1 AND is_cancelled=FALSE
           AND voucher_type ILIKE '%Purchase%'
           AND party_name IS NOT NULL AND party_name != ''
           AND date BETWEEN $2 AND $3
         GROUP BY party_name ORDER BY total_spend DESC LIMIT 5
-      `, [companyGuid, from, to]),
+      `, [companyId, from, to]),
 
       // Top 5 customers
       query(`
         SELECT party_name, SUM(ABS(amount)) AS total_rev, COUNT(*) AS txns
         FROM vouchers
-        WHERE company_guid=$1 AND is_cancelled=FALSE
+        WHERE company_id=$1 AND is_cancelled=FALSE
           AND voucher_type ILIKE '%Sales%'
           AND voucher_type NOT ILIKE '%Order%'
           AND party_name IS NOT NULL AND party_name != ''
           AND date BETWEEN $2 AND $3
         GROUP BY party_name ORDER BY total_rev DESC LIMIT 5
-      `, [companyGuid, from, to]),
+      `, [companyId, from, to]),
 
       // Stockout / low-stock
       query(`
         SELECT name, closing_qty, reorder_level, unit
         FROM stocks
-        WHERE company_guid=$1
+        WHERE company_id=$1
           AND reorder_level > 0 AND closing_qty <= reorder_level
         ORDER BY closing_qty ASC LIMIT 8
-      `, [companyGuid]),
+      `, [companyId]),
 
       // Receivables aging
       query(`
@@ -110,9 +110,9 @@ export async function computeInsightMetrics(companyGuid, from, to, financialYear
                    AND ($1::date - b.due_date::date) > 60              THEN ABS(b.pending_amount) ELSE 0 END) AS bucket_61plus,
           SUM(ABS(b.pending_amount)) AS total
         FROM bill_outstanding b
-        WHERE b.company_guid=$2 AND b.pending_amount > 0
+        WHERE b.company_id=$2 AND b.pending_amount > 0
           AND b.bill_type NOT ILIKE '%Cr%'
-      `, [nowStr, companyGuid]),
+      `, [nowStr, companyId]),
     ]);
 
   // ── Revenue forecast (current FY only) ─────────────────────────────────────
@@ -470,34 +470,58 @@ export async function ensureCacheTables() {
   await query(`
     CREATE TABLE IF NOT EXISTS ai_insights_cache (
       id             SERIAL PRIMARY KEY,
-      company_guid   TEXT NOT NULL,
+      company_id     BIGINT,
+      company_guid   TEXT,
       month_key      TEXT NOT NULL,
       metrics_json   JSONB,
       ai_output_json JSONB,
       generated_at   TIMESTAMPTZ DEFAULT NOW(),
       valid_until    TIMESTAMPTZ,
-      UNIQUE(company_guid, month_key)
+      UNIQUE(company_id, month_key)
     )
   `);
+  await query(`ALTER TABLE ai_insights_cache ADD COLUMN IF NOT EXISTS company_id BIGINT`).catch(() => {});
+  await query(`ALTER TABLE ai_insights_cache ADD COLUMN IF NOT EXISTS company_guid TEXT`).catch(() => {});
+  await query(`CREATE INDEX IF NOT EXISTS idx_ai_insights_cache_company_id ON ai_insights_cache (company_id)`).catch(() => {});
+  await query(`
+    DO $$ BEGIN
+      ALTER TABLE ai_insights_cache ADD CONSTRAINT uq_ai_insights_company_id_month UNIQUE (company_id, month_key);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+               WHEN unique_violation THEN NULL;
+               WHEN not_null_violation THEN NULL;
+    END $$;
+  `).catch(() => {});
   await query(`
     CREATE TABLE IF NOT EXISTS financial_year_summaries (
       id             SERIAL PRIMARY KEY,
-      company_guid   TEXT NOT NULL,
+      company_id     BIGINT,
+      company_guid   TEXT,
       financial_year TEXT NOT NULL,
       summary_json   JSONB,
       generated_at   TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(company_guid, financial_year)
+      UNIQUE(company_id, financial_year)
     )
   `);
+  await query(`ALTER TABLE financial_year_summaries ADD COLUMN IF NOT EXISTS company_id BIGINT`).catch(() => {});
+  await query(`ALTER TABLE financial_year_summaries ADD COLUMN IF NOT EXISTS company_guid TEXT`).catch(() => {});
+  await query(`CREATE INDEX IF NOT EXISTS idx_fy_summaries_company_id ON financial_year_summaries (company_id)`).catch(() => {});
+  await query(`
+    DO $$ BEGIN
+      ALTER TABLE financial_year_summaries ADD CONSTRAINT uq_fy_summaries_company_id_fy UNIQUE (company_id, financial_year);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+               WHEN unique_violation THEN NULL;
+               WHEN not_null_violation THEN NULL;
+    END $$;
+  `).catch(() => {});
 }
 
-export async function getCachedInsights(companyGuid, monthKey) {
+export async function getCachedInsights(companyId, monthKey) {
   try {
     const { rows } = await query(
       `SELECT ai_output_json, generated_at, valid_until FROM ai_insights_cache
-       WHERE company_guid=$1 AND month_key=$2
+       WHERE company_id=$1 AND month_key=$2
          AND valid_until > NOW() LIMIT 1`,
-      [companyGuid, monthKey]
+      [companyId, monthKey]
     );
     if (!rows[0]) return null;
     // Inject cache timestamps into the payload so the UI can show the disclaimer
@@ -508,16 +532,21 @@ export async function getCachedInsights(companyGuid, monthKey) {
   } catch { return null; }
 }
 
-export async function setCachedInsights(companyGuid, monthKey, metricsJson, aiOutputJson) {
+export async function setCachedInsights(companyId, monthKey, metricsJson, aiOutputJson) {
   // valid_until = end of next month (so cache stays valid for the whole month)
   try {
     await query(`
-      INSERT INTO ai_insights_cache (company_guid, month_key, metrics_json, ai_output_json, valid_until)
-      VALUES ($1, $2, $3, $4, date_trunc('month', NOW()) + INTERVAL '2 months')
-      ON CONFLICT (company_guid, month_key) DO UPDATE
-        SET metrics_json=$3, ai_output_json=$4, generated_at=NOW(),
+      INSERT INTO ai_insights_cache (company_id, company_guid, month_key, metrics_json, ai_output_json, valid_until)
+      VALUES (
+        $1,
+        (SELECT guid FROM companies WHERE id = $1),
+        $2, $3, $4,
+        date_trunc('month', NOW()) + INTERVAL '2 months'
+      )
+      ON CONFLICT (company_id, month_key) DO UPDATE
+        SET company_id=$1, metrics_json=$3, ai_output_json=$4, generated_at=NOW(),
             valid_until=date_trunc('month', NOW()) + INTERVAL '2 months'
-    `, [companyGuid, monthKey, JSON.stringify(metricsJson), JSON.stringify(aiOutputJson)]);
+    `, [companyId, monthKey, JSON.stringify(metricsJson), JSON.stringify(aiOutputJson)]);
   } catch (err) {
     console.warn('[AI Insights] Cache write failed:', err.message);
   }
@@ -526,18 +555,18 @@ export async function setCachedInsights(companyGuid, monthKey, metricsJson, aiOu
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 4 — Historical FY (deterministic, no LLM)
 // ─────────────────────────────────────────────────────────────────────────────
-export async function computeHistoricalSummary(companyGuid, financialYear, from, to) {
+export async function computeHistoricalSummary(companyId, financialYear, from, to) {
   // Check cache first
   try {
     const { rows } = await query(
-      'SELECT summary_json FROM financial_year_summaries WHERE company_guid=$1 AND financial_year=$2 LIMIT 1',
-      [companyGuid, financialYear]
+      'SELECT summary_json FROM financial_year_summaries WHERE company_id=$1 AND financial_year=$2 LIMIT 1',
+      [companyId, financialYear]
     );
     if (rows[0]?.summary_json) return rows[0].summary_json;
   } catch {}
 
   // Compute fresh
-  const metrics = await computeInsightMetrics(companyGuid, from, to, financialYear);
+  const metrics = await computeInsightMetrics(companyId, from, to, financialYear);
   const { forecastData, expenseWithSpike, topSuppliers, topCustomers,
           stockout, receivablesAging, summary } = metrics;
 
@@ -565,10 +594,11 @@ export async function computeHistoricalSummary(companyGuid, financialYear, from,
   // Cache permanently
   try {
     await query(`
-      INSERT INTO financial_year_summaries (company_guid, financial_year, summary_json)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (company_guid, financial_year) DO UPDATE SET summary_json=$3, generated_at=NOW()
-    `, [companyGuid, financialYear, JSON.stringify(summaryObj)]);
+      INSERT INTO financial_year_summaries (company_id, company_guid, financial_year, summary_json)
+      VALUES ($1, (SELECT guid FROM companies WHERE id = $1), $2, $3)
+      ON CONFLICT (company_id, financial_year) DO UPDATE SET
+        company_id=$1, summary_json=$3, generated_at=NOW()
+    `, [companyId, financialYear, JSON.stringify(summaryObj)]);
   } catch (err) {
     console.warn('[AI Insights] Historical cache write failed:', err.message);
   }

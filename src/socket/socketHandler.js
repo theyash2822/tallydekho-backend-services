@@ -14,12 +14,37 @@ setTimeout(async () => {
 let _io = null;
 
 // ── Voucher lifecycle emitters ────────────────────────────────────────────────
-// Clients join `company:<guid>` room when they register (see register handler below).
+// Clients join `company:<internalId>` after server resolves tally GUID (Phase 3).
 
-export function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo) {
-  if (!_io) return;
-  _io.to(`company:${companyGuid}`).emit('voucher:regularized', {
+/** Prefer explicit companyId; else workspace-scoped guid. Never guid-alone. */
+async function resolveCompanyRoomId(companyGuid, { companyId = null, workspaceId = null } = {}) {
+  if (companyId != null) return Number(companyId);
+  if (!companyGuid || !workspaceId) {
+    if (companyGuid && !workspaceId) {
+      console.warn('[socket] company room resolve refused: guid without workspaceId');
+    }
+    return null;
+  }
+  const { rows } = await query(
+    `SELECT id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+    [companyGuid, workspaceId]
+  );
+  return rows[0]?.id ?? null;
+}
+
+function emitCompanyEvent(companyId, companyGuid, event, payload) {
+  if (!_io || companyId == null) return;
+  _io.to(`company:${companyId}`).emit(event, {
+    ...payload,
+    companyId,
     companyGuid,
+  });
+}
+
+export async function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
+  if (!_io) return;
+  const companyId = await resolveCompanyRoomId(companyGuid, opts);
+  emitCompanyEvent(companyId, companyGuid, 'voucher:regularized', {
     tdkReferenceNo: tdkRef,
     tallyVoucherNo,
     currentEntryType: 'regular',
@@ -27,13 +52,13 @@ export function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo) {
     conversionStatus: 'converted',
     timestamp: new Date().toISOString(),
   });
-  console.log(`[socket] voucher:regularized emitted for ${tdkRef}`);
+  console.log(`[socket] voucher:regularized emitted for ${tdkRef} room=company:${companyId}`);
 }
 
-export function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo) {
+export async function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
   if (!_io) return;
-  _io.to(`company:${companyGuid}`).emit('voucher:tallySynced', {
-    companyGuid,
+  const companyId = await resolveCompanyRoomId(companyGuid, opts);
+  emitCompanyEvent(companyId, companyGuid, 'voucher:tallySynced', {
     tdkReferenceNo: tdkRef,
     tallyVoucherNo,
     tallySyncStatus: 'synced',
@@ -41,7 +66,7 @@ export function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo) {
     timestamp: new Date().toISOString(),
   });
   // Spec-compliant event for the invoice preview/share flow
-  _io.to(`company:${companyGuid}`).emit('invoice_posting_updated', {
+  emitCompanyEvent(companyId, companyGuid, 'invoice_posting_updated', {
     referenceNumber: tdkRef,
     postingTag: 'Posted',
     invoiceNumberLabel: tallyVoucherNo,
@@ -157,18 +182,22 @@ export function setupSocket(io) {
         socket.workspaceId = workspaceId;
         console.log(`[WS] user ${socket.userId} joined ${socket.workspaceRoom}`);
         const { rows: cos } = await query(
-          `SELECT guid FROM companies
+          `SELECT id, guid FROM companies
            WHERE workspace_id = $1 AND (is_active = TRUE OR is_active IS NULL)`,
           [workspaceId]
         );
         for (const c of cos) {
-          if (c.guid) {
-            const room = `company:${c.guid}`;
+          if (c.id != null) {
+            const room = `company:${c.id}`;
             socket.join(room);
             socket.companyRooms.push(room);
           }
         }
-        socket.emit('workspace_registered', { workspaceId, companies: cos.map((c) => c.guid) });
+        socket.emit('workspace_registered', {
+          workspaceId,
+          companies: cos.map((c) => c.guid),
+          companyIds: cos.map((c) => c.id),
+        });
       } catch (err) {
         console.warn('[WS] workspace:register failed', err.message);
       }
@@ -191,12 +220,11 @@ export function setupSocket(io) {
           socket.emit('company_access_denied', { companyGuid, code: 'WORKSPACE_ACCESS_DENIED' });
           return;
         }
+        // CID Phase 3: workspace_id ONLY — no user_id ownership fallback
         const { rows: cos } = await query(
-          `SELECT guid FROM companies
-           WHERE guid = $1 AND (
-             workspace_id = $2
-             OR (workspace_id IS NULL AND user_id = (SELECT owner_user_id FROM workspaces WHERE id = $2))
-           ) LIMIT 1`,
+          `SELECT id, guid FROM companies
+           WHERE guid = $1 AND workspace_id = $2
+           LIMIT 1`,
           [companyGuid, workspaceId]
         );
         if (!cos[0]) {
@@ -206,74 +234,25 @@ export function setupSocket(io) {
         if (mem[0].membership_type !== 'OWNER') {
           try {
             const { assertCompanyAccess } = await import('../services/scopeService.js');
-            await assertCompanyAccess(mem[0].id, companyGuid);
+            await assertCompanyAccess(mem[0].id, companyGuid, { companyId: cos[0].id });
           } catch {
             socket.emit('company_access_denied', { companyGuid, code: 'COMPANY_SCOPE_DENIED' });
             return;
           }
         }
-        const room = `company:${companyGuid}`;
+        const room = `company:${cos[0].id}`;
         if (!Array.isArray(socket.companyRooms)) socket.companyRooms = [];
         if (!socket.companyRooms.includes(room)) {
           socket.join(room);
           socket.companyRooms.push(room);
         }
+        socket.emit('company_registered', {
+          companyGuid: cos[0].guid,
+          companyId: cos[0].id,
+          room,
+        });
       } catch (err) {
         console.warn('[WS] company:register failed', err.message);
-      }
-    });
-
-    // Desktop registers — device-id is NOT a credential. Require secret when hashed;
-    // before claim (no hash): allow socket identity only, ZERO privileged authority.
-    socket.on('register_desktop', async ({ deviceId, deviceSecret } = {}) => {
-      try {
-        if (!deviceId) {
-          socket.emit('error', { code: 'DEVICE_ID_REQUIRED', message: 'deviceId required' });
-          return;
-        }
-        const { rows } = await query(
-          `SELECT user_id, workspace_id, device_secret_hash, paired, binding_status
-           FROM devices WHERE device_id=$1 LIMIT 1`,
-          [deviceId]
-        );
-        const d = rows[0];
-        if (!d) {
-          socket.emit('error', { code: 'DEVICE_NOT_REGISTERED', message: 'Device not registered' });
-          return;
-        }
-        if (d.device_secret_hash) {
-          const { verifySecret } = await import('../services/deviceCredential.js');
-          const ok = deviceSecret ? await verifySecret(deviceSecret, d.device_secret_hash) : false;
-          if (!ok) {
-            socket.emit('error', { code: 'DEVICE_CREDENTIAL_INVALID', message: 'Device credential invalid' });
-            return;
-          }
-        } else {
-          // Pre-claim: identity only — no writeback map, no room, no retry
-          socket.deviceId = deviceId;
-          socket.clientType = 'desktop';
-          socket.privilegedDesktop = false;
-          socket.emit('registered', { status: true, privileged: false, reason: 'CREDENTIAL_NOT_CLAIMED' });
-          return;
-        }
-        if (!d.paired || d.binding_status === 'REVOKED') {
-          socket.emit('error', { code: 'DEVICE_NOT_PAIRED', message: 'Device is not paired' });
-          return;
-        }
-        socket.deviceId = deviceId;
-        socket.clientType = 'desktop';
-        socket.privilegedDesktop = true;
-        connectedClients.set(`desktop_${deviceId}`, socket);
-        if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
-        console.log(`[WS] registered desktop (credentialed): ${deviceId}`);
-        socket.emit('registered', { status: true, privileged: true });
-        if (_retryOfflineEntries) {
-          console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-          _retryOfflineEntries(d.user_id, null, d.workspace_id || null);
-        }
-      } catch (err) {
-        console.warn('[WS] register_desktop failed', err.message);
-        socket.emit('error', { code: 'REGISTER_FAILED', message: 'Desktop registration failed' });
       }
     });
 

@@ -65,23 +65,18 @@ test('GET /api/tally-sync/status — returns 401 without token', async () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Data: POST /app/dashboard — returns 4xx when device not paired
-//    (hits the /app/ route which checks for pairing via device-id header)
+// 4. Data: GET /api/dashboard/metrics — returns 401 without auth
+//    Phase 5 deleted /app/dashboard; there is no bare GET /api/dashboard.
+//    Auth is enforced on concrete dashboard routes (metrics/kpi-strip/…).
 // ─────────────────────────────────────────────────────────────────────────────
-test('POST /app/dashboard — returns 4xx when device not paired', async () => {
-  // No device-id header → device lookup will find no user → 403
-  const res = await http.post('/app/dashboard', {
-    companyGuid: 'nonexistent-guid',
-  }, {
-    headers: {
-      'device-id': 'test-device-that-does-not-exist',
-      'Content-Type': 'application/json',
-    }
+test('GET /api/dashboard/metrics — returns 401 without token', async () => {
+  const res = await http.get('/api/dashboard/metrics', {
+    params: { companyGuid: 'nonexistent-guid' },
   });
 
-  assert.ok(
-    res.status >= 400 && res.status < 500,
-    `Expected 4xx status (unpaired device), got ${res.status}: ${JSON.stringify(res.data)}`
+  assert.equal(
+    res.status, 401,
+    `Expected 401, got ${res.status}: ${JSON.stringify(res.data)}`
   );
 });
 

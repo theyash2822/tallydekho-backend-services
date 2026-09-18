@@ -29,13 +29,13 @@ function pickColumn(cols, candidates) {
   return null;
 }
 
-async function fromCostCentresTable(companyGuid) {
+async function fromCostCentresTable(companyId) {
   try {
     const { rows } = await query(
       `SELECT guid, name, parent_name FROM cost_centres
-       WHERE company_guid=$1 AND (is_active IS TRUE OR is_active IS NULL)
+       WHERE company_id=$1 AND (is_active IS TRUE OR is_active IS NULL)
        ORDER BY name`,
-      [companyGuid]
+      [companyId]
     );
     return rows;
   } catch {
@@ -43,20 +43,20 @@ async function fromCostCentresTable(companyGuid) {
   }
 }
 
-async function fromAllocationTables(companyGuid) {
+async function fromAllocationTables(companyId) {
   const fallbackSqls = [
     `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
      FROM voucher_cost_centre_allocations
-     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
+     WHERE company_id=$1 AND cost_centre_guid IS NOT NULL
      ORDER BY 2`,
     `SELECT DISTINCT cost_centre_guid AS guid, cost_centre_name AS name, NULL::text AS parent_name
      FROM voucher_cost_allocations
-     WHERE company_guid=$1 AND cost_centre_guid IS NOT NULL
+     WHERE company_id=$1 AND cost_centre_guid IS NOT NULL
      ORDER BY 2`,
   ];
   for (const sql of fallbackSqls) {
     try {
-      const { rows } = await query(sql, [companyGuid]);
+      const { rows } = await query(sql, [companyId]);
       if (rows.length) return rows;
     } catch {
       /* table missing */
@@ -65,7 +65,7 @@ async function fromAllocationTables(companyGuid) {
   return [];
 }
 
-async function fromVoucherColumns(companyGuid) {
+async function fromVoucherColumns(companyId) {
   const cols = await tableColumns('vouchers');
   const nameCol = pickColumn(cols, VOUCHER_NAME_CANDIDATES);
   if (!nameCol) {
@@ -75,21 +75,21 @@ async function fromVoucherColumns(companyGuid) {
               COALESCE(cost_centre_name, cost_centre_guid) AS name,
               NULL::text AS parent_name
        FROM vouchers
-       WHERE company_guid=$1
+       WHERE company_id=$1
          AND (cost_centre_name IS NOT NULL OR cost_centre_guid IS NOT NULL)
        ORDER BY 2`,
       `SELECT DISTINCT cost_centre AS guid, cost_centre AS name, NULL::text AS parent_name
        FROM vouchers
-       WHERE company_guid=$1 AND cost_centre IS NOT NULL AND TRIM(cost_centre) <> ''
+       WHERE company_id=$1 AND cost_centre IS NOT NULL AND TRIM(cost_centre) <> ''
        ORDER BY 2`,
       `SELECT DISTINCT costcentre AS guid, costcentre AS name, NULL::text AS parent_name
        FROM vouchers
-       WHERE company_guid=$1 AND costcentre IS NOT NULL AND TRIM(costcentre) <> ''
+       WHERE company_id=$1 AND costcentre IS NOT NULL AND TRIM(costcentre) <> ''
        ORDER BY 2`,
     ];
     for (const sql of trySqls) {
       try {
-        const { rows } = await query(sql, [companyGuid]);
+        const { rows } = await query(sql, [companyId]);
         if (rows.length) return rows;
       } catch {
         /* column missing */
@@ -105,11 +105,11 @@ async function fromVoucherColumns(companyGuid) {
     const { rows } = await query(
       `SELECT DISTINCT ${guidExpr} AS guid, ${nameExpr} AS name, NULL::text AS parent_name
        FROM vouchers
-       WHERE company_guid=$1
+       WHERE company_id=$1
          AND ${nameCol} IS NOT NULL
          AND TRIM(${nameCol}::text) <> ''
        ORDER BY 2`,
-      [companyGuid]
+      [companyId]
     );
     return rows;
   } catch {
@@ -117,18 +117,18 @@ async function fromVoucherColumns(companyGuid) {
   }
 }
 
-async function fromLedgers(companyGuid) {
+async function fromLedgers(companyId) {
   try {
     const { rows } = await query(
       `SELECT guid, name, parent AS parent_name
        FROM ledgers
-       WHERE company_guid=$1
+       WHERE company_id=$1
          AND (
            parent ILIKE '%cost centre%' OR parent ILIKE '%cost center%'
            OR name ILIKE '%cost centre%' OR name ILIKE '%cost center%'
          )
        ORDER BY name`,
-      [companyGuid]
+      [companyId]
     );
     return rows;
   } catch {
@@ -136,42 +136,42 @@ async function fromLedgers(companyGuid) {
   }
 }
 
-async function upsertDiscovered(companyGuid, rows) {
-  if (!rows?.length) return;
+async function upsertDiscovered(companyId, rows) {
+  if (!rows?.length || companyId == null) return;
+  const { rows: co } = await query('SELECT guid FROM companies WHERE id=$1 LIMIT 1', [companyId]);
+  const companyGuid = co[0]?.guid;
+  if (!companyGuid) return;
   for (const row of rows) {
     const guid = row.guid || row.name;
     const name = row.name || row.guid;
     if (!guid || !name) continue;
     try {
       await query(
-        `INSERT INTO cost_centres (guid, company_guid, name, parent_name, is_active)
-         VALUES ($1, $2, $3, $4, TRUE)
-         ON CONFLICT (company_guid, guid) DO UPDATE SET
-           name = EXCLUDED.name,
-           parent_name = COALESCE(EXCLUDED.parent_name, cost_centres.parent_name),
-           is_active = TRUE`,
-        [String(guid), companyGuid, String(name), row.parent_name || null]
+        `INSERT INTO cost_centres (guid, company_guid, name, parent_name, is_active, company_id)
+         VALUES ($1,$2,$3,$4,TRUE,$5)
+         ON CONFLICT (company_id, guid) DO UPDATE SET
+           name=EXCLUDED.name, parent_name=COALESCE(EXCLUDED.parent_name, cost_centres.parent_name),
+           company_id=COALESCE(EXCLUDED.company_id, cost_centres.company_id)`,
+        [String(guid), companyGuid, String(name), row.parent_name || null, companyId]
       );
-    } catch {
-      /* best-effort */
-    }
+    } catch { /* ignore */ }
   }
 }
 
 /**
- * @param {string} companyGuid
+ * @param {number|string} companyId
  * @returns {Promise<Array<{ guid: string, name: string, parent_name: string|null }>>}
  */
-export async function listCostCentresForCompany(companyGuid) {
-  let rows = await fromCostCentresTable(companyGuid);
+export async function listCostCentresForCompany(companyId) {
+  let rows = await fromCostCentresTable(companyId);
   if (rows.length) return rows;
 
-  rows = await fromAllocationTables(companyGuid);
-  if (!rows.length) rows = await fromVoucherColumns(companyGuid);
-  if (!rows.length) rows = await fromLedgers(companyGuid);
+  rows = await fromAllocationTables(companyId);
+  if (!rows.length) rows = await fromVoucherColumns(companyId);
+  if (!rows.length) rows = await fromLedgers(companyId);
 
   if (rows.length) {
-    upsertDiscovered(companyGuid, rows).catch(() => {});
+    upsertDiscovered(companyId, rows).catch(() => {});
   }
   return rows;
 }

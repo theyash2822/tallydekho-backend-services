@@ -29,27 +29,9 @@ describe('Phase 3 capability catalogue', () => {
   });
 });
 
-describe('Phase 3 fail-closed RBAS', () => {
-  it('rbas_enabled false → DENY without test bypass', async () => {
-    const prev = FEATURE_FLAGS.rbas_enabled;
-    const prevBypass = process.env.ALLOW_RBAS_BYPASS;
-    const prevEnv = process.env.NODE_ENV;
-    FEATURE_FLAGS.rbas_enabled = false;
-    process.env.ALLOW_RBAS_BYPASS = '0';
-    process.env.NODE_ENV = 'production';
-    try {
-      const r = await authorize({
-        userId: 'user-a',
-        workspaceId: 'ws-a',
-        capability: 'dashboard.view',
-      });
-      assert.equal(r.decision, 'DENY');
-      assert.equal(r.reason, 'RBAS_DISABLED');
-    } finally {
-      FEATURE_FLAGS.rbas_enabled = prev;
-      process.env.ALLOW_RBAS_BYPASS = prevBypass;
-      process.env.NODE_ENV = prevEnv;
-    }
+describe('Phase 3/4 RBAC always on', () => {
+  it('rbas_enabled flag is deleted', () => {
+    assert.equal(Object.prototype.hasOwnProperty.call(FEATURE_FLAGS, 'rbas_enabled'), false);
   });
 });
 
@@ -105,8 +87,8 @@ describe('Phase 3 legacy JWT fail-closed (Q022)', () => {
   });
 });
 
-describe('Phase 3 A/B cross-tenant (requires DATABASE_URL + fixtures)', () => {
-  it('documents required fixture shape', () => {
+describe('Phase 3 A/B cross-tenant contract', () => {
+  it('documents required fixture shape (live suite under src/__tests__/rbac/)', () => {
     const fixture = {
       workspaceA: { owner: 'OwnerA', admin: 'AdminA', member: 'MemberA', restricted: 'RestrictedA', companies: ['A1', 'A2'] },
       workspaceB: { owner: 'OwnerB', member: 'MemberB', companies: ['B1'] },
@@ -121,14 +103,5 @@ describe('Phase 3 A/B cross-tenant (requires DATABASE_URL + fixtures)', () => {
     };
     assert.equal(fixture.workspaceA.companies.length, 2);
     assert.equal(fixture.negatives.length, 6);
-  });
-
-  it('skips live A/B HTTP matrix without DATABASE_URL', async () => {
-    if (!process.env.DATABASE_URL || !process.env.RBAC_AB_FIXTURES) {
-      assert.ok(true, 'Set DATABASE_URL + RBAC_AB_FIXTURES=1 to run live A/B');
-      return;
-    }
-    // Live runner reserved for CI with seeded workspaces — see RBAC_REMEDIATION_LOG.md
-    assert.fail('Live A/B runner not yet wired to this process — use scripts/rbac-ab-fixture when present');
   });
 });

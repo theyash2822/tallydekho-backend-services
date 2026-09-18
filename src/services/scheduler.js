@@ -94,9 +94,11 @@ async function runPaymentReminderJob() {
                  l.mobile AS party_mobile, l.email AS party_email
           FROM bill_outstanding bo
           JOIN companies c ON c.guid = bo.company_guid
-          LEFT JOIN ledgers l ON l.company_guid = bo.company_guid AND l.name = bo.ledger_name
+          LEFT JOIN ledgers l ON l.company_id = bo.company_id AND l.name = bo.ledger_name
           WHERE bo.company_guid IN (
-            SELECT guid FROM companies WHERE user_id=$1
+            SELECT c.guid FROM companies c
+            JOIN workspace_memberships m ON m.workspace_id = c.workspace_id
+            WHERE m.user_id = $1 AND m.status = 'ACTIVE'
           )
           AND DATE(TO_TIMESTAMP(bo.due_date::bigint / 1000)) = ($2)::date
           AND bo.amount >= $3

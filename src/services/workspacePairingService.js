@@ -207,18 +207,17 @@ export async function pairDeviceToWorkspace({ device, userId, workspaceId = null
   const secret = generateDeviceSecret();
   const secretHash = await hashSecret(secret);
 
-  // Ownership = Workspace. user_id kept as workspace owner for legacy status helpers only — not actor.
+  // Ownership = Workspace. Phase 4: do not write devices.user_id
   await query(
     `UPDATE devices SET
-       user_id = $1,
-       workspace_id = $2,
+       workspace_id = $1,
        paired = TRUE,
        binding_status = 'ACTIVE',
-       device_secret_hash = $3,
+       device_secret_hash = $2,
        credential_claimed_at = NULL,
-       last_seen = $4
-     WHERE device_id = $5`,
-    [workspace.owner_user_id, workspace.id, secretHash, ts, device.device_id]
+       last_seen = $3
+     WHERE device_id = $4`,
+    [workspace.id, secretHash, ts, device.device_id]
   );
 
   // Attach device companies to workspace ownership — do NOT force is_active
@@ -305,7 +304,6 @@ export async function unpairDevice(deviceId, actorUserId = null) {
   await query(
     `UPDATE devices SET
        paired = FALSE,
-       user_id = NULL,
        workspace_id = NULL,
        binding_status = 'REVOKED',
        device_secret_hash = NULL,
@@ -703,15 +701,14 @@ export async function claimPairingCredential({ sessionId, claimToken }) {
 
   await query(
     `UPDATE devices SET
-       user_id = $1,
-       workspace_id = $2,
+       workspace_id = $1,
        paired = TRUE,
        binding_status = 'ACTIVE',
-       device_secret_hash = $3,
+       device_secret_hash = $2,
        credential_claimed_at = NULL,
-       last_seen = $4
-     WHERE device_id = $5`,
-    [workspace.owner_user_id, workspace.id, secretHash, ts, device.device_id]
+       last_seen = $3
+     WHERE device_id = $4`,
+    [workspace.id, secretHash, ts, device.device_id]
   );
 
   await query(

@@ -82,10 +82,10 @@ export function normalizeCategoryLabel(groupName, category) {
 /**
  * Aggregate stock dashboard payload (async — uses injected query fn).
  */
-export async function buildStockDashboardInsights(query, companyGuid) {
+export async function buildStockDashboardInsights(query, companyId) {
   const { rows: total } = await query(
-    'SELECT COUNT(*) as c, COALESCE(SUM(closing_value), 0) as v, COALESCE(SUM(closing_qty), 0) as qty FROM stocks WHERE company_guid = $1',
-    [companyGuid]
+    'SELECT COUNT(*) as c, COALESCE(SUM(closing_value), 0) as v, COALESCE(SUM(closing_qty), 0) as qty FROM stocks WHERE company_id=$1',
+    [companyId]
   );
   const totalItems = parseInt(total[0]?.c || 0, 10);
   const totalValue = parseFloat(total[0]?.v || 0);
@@ -94,18 +94,18 @@ export async function buildStockDashboardInsights(query, companyGuid) {
   const { rows: low } = await query(`
     SELECT COUNT(*) as c, COALESCE(SUM(s.closing_value), 0) as reorder_value
     FROM stocks s
-    LEFT JOIN groups g ON g.company_guid = s.company_guid AND g.name = s.group_name
-    WHERE s.company_guid = $1
+    LEFT JOIN groups g ON g.company_id = s.company_id AND g.name = s.group_name
+    WHERE s.company_id=$1
       AND s.closing_qty > 0
       AND (
         (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
         OR (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
       )
-  `, [companyGuid]);
+  `, [companyId]);
 
   const { rows: out } = await query(
-    'SELECT COUNT(*) as c FROM stocks WHERE company_guid = $1 AND closing_qty = 0',
-    [companyGuid]
+    'SELECT COUNT(*) as c FROM stocks WHERE company_id=$1 AND closing_qty = 0',
+    [companyId]
   );
 
   const lowStock = parseInt(low[0]?.c || 0, 10);
@@ -113,27 +113,27 @@ export async function buildStockDashboardInsights(query, companyGuid) {
   const reorderValue = parseFloat(low[0]?.reorder_value || 0);
 
   const { rows: wh } = await query(
-    'SELECT COUNT(*) as c FROM warehouses WHERE company_guid = $1',
-    [companyGuid]
+    'SELECT COUNT(*) as c FROM warehouses WHERE company_id=$1',
+    [companyId]
   );
   const warehouseCount = parseInt(wh[0]?.c || 0, 10);
 
   const { rows: recent } = await query(`
     SELECT COUNT(*) as c FROM stock_transactions
-    WHERE company_guid = $1 AND date::date >= CURRENT_DATE - INTERVAL '7 days'
-  `, [companyGuid]);
+    WHERE company_id=$1 AND date::date >= CURRENT_DATE - INTERVAL '7 days'
+  `, [companyId]);
   const recentMovements = parseInt(recent[0]?.c || 0, 10);
 
   const { rows: agedSimple } = await query(`
     SELECT COALESCE(SUM(sub.value), 0) as v FROM (
       SELECT s.closing_qty * s.closing_rate as value
       FROM stocks s
-      LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_guid = s.company_guid
-      WHERE s.company_guid = $1 AND s.closing_qty > 0
+      LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_id = s.company_id
+      WHERE s.company_id=$1 AND s.closing_qty > 0
       GROUP BY s.guid, s.closing_qty, s.closing_rate
       HAVING CURRENT_DATE - MAX(st.date::date) >= 90 OR MAX(st.date::date) IS NULL
     ) sub
-  `, [companyGuid]);
+  `, [companyId]);
   const agedInventoryValue = parseFloat(agedSimple[0]?.v || 0);
 
   const fyStart = `${new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1}-04-01`;
@@ -144,31 +144,31 @@ export async function buildStockDashboardInsights(query, companyGuid) {
       SELECT s.name
       FROM stocks s
       LEFT JOIN stock_transactions st
-        ON st.stock_guid = s.name AND st.company_guid = s.company_guid
+        ON st.stock_guid = s.name AND st.company_id = s.company_id
         AND st.type = 'outward'
         AND st.date::date >= $2::date AND st.date::date <= $3::date
         AND st.voucher_type NOT IN ('Stock Journal','Physical Stock','Opening Balance')
-      WHERE s.company_guid = $1 AND COALESCE(s.closing_qty, 0) > 0
+      WHERE s.company_id=$1 AND COALESCE(s.closing_qty, 0) > 0
       GROUP BY s.name, s.closing_qty
       HAVING COALESCE(SUM(st.qty), 0) > 0
     ) sub
-  `, [companyGuid, fyStart, fyEnd]);
+  `, [companyId, fyStart, fyEnd]);
   const fastMovingCount = parseInt(fastRows[0]?.c || 0, 10);
 
   const { rows: outwardRows } = await query(`
     SELECT COALESCE(SUM(CASE WHEN st.type = 'outward' THEN COALESCE(st.value, ABS(st.qty) * COALESCE(s.closing_rate, 0)) ELSE 0 END), 0) as outward_value
     FROM stocks s
     LEFT JOIN stock_transactions st
-      ON st.stock_guid = s.name AND st.company_guid = s.company_guid
+      ON st.stock_guid = s.name AND st.company_id = s.company_id
       AND st.date::date >= $2::date AND st.date::date <= $3::date
-    WHERE s.company_guid = $1
-  `, [companyGuid, fyStart, fyEnd]);
+    WHERE s.company_id=$1
+  `, [companyId, fyStart, fyEnd]);
   const outwardValue = parseFloat(outwardRows[0]?.outward_value || 0);
 
   const { rows: openVal } = await query(`
     SELECT COALESCE(SUM(opening_value), 0) as v, COALESCE(SUM(closing_value), 0) as c
-    FROM stock_fy_valuation WHERE company_guid = $1
-  `, [companyGuid]);
+    FROM stock_fy_valuation WHERE company_id=$1
+  `, [companyId]);
   const openingVal = parseFloat(openVal[0]?.v || 0);
   const sfvClosing = parseFloat(openVal[0]?.c || 0);
   const avgInventory = sfvClosing > 0 && openingVal > 0
@@ -180,11 +180,11 @@ export async function buildStockDashboardInsights(query, companyGuid) {
       COALESCE(NULLIF(TRIM(s.group_name), ''), NULLIF(TRIM(s.category), ''), 'Other') AS label,
       COALESCE(SUM(s.closing_value), 0) AS value
     FROM stocks s
-    WHERE s.company_guid = $1 AND COALESCE(s.closing_value, 0) != 0
+    WHERE s.company_id=$1 AND COALESCE(s.closing_value, 0) != 0
     GROUP BY 1
     ORDER BY value DESC
     LIMIT 8
-  `, [companyGuid]);
+  `, [companyId]);
 
   const categories = catRows.map(r => ({
     label: r.label,
@@ -203,11 +203,11 @@ export async function buildStockDashboardInsights(query, companyGuid) {
       COALESCE(SUM(CASE WHEN st.type = 'inward' THEN COALESCE(st.value, ABS(st.qty) * COALESCE(s.closing_rate, 0)) ELSE 0 END), 0)
       - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN COALESCE(st.value, ABS(st.qty) * COALESCE(s.closing_rate, 0)) ELSE 0 END), 0) AS net_change
     FROM stock_transactions st
-    LEFT JOIN stocks s ON s.company_guid = st.company_guid AND s.name = st.stock_guid
-    WHERE st.company_guid = $1 AND st.date::date >= (CURRENT_DATE - INTERVAL '6 months')
+    LEFT JOIN stocks s ON s.company_id = st.company_id AND s.name = st.stock_guid
+    WHERE st.company_id=$1 AND st.date::date >= (CURRENT_DATE - INTERVAL '6 months')
     GROUP BY 1
     ORDER BY 1 ASC
-  `, [companyGuid]);
+  `, [companyId]);
 
   const trend = buildStockValueTrend(totalValue, monthlyRows);
   const { valueTrendPct, valueTrendPositive } = computeValueTrend(trend);

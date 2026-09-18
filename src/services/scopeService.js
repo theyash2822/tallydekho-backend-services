@@ -35,16 +35,33 @@ async function assertSelected(table, whereSql, params, deniedCode, deniedMessage
   }
 }
 
-export async function assertCompanyAccess(membershipId, companyGuid) {
+export async function assertCompanyAccess(membershipId, companyGuid, opts = {}) {
   if (!flags.scope_company_enabled()) return true;
-  if (!companyGuid) return true;
+  if (!companyGuid && opts.companyId == null) return true;
   const policy = await getPolicy(membershipId);
   if (policy.company_mode === 'NONE') throw new ScopeError('SCOPE_COMPANY_DENIED', 'No company access for this member.', 403);
   if (policy.company_mode === 'ALL') return true;
+
+  // Phase 3D: company_id authoritative; resolve guid only via member's workspace
+  let companyId = opts.companyId ?? null;
+  if (companyId == null && companyGuid) {
+    const { rows } = await query(
+      `SELECT c.id
+         FROM companies c
+         JOIN workspace_memberships m ON m.workspace_id = c.workspace_id
+        WHERE m.id = $1 AND c.guid = $2
+        LIMIT 1`,
+      [membershipId, companyGuid]
+    );
+    companyId = rows[0]?.id ?? null;
+  }
+  if (companyId == null) {
+    throw new ScopeError('SCOPE_COMPANY_DENIED', 'This member does not have access to the selected company.', 403);
+  }
   await assertSelected(
     'member_company_access',
-    'membership_id = $1 AND company_guid = $2',
-    [membershipId, companyGuid],
+    'membership_id = $1 AND company_id = $2',
+    [membershipId, companyId],
     'SCOPE_COMPANY_DENIED',
     'This member does not have access to the selected company.'
   );

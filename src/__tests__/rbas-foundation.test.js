@@ -13,9 +13,9 @@ import { TALLY_WRITE_CAPABILITIES } from '../middleware/companyAccess.js';
 import { FEATURE_FLAGS } from '../config/featureFlags.js';
 
 describe('feature flags ON', () => {
-  it('enables workspace + rbas + scopes', () => {
+  it('enables workspace + scopes (RBAC always on — no rbas_enabled)', () => {
     assert.equal(FEATURE_FLAGS.workspace_model_enabled, true);
-    assert.equal(FEATURE_FLAGS.rbas_enabled, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(FEATURE_FLAGS, 'rbas_enabled'), false);
     assert.equal(FEATURE_FLAGS.scope_company_enabled, true);
   });
 });

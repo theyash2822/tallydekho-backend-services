@@ -16,11 +16,8 @@ import tallyWriteRoutes, { setTallyWriteSocket } from './routes/tally-write.js';
 import authRoutes from './routes/auth.js';
 import aiRoutes from './routes/ai.js';
 import pairingRoutes from './routes/pairing.js';
-import companiesRoutes from './routes/companies.js';
 import ingestRoutes, { setSocketService } from './routes/ingest.js';
 import { setPairingSocket } from './routes/pairing.js';
-import dataRoutes from './routes/data.js';
-import integrationRoutes from './routes/integrations.js';
 import apiV1Routes, { setApiSocket } from './routes/api-v1.js';
 import desktopWorkspaceRoutes, { localObjectPutHandler, localObjectGetHandler, setDesktopWorkspaceSocket } from './routes/desktopWorkspace.js';
 import { setWorkspaceApiSocket } from './routes/workspaceApi.js';
@@ -85,13 +82,9 @@ app.use('/app/verify-otp', authLimiter);
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '1.0.0', db: 'postgresql' }));
 
 // ── Routes ─────────────────────────────────────────────────────────────────
+// LEGACY-BLOCK-APP-AUTH: /app auth retained for abandoned pre-V4 clients (see LEGACY_APP_USAGE_MATRIX)
 app.use('/app', authRoutes);
-app.use('/app', companiesRoutes);
-app.use('/app', dataRoutes);
-app.use('/app', pairingRoutes);
-app.use('/app/integrations', integrationRoutes);
-app.use('/app/ai', aiRoutes);
-app.use('/api/ai', aiRoutes); // also accessible via /api prefix for mobile
+app.use('/api/ai', aiRoutes);
 app.use('/desktop', pairingRoutes);
 app.put('/desktop/backup/objects/:token', localObjectPutHandler);
 app.get('/desktop/backup/objects/:token', localObjectGetHandler);
@@ -106,16 +99,26 @@ app.post('/ingest/complete-notify', express.json(), async (req, res) => {
   if (secret !== process.env.INTERNAL_SECRET) {
     return res.status(403).json({ status: false, message: 'Forbidden' });
   }
-  const { userId, companyGuid } = req.body;
+  const { userId, companyGuid, companyId: bodyCompanyId, workspaceId: bodyWorkspaceId } = req.body;
   if (userId) {
-    let wsId = null;
-    if (companyGuid) {
+    let wsId = bodyWorkspaceId || null;
+    let resolvedCompanyId = bodyCompanyId != null ? Number(bodyCompanyId) : null;
+    if (resolvedCompanyId != null && Number.isFinite(resolvedCompanyId)) {
       try {
         const { rows } = await query(
-          `SELECT workspace_id FROM companies WHERE guid = $1 LIMIT 1`,
-          [companyGuid]
+          `SELECT workspace_id, guid FROM companies WHERE id = $1 LIMIT 1`,
+          [resolvedCompanyId]
         );
-        wsId = rows[0]?.workspace_id || null;
+        wsId = rows[0]?.workspace_id || wsId;
+      } catch (_) { /* still notify */ }
+    } else if (companyGuid && wsId) {
+      try {
+        const { rows } = await query(
+          `SELECT id, workspace_id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+          [companyGuid, wsId]
+        );
+        resolvedCompanyId = rows[0]?.id ?? null;
+        wsId = rows[0]?.workspace_id || wsId;
       } catch (_) { /* still notify user clients */ }
     }
     socketService.notifySynced(userId, companyGuid, wsId);

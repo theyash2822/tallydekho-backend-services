@@ -80,12 +80,12 @@ function classifyFacility(parent, name) {
   return null;
 }
 
-async function loadCandidateLedgers(companyGuid) {
+async function loadCandidateLedgers(companyId) {
   const { rows } = await query(
     `SELECT guid, name, parent, closing_balance, balance_type, opening_balance,
             credit_limit
      FROM ledgers
-     WHERE company_guid = $1
+     WHERE company_id=$1
        AND (
          parent ILIKE 'Secured Loans'
          OR parent ILIKE 'Unsecured Loans'
@@ -96,7 +96,7 @@ async function loadCandidateLedgers(companyGuid) {
          OR parent ILIKE 'Bank OD Accounts'
        )
      ORDER BY ABS(closing_balance) DESC`,
-    [companyGuid]
+    [companyId]
   );
   return rows
     .map((r) => {
@@ -117,28 +117,28 @@ async function loadCandidateLedgers(companyGuid) {
     .filter(Boolean);
 }
 
-async function loadLedgerMovements(companyGuid, ledgerName) {
+async function loadLedgerMovements(companyId, ledgerName) {
   const { rows } = await query(
     `SELECT v.guid AS voucher_guid, v.date, v.voucher_number, v.voucher_type, v.party_name,
             vle.amount, vle.dr_cr, vle.ledger_name
      FROM voucher_ledger_entries vle
-     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1 AND vle.ledger_name = $2 AND v.is_cancelled = FALSE
+     JOIN vouchers v ON v.guid = vle.voucher_guid AND v.company_id = vle.company_id
+     WHERE vle.company_id=$1 AND vle.ledger_name = $2 AND v.is_cancelled = FALSE
        AND v.date IS NOT NULL AND v.date <> ''
      ORDER BY v.date ASC, v.voucher_number ASC NULLS LAST`,
-    [companyGuid, ledgerName]
+    [companyId, ledgerName]
   );
   return rows;
 }
 
-async function loadVoucherLegs(companyGuid, voucherGuids) {
+async function loadVoucherLegs(companyId, voucherGuids) {
   if (!voucherGuids.length) return new Map();
   const { rows } = await query(
     `SELECT vle.voucher_guid, vle.ledger_name, vle.amount, vle.dr_cr, l.parent
      FROM voucher_ledger_entries vle
-     LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_guid = vle.company_guid
-     WHERE vle.company_guid = $1 AND vle.voucher_guid = ANY($2::text[])`,
-    [companyGuid, voucherGuids]
+     LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
+     WHERE vle.company_id=$1 AND vle.voucher_guid = ANY($2::text[])`,
+    [companyId, voucherGuids]
   );
   const map = new Map();
   for (const r of rows) {
@@ -552,10 +552,10 @@ function buildUpcomingFromCadence(emiAmountField, nextDateField, count = 6) {
   return rows;
 }
 
-async function enrichLoan(companyGuid, facility) {
-  const movements = await loadLedgerMovements(companyGuid, facility.name);
+async function enrichLoan(companyId, facility) {
+  const movements = await loadLedgerMovements(companyId, facility.name);
   const voucherGuids = [...new Set(movements.map((m) => m.voucher_guid))];
-  const legsByVoucher = await loadVoucherLegs(companyGuid, voucherGuids);
+  const legsByVoucher = await loadVoucherLegs(companyId, voucherGuids);
   let events = detectEmiEvents(facility.name, movements, legsByVoucher);
   events = attachOpenings(events, facility);
 
@@ -641,13 +641,13 @@ async function enrichLoan(companyGuid, facility) {
   };
 }
 
-async function enrichOd(companyGuid, facility) {
-  const movements = await loadLedgerMovements(companyGuid, facility.name);
+async function enrichOd(companyId, facility) {
+  const movements = await loadLedgerMovements(companyId, facility.name);
   const util = buildOdUtilisation(facility, movements, 30);
 
   // Interest history: expense co-occurrence rough
   const voucherGuids = [...new Set(movements.map((m) => m.voucher_guid))];
-  const legsByVoucher = await loadVoucherLegs(companyGuid, voucherGuids);
+  const legsByVoucher = await loadVoucherLegs(companyId, voucherGuids);
   const interestEvents = [];
   for (const [vg, legs] of legsByVoucher) {
     const interestLegs = legs.filter((l) => INTEREST_NAME_RE.test(l.ledger_name));
@@ -723,18 +723,18 @@ async function enrichOd(companyGuid, facility) {
 /**
  * Build full KPI payload for Loans & ODs screen.
  */
-export async function buildLoansOdsPayload(companyGuid) {
+export async function buildLoansOdsPayload(companyId) {
   const asOf = new Date().toISOString();
   const asOfDay = trendIsoDay(asOf) || new Date().toISOString().slice(0, 10);
-  const facilities = await loadCandidateLedgers(companyGuid);
+  const facilities = await loadCandidateLedgers(companyId);
   const loans = [];
   const overdrafts = [];
 
   for (const f of facilities) {
     if (f.facilityType === 'OD') {
-      overdrafts.push(await enrichOd(companyGuid, f));
+      overdrafts.push(await enrichOd(companyId, f));
     } else {
-      loans.push(await enrichLoan(companyGuid, f));
+      loans.push(await enrichLoan(companyId, f));
     }
   }
 
@@ -746,13 +746,17 @@ export async function buildLoansOdsPayload(companyGuid) {
   // Phase 4: daily snapshot + trend vs ~30d prior (null if no history)
   try {
     await query(
-      `INSERT INTO kpi_loans_snapshots (company_guid, as_of, total, loan_total, od_total, created_at)
-       VALUES ($1, $2::date, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT)
-       ON CONFLICT (company_guid, as_of)
-       DO UPDATE SET total = EXCLUDED.total, loan_total = EXCLUDED.loan_total,
+      `INSERT INTO kpi_loans_snapshots (company_id, company_guid, as_of, total, loan_total, od_total, created_at)
+       VALUES (
+         $1,
+         (SELECT guid FROM companies WHERE id = $1),
+         $2::date, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT
+       )
+       ON CONFLICT (company_id, as_of)
+       DO UPDATE SET company_id = EXCLUDED.company_id, total = EXCLUDED.total, loan_total = EXCLUDED.loan_total,
                      od_total = EXCLUDED.od_total,
                      created_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
-      [companyGuid, asOfDay, total, money(loanSum), money(odSum)]
+      [companyId, asOfDay, total, money(loanSum), money(odSum)]
     );
   } catch (e) {
     console.warn('[loans] snapshot upsert skipped:', e.message);
@@ -766,11 +770,11 @@ export async function buildLoansOdsPayload(companyGuid) {
     const { rows } = await query(
       `SELECT as_of::text AS as_of, total, loan_total, od_total
        FROM kpi_loans_snapshots
-       WHERE company_guid = $1
+       WHERE company_id=$1
          AND as_of BETWEEN $2::date AND $3::date
          AND as_of <> $4::date
        ORDER BY as_of DESC`,
-      [companyGuid, from, to, asOfDay]
+      [companyId, from, to, asOfDay]
     );
     prior = pickPriorSnapshot(rows, target, 3);
   } catch (e) {

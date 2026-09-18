@@ -16,14 +16,14 @@ import { query } from '../db/schema.js';
 export async function generateIRN(companyGuid, voucher, company, creds) {
   // ── 1. Load GST details ────────────────────────────────────────────────────
   const { rows: gstRows } = await query(
-    `SELECT * FROM gst_voucher_details WHERE voucher_guid = $1 AND company_guid = $2`,
+    `SELECT * FROM gst_voucher_details WHERE voucher_guid = $1 AND company_id=$2`,
     [voucher.guid, companyGuid]
   );
   const gstDetail = gstRows[0] || {};
 
   // ── 2. Load line items ─────────────────────────────────────────────────────
   const { rows: items } = await query(
-    `SELECT * FROM voucher_inventory_items WHERE voucher_guid = $1 AND company_guid = $2`,
+    `SELECT * FROM voucher_inventory_items WHERE voucher_guid = $1 AND company_id=$2`,
     [voucher.guid, companyGuid]
   );
 

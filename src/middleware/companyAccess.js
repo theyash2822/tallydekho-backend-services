@@ -39,14 +39,15 @@ export async function ensureReqWorkspace(req) {
  * Company must belong to the resolved workspace (workspace_id authoritative).
  * Legacy companies.user_id is NOT used for authorization (CTO Phase 2).
  */
-async function companyInWorkspace(companyGuid, workspaceId, _userId) {
+export async function companyInWorkspace(companyGuid, workspaceId, _userId) {
   const { rows } = await query(
-    `SELECT c.guid FROM companies c
+    `SELECT c.id, c.guid, c.workspace_id, c.name, c.device_id, c.is_active
+     FROM companies c
      WHERE c.guid = $1 AND c.workspace_id = $2
      LIMIT 1`,
     [companyGuid, workspaceId]
   );
-  return rows.length > 0;
+  return rows[0] || null;
 }
 
 /**
@@ -80,18 +81,8 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
     if (!req.user?.userId) return deny(401, 'UNAUTHORIZED', 'Auth required');
 
     if (!flag('workspace_model_enabled')) {
-      // Workspace model is required — never fall back to user_id company ownership.
-      const allowBypass =
-        process.env.ALLOW_RBAS_BYPASS === '1' && process.env.NODE_ENV === 'test';
-      if (!allowBypass) {
-        return deny(403, 'WORKSPACE_REQUIRED', 'Workspace authorization required');
-      }
-      const { rows } = await query(
-        'SELECT guid FROM companies WHERE guid = $1 AND workspace_id IS NOT NULL LIMIT 1',
-        [companyGuid]
-      );
-      if (!rows.length) return deny(403, 'FORBIDDEN', 'Company not found or access denied');
-      return true;
+      // Workspace model is required — never fall back to guid-only company lookup.
+      return deny(403, 'WORKSPACE_REQUIRED', 'Workspace authorization required');
     }
 
     const workspaceId = await ensureReqWorkspace(req);
@@ -99,10 +90,19 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
       return deny(403, 'WORKSPACE_ACCESS_DENIED', 'Workspace membership required');
     }
 
-    const okCompany = await companyInWorkspace(companyGuid, workspaceId, req.user.userId);
-    if (!okCompany) {
+    const companyRow = await companyInWorkspace(companyGuid, workspaceId, req.user.userId);
+    if (!companyRow) {
       return deny(403, 'COMPANY_SCOPE_DENIED', 'Company not in this workspace');
     }
+    // Phase 3B: resolve once — attach canonical company context for handlers
+    req.company = {
+      id: companyRow.id,
+      workspaceId: companyRow.workspace_id,
+      tallyGuid: companyRow.guid,
+      name: companyRow.name,
+      deviceId: companyRow.device_id,
+      isActive: companyRow.is_active,
+    };
 
     // Resolve pairing — Demo never elevates RBAS (product 2A).
     // CONNECTED: Demo is forbidden. UNPAIRED/RECONNECTING: Demo readable with real caps;
@@ -140,7 +140,7 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
     const skipCompanyScopeForDemo = demoRow && pairingStatus !== 'CONNECTED';
     if (flag('scope_company_enabled') && !skipCompanyScopeForDemo && req.membership?.membership_type !== 'OWNER') {
       try {
-        await assertCompanyAccess(req.membership.id, companyGuid);
+        await assertCompanyAccess(req.membership.id, companyGuid, { companyId: req.company?.id });
       } catch (scopeErr) {
         return deny(403, scopeErr.code || 'COMPANY_SCOPE_DENIED', scopeErr.message || 'Company scope denied');
       }

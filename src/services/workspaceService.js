@@ -251,10 +251,12 @@ export function workspacePublicView(workspace) {
 export async function listWorkspacesForUser(userId) {
   const { rows } = await query(
     `SELECT w.*, m.membership_type, m.status AS membership_status, m.role_id,
-            b.connection_status AS binding_status
+            b.connection_status AS binding_status,
+            r.system_key AS role_system_key, r.display_name AS role_display_name
      FROM workspaces w
      JOIN workspace_memberships m ON m.workspace_id = w.id
      LEFT JOIN workspace_tally_bindings b ON b.workspace_id = w.id
+     LEFT JOIN workspace_roles r ON r.id = m.role_id
      WHERE m.user_id = $1 AND m.status IN ('ACTIVE','SUSPENDED')
        AND w.lifecycle_status = 'ACTIVE'
      ORDER BY w.is_base DESC, w.created_at ASC`,
@@ -269,18 +271,15 @@ export async function listWorkspacesForUser(userId) {
       membershipType: w.membership_type,
       membershipStatus: w.membership_status,
       roleId: w.role_id,
+      roleSystemKey: w.role_system_key || null,
+      roleDisplayName: w.role_display_name || null,
     };
   });
 
-  // A user can hold BOTH at once:
-  //  1) Own workspace(s) — membership OWNER (Personal + any additional they created)
-  //  2) Invited workspace(s) — MEMBER/ADMIN on someone else's workspace (often is_base=true
-  //     for the host's personal/business WS). Do NOT filter out is_base invites — that hid
-  //     Yash's workspace from Sudhir on Mobile while Web Team Access still listed him.
+  // OWNER workspaces + MEMBER invites (admin-equivalent = MEMBER + ADMIN role)
   return mapped.filter((w) => {
     const mt = String(w.membershipType || '').toUpperCase();
-    if (mt === 'OWNER') return true;
-    return mt === 'MEMBER' || mt === 'ADMIN';
+    return mt === 'OWNER' || mt === 'MEMBER';
   });
 }
 
@@ -307,9 +306,9 @@ export async function getWorkspaceContext(userId, workspaceId) {
 
   const { rows: companiesRaw } = await query(
     `SELECT guid, name, gstin, is_active FROM companies
-     WHERE workspace_id = $1 OR (workspace_id IS NULL AND user_id = $2)
+     WHERE workspace_id = $1
      ORDER BY name ASC`,
-    [workspaceId, workspace.owner_user_id]
+    [workspaceId]
   );
   let companies = companiesRaw;
 
@@ -482,7 +481,10 @@ export async function getMemberScopes(membershipId, workspaceId = null) {
     [membershipId]
   );
   const { rows: companies } = await query(
-    `SELECT company_guid FROM member_company_access WHERE membership_id = $1`,
+    `SELECT c.guid AS company_guid, mca.company_id
+       FROM member_company_access mca
+       JOIN companies c ON c.id = mca.company_id
+      WHERE mca.membership_id = $1`,
     [membershipId]
   );
   const { rows: fys } = await query(
@@ -539,9 +541,27 @@ export async function putMemberScopes(membershipId, scopes = {}, workspaceId = n
   if (Array.isArray(scopes.companies)) {
     await query(`DELETE FROM member_company_access WHERE membership_id = $1`, [membershipId]);
     for (const guid of scopes.companies) {
+      if (!workspaceId) {
+        const err = new Error('workspaceId required to set company scopes');
+        err.code = 'WORKSPACE_REQUIRED';
+        err.httpStatus = 400;
+        throw err;
+      }
+      const { rows: cos } = await query(
+        `SELECT id FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+        [guid, workspaceId]
+      );
+      if (!cos[0]?.id) {
+        const err = new Error(`Company ${guid} not in workspace`);
+        err.code = 'COMPANY_SCOPE_DENIED';
+        err.httpStatus = 403;
+        throw err;
+      }
       await query(
-        `INSERT INTO member_company_access (membership_id, company_guid) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-        [membershipId, guid]
+        `INSERT INTO member_company_access (membership_id, company_id)
+         VALUES ($1,$2)
+         ON CONFLICT (membership_id, company_id) DO NOTHING`,
+        [membershipId, cos[0].id]
       );
     }
   }
@@ -856,14 +876,19 @@ export async function acceptInvitation(userId, invitationId) {
     err.httpStatus = 409;
     throw err;
   }
-  // Admin system role → membership_type ADMIN (protected authority); others stay MEMBER + role_id
-  let membershipType = 'MEMBER';
+  // Admin-equivalent invite → MEMBER + builtin ADMIN role_id (never membership_type ADMIN)
+  const membershipType = 'MEMBER';
   if (inv.role_id) {
     const { rows: roleRows } = await query(
       `SELECT system_key FROM workspace_roles WHERE id = $1 LIMIT 1`,
       [inv.role_id]
     );
-    if (roleRows[0]?.system_key === 'ADMIN') membershipType = 'ADMIN';
+    if (!roleRows[0]) {
+      const err = new Error('Invitation role no longer exists');
+      err.code = 'ROLE_NOT_FOUND';
+      err.httpStatus = 409;
+      throw err;
+    }
   }
   const membershipId = uuid();
   // Free prior seat if re-joining after REMOVED with a stale seat pointer
@@ -1053,8 +1078,7 @@ export async function removeMember(actorUserId, workspaceId, targetUserId) {
 }
 
 /**
- * Assign/change a member's role_id and derive membership_type from role system_key.
- * OWNER is never changed via this endpoint. Client must not set membership_type.
+ * Assign/change a member's role_id. membership_type stays MEMBER (OWNER never via this path).
  * Capability checked at route (members.role_assign).
  */
 export async function changeMemberRole(actorUserId, workspaceId, targetUserId, roleId) {
@@ -1087,7 +1111,7 @@ export async function changeMemberRole(actorUserId, workspaceId, targetUserId, r
     err.httpStatus = 404;
     throw err;
   }
-  const membershipType = roleRows[0].system_key === 'ADMIN' ? 'ADMIN' : 'MEMBER';
+  const membershipType = 'MEMBER';
   const previousRoleId = target.role_id;
   await query(
     `UPDATE workspace_memberships SET role_id = $2, membership_type = $3 WHERE id = $1`,
@@ -1098,6 +1122,7 @@ export async function changeMemberRole(actorUserId, workspaceId, targetUserId, r
     previousRoleId,
     roleId,
     membershipType,
+    roleSystemKey: roleRows[0].system_key,
   });
   return {
     membershipId: target.id,
@@ -1105,6 +1130,7 @@ export async function changeMemberRole(actorUserId, workspaceId, targetUserId, r
     roleId,
     previousRoleId,
     membershipType,
+    roleSystemKey: roleRows[0].system_key,
   };
 }
 
@@ -1924,18 +1950,19 @@ export async function executeWorkspaceReset(actorUserId, workspaceId, { system =
 
   // Detach non-demo companies: purge tally data + clear workspace binding
   const { rows: companies } = await query(
-    `SELECT guid, name FROM companies WHERE workspace_id = $1`,
+    `SELECT id, guid, name FROM companies WHERE workspace_id = $1`,
     [workspaceId]
   );
   for (const c of companies) {
     const isDemo = /demo/i.test(c.name || '') || String(c.guid || '').startsWith('DEMO');
     if (!isDemo) {
-      await purgeCompanyTallyData(c.guid).catch((e) => {
+      await purgeCompanyTallyData(c.guid, { workspaceId, companyId: c.id }).catch((e) => {
         console.warn('[reset] purgeCompanyTallyData:', e.message);
       });
+      // CID-Q007: disconnect/reset must NOT null workspace ownership
       await query(
-        `UPDATE companies SET workspace_id = NULL, device_id = NULL WHERE guid = $1`,
-        [c.guid]
+        `UPDATE companies SET is_active = FALSE, device_id = NULL WHERE id = $1 AND workspace_id = $2`,
+        [c.id, workspaceId]
       ).catch(() => {});
     }
   }
@@ -2365,14 +2392,15 @@ export async function executeWorkspaceClose(actorUserId, workspaceId, { system =
   ).catch(() => {});
 
   const { rows: companies } = await query(
-    `SELECT guid FROM companies WHERE workspace_id = $1`,
+    `SELECT id, guid FROM companies WHERE workspace_id = $1`,
     [workspaceId]
   );
   for (const c of companies) {
-    await purgeCompanyTallyData(c.guid).catch(() => {});
+    await purgeCompanyTallyData(c.guid, { workspaceId, companyId: c.id }).catch(() => {});
+    // CID-Q007: close archives in-place — never steal/null ownership
     await query(
-      `UPDATE companies SET workspace_id = NULL, device_id = NULL WHERE guid = $1`,
-      [c.guid]
+      `UPDATE companies SET is_active = FALSE, device_id = NULL WHERE id = $1 AND workspace_id = $2`,
+      [c.id, workspaceId]
     ).catch(() => {});
   }
 
@@ -2411,29 +2439,15 @@ export async function executeWorkspaceClose(actorUserId, workspaceId, { system =
   return { status: 'CLOSED', requestId: req.id, stub: false };
 }
 
-async function assertCompanyInWorkspace(workspaceId, companyGuid, userId) {
-  const { rows } = await query(
-    `SELECT guid FROM companies
-     WHERE guid = $1 AND (workspace_id = $2 OR user_id = $3)
-     LIMIT 1`,
-    [companyGuid, workspaceId, userId]
-  );
-  if (!rows[0]) {
-    const err = new Error('Company not in workspace');
-    err.code = 'COMPANY_SCOPE_DENIED';
-    err.httpStatus = 403;
-    throw err;
-  }
-}
-
 export async function getPaymentModeMap(workspaceId, companyGuid, userId) {
-  await assertCompanyInWorkspace(workspaceId, companyGuid, userId);
+  const { resolveCompanyInWorkspace } = await import('./deviceCompanyResolution.js');
+  const company = await resolveCompanyInWorkspace({ workspaceId, companyGuid });
   const { rows } = await query(
-    `SELECT id, workspace_id, company_guid, payment_mode, ledger_guid, ledger_name
+    `SELECT id, workspace_id, company_guid, company_id, payment_mode, ledger_guid, ledger_name
      FROM payment_mode_posting_map
-     WHERE workspace_id = $1 AND company_guid = $2
+     WHERE workspace_id = $1 AND company_id = $2
      ORDER BY payment_mode`,
-    [workspaceId, companyGuid]
+    [workspaceId, company.id]
   );
   return rows;
 }
@@ -2442,26 +2456,29 @@ export async function getPaymentModeMap(workspaceId, companyGuid, userId) {
  * Replace payment-mode → ledger map for a company. Body: { mappings: [{ paymentMode, ledgerGuid, ledgerName }] }
  */
 export async function putPaymentModeMap(workspaceId, companyGuid, userId, mappings) {
-  await assertCompanyInWorkspace(workspaceId, companyGuid, userId);
+  const { resolveCompanyInWorkspace } = await import('./deviceCompanyResolution.js');
+  const company = await resolveCompanyInWorkspace({ workspaceId, companyGuid });
   const list = Array.isArray(mappings) ? mappings : [];
   await query(
-    `DELETE FROM payment_mode_posting_map WHERE workspace_id = $1 AND company_guid = $2`,
-    [workspaceId, companyGuid]
+    `DELETE FROM payment_mode_posting_map WHERE workspace_id = $1 AND company_id = $2`,
+    [workspaceId, company.id]
   );
   for (const m of list) {
     const paymentMode = String(m.paymentMode || m.payment_mode || '').trim();
     if (!paymentMode) continue;
     await query(
       `INSERT INTO payment_mode_posting_map
-         (id, workspace_id, company_guid, payment_mode, ledger_guid, ledger_name)
-       VALUES ($1,$2,$3,$4,$5,$6)
+         (id, workspace_id, company_guid, company_id, payment_mode, ledger_guid, ledger_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
        ON CONFLICT (workspace_id, company_guid, payment_mode) DO UPDATE SET
+         company_id = EXCLUDED.company_id,
          ledger_guid = EXCLUDED.ledger_guid,
          ledger_name = EXCLUDED.ledger_name`,
       [
         uuid(),
         workspaceId,
-        companyGuid,
+        company.guid,
+        company.id,
         paymentMode,
         m.ledgerGuid || m.ledger_guid || null,
         m.ledgerName || m.ledger_name || null,

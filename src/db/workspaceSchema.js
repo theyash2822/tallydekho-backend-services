@@ -74,8 +74,8 @@ export async function applyWorkspaceSchema(client) {
 
     CREATE TABLE IF NOT EXISTS member_company_access (
       membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
-      company_guid    TEXT NOT NULL,
-      PRIMARY KEY (membership_id, company_guid)
+      company_id      BIGINT NOT NULL,
+      PRIMARY KEY (membership_id, company_id)
     );
     CREATE TABLE IF NOT EXISTS member_fy_access (
       membership_id   TEXT NOT NULL REFERENCES workspace_memberships(id) ON DELETE CASCADE,
@@ -477,5 +477,22 @@ export async function applyWorkspaceSchema(client) {
     );
     CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_auth_sessions_refresh ON auth_sessions(refresh_token_hash);
+  `);
+
+  // RBAC Phase 7 — legacy auth usage counters (aggregate only, no PII/secrets).
+  // Makes "verified clean day" answerable from the database instead of stdout.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS legacy_auth_events (
+      day               DATE NOT NULL,
+      event_type        TEXT NOT NULL,
+      route_class       TEXT NOT NULL,
+      platform          TEXT NOT NULL DEFAULT 'unknown',
+      app_version       TEXT NOT NULL DEFAULT 'unknown',
+      identified_client BOOLEAN NOT NULL DEFAULT FALSE,
+      hits              BIGINT NOT NULL DEFAULT 0,
+      last_seen         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (day, event_type, route_class, platform, app_version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_legacy_auth_events_day ON legacy_auth_events(day DESC);
   `);
 }

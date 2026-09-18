@@ -7,6 +7,9 @@ import { authMiddleware, generateToken } from '../middleware/auth.js';
 import { sendWhatsAppOTP, getRegion } from '../services/whatsapp.js';
 import { sendEmailVerificationOTP } from '../services/notifications.js';
 import { ensurePersonalWorkspace } from '../services/workspaceService.js';
+import { getUserPairingHints } from '../services/userPairingHints.js';
+import { devOtpSuffix } from '../utils/otpLogging.js';
+import { recordLegacyAuthEvent, LEGACY_EVENTS } from '../services/legacyAuthTelemetry.js';
 
 /** Bootstrap Personal Workspace + billing/roles; never fail the auth response. */
 async function bootstrapWorkspaceSafe(userId) {
@@ -41,6 +44,14 @@ const router = Router();
 const makeOtp = () => String(Math.floor(1000 + Math.random() * 9000));
 const now = () => Math.floor(Date.now() / 1000);
 
+// LEGACY-BLOCK-APP-AUTH telemetry — every hit on this router is legacy surface
+// usage. Counters answer "did a supported client still use /app auth today?";
+// see RBAC_PHASE7_OBSERVATION.md. Never blocks the request.
+router.use((req, _res, next) => {
+  void recordLegacyAuthEvent(LEGACY_EVENTS.APP_AUTH_HIT, req);
+  next();
+});
+
 // ─── POST /app/send-otp ───────────────────────────────────────────────────────
 router.post('/send-otp', async (req, res) => {
   const { mobileNumber, countryCode = '+91' } = req.body;
@@ -67,13 +78,13 @@ router.post('/send-otp', async (req, res) => {
     // Skip WhatsApp for test/bypass numbers
     const isBypass = BYPASS_NUMBERS.includes(cleanMobile);
 
-    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region} | OTP: ${otp} ${isBypass ? '(BYPASS)' : ''}`);
+    console.log(`[OTP] Sending to ${countryCode}${cleanMobile} | Region: ${region}${isBypass ? ' (BYPASS)' : ''}${devOtpSuffix(otp)}`);
     const waResult = isBypass
       ? { success: true }
       : await sendWhatsAppOTP(countryCode, cleanMobile, otp);
 
     if (!waResult.success) {
-      console.warn(`[OTP] WhatsApp failed — OTP: ${otp}`);
+      console.warn(`[OTP] WhatsApp send failed${devOtpSuffix(otp)}`);
       if (process.env.NODE_ENV !== 'production') {
         return res.json({ status: true, message: 'OTP generated (WhatsApp failed)', data: { otp } });
       }
@@ -129,9 +140,7 @@ router.post('/verify-otp', async (req, res) => {
 
     await bootstrapWorkspaceSafe(user.id);
 
-    // Check if device is paired
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
 
     // isNewUser = true if name is not set (never completed onboarding)
     const isNewUser = !user.name;
@@ -165,8 +174,7 @@ router.post('/verify', async (req, res) => {
     const user = rows[0];
     if (!user) return res.json({ status: false, data: { valid: false } });
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id = $1 AND paired = TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
 
     res.json({
       status: true,
@@ -184,20 +192,7 @@ router.get('/me', authMiddleware, async (req, res) => {
     const user = rows[0];
     if (!user) return res.status(404).json({ status: false, message: 'User not found' });
 
-    // Also return company + pairing status so the mobile can restore context on fresh install
-    const { rows: devices } = await query(
-      'SELECT paired FROM devices WHERE user_id = $1 AND paired = TRUE ORDER BY last_seen DESC LIMIT 1',
-      [req.user.userId]
-    );
-    const isPaired = !!(devices[0]?.paired);
-    let company = null;
-    if (isPaired) {
-      const { rows: cos } = await query(
-        'SELECT guid, name, gstin FROM companies WHERE user_id = $1 ORDER BY synced_at DESC NULLS LAST, id ASC LIMIT 1',
-        [req.user.userId]
-      );
-      if (cos[0]) company = { guid: cos[0].guid, name: cos[0].name, gstin: cos[0].gstin || null };
-    }
+    const { isPaired, company } = await getUserPairingHints(req.user.userId);
 
     res.json({
       status: true,
@@ -369,8 +364,7 @@ router.post('/verify-pin', preAuthMiddleware, async (req, res) => {
 
     await bootstrapWorkspaceSafe(user.id);
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [user.id]);
-    const isPaired = devices.length > 0;
+    const { isPaired } = await getUserPairingHints(user.id);
     const isNewUser = !user.name;
 
     console.log(`[2FA] PIN verified for user ${user.id}`);
@@ -430,14 +424,14 @@ router.post('/reset-pin', preAuthMiddleware, async (req, res) => {
     const token = generateToken({ userId: req.user.userId, mobile: user.mobile });
     await query('UPDATE users SET token=$1 WHERE id=$2', [token, req.user.userId]);
 
-    const { rows: devices } = await query('SELECT device_id FROM devices WHERE user_id=$1 AND paired=TRUE LIMIT 1', [req.user.userId]);
+    const { isPaired } = await getUserPairingHints(req.user.userId);
     console.log(`[2FA] PIN reset for user ${req.user.userId}`);
     res.json({
       status: true,
       message: 'PIN reset successfully',
       data: {
         token,
-        isPaired: devices.length > 0,
+        isPaired,
         isNewUser: !user.name,
         user: { id: req.user.userId, mobile: user.mobile, name: user.name || null, language: user.language || 'English' },
       },
