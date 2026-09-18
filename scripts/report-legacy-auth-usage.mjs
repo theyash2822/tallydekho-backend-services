@@ -5,10 +5,15 @@
  * Turns `legacy_auth_events` counters into the daily verdict required by
  * RBAC_PHASE7_OBSERVATION.md. Run against PRODUCTION.
  *
- * A day is CLEAN when zero legacy hits came from an IDENTIFIED client
- * (one that sent both x-client-platform and x-app-version). Unattributed
- * traffic — abandoned builds, scanners, bots — is reported separately and does
- * not by itself reset the clean-day clock; the operator decides using the split.
+ * A day is CLEAN when zero legacy hits came from an IDENTIFIED client, meaning
+ * one that presented a token our own JWT_SECRET validates, or that declared both
+ * x-client-platform and x-app-version. The credential is the signal that matters,
+ * since no shipped client sends those headers yet; see isIdentifiedClient() in
+ * src/services/legacyAuthTelemetry.js for the full rationale.
+ *
+ * Unattributed traffic — forged or malformed tokens, scanners, bots — is reported
+ * separately and does not by itself reset the clean-day clock; the operator decides
+ * using the split.
  *
  * Usage:
  *   node scripts/report-legacy-auth-usage.mjs             # last 7 days
@@ -39,7 +44,11 @@ async function main() {
   }
 
   const { rows: days } = await query(
-    `SELECT day,
+    // The day is formatted in SQL on purpose. Reading it as a JS Date and calling
+    // toISOString() renders local midnight in UTC, which shifts the date backwards
+    // for any positive offset — IST reported 2026-09-18 as 2026-09-17, silently
+    // filing a verdict against the wrong observation day.
+    `SELECT to_char(day, 'YYYY-MM-DD') AS day,
             SUM(hits) FILTER (WHERE identified_client) AS identified_hits,
             SUM(hits) FILTER (WHERE NOT identified_client) AS unattributed_hits,
             SUM(hits) FILTER (WHERE event_type = 'LEGACY_JWT_ACCEPTED') AS jwt_accepted,
@@ -66,7 +75,7 @@ async function main() {
 
   let identifiedTotal = 0;
   for (const row of days) {
-    const date = new Date(row.day).toISOString().slice(0, 10);
+    const date = row.day;
     const identified = n(row.identified_hits);
     identifiedTotal += identified;
     if (MARKDOWN) {
@@ -95,8 +104,15 @@ async function main() {
   if (offenders.length) {
     console.log('\nidentified clients still using legacy auth (migrate these, then restart the clock):');
     for (const o of offenders) {
+      // Until clients send the identification headers, most identified events are
+      // attributed by credential alone, so say that rather than printing
+      // "unknown vunknown" and implying the data is missing.
+      const who =
+        o.platform === 'unknown' && o.app_version === 'unknown'
+          ? 'verified credential (platform/version not declared)'
+          : `${o.platform} v${o.app_version}`;
       console.log(
-        `  ${o.platform} v${o.app_version} ${o.event_type} ${o.route_class} hits=${o.hits} last=${new Date(o.last_seen).toISOString()}`
+        `  ${who}  ${o.event_type} ${o.route_class} hits=${o.hits} last=${new Date(o.last_seen).toISOString()}`
       );
     }
   } else {

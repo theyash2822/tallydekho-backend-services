@@ -10,8 +10,10 @@ import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import jwt from 'jsonwebtoken';
 import {
   LEGACY_EVENTS,
+  carriesOurCredential,
   isIdentifiedClient,
   legacyEventFromRequest,
 } from '../services/legacyAuthTelemetry.js';
@@ -34,11 +36,57 @@ describe('legacy auth telemetry', () => {
     assert.match(appAuth, /router\.use\(\(req, _res, next\) => \{\s*void recordLegacyAuthEvent\(LEGACY_EVENTS\.APP_AUTH_HIT, req\)/);
   });
 
-  it('only a platform+version client counts as identified', () => {
+  it('a verified credential identifies a client even with no headers at all', () => {
+    // The reason this matters: no shipped client sends x-client-platform or
+    // x-app-version. If headers were the only signal, every real legacy request
+    // would score unattributed, STRICT would exit 0 daily, and seven "clean" days
+    // would be declared while genuine legacy usage continued.
+    assert.equal(isIdentifiedClient(undefined, undefined, true), true);
+    assert.equal(isIdentifiedClient('unknown', 'unknown', true), true);
+  });
+
+  it('headers alone still identify a client, and their absence does not clear it', () => {
     assert.equal(isIdentifiedClient('android', '4.2.0'), true);
     assert.equal(isIdentifiedClient('android', undefined), false);
     assert.equal(isIdentifiedClient(undefined, '4.2.0'), false);
     assert.equal(isIdentifiedClient(undefined, undefined), false);
+
+    // Withholding headers must never downgrade a verified credential, or a client
+    // could hide from the cutover gate simply by sending less.
+    assert.equal(isIdentifiedClient(undefined, undefined, true), true);
+  });
+
+  it('only our own signing key can mark a request identified', () => {
+    const prev = process.env.JWT_SECRET;
+    process.env.JWT_SECRET = 'test-secret-for-telemetry';
+    try {
+      const ours = jwt.sign({ userId: 1 }, process.env.JWT_SECRET);
+      const forged = jwt.sign({ userId: 1 }, 'attacker-key');
+
+      assert.equal(carriesOurCredential({ headers: { authorization: `Bearer ${ours}` } }), true);
+      assert.equal(carriesOurCredential({ headers: { authorization: `Bearer ${forged}` } }), false);
+      assert.equal(carriesOurCredential({ headers: { authorization: 'Bearer garbage' } }), false);
+      assert.equal(carriesOurCredential({ headers: {} }), false);
+      assert.equal(carriesOurCredential({}), false);
+
+      // An expired token still proves origin: the client is ours either way, and
+      // that is the question the observation window asks.
+      const expired = jwt.sign({ userId: 1 }, process.env.JWT_SECRET, { expiresIn: -60 });
+      assert.equal(
+        carriesOurCredential({ headers: { authorization: `Bearer ${expired}` } }),
+        true
+      );
+    } finally {
+      process.env.JWT_SECRET = prev;
+    }
+  });
+
+  it('JWT events assert the credential rather than inferring it from headers', () => {
+    // Both sites sit after jwt.verify(), so they must say so explicitly; deriving
+    // it again would be redundant, and omitting it would misclassify the event.
+    const mw = read('middleware/auth.js');
+    assert.match(mw, /JWT_REJECTED, req, \{\s*credentialVerified: true,?\s*\}/);
+    assert.match(mw, /JWT_ACCEPTED, req, \{\s*credentialVerified: true,?\s*\}/);
   });
 
   it('client labels are bounded — no free-form text reaches the counters', () => {

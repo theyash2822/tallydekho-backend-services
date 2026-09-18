@@ -13,6 +13,7 @@
  *
  * Aggregate-only by design — counters cannot become a personal-data store.
  */
+import jwt from 'jsonwebtoken';
 import { query } from '../db/schema.js';
 
 export const LEGACY_EVENTS = {
@@ -34,12 +35,46 @@ function label(value) {
 }
 
 /**
- * A client that sends platform + version identifies itself, so its traffic is a
- * real migration blocker. Traffic with no identity is treated as unattributed
- * (abandoned builds, scanners) and must not silently reset the clean-day clock —
- * the operator decides, using the split the report provides.
+ * Does the request carry a token that our own JWT_SECRET validates?
+ *
+ * This is the load-bearing signal, because it cannot be forged: only this server
+ * can mint a token that verifies. Expiry is ignored on purpose — an expired token
+ * still proves the sender is one of our clients, which is the question being asked.
  */
-export function isIdentifiedClient(platform, appVersion) {
+export function carriesOurCredential(req) {
+  const header = req?.headers?.authorization;
+  if (!header?.startsWith('Bearer ') || !process.env.JWT_SECRET) return false;
+  try {
+    jwt.verify(header.slice(7), process.env.JWT_SECRET, { ignoreExpiration: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether this event attributes to a real client of ours, which is what blocks
+ * the RBAC cutover and resets the clean-day clock.
+ *
+ * Header self-declaration alone is NOT sufficient, and relying on it was a bug:
+ * no shipped Web, Mobile or Desktop client sends x-client-platform or
+ * x-app-version, so an earlier version of this function returned false for every
+ * request including genuine legacy usage. STRICT mode would then have exited 0
+ * every day and the seven clean days would have been declared vacuously — the
+ * precise false confidence this telemetry exists to prevent.
+ *
+ * A verified credential is therefore what counts. Headers only refine attribution
+ * to a platform and version once clients start sending them, and they can only
+ * ever move an event toward "identified", never away from it, so a client cannot
+ * hide from the gate by withholding them.
+ *
+ * Spoofing runs one way: anything may *claim* headers and be counted as
+ * identified. That direction is safe, since it delays a destructive migration
+ * rather than permitting one. The unsafe direction, a real client being scored
+ * unattributed, is what the credential check closes.
+ */
+export function isIdentifiedClient(platform, appVersion, credentialVerified = false) {
+  if (credentialVerified) return true;
   return label(platform) !== UNKNOWN && label(appVersion) !== UNKNOWN;
 }
 
@@ -55,9 +90,13 @@ export function legacyEventFromRequest(req) {
  * Fire-and-forget counter increment. Never throws and never blocks an auth
  * response — telemetry must not be able to break login.
  */
-export async function recordLegacyAuthEvent(eventType, req) {
+export async function recordLegacyAuthEvent(eventType, req, opts = {}) {
   const { platform, appVersion, routeClass } = legacyEventFromRequest(req);
-  const identified = isIdentifiedClient(platform, appVersion);
+  // JWT_* events are only reachable after the signature already verified, so the
+  // caller states that directly. /app/* hits are open to anyone, so the token is
+  // checked here instead.
+  const credentialVerified = opts.credentialVerified ?? carriesOurCredential(req);
+  const identified = isIdentifiedClient(platform, appVersion, credentialVerified);
 
   // stdout line retained for existing log pipelines / greppability.
   console.warn(

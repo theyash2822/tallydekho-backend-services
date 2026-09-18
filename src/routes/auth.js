@@ -47,6 +47,10 @@ const now = () => Math.floor(Date.now() / 1000);
 // LEGACY-BLOCK-APP-AUTH telemetry — every hit on this router is legacy surface
 // usage. Counters answer "did a supported client still use /app auth today?";
 // see RBAC_PHASE7_OBSERVATION.md. Never blocks the request.
+//
+// Unlike the JWT events, this router is open to unauthenticated traffic, so
+// credentialVerified is left to be derived from the request: a scanner probing
+// /app/auth stays unattributed, while a real client carrying our token counts.
 router.use((req, _res, next) => {
   void recordLegacyAuthEvent(LEGACY_EVENTS.APP_AUTH_HIT, req);
   next();
