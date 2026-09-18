@@ -19,6 +19,52 @@ describe('Company Identity Phase 3C/3D', () => {
     assert.ok(src.includes('wrapIngestClient'));
   });
 
+  it('no write to companies is keyed on guid alone', () => {
+    // A Tally GUID is unique only within a workspace, so `UPDATE companies ...
+    // WHERE guid = $1` reaches every tenant that happens to sync the same Tally
+    // company. Four such statements existed: the company profile update (GSTIN,
+    // address), the logo upload, the opening-balance difference written during
+    // ingest, and the legacy no-workspace branch of company activation.
+    //
+    // Writes must be scoped by internal id, or by workspace_id/device_id where a
+    // set of companies is being addressed.
+    const files = [
+      'routes/api-v1.js',
+      'routes/ingest.js',
+      'controllers/ingestProcessor.js',
+      'services/hardSyncService.js',
+      'services/companyPurge.js',
+    ];
+
+    const offenders = [];
+    for (const rel of files) {
+      const full = path.join(root, rel);
+      if (!fs.existsSync(full)) continue;
+      const src = fs.readFileSync(full, 'utf8');
+      const re = /(UPDATE|DELETE FROM)\s+companies\b[\s\S]{0,400}?WHERE([\s\S]{0,300}?)(?=`|;|\n\s*\n)/gi;
+      let m;
+      while ((m = re.exec(src))) {
+        const where = m[2];
+        if (!/guid/i.test(where)) continue;
+        const scoped = /\bid\s*=|workspace_id|device_id/i.test(where);
+        if (!scoped) {
+          offenders.push(`${rel}: ${m[0].replace(/\s+/g, ' ').slice(0, 110)}`);
+        }
+      }
+    }
+
+    assert.deepEqual(offenders, [], `writes to companies keyed on guid alone:\n${offenders.join('\n')}`);
+  });
+
+  it('company profile and logo updates target the internal id', () => {
+    // The profile update compared the guid column against companyId, an integer,
+    // so it matched no rows and every edit was discarded behind a success
+    // response. Pin the column it keys on.
+    const src = fs.readFileSync(path.join(root, 'routes/api-v1.js'), 'utf8');
+    assert.match(src, /UPDATE companies SET logo_url=\$1 WHERE id=\$2/);
+    assert.match(src, /email = COALESCE\(\$5, email\)\s*\n\s*WHERE id = \$6/);
+  });
+
   it('rewriteInsertWithCompanyId is deleted (Phase 3D)', () => {
     const dual = fs.readFileSync(path.join(root, 'utils/ingestCompanyDualWrite.js'), 'utf8');
     assert.ok(!dual.includes('export function rewriteInsertWithCompanyId'));

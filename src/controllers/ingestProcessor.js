@@ -2825,10 +2825,18 @@ async function processOpeningBalanceDiff(data, companyGuid) {
   // netSigned: positive = Cr dominates, negative = Dr dominates
   const diffAmount = Math.abs(netSigned);
   const diffType   = netSigned < 0 ? 'Dr' : 'Cr';
+  // Scope to the company being ingested. Keyed on guid alone this wrote the
+  // opening-balance difference into every workspace holding the same Tally GUID,
+  // so one tenant's sync silently altered another tenant's figures.
+  const companyId = currentCompanyId();
+  if (companyId == null) {
+    console.warn('[DB] OpeningBalanceDiff skipped — no resolved company_id for', companyGuid);
+    return;
+  }
   try {
     await dbQuery(
-      `UPDATE companies SET ob_diff_amount=$1, ob_diff_type=$2 WHERE guid=$3`,
-      [diffAmount, diffType, companyGuid]
+      `UPDATE companies SET ob_diff_amount=$1, ob_diff_type=$2 WHERE id=$3`,
+      [diffAmount, diffType, companyId]
     );
     console.log(`[DB] OpeningBalanceDiff: \u20b9${diffAmount.toLocaleString('en-IN')} ${diffType} (${data.length} ledgers summed)`);
   } catch (err) {

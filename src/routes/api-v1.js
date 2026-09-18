@@ -6993,14 +6993,26 @@ const _companyProfileUpdate = async (req, res) => {
   const companyId = requireResolvedCompanyId(req);
   const { gstin, address, state, email, formal_name } = req.body || {};
   try {
-    await query(`
+    // Scoped by internal id, not guid. Two things were wrong here: the guid
+    // column was being compared against companyId, an integer, so the statement
+    // matched nothing and every profile edit was silently discarded behind a
+    // success response; and had it matched, `WHERE guid = ...` would have
+    // rewritten the GSTIN and address of every workspace sharing that Tally GUID.
+    const { rowCount } = await query(`
       UPDATE companies SET
         gstin = COALESCE($1, gstin),
         address = COALESCE($2, address),
         state = COALESCE($3, state),
-        formal_name = COALESCE($5, formal_name)
-      WHERE guid = $4
-    `, [gstin || null, address || null, state || null, companyId, formal_name || null]);
+        formal_name = COALESCE($4, formal_name),
+        email = COALESCE($5, email)
+      WHERE id = $6
+    `, [gstin || null, address || null, state || null, formal_name || null, email || null, companyId]);
+    if (!rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: 'Company not found' },
+      });
+    }
     res.json({ success: true, message: 'Company profile updated' });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -7021,7 +7033,16 @@ router.post('/company/:guid/logo', authMiddleware, async (req, res) => {
   // Rough size check: base64 of 500KB image is ~680KB
   if (logo.length > 750_000) return res.status(413).json({ success: false, error: { code: 'TOO_LARGE', message: 'Logo too large. Max 500 KB.' } });
   try {
-    await query('UPDATE companies SET logo_url=$1 WHERE guid=$2', [logo, guid]);
+    // Scoped by internal id. `WHERE guid=...` replaced the logo of every company
+    // sharing that Tally GUID, in every workspace — the GET directly below was
+    // already scoped by workspace_id, so the two disagreed.
+    const { rowCount } = await query('UPDATE companies SET logo_url=$1 WHERE id=$2', [logo, companyId]);
+    if (!rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: 'Company not found' },
+      });
+    }
     res.json({ success: true, data: { logo_url: logo }, message: 'Logo updated' });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });

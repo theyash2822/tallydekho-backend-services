@@ -139,10 +139,15 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
            WHERE device_id = $1 AND guid NOT IN (${ph})`,
           [deviceId, ...activeGuids]
         ).catch(() => {});
-        const phActivate = activeGuids.map((_, i) => `$${i + 1}`).join(',');
+        // Constrained to this device. Without it, a device that has no
+        // workspace_id yet would reactivate companies with the same Tally GUID
+        // in every other workspace — the deactivate above was already scoped by
+        // device_id, so only this half was open.
+        const phActivate = activeGuids.map((_, i) => `$${i + 2}`).join(',');
         await query(
-          `UPDATE companies SET is_active = TRUE WHERE guid IN (${phActivate})`,
-          [...activeGuids]
+          `UPDATE companies SET is_active = TRUE
+           WHERE device_id = $1 AND guid IN (${phActivate})`,
+          [deviceId, ...activeGuids]
         ).catch(() => {});
       }
     }
