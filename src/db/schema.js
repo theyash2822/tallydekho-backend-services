@@ -512,6 +512,19 @@ export async function initSchema() {
       ALTER TABLE company_years ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE;
 
       -- companies migrations
+      -- Authoritative Demo marker. Demo used to be inferred from the name
+      -- starting with "demo" or a reserved GUID prefix, which meant a customer
+      -- who named a real Tally company "Demo Traders" would have had it treated
+      -- as sample data — hidden once Tally connected, and exempted from the
+      -- guards that key off Demo. Visibility, mutation blocking, Desktop
+      -- exclusion and billing bypass all read this column now.
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
+      -- One-time backfill of rows created before the column existed. Matches the
+      -- legacy generator's reserved GUID prefix only — deliberately NOT the name
+      -- heuristic, so a real company called "Demo…" is never swept in.
+      UPDATE companies SET is_demo = TRUE
+       WHERE is_demo = FALSE AND guid LIKE 'dddddddd-dddd-4ddd-8ddd-%';
+      CREATE INDEX IF NOT EXISTS idx_companies_is_demo ON companies (is_demo) WHERE is_demo = TRUE;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS device_id TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS synced_at BIGINT;

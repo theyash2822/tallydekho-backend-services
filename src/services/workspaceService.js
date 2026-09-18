@@ -5,7 +5,12 @@ import { audit } from './auditService.js';
 import { ensureBillingAccount, getServiceRate, deductCredits, getBillingOverview, getWallet } from './billingService.js';
 import { seedBuiltinRoles } from './roleService.js';
 import { getEffectiveAccess, loadMembership, assertCapability } from './authorizationService.js';
-import { ensureDemoCompany, filterCompaniesByPairingStatus } from './demoDataService.js';
+import {
+  ensureDemoCompany,
+  filterCompaniesByPairingStatus,
+  isDemoEligible,
+  CANONICAL_DEMO_GUID,
+} from './demoDataService.js';
 import { sendOwnershipConfirmEmail, sendLifecycleConfirmEmail } from './email.js';
 import { purgeCompanyTallyData } from './companyPurge.js';
 import { unpairDevice } from './deviceBinding.js';
@@ -297,23 +302,38 @@ export async function getWorkspaceContext(userId, workspaceId) {
   );
   const pairingStatus = binding[0]?.connection_status || workspace.tally_connection || 'UNPAIRED';
 
-  // Unpaired → ensure one Demo Company with full sample data (owner-bound seed)
-  if (String(pairingStatus).toUpperCase() !== 'CONNECTED') {
+  const demoEligible = isDemoEligible(pairingStatus);
+
+  // Truly unpaired → make sure the one canonical Demo company exists. It lives in
+  // the reserved system workspace and is projected in below, so nothing is
+  // created inside the user's workspace.
+  if (demoEligible) {
     await ensureDemoCompany(workspace.owner_user_id || userId, workspaceId).catch((e) =>
       console.warn('[context] ensureDemoCompany:', e.message)
     );
   }
 
   const { rows: companiesRaw } = await query(
-    `SELECT guid, name, gstin, is_active FROM companies
+    `SELECT guid, name, gstin, is_active, is_demo FROM companies
      WHERE workspace_id = $1
      ORDER BY name ASC`,
     [workspaceId]
   );
   let companies = companiesRaw;
 
-  if (String(pairingStatus).toUpperCase() === 'CONNECTED') {
-    // Live books: apply member company scope, then hide Demo
+  if (demoEligible) {
+    // Demo projection: the canonical company is owned by the system workspace, so
+    // it is read in explicitly rather than by workspace_id. Company scope is
+    // ignored here on purpose — Demo is the same fixture for every member.
+    const { rows: demoRows } = await query(
+      `SELECT guid, name, gstin, is_active, is_demo FROM companies
+       WHERE guid = $1 AND is_demo = TRUE LIMIT 1`,
+      [CANONICAL_DEMO_GUID]
+    );
+    companies = demoRows;
+  } else {
+    // Paired in any state — including Desktop offline or awaiting first sync —
+    // means real books, with the member's company scope applied.
     if (access.membership?.membership_type !== 'OWNER') {
       const mode = access.scopes?.policy?.company_mode || 'NONE';
       if (mode === 'NONE') companies = [];
@@ -324,9 +344,6 @@ export async function getWorkspaceContext(userId, workspaceId) {
       // ALL: keep companiesRaw; never treat undefined/empty as ALL
     }
     companies = filterCompaniesByPairingStatus(companies, pairingStatus);
-  } else {
-    // UNPAIRED / RECONNECTING: Demo only — ignore company scope so every member sees it
-    companies = filterCompaniesByPairingStatus(companiesRaw, pairingStatus);
   }
 
   return {

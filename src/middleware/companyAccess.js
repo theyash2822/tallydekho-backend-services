@@ -8,7 +8,7 @@ import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { loadMembership, authorize } from '../services/authorizationService.js';
 import { assertCompanyAccess, assertFyAccess, assertLedgerAccess, assertGodownAccess, assertCostCentreAccess } from '../services/scopeService.js';
 import { applyMask, getPolicies } from '../services/sensitivePolicyService.js';
-import { isDemoCompany } from '../services/demoDataService.js';
+import { isDemoCompany, isDemoEligible } from '../services/demoDataService.js';
 
 function readWorkspaceHeader(req) {
   const h = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
@@ -122,11 +122,18 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
         bindRows[0]?.connection_status || wsRows[0]?.tally_connection || 'UNPAIRED'
       ).toUpperCase();
     }
-    if (demoRow && pairingStatus === 'CONNECTED') {
-      return deny(403, 'DEMO_HIDDEN', 'Demo Company is not available while Tally is connected');
+    if (demoRow && !isDemoEligible(pairingStatus)) {
+      return deny(403, 'DEMO_HIDDEN', 'Demo Company is not available once Tally is paired');
     }
-    // Real Company GUID must not bypass Demo gate while Workspace is not CONNECTED
-    if (!demoRow && pairingStatus !== 'CONNECTED') {
+    // A workspace that has never been paired has no real books to read, so a real
+    // company GUID there is either a stale client or a probe.
+    //
+    // Note this is keyed on Demo eligibility (has the workspace ever been paired)
+    // and NOT on live connectivity. Previously any non-CONNECTED status denied
+    // real data, so closing the Desktop made the customer's own synced history
+    // return 403 until it reopened. Desktop connectivity governs sync, writeback
+    // and live Tally mutations — not reads of data already in our database.
+    if (!demoRow && isDemoEligible(pairingStatus)) {
       return deny(
         403,
         'TALLY_NOT_CONNECTED',

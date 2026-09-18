@@ -699,17 +699,28 @@ export async function claimPairingCredential({ sessionId, claimToken }) {
     throw new BindingError('PAIRING_SESSION_EXPIRED', 'Pairing session is no longer valid', 400);
   }
 
-  await query(
-    `UPDATE devices SET
-       workspace_id = $1,
-       paired = TRUE,
-       binding_status = 'ACTIVE',
-       device_secret_hash = $2,
-       credential_claimed_at = NULL,
-       last_seen = $3
-     WHERE device_id = $4`,
-    [workspace.id, secretHash, ts, device.device_id]
-  );
+  // Two Desktops can both reach APPROVED before either claims, so the winner is
+  // settled here. idx_devices_one_paired_per_workspace is the real guarantee;
+  // without this catch its unique violation escaped as a raw Postgres error and
+  // the losing Desktop got a 500 rather than being told what actually happened.
+  try {
+    await query(
+      `UPDATE devices SET
+         workspace_id = $1,
+         paired = TRUE,
+         binding_status = 'ACTIVE',
+         device_secret_hash = $2,
+         credential_claimed_at = NULL,
+         last_seen = $3
+       WHERE device_id = $4`,
+      [workspace.id, secretHash, ts, device.device_id]
+    );
+  } catch (e) {
+    if (e?.code === '23505') {
+      throw new BindingError('WORKSPACE_ALREADY_HAS_DESKTOP', RESTORE_REPLACE_MSG, 409);
+    }
+    throw e;
+  }
 
   await query(
     `UPDATE companies SET workspace_id = $1

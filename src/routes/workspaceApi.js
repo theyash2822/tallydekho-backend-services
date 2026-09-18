@@ -1253,7 +1253,7 @@ router.post('/workspaces/:id/tally/pair', authMiddleware, bindWorkspaceParam, re
     });
 
     if (_socket) {
-      _socket.notifyPaired?.(req.user.userId, 'Desktop');
+      _socket.notifyPaired?.(req.user.userId, 'Desktop', req.params.id);
       // Wake-up only — secret comes from HTTP claim (except legacy_immediate bridge)
       if (bound.mode === 'session_approved' && bound.deviceId) {
         _socket.notifyDesktop?.(bound.deviceId, 'pairing_approved', {

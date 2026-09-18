@@ -8,22 +8,55 @@ import { query } from '../db/schema.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 
-/** Stable-ish demo GUID derived from workspace (never a real Tally GUID). */
-export function demoCompanyGuidForWorkspace(workspaceId) {
+/**
+ * The single canonical Demo company, shared by every Demo-eligible user.
+ *
+ * Demo used to be seeded once per workspace — 484 copies of the same fixture,
+ * each with its own GUID derived from the workspace id. That made the "sample
+ * data" different data for every tenant, impossible to assert against, and it
+ * grew without bound.
+ */
+export const SYSTEM_DEMO_WORKSPACE_ID = 'system-demo-workspace';
+export const CANONICAL_DEMO_GUID = 'dddddddd-dddd-4ddd-8ddd-000000000001';
+
+/** Legacy per-workspace GUID scheme. Retained ONLY so cleanup can recognise its output. */
+export function legacyDemoGuidForWorkspace(workspaceId) {
   const hex = String(workspaceId || '').replace(/-/g, '').slice(0, 12).padEnd(12, '0');
   return `dddddddd-dddd-4ddd-8ddd-${hex}`;
 }
 
-/** True for Demo Company rows (name or reserved GUID prefix). */
+/**
+ * Is this the Demo company?
+ *
+ * Reads the authoritative `companies.is_demo` flag. The previous version matched
+ * on `name.startsWith('demo')` or a GUID prefix, so a customer's real Tally
+ * company named "Demo Traders" was classified as sample data: hidden the moment
+ * Tally connected, and waved through guards that exempt Demo.
+ *
+ * Callers must pass a row that includes is_demo. The GUID fallback exists only
+ * for callers holding a bare GUID string, and matches the reserved prefix that
+ * no real Tally GUID uses — never the name.
+ */
 export function isDemoCompany(c) {
   if (!c) return false;
-  const name = String(c.name || '').toLowerCase().trim();
-  const guid = String(c.guid || c.id || '');
-  return (
-    name.startsWith('demo')
-    || guid.startsWith('DEMO')
-    || guid.startsWith('dddddddd-dddd-4ddd-8ddd-')
-  );
+  if (typeof c === 'string') return c.startsWith('dddddddd-dddd-4ddd-8ddd-');
+  if (typeof c.is_demo === 'boolean') return c.is_demo;
+  if (typeof c.isDemo === 'boolean') return c.isDemo;
+  return String(c.guid || '').startsWith('dddddddd-dddd-4ddd-8ddd-');
+}
+
+/**
+ * One authoritative predicate for "this request is operating on Demo".
+ *
+ * Billing, metering and write-blocking must all consult this rather than
+ * re-deriving Demo-ness, so the future credit work has a single place to make
+ * Demo free.
+ */
+export function isDemoContext(req) {
+  if (!req) return false;
+  if (req.authz?.demoMode === true) return true;
+  if (req.company && isDemoCompany(req.company)) return true;
+  return false;
 }
 
 /**
@@ -31,12 +64,31 @@ export function isDemoCompany(c) {
  * Unpaired / reconnecting / unknown → Demo Company only (fail-closed).
  * Universal MD §8: real synced data stays stored but hidden from operational APIs/UI.
  */
+/**
+ * Is this workspace entitled to the Demo company?
+ *
+ * Demo eligibility tracks whether the workspace has a real Desktop pairing at
+ * all — NOT whether that Desktop happens to be reachable right now. A paired
+ * workspace whose Desktop is closed previously reported RECONNECTING, which
+ * dropped it to Demo and hid the customer's real books until the Desktop came
+ * back.
+ */
+export function isDemoEligible(pairingStatus) {
+  const status = String(pairingStatus || 'UNPAIRED').toUpperCase();
+  return status === 'UNPAIRED';
+}
+
+/**
+ * Which companies this workspace may see.
+ *
+ * Truly unpaired: the canonical Demo company only.
+ * Paired in any state, including offline or awaiting first sync: real companies
+ * only. Demo is never mixed in alongside real books.
+ */
 export function filterCompaniesByPairingStatus(companies, pairingStatus) {
   const list = Array.isArray(companies) ? companies : [];
-  const status = String(pairingStatus || '').toUpperCase();
-  if (status === 'CONNECTED') return list.filter((c) => !isDemoCompany(c));
-  // UNPAIRED | RECONNECTING | anything else → Demo only (never leak live books)
-  return list.filter((c) => isDemoCompany(c));
+  if (isDemoEligible(pairingStatus)) return list.filter((c) => isDemoCompany(c));
+  return list.filter((c) => !isDemoCompany(c));
 }
 
 function currentIndianFy(ref = new Date()) {
@@ -46,6 +98,16 @@ function currentIndianFy(ref = new Date()) {
     return { finYear: `${y}-${y + 1}`, begin: `${y}-04-01`, end: `${y + 1}-03-31` };
   }
   return { finYear: `${y - 1}-${y}`, begin: `${y - 1}-04-01`, end: `${y}-03-31` };
+}
+
+/** The financial year immediately before `fy`. */
+function previousIndianFy(fy) {
+  const startYear = Number(String(fy.finYear).split('-')[0]) - 1;
+  return {
+    finYear: `${startYear}-${startYear + 1}`,
+    begin: `${startYear}-04-01`,
+    end: `${startYear + 1}-03-31`,
+  };
 }
 
 function isoDate(d) {
@@ -210,13 +272,14 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     `INSERT INTO companies
        (guid, workspace_id, name, formal_name, gstin, address, state, country, currency,
         fy_start, fy_end, is_active, synced_at, created_at, pincode, pan, phone, mobile, email, website,
-        gst_taxpayer_type)
+        gst_taxpayer_type, is_demo)
      VALUES ($1,$2,'Demo Company','Demo Company Pvt Ltd','29AABCD1234A1Z5',
              '42 MG Road, Indiranagar','Karnataka','India','INR',$3,$4,TRUE,$5,$5,
              '560038','AABCD1234A','08041234567','9024400000','demo@tallydekho.com','https://demo.tallydekho.com',
-             'Regular')
+             'Regular', TRUE)
      ON CONFLICT (workspace_id, guid) DO UPDATE SET
        name = 'Demo Company',
+       is_demo = TRUE,
        formal_name = EXCLUDED.formal_name, gstin = EXCLUDED.gstin, address = EXCLUDED.address,
        state = EXCLUDED.state, fy_start = EXCLUDED.fy_start, fy_end = EXCLUDED.fy_end,
        is_active = TRUE, synced_at = EXCLUDED.synced_at, pincode = EXCLUDED.pincode,
@@ -234,13 +297,19 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     throw new Error(`[demo] company_id missing after upsert for ${companyGuid}`);
   }
 
-  await query(
-    `INSERT INTO company_years (company_guid, company_id, fin_year, begin_date, end_date, is_active)
-     VALUES ($1,$2,$3,$4,$5,TRUE)
-     ON CONFLICT (company_id, fin_year) DO UPDATE SET
-       begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, is_active = TRUE`,
-    [companyGuid, companyId, fy.finYear, fy.begin, fy.end]
-  );
+  // Two financial years, so switching FY visibly changes the figures rather than
+  // showing the same numbers twice. Both carry transactions; see the prior-year
+  // block after the current-year vouchers are written.
+  const prevFy = previousIndianFy(fy);
+  for (const y of [prevFy, fy]) {
+    await query(
+      `INSERT INTO company_years (company_guid, company_id, fin_year, begin_date, end_date, is_active)
+       VALUES ($1,$2,$3,$4,$5,TRUE)
+       ON CONFLICT (company_id, fin_year) DO UPDATE SET
+         begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, is_active = TRUE`,
+      [companyGuid, companyId, y.finYear, y.begin, y.end]
+    );
+  }
 
   // ── Groups ──────────────────────────────────────────────────────────────
   const groupDefs = [
@@ -731,6 +800,59 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
     }, fy.finYear);
   }
 
+  // ── Prior financial year ────────────────────────────────────────────────
+  // A second year with real transactions, so switching FY visibly changes every
+  // report instead of showing the current year's figures twice. Deliberately a
+  // smaller, fixed set: the current year carries the detail, the prior year
+  // exists to prove FY selection works and to give comparatives something to
+  // compare against. Deterministic — same dates, parties and amounts every run.
+  let prevN = 0;
+  const prevDates = [
+    addDays(prevFy.begin, 20),
+    addDays(prevFy.begin, 78),
+    addDays(prevFy.begin, 141),
+    addDays(prevFy.begin, 203),
+    addDays(prevFy.begin, 265),
+    addDays(prevFy.begin, 326),
+  ];
+  for (let i = 0; i < prevDates.length; i++) {
+    const date = prevDates[i];
+    const debtor = debtors[i % debtors.length];
+    const creditor = creditors[i % creditors.length];
+    const sk = stocks[sellable[i % sellable.length]];
+
+    prevN += 1;
+    const qty = 3 + (i % 4);
+    const g = gstSplit(qty * sk.rate);
+    const sGuid = gid(companyGuid, `v-prev-sales-${String(prevN).padStart(3, '0')}`);
+    await insertVoucher(companyId, companyGuid, {
+      guid: sGuid, number: `DEMO-PY-SI-${prevN}`, type: 'Sales', date,
+      partyName: debtor.name, partyGuid: debtor.guid, amount: g.total,
+      narration: `Demo prior-year sale of ${sk.name}`, partyGstin: debtor.gstin || null,
+    }, ts, prevFy.finYear);
+    await insertVle(companyId, companyGuid, sGuid, [
+      { name: debtor.name, guid: debtor.guid, amount: g.total, drCr: 'Dr' },
+      { name: 'Sales', guid: ledgers.sales.guid, amount: g.taxable, drCr: 'Cr' },
+      { name: 'CGST', guid: ledgers.cgst.guid, amount: g.cgst, drCr: 'Cr' },
+      { name: 'SGST', guid: ledgers.sgst.guid, amount: g.sgst, drCr: 'Cr' },
+    ], ts, prevFy.finYear);
+
+    const pTaxable = Math.round(qty * sk.rate * 0.62 * 100) / 100;
+    const pg = gstSplit(pTaxable);
+    const pGuid = gid(companyGuid, `v-prev-purch-${String(prevN).padStart(3, '0')}`);
+    await insertVoucher(companyId, companyGuid, {
+      guid: pGuid, number: `DEMO-PY-PI-${prevN}`, type: 'Purchase', date,
+      partyName: creditor.name, partyGuid: creditor.guid, amount: pg.total,
+      narration: `Demo prior-year purchase from ${creditor.name}`, partyGstin: creditor.gstin || null,
+    }, ts, prevFy.finYear);
+    await insertVle(companyId, companyGuid, pGuid, [
+      { name: 'Purchase', guid: ledgers.purchase.guid, amount: pg.taxable, drCr: 'Dr' },
+      { name: 'CGST', guid: ledgers.cgst.guid, amount: pg.cgst, drCr: 'Dr' },
+      { name: 'SGST', guid: ledgers.sgst.guid, amount: pg.sgst, drCr: 'Dr' },
+      { name: creditor.name, guid: creditor.guid, amount: pg.total, drCr: 'Cr' },
+    ], ts, prevFy.finYear);
+  }
+
   // KPI snapshots for trend pills
   const asOfs = [0, 7, 14, 30].map((n) => clampIso(addDays(todayClamped, -n), fy.begin, fy.end));
   for (const asOf of asOfs) {
@@ -757,9 +879,14 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
   }
 
   console.log(
-    `[demo] full seed ${companyGuid} ws=${workspaceId}: sales=${salesN} purch=${purchN} rcpt=${rcptN} pmt=${pmtN} exp=${expN} stocks=${stockDefs.length}`
+    `[demo] full seed ${companyGuid} ws=${workspaceId}: sales=${salesN} purch=${purchN} rcpt=${rcptN} pmt=${pmtN} exp=${expN} stocks=${stockDefs.length} prevFy=${prevN * 2}`
   );
-  return { guid: companyGuid, name: 'Demo Company', counts: { salesN, purchN, rcptN, pmtN, expN, stocks: stockDefs.length } };
+  return {
+    guid: companyGuid,
+    name: 'Demo Company',
+    financialYears: [prevFy.finYear, fy.finYear],
+    counts: { salesN, purchN, rcptN, pmtN, expN, stocks: stockDefs.length, priorYearVouchers: prevN * 2 },
+  };
 }
 
 /**
@@ -770,48 +897,65 @@ export async function seedFullDemoCompany(userId, workspaceId, companyGuid) {
  */
 export async function ensureDemoCompany(userId, workspaceId, { force = false } = {}) {
   if (!userId || !workspaceId) return null;
-  // RBAC / unit harnesses set SKIP_DEMO_SEED to avoid multi-minute reseeds
-  // of accumulated local unpaired workspaces during initSchema backfill.
+  // RBAC / unit harnesses set SKIP_DEMO_SEED to avoid seeding during initSchema.
   if (process.env.SKIP_DEMO_SEED === '1' && !force) return null;
+  return ensureCanonicalDemoCompany({ force });
+}
 
-  const { rows: wsRows } = await query(
-    `SELECT id, tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
-    [workspaceId]
+/**
+ * Ensure the single canonical Demo company exists, and return it.
+ *
+ * Idempotent: once the fixture is present this returns immediately. The previous
+ * per-workspace version selected `guid, name` and then tested `demoRows[0].id`,
+ * which is undefined, so its "already seeded" count always came back zero and it
+ * wiped and reseeded the whole fixture on every call — including on every
+ * company-list fetch for an unpaired workspace.
+ */
+export async function ensureCanonicalDemoCompany({ force = false } = {}) {
+  await ensureSystemDemoWorkspace();
+
+  const { rows } = await query(
+    `SELECT id, guid, name FROM companies WHERE guid = $1 LIMIT 1`,
+    [CANONICAL_DEMO_GUID]
   );
-  const ws = wsRows[0];
-  if (!ws) return null;
+  const existing = rows[0];
 
-  const { rows: demoRows } = await query(
-    `SELECT guid, name FROM companies
-     WHERE workspace_id = $1 AND (name ILIKE 'Demo%' OR guid LIKE 'dddddddd%')
-     ORDER BY CASE WHEN is_active THEN 0 ELSE 1 END, name ASC
-     LIMIT 1`,
-    [workspaceId]
-  );
-
-  if (ws.tally_connection === 'CONNECTED' && !demoRows[0] && !force) {
-    // Connected workspace with no demo row — don't invent one next to live books
-    return null;
-  }
-
-  const companyGuid = demoRows[0]?.guid || demoCompanyGuidForWorkspace(workspaceId);
-
-  // Already seeded → keep data (avoids wipe/race that blanks home KPI cards)
-  if (demoRows[0] && !force) {
+  if (existing && !force) {
     const { rows: cnt } = await query(
       `SELECT COUNT(*)::int AS n FROM vouchers WHERE company_id = $1`,
-      [demoRows[0].id]
+      [existing.id]
     );
     if ((cnt[0]?.n || 0) > 0) {
-      await query(
-        `UPDATE companies SET is_active = TRUE, synced_at = $2 WHERE id = $1`,
-        [demoRows[0].id, now()]
-      ).catch(() => {});
-      return { guid: companyGuid, name: 'Demo Company', skipped: true };
+      return { id: existing.id, guid: existing.guid, name: existing.name, skipped: true };
     }
   }
 
-  return seedFullDemoCompany(userId, workspaceId, companyGuid);
+  return seedFullDemoCompany(null, SYSTEM_DEMO_WORKSPACE_ID, CANONICAL_DEMO_GUID);
+}
+
+/**
+ * The reserved workspace that owns the canonical Demo company.
+ *
+ * It exists so Demo data keeps the same ownership shape as real data —
+ * companies.workspace_id stays NOT NULL, foreign keys and company_id-scoped
+ * report queries all work unchanged. It is never listed as a user workspace,
+ * needs no membership, pairs no Desktop and carries no billing account; access
+ * to its company is granted only through the Demo projection, to users whose
+ * ACTIVE workspace is Demo-eligible.
+ */
+export async function ensureSystemDemoWorkspace() {
+  const ts = now();
+  // owner_user_id stays NULL and no workspace_memberships row is ever created.
+  // Workspace listing joins memberships, so this workspace cannot appear in any
+  // user's list — it is excluded by construction rather than by a filter someone
+  // has to remember. workspace_type marks it for the cleanup and audit scripts.
+  await query(
+    `INSERT INTO workspaces (id, name, owner_user_id, workspace_type, is_base, created_at, updated_at, tally_connection)
+     VALUES ($1, 'TallyDekho Demo', NULL, 'SYSTEM_DEMO', FALSE, $2, $2, 'UNPAIRED')
+     ON CONFLICT (id) DO UPDATE SET workspace_type = 'SYSTEM_DEMO', is_base = FALSE`,
+    [SYSTEM_DEMO_WORKSPACE_ID, ts]
+  );
+  return SYSTEM_DEMO_WORKSPACE_ID;
 }
 
 /** Reseed every Demo Company in the DB (ops / founder refresh). */

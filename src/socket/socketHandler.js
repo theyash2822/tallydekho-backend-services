@@ -277,13 +277,10 @@ export function setupSocket(io) {
     // Called after ingest complete — notifies mobile/web that new data is available
     notifySynced: (userId, companyGuid, workspaceId = null) => {
       const payload = { companyGuid, syncedAt: new Date().toISOString(), workspaceId };
-      ['mobile', 'web'].forEach(type => {
-        const client = connectedClients.get(`${type}_${userId}`);
-        if (client?.connected) {
-          client.emit('synced', payload);
-          console.log(`[WS] notified ${type} client for user ${userId}`);
-        }
-      });
+      // Room delivery when the workspace is known. The user-socket fanout that
+      // used to run unconditionally alongside it reached clients viewing a
+      // different workspace, which is how one workspace's sync toast and company
+      // reload landed on another.
       if (workspaceId) {
         _io?.to(`workspace:${workspaceId}`).emit('synced', payload);
         _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
@@ -291,17 +288,36 @@ export function setupSocket(io) {
           workspaceId,
           companyGuid,
         });
+        return;
       }
-    },
-
-    // Called when device is successfully paired - refresh all clients
-    notifyPaired: (userId, deviceName) => {
       ['mobile', 'web'].forEach(type => {
         const client = connectedClients.get(`${type}_${userId}`);
-        if (client?.connected) {
-          client.emit('paired', { deviceName, pairedAt: new Date().toISOString() });
-          console.log(`[WS] notified ${type} client: paired for user ${userId}`);
-        }
+        if (client?.connected) client.emit('synced', payload);
+      });
+    },
+
+    /**
+     * Desktop paired. Delivered to the workspace room, so only clients currently
+     * viewing that workspace react.
+     *
+     * This used to emit to the acting user's socket with a payload of
+     * { deviceName, pairedAt } and no workspace id at all. A user who owns an
+     * unpaired workspace and is a member of a paired one would see the paired
+     * workspace's toast while looking at the unpaired one, and the client had no
+     * way to tell which workspace the event belonged to.
+     */
+    notifyPaired: (userId, deviceName, workspaceId = null) => {
+      const payload = { deviceName, pairedAt: new Date().toISOString(), workspaceId };
+      if (workspaceId && _io) {
+        _io.to(`workspace:${workspaceId}`).emit('paired', payload);
+        console.log(`[WS] paired → workspace:${workspaceId}`);
+        return;
+      }
+      // No workspace known: still carry the null explicitly so clients can apply
+      // their "ignore workspace-ambiguous events" rule rather than guessing.
+      ['mobile', 'web'].forEach(type => {
+        const client = connectedClients.get(`${type}_${userId}`);
+        if (client?.connected) client.emit('paired', payload);
       });
     },
 
@@ -358,16 +374,19 @@ export function setupSocket(io) {
     // Called when device is unpaired
     // newCode: the freshly generated replacement pairing code (for desktop to display)
     notifyUnpaired: (userId, newCode, deviceId = null, workspaceId = null) => {
-      // Notify mobile + web: they are now unpaired
-      ['mobile', 'web'].forEach(type => {
-        const client = connectedClients.get(`${type}_${userId}`);
-        if (client?.connected) client.emit('unpaired', {});
-      });
+      // Room delivery only for app clients. The previous user-socket emit sent a
+      // bare {} — no workspace id — so a client could not tell which workspace
+      // had been unpaired and applied it to whichever one was on screen.
       if (workspaceId) {
-        _io?.to(`workspace:${workspaceId}`).emit('unpaired', {});
+        _io?.to(`workspace:${workspaceId}`).emit('unpaired', { workspaceId });
         _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
           status: 'UNPAIRED',
           workspaceId,
+        });
+      } else {
+        ['mobile', 'web'].forEach(type => {
+          const client = connectedClients.get(`${type}_${userId}`);
+          if (client?.connected) client.emit('unpaired', { workspaceId: null });
         });
       }
       // Only the unbound Desktop — never wipe secrets on every LAN Desktop
