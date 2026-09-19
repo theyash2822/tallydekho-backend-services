@@ -1578,7 +1578,13 @@ async function applyCidConstraintCutover(client) {
           END;
           BEGIN
             ALTER TABLE companies ADD CONSTRAINT companies_workspace_guid_key UNIQUE (workspace_id, guid);
+          -- Postgres reports the second attempt as duplicate_table, since the
+          -- constraint is backed by an index. That was not handled, so once the
+          -- unique existed this exception aborted the whole DO block and every
+          -- statement below it — including the cost_centres primary key — never
+          -- ran again on any boot.
           EXCEPTION WHEN duplicate_object THEN NULL;
+                    WHEN duplicate_table THEN NULL;
                     WHEN unique_violation THEN NULL;
           END;
         END IF;

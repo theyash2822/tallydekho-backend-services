@@ -12,6 +12,7 @@ const TALLY_PROJECTION_TABLES = [
   'voucher_ledger_entries',
   'voucher_inventory_items',
   'voucher_items',
+  'voucher_line_taxes',
   'batch_allocations',
   'gst_voucher_details',
   'bill_outstanding',

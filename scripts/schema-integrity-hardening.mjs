@@ -20,10 +20,12 @@ import fs from 'node:fs';
 import { query, getClient } from '../src/db/schema.js';
 import {
   FOREIGN_KEYS,
+  COMPOSITE_FOREIGN_KEYS,
   UNIQUE_INDEXES,
   LOOKUP_INDEXES,
   REDUNDANT_INDEXES,
   NOT_NULL_COLUMNS,
+  STATUS_CHECKS,
   applyIntegrityConstraints,
 } from '../src/db/integrityConstraints.js';
 
@@ -63,6 +65,12 @@ async function reportPreconditions() {
     console.log(`  ${name}: dangling rows = ${dangling}${dangling ? '  ← blocks the FK' : ''}`);
   }
 
+  for (const fk of COMPOSITE_FOREIGN_KEYS) {
+    if (!(await tableExists(fk.table))) continue;
+    const { rows } = await query(fk.orphanSql);
+    console.log(`  ${fk.name}: rows with no parent voucher = ${rows[0].n}${rows[0].n ? '  ← blocks the FK' : ''}`);
+  }
+
   for (const [name, table, columns, where] of UNIQUE_INDEXES) {
     if (!(await tableExists(table))) continue;
     const col = columns.replace(/[()]/g, '');
@@ -78,6 +86,20 @@ async function reportPreconditions() {
     if (!(await tableExists(table))) continue;
     const nulls = await count(`SELECT count(*)::int AS n FROM ${table} WHERE ${column} IS NULL`);
     console.log(`  ${table}.${column}: NULL rows = ${nulls}${nulls ? '  ← blocks NOT NULL' : ''}`);
+  }
+
+  for (const [name, table, column, values] of STATUS_CHECKS) {
+    if (!(await tableExists(table))) continue;
+    const { rows } = await query(
+      `SELECT DISTINCT ${column} AS v FROM ${table}
+        WHERE ${column} IS NOT NULL AND ${column} <> ALL($1::text[])`,
+      [values]
+    );
+    const unknown = rows.map((r) => r.v);
+    console.log(
+      `  ${name}: values outside the vocabulary = ${unknown.length}` +
+        (unknown.length ? ` (${unknown.join(', ')})  ← blocks the CHECK` : '')
+    );
   }
 
   console.log('\ndead tables');
