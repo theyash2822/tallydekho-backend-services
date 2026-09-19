@@ -1256,6 +1256,14 @@ export async function initSchema() {
     }
     console.log('✅ Company Identity Phase 2 additive company_id columns ensured');
 
+    // Referential and uniqueness guarantees the code assumed. Additive and
+    // idempotent; scripts/schema-integrity-hardening.mjs applies the same list
+    // where schema change has to be a reviewed step.
+    {
+      const { applyIntegrityConstraints } = await import('./integrityConstraints.js');
+      await applyIntegrityConstraints(client, (line) => console.log(`[integrity] ${line}`));
+    }
+
     // Compliance detail rows are one-per-voucher-per-company. Both writers used
     // ON CONFLICT (voucher_guid, company_guid) against a constraint that was
     // never created, so the IRN insert always raised and the e-Way Bill insert
