@@ -143,7 +143,8 @@ export async function applyWorkspaceSchema(client) {
     );
     CREATE TABLE IF NOT EXISTS credit_lots (
       id                  TEXT PRIMARY KEY,
-      wallet_id           TEXT NOT NULL REFERENCES wallets(id),
+      wallet_id           TEXT REFERENCES wallets(id),
+      workspace_id        TEXT,
       credits_remaining   NUMERIC(14,2) NOT NULL,
       credits_original    NUMERIC(14,2) NOT NULL,
       source              TEXT NOT NULL DEFAULT 'SIGNUP',
@@ -152,12 +153,13 @@ export async function applyWorkspaceSchema(client) {
     );
     CREATE TABLE IF NOT EXISTS wallet_transactions (
       id                  TEXT PRIMARY KEY,
-      wallet_id           TEXT NOT NULL REFERENCES wallets(id),
+      wallet_id           TEXT REFERENCES wallets(id),
       workspace_id        TEXT,
       amount              NUMERIC(14,2) NOT NULL,
       kind                TEXT NOT NULL,
       reference           TEXT,
       meta_json           JSONB,
+      funding_source      TEXT,
       created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
     CREATE TABLE IF NOT EXISTS service_rates (
@@ -449,6 +451,36 @@ export async function applyWorkspaceSchema(client) {
     ALTER TABLE billing_payment_orders ADD COLUMN IF NOT EXISTS provider_payment_id TEXT;
     ALTER TABLE wallets DROP CONSTRAINT IF EXISTS chk_wallets_balance_nonneg;
     ALTER TABLE wallets ADD CONSTRAINT chk_wallets_balance_nonneg CHECK (balance_credits >= 0);
+
+    ALTER TABLE credit_lots ADD COLUMN IF NOT EXISTS workspace_id TEXT;
+    ALTER TABLE credit_lots ALTER COLUMN wallet_id DROP NOT NULL;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS funding_source TEXT;
+    ALTER TABLE wallet_transactions ALTER COLUMN wallet_id DROP NOT NULL;
+    UPDATE wallet_transactions SET funding_source = 'OWNER_GLOBAL' WHERE funding_source IS NULL;
+
+    ALTER TABLE credit_lots DROP CONSTRAINT IF EXISTS chk_credit_lots_remaining_nonneg;
+    ALTER TABLE credit_lots ADD CONSTRAINT chk_credit_lots_remaining_nonneg CHECK (credits_remaining >= 0);
+    ALTER TABLE credit_lots DROP CONSTRAINT IF EXISTS chk_credit_lots_remaining_le_original;
+    ALTER TABLE credit_lots ADD CONSTRAINT chk_credit_lots_remaining_le_original
+      CHECK (credits_remaining <= credits_original);
+    ALTER TABLE credit_lots DROP CONSTRAINT IF EXISTS chk_credit_lots_original_positive;
+    ALTER TABLE credit_lots ADD CONSTRAINT chk_credit_lots_original_positive CHECK (credits_original > 0);
+    ALTER TABLE credit_lots DROP CONSTRAINT IF EXISTS chk_credit_lots_owner_or_workspace;
+    ALTER TABLE credit_lots ADD CONSTRAINT chk_credit_lots_owner_or_workspace
+      CHECK (
+        (wallet_id IS NOT NULL AND workspace_id IS NULL)
+        OR (wallet_id IS NULL AND workspace_id IS NOT NULL)
+      );
+
+    ALTER TABLE wallet_transactions DROP CONSTRAINT IF EXISTS chk_wallet_txn_funding_source;
+    ALTER TABLE wallet_transactions ADD CONSTRAINT chk_wallet_txn_funding_source
+      CHECK (funding_source IS NULL OR funding_source IN ('OWNER_GLOBAL', 'WORKSPACE'));
+    ALTER TABLE wallet_transactions DROP CONSTRAINT IF EXISTS chk_wallet_txn_workspace_funding;
+    ALTER TABLE wallet_transactions ADD CONSTRAINT chk_wallet_txn_workspace_funding
+      CHECK (funding_source IS DISTINCT FROM 'WORKSPACE' OR workspace_id IS NOT NULL);
+    ALTER TABLE wallet_transactions DROP CONSTRAINT IF EXISTS chk_wallet_txn_owner_funding;
+    ALTER TABLE wallet_transactions ADD CONSTRAINT chk_wallet_txn_owner_funding
+      CHECK (funding_source IS DISTINCT FROM 'OWNER_GLOBAL' OR wallet_id IS NOT NULL);
   `);
 
   // Backfill display_name from legacy `name` if that column exists on older drafts.
