@@ -79,14 +79,14 @@ describe('billing integrity', () => {
     // anyone holding integrations.configure, spending the Owner's credits.
     const src = read('routes/workspaceApi.js');
     const activeGuard = src.indexOf("rows[0].status === 'ACTIVE'");
-    const deduct = src.indexOf('await deductCredits({');
+    const deduct = src.indexOf('await spendForWorkspaceAction({');
     assert.ok(activeGuard > -1, 'an ACTIVE short-circuit must exist');
     assert.ok(deduct > activeGuard, 'the ACTIVE check must precede the deduction');
   });
 
   it('activation price comes from service_rates, not a literal', () => {
     const src = read('routes/workspaceApi.js');
-    assert.match(src, /getServiceRate\(rateKey\)/, 'price must be looked up');
+    assert.match(src, /serviceKey: rateKey/, 'price must be looked up via the spend resolver');
     assert.ok(
       !/amount:\s*100\b/.test(src),
       'a hardcoded 100 means repricing in service_rates has no effect'
@@ -103,10 +103,19 @@ describe('billing integrity', () => {
   it('TALLY_WRITE and PDF_GENERATE are not charged by current callers', () => {
     const write = read('routes/tally-write.js');
     const api = read('routes/api-v1.js');
-    assert.ok(!write.includes('deductCredits'), 'tally-write must not debit');
-    assert.ok(!api.includes('deductCredits'), 'api-v1 must not debit');
+    assert.ok(!write.includes('deductCredits') && !write.includes('spendForWorkspaceAction'), 'tally-write must not debit');
+    assert.ok(!api.includes('deductCredits') && !api.includes('spendForWorkspaceAction'), 'api-v1 must not debit');
     const hard = read('services/hardSyncService.js');
-    assert.ok(!hard.includes('deductCredits'), 'hard sync is not a credit product');
+    assert.ok(!hard.includes('deductCredits') && !hard.includes('spendForWorkspaceAction'), 'hard sync is not a credit product');
+  });
+
+  it('workspace business callers use the funding resolver, not deductCredits', () => {
+    const workspace = read('services/workspaceService.js');
+    assert.match(workspace, /spendForWorkspaceAction/);
+    assert.ok(!/\bdeductCredits\(/.test(workspace), 'workspaceService must not call deductCredits');
+    const api = read('routes/workspaceApi.js');
+    assert.match(api, /spendForWorkspaceAction/);
+    assert.ok(!/\bdeductCredits\(/.test(api), 'activation must not call deductCredits');
   });
 
   it('spending credits is a single conditional statement, never read-then-write', () => {

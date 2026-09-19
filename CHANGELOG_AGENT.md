@@ -1,3 +1,25 @@
+## 2026-09-19 — Workspace-specific spendable credits
+
+`credit_lots` now carries two roles: owner-wallet grant receipts
+(`wallet_id` set, `workspace_id` NULL — display / signup-topup metadata;
+owner spend SoT remains `wallets.balance_credits`) and workspace-restricted
+spendable lots (`workspace_id` set, `wallet_id` NULL). Workspace lots are
+consumed FIFO by `expires_at NULLS LAST, created_at` — the same order
+`getBillingOverview` already listed lots.
+
+`spendForWorkspaceAction` is the single funding boundary. Lock order:
+workspace lots, then owner wallet. Mixed pots that can both cover, or a
+non-empty workspace pot that cannot cover while the owner can, return
+`MIXED_FUNDING_PRIORITY_UNDEFINED`. Combined cover with neither pot alone
+enough returns `SPLIT_FUNDING_RULE_UNDEFINED`. No priority or split was
+found in product/code, so none was invented.
+
+Historical CREDIT rows keep `workspace_id` NULL. `funding_source` is
+`OWNER_GLOBAL` or `WORKSPACE`. Unpair/restore/ownership transfer do not
+move workspace lots.
+
+---
+
 ## 2026-09-19 — Billing / credits owner-wallet hardening
 
 Credits only. One spendable balance: the owner wallet. `wallet_transactions.workspace_id`
