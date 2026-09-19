@@ -130,13 +130,13 @@ export async function ensureBillingAccount(userId) {
     );
     if (!lots[0]) {
       await query(
-        `INSERT INTO credit_lots (id, wallet_id, credits_remaining, credits_original, source, expires_at, created_at)
-         VALUES ($1,$2,$3,$3,'SIGNUP',$4,$5)`,
+        `INSERT INTO credit_lots (id, wallet_id, workspace_id, credits_remaining, credits_original, source, expires_at, created_at)
+         VALUES ($1,$2,NULL,$3,$3,'SIGNUP',$4,$5)`,
         [uuid(), walletId, SIGNUP_CREDITS, ts + FIVE_YEARS_SEC, ts]
       );
       await query(
-        `INSERT INTO wallet_transactions (id, wallet_id, amount, kind, reference, meta_json, created_at)
-         VALUES ($1,$2,$3,'CREDIT','SIGNUP_BONUS',$4,$5)`,
+        `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at)
+         VALUES ($1,$2,NULL,$3,'CREDIT','SIGNUP_BONUS',$4,'OWNER_GLOBAL',$5)`,
         [uuid(), walletId, SIGNUP_CREDITS, JSON.stringify({ source: 'SIGNUP' }), ts]
       );
       await audit(null, userId, 'billing.signup_credit', { credits: SIGNUP_CREDITS });
@@ -172,14 +172,14 @@ export async function listRates() {
 }
 
 /**
- * Atomic debit of the owner wallet. Usage kinds require workspace_id (where
- * consumed). Replay of the same (wallet, kind, reference) returns the prior
- * debit and does not charge again.
+ * Low-level atomic debit of the owner/global wallet.
+ * Usage kinds require workspace_id (where consumed — attribution, not funding pot).
+ * Replay of the same (wallet, kind, reference) returns the prior debit.
  *
- * There is one spendable balance: the owner's wallet. workspace_id is
- * attribution, not a second pot. See BILLING-POLICY-BLOCK.
+ * Business actions that may use workspace-restricted credits must call
+ * spendForWorkspaceAction, not this primitive.
  */
-export async function deductCredits({
+export async function deductOwnerCredits({
   userId,
   amount,
   kind,
@@ -205,7 +205,7 @@ export async function deductCredits({
   return withBillingClient(client, async (db) => {
     if (reference) {
       const prior = await db.query(
-        `SELECT id FROM wallet_transactions
+        `SELECT id, funding_source FROM wallet_transactions
           WHERE wallet_id = $1 AND kind = $2 AND reference = $3 AND amount < 0
           LIMIT 1
           FOR UPDATE`,
@@ -213,7 +213,12 @@ export async function deductCredits({
       );
       if (prior.rows[0]) {
         const { rows: w } = await db.query(`SELECT * FROM wallets WHERE id = $1`, [wallet.id]);
-        return { ...w[0], alreadyCharged: true, transactionId: prior.rows[0].id };
+        return {
+          ...w[0],
+          alreadyCharged: true,
+          transactionId: prior.rows[0].id,
+          fundingSource: prior.rows[0].funding_source || 'OWNER_GLOBAL',
+        };
       }
     }
 
@@ -229,8 +234,9 @@ export async function deductCredits({
     }
     const txnId = uuid();
     await db.query(
-      `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
-       VALUES ($1,$2,$3,(-$4::numeric),$5,$6,$7,$8)`,
+      `INSERT INTO wallet_transactions
+         (id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at)
+       VALUES ($1,$2,$3,(-$4::numeric),$5,$6,$7,'OWNER_GLOBAL',$8)`,
       [txnId, wallet.id, workspaceId, credits, spendKind, reference || null, JSON.stringify(meta || {}), ts]
     );
     await recordUsageEvent({
@@ -240,22 +246,394 @@ export async function deductCredits({
       amount: `-${credits}`,
       reference,
       walletTxnId: txnId,
-      meta,
+      meta: { ...meta, fundingSource: 'OWNER_GLOBAL' },
       client: db,
     }).catch(() => {});
-    return { ...rows[0], alreadyCharged: false, transactionId: txnId };
+    return {
+      ...rows[0],
+      alreadyCharged: false,
+      transactionId: txnId,
+      fundingSource: 'OWNER_GLOBAL',
+    };
   });
 }
 
-export async function getBillingOverview(userId) {
+/** @deprecated Use deductOwnerCredits or spendForWorkspaceAction. */
+export const deductCredits = deductOwnerCredits;
+
+function creditsNumber(value) {
+  return Number(value) || 0;
+}
+
+export async function workspaceAvailableCredits(workspaceId, client = null) {
+  if (!workspaceId) return 0;
+  const exec = client ? client.query.bind(client) : query;
+  const { rows } = await exec(
+    `SELECT coalesce(sum(credits_remaining), 0) AS n
+       FROM credit_lots WHERE workspace_id = $1`,
+    [workspaceId]
+  );
+  return creditsNumber(rows[0]?.n);
+}
+
+/**
+ * Internal/admin grant of workspace-restricted credits.
+ * Independent of the owner wallet — does not convert owner/global credits.
+ */
+export async function grantWorkspaceCredits({
+  workspaceId,
+  amount,
+  source = 'WORKSPACE_GRANT',
+  reference = null,
+  actorUserId = null,
+  meta = {},
+  client = null,
+}) {
+  if (!workspaceId) {
+    throw billingError('workspace_id required for workspace credit grant', 'BILLING_WORKSPACE_REQUIRED', 400);
+  }
+  const credits = normalizeCredits(amount);
+  if (!credits) {
+    throw billingError('Invalid credit amount', 'BILLING_INVALID_AMOUNT', 400);
+  }
+  const { rows: ws } = await query(`SELECT id FROM workspaces WHERE id = $1 LIMIT 1`, [workspaceId]);
+  if (!ws[0]) {
+    throw billingError('Workspace not found', 'WORKSPACE_NOT_FOUND', 404);
+  }
+  const kind = 'WORKSPACE_GRANT';
+  return withBillingClient(client, async (db) => {
+    await db.query(
+      `SELECT id FROM credit_lots WHERE workspace_id = $1 ORDER BY id FOR UPDATE`,
+      [workspaceId]
+    );
+    if (reference) {
+      const prior = await db.query(
+        `SELECT id FROM wallet_transactions
+          WHERE workspace_id = $1 AND kind = $2 AND reference = $3 AND amount > 0
+            AND funding_source = 'WORKSPACE'
+          LIMIT 1
+          FOR UPDATE`,
+        [workspaceId, kind, reference]
+      );
+      if (prior.rows[0]) {
+        const available = await workspaceAvailableCredits(workspaceId, db);
+        return { alreadyGranted: true, transactionId: prior.rows[0].id, available };
+      }
+    }
+    const ts = now();
+    const lotId = uuid();
+    await db.query(
+      `INSERT INTO credit_lots
+         (id, wallet_id, workspace_id, credits_remaining, credits_original, source, expires_at, created_at)
+       VALUES ($1,NULL,$2,$3::numeric,$3::numeric,$4,$5,$6)`,
+      [lotId, workspaceId, credits, source, ts + FIVE_YEARS_SEC, ts]
+    );
+    const txnId = uuid();
+    await db.query(
+      `INSERT INTO wallet_transactions
+         (id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at)
+       VALUES ($1,NULL,$2,$3::numeric,$4,$5,$6,'WORKSPACE',$7)`,
+      [txnId, workspaceId, credits, kind, reference, JSON.stringify({ ...meta, actorUserId, lotId }), ts]
+    );
+    if (actorUserId) {
+      await audit(workspaceId, actorUserId, 'billing.workspace_credit_grant', { credits, reference, lotId });
+    }
+    const available = await workspaceAvailableCredits(workspaceId, db);
+    return { alreadyGranted: false, transactionId: txnId, lotId, available };
+  });
+}
+
+async function consumeWorkspaceLots(db, lots, credits) {
+  let leftCents = Math.round(Number(credits) * 100);
+  for (const lot of lots) {
+    if (leftCents <= 0) break;
+    const lotCents = Math.round(Number(lot.credits_remaining) * 100);
+    const takeCents = Math.min(lotCents, leftCents);
+    const take = (takeCents / 100).toFixed(2);
+    const { rows } = await db.query(
+      `UPDATE credit_lots
+          SET credits_remaining = credits_remaining - $1::numeric
+        WHERE id = $2 AND credits_remaining >= $1::numeric
+        RETURNING credits_remaining`,
+      [take, lot.id]
+    );
+    if (!rows[0]) {
+      throw billingError('Insufficient credits', 'INSUFFICIENT_CREDITS', 402);
+    }
+    leftCents -= takeCents;
+  }
+  if (leftCents > 0) {
+    throw billingError('Insufficient credits', 'INSUFFICIENT_CREDITS', 402);
+  }
+}
+
+/**
+ * Low-level workspace-lot debit. Callers that also have an owner pot must use
+ * spendForWorkspaceAction so mixed-funding policy is applied atomically.
+ */
+export async function deductWorkspaceCredits({
+  workspaceId,
+  amount,
+  kind,
+  reference,
+  userId = null,
+  meta = {},
+  client = null,
+}) {
+  const credits = normalizeCredits(amount);
+  if (!credits) {
+    throw billingError('Invalid debit amount', 'BILLING_INVALID_AMOUNT', 400);
+  }
+  if (!workspaceId) {
+    throw billingError('workspace_id required for workspace credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
+  }
+  const spendKind = kind || 'DEBIT';
+  return withBillingClient(client, async (db) => {
+    const { rows: lots } = await db.query(
+      `SELECT id, credits_remaining FROM credit_lots
+        WHERE workspace_id = $1 AND credits_remaining > 0
+        ORDER BY expires_at NULLS LAST, created_at ASC, id ASC
+        FOR UPDATE`,
+      [workspaceId]
+    );
+    if (reference) {
+      const prior = await db.query(
+        `SELECT id, funding_source FROM wallet_transactions
+          WHERE workspace_id = $1 AND kind = $2 AND reference = $3 AND amount < 0
+            AND funding_source = 'WORKSPACE'
+          LIMIT 1
+          FOR UPDATE`,
+        [workspaceId, spendKind, reference]
+      );
+      if (prior.rows[0]) {
+        const available = await workspaceAvailableCredits(workspaceId, db);
+        return {
+          alreadyCharged: true,
+          transactionId: prior.rows[0].id,
+          fundingSource: 'WORKSPACE',
+          available,
+        };
+      }
+    }
+    await consumeWorkspaceLots(db, lots, credits);
+    const ts = now();
+    const txnId = uuid();
+    await db.query(
+      `INSERT INTO wallet_transactions
+         (id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at)
+       VALUES ($1,NULL,$2,(-$3::numeric),$4,$5,$6,'WORKSPACE',$7)`,
+      [txnId, workspaceId, credits, spendKind, reference || null, JSON.stringify(meta || {}), ts]
+    );
+    await recordUsageEvent({
+      userId,
+      workspaceId,
+      kind: spendKind,
+      amount: `-${credits}`,
+      reference,
+      walletTxnId: txnId,
+      meta: { ...meta, fundingSource: 'WORKSPACE' },
+      client: db,
+    }).catch(() => {});
+    const available = await workspaceAvailableCredits(workspaceId, db);
+    return {
+      alreadyCharged: false,
+      transactionId: txnId,
+      fundingSource: 'WORKSPACE',
+      available,
+    };
+  });
+}
+
+function resolveFundingPolicy({ workspaceAvailable, ownerAvailable, cost }) {
+  const ws = creditsNumber(workspaceAvailable);
+  const owner = creditsNumber(ownerAvailable);
+  const need = creditsNumber(cost);
+  const wsCanCover = ws + 1e-9 >= need;
+  const ownerCanCover = owner + 1e-9 >= need;
+  const wsHasAny = ws > 0;
+
+  if (wsCanCover && ownerCanCover) {
+    throw billingError(
+      'BILLING-POLICY-BLOCK: MIXED_FUNDING_PRIORITY_UNDEFINED',
+      'MIXED_FUNDING_PRIORITY_UNDEFINED',
+      409
+    );
+  }
+  if (wsCanCover && !ownerCanCover) return 'WORKSPACE';
+  if (!wsCanCover && ownerCanCover && !wsHasAny) return 'OWNER_GLOBAL';
+  if (!wsCanCover && ownerCanCover && wsHasAny) {
+    throw billingError(
+      'BILLING-POLICY-BLOCK: MIXED_FUNDING_PRIORITY_UNDEFINED',
+      'MIXED_FUNDING_PRIORITY_UNDEFINED',
+      409
+    );
+  }
+  if (!wsCanCover && !ownerCanCover && wsHasAny && ws + owner + 1e-9 >= need) {
+    throw billingError(
+      'BILLING-POLICY-BLOCK: SPLIT_FUNDING_RULE_UNDEFINED',
+      'SPLIT_FUNDING_RULE_UNDEFINED',
+      409
+    );
+  }
+  throw billingError('Insufficient credits', 'INSUFFICIENT_CREDITS', 402);
+}
+
+/**
+ * Single billing decision boundary for a workspace-attributed business action.
+ * Lock order: workspace lots, then owner wallet. Funding selection and debit
+ * are one transaction. Mixed/split rules are not invented — they policy-block.
+ */
+export async function spendForWorkspaceAction({
+  ownerUserId,
+  workspaceId,
+  serviceKey = null,
+  operationId,
+  kind = null,
+  amount = null,
+  meta = {},
+  client = null,
+}) {
+  if (!workspaceId) {
+    throw billingError('workspace_id required for credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
+  }
+  if (!operationId) {
+    throw billingError('operationId required for credit usage', 'BILLING_OPERATION_REQUIRED', 400);
+  }
+  let credits = null;
+  let rate = null;
+  if (serviceKey) {
+    rate = await getServiceRate(serviceKey);
+    credits = normalizeCredits(rate ? Number(rate.credits) : null);
+    if (!credits) {
+      throw billingError(`No service rate for ${serviceKey}`, 'BILLING_RATE_MISSING', 500);
+    }
+  } else {
+    credits = normalizeCredits(amount);
+  }
+  if (!credits) {
+    throw billingError('Invalid debit amount', 'BILLING_INVALID_AMOUNT', 400);
+  }
+  const spendKind = kind || serviceKey || 'DEBIT';
+  if (USAGE_KINDS.has(spendKind) && !workspaceId) {
+    throw billingError('workspace_id required for credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
+  }
+  await ensureBillingAccount(ownerUserId);
+  const wallet = await getWallet(ownerUserId);
+  if (!wallet) {
+    throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
+  }
+
+  return withBillingClient(client, async (db) => {
+    const { rows: lots } = await db.query(
+      `SELECT id, credits_remaining FROM credit_lots
+        WHERE workspace_id = $1 AND credits_remaining > 0
+        ORDER BY expires_at NULLS LAST, created_at ASC, id ASC
+        FOR UPDATE`,
+      [workspaceId]
+    );
+    const { rows: walletRows } = await db.query(
+      `SELECT * FROM wallets WHERE id = $1 FOR UPDATE`,
+      [wallet.id]
+    );
+    const lockedWallet = walletRows[0];
+    if (!lockedWallet) {
+      throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
+    }
+
+    const prior = await db.query(
+      `SELECT id, funding_source, wallet_id, workspace_id FROM wallet_transactions
+        WHERE kind = $1 AND reference = $2 AND amount < 0
+          AND (
+            (wallet_id = $3 AND (funding_source = 'OWNER_GLOBAL' OR funding_source IS NULL))
+            OR (workspace_id = $4 AND funding_source = 'WORKSPACE')
+          )
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE`,
+      [spendKind, operationId, wallet.id, workspaceId]
+    );
+    if (prior.rows[0]) {
+      return {
+        ...lockedWallet,
+        alreadyCharged: true,
+        transactionId: prior.rows[0].id,
+        fundingSource: prior.rows[0].funding_source || 'OWNER_GLOBAL',
+      };
+    }
+
+    const workspaceAvailable = lots.reduce((sum, row) => sum + creditsNumber(row.credits_remaining), 0);
+    const ownerAvailable = creditsNumber(lockedWallet.balance_credits);
+    const fundingSource = resolveFundingPolicy({
+      workspaceAvailable,
+      ownerAvailable,
+      cost: credits,
+    });
+    const spendMeta = {
+      ...meta,
+      serviceKey,
+      rateVersion: rate?.version ?? null,
+      fundingSource,
+    };
+
+    if (fundingSource === 'WORKSPACE') {
+      const result = await deductWorkspaceCredits({
+        workspaceId,
+        amount: credits,
+        kind: spendKind,
+        reference: operationId,
+        userId: ownerUserId,
+        meta: spendMeta,
+        client: db,
+      });
+      return { ...lockedWallet, ...result, fundingSource: 'WORKSPACE' };
+    }
+
+    const result = await deductOwnerCredits({
+      userId: ownerUserId,
+      amount: credits,
+      kind: spendKind,
+      reference: operationId,
+      workspaceId,
+      meta: spendMeta,
+      client: db,
+    });
+    return { ...result, fundingSource: 'OWNER_GLOBAL' };
+  });
+}
+
+export async function getBillingOverview(userId, { workspaceId = null } = {}) {
   await ensureBillingAccount(userId);
   const wallet = await getWallet(userId);
   const rates = await listRates();
   const { rows: lots } = await query(
-    `SELECT id, credits_remaining, credits_original, source, expires_at, created_at
-     FROM credit_lots WHERE wallet_id = $1 ORDER BY expires_at NULLS LAST`,
+    `SELECT id, credits_remaining, credits_original, source, expires_at, created_at, workspace_id
+     FROM credit_lots
+     WHERE wallet_id = $1 AND workspace_id IS NULL
+     ORDER BY expires_at NULLS LAST`,
     [wallet.id]
   );
+  let workspaceCredits = null;
+  if (workspaceId) {
+    const { rows: mem } = await query(
+      `SELECT 1 FROM workspace_memberships
+        WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+      [workspaceId, userId]
+    );
+    if (mem[0]) {
+      const { rows: wsLots } = await query(
+        `SELECT id, credits_remaining, credits_original, source, expires_at, created_at, workspace_id
+         FROM credit_lots
+         WHERE workspace_id = $1
+         ORDER BY expires_at NULLS LAST, created_at ASC`,
+        [workspaceId]
+      );
+      workspaceCredits = {
+        workspaceId,
+        available: wsLots.reduce((sum, row) => sum + creditsNumber(row.credits_remaining), 0),
+        lots: wsLots,
+      };
+    }
+  }
   return {
     wallet: {
       id: wallet.id,
@@ -263,6 +641,7 @@ export async function getBillingOverview(userId) {
       updatedAt: wallet.updated_at,
     },
     lots,
+    workspaceCredits,
     rates,
   };
 }
@@ -281,13 +660,21 @@ export async function listWalletTransactions(userId, { limit = 100, offset = 0, 
     let where = 'wallet_id = $1';
     if (workspaceId) {
       params.push(workspaceId);
-      // Usage for this workspace plus owner-global funding (NULL workspace_id).
-      // Other workspaces' restricted usage rows are excluded.
-      where += ` AND (workspace_id = $${params.length} OR (workspace_id IS NULL AND amount > 0))`;
+      const { rows: mem } = await query(
+        `SELECT 1 FROM workspace_memberships
+          WHERE workspace_id = $1 AND user_id = $2 AND status = 'ACTIVE' LIMIT 1`,
+        [workspaceId, userId]
+      );
+      // Owner-wallet history for this workspace's usage plus owner-global funding.
+      // Workspace-restricted ledger is included only for an active member.
+      where = `wallet_id = $1 AND (workspace_id = $2 OR (workspace_id IS NULL AND amount > 0))`;
+      if (mem[0]) {
+        where = `(${where}) OR (workspace_id = $2 AND funding_source = 'WORKSPACE')`;
+      }
     }
     params.push(lim, off);
     const { rows } = await query(
-      `SELECT id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at
+      `SELECT id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at
        FROM wallet_transactions
        WHERE ${where}
        ORDER BY created_at DESC
@@ -299,6 +686,22 @@ export async function listWalletTransactions(userId, { limit = 100, offset = 0, 
     console.warn('[billing] listWalletTransactions:', err.message);
     return [];
   }
+}
+
+/** Workspace-restricted grant/debit ledger. Caller must already authorize membership. */
+export async function listWorkspaceCreditTransactions(workspaceId, { limit = 100, offset = 0 } = {}) {
+  if (!workspaceId) return [];
+  const lim = Math.min(Number(limit) || 100, 200);
+  const off = Math.max(Number(offset) || 0, 0);
+  const { rows } = await query(
+    `SELECT id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at
+       FROM wallet_transactions
+      WHERE workspace_id = $1 AND funding_source = 'WORKSPACE'
+      ORDER BY created_at DESC
+      LIMIT $2 OFFSET $3`,
+    [workspaceId, lim, off]
+  );
+  return rows;
 }
 
 /**
@@ -351,13 +754,14 @@ export async function creditWallet({
     );
     const txnId = uuid();
     await db.query(
-      `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
-       VALUES ($1,$2,$3,$4::numeric,$5,$6,$7,$8)`,
+      `INSERT INTO wallet_transactions
+         (id, wallet_id, workspace_id, amount, kind, reference, meta_json, funding_source, created_at)
+       VALUES ($1,$2,$3,$4::numeric,$5,$6,$7,'OWNER_GLOBAL',$8)`,
       [txnId, wallet.id, workspaceId, credits, kind, reference, JSON.stringify(meta || {}), ts]
     );
     await db.query(
-      `INSERT INTO credit_lots (id, wallet_id, credits_remaining, credits_original, source, expires_at, created_at)
-       VALUES ($1,$2,$3::numeric,$3::numeric,$4,$5,$6)`,
+      `INSERT INTO credit_lots (id, wallet_id, workspace_id, credits_remaining, credits_original, source, expires_at, created_at)
+       VALUES ($1,$2,NULL,$3::numeric,$3::numeric,$4,$5,$6)`,
       [uuid(), wallet.id, credits, source, ts + FIVE_YEARS_SEC, ts]
     );
     await recordUsageEvent({
