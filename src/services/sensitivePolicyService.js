@@ -45,15 +45,6 @@ export async function getPolicies(roleId) {
   return policies;
 }
 
-export async function setPolicy(roleId, policyKey, visibility) {
-  const granted = visibility === 'VISIBLE' || visibility === true;
-  await query(
-    `INSERT INTO role_sensitive_policies (role_id, policy_key, granted) VALUES ($1,$2,$3)
-     ON CONFLICT (role_id, policy_key) DO UPDATE SET granted = EXCLUDED.granted`,
-    [roleId, policyKey, granted]
-  );
-}
-
 function maskValue(value) {
   if (value == null) return value;
   if (typeof value === 'number') return null;

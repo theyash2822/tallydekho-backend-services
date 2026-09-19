@@ -104,12 +104,6 @@ export async function refreshBuiltinRoleCapabilities(roleId, systemKey) {
   }
 }
 
-/** @deprecated alias — Owner is not a role; prefer seedBuiltinRoles */
-export async function seedSystemRolesForWorkspace(workspaceId) {
-  await seedBuiltinRoles(workspaceId);
-  return null;
-}
-
 export async function listRoles(workspaceId) {
   const { rows } = await query(
     `SELECT * FROM workspace_roles WHERE workspace_id = $1
@@ -117,10 +111,6 @@ export async function listRoles(workspaceId) {
     [workspaceId]
   );
   return rows;
-}
-
-export async function listRolesForWorkspace(workspaceId) {
-  return listRoles(workspaceId);
 }
 
 export async function getRole(roleId) {
@@ -153,19 +143,6 @@ export async function getGrantedCapabilityKeys(roleId) {
     [roleId]
   );
   return new Set(rows.map((r) => r.capability_key));
-}
-
-/** Compat for authzService */
-export async function getCapabilitiesForRole(roleId) {
-  return getGrantedCapabilityKeys(roleId);
-}
-
-export async function getEntryModeForMembership(membership) {
-  if (!membership) return 'BOTH';
-  if (membership.entry_mode_override) return membership.entry_mode_override;
-  if (!membership.role_id) return 'BOTH';
-  const role = await getRole(membership.role_id);
-  return role?.entry_mode || 'BOTH';
 }
 
 /**
@@ -336,10 +313,3 @@ export async function deleteRole(roleId, workspaceId) {
   return true;
 }
 
-export async function setRoleCapabilities(roleId, capabilityKeys) {
-  const grants = Object.fromEntries(allKeys().map((k) => [k, false]));
-  for (const k of capabilityKeys || []) {
-    if (getCapability(k)) grants[k] = true;
-  }
-  return updateRoleCapabilities(roleId, grants);
-}

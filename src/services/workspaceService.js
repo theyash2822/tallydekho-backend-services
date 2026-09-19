@@ -192,10 +192,6 @@ export async function backfillPersonalWorkspaces() {
   }
 }
 
-export async function getWorkspaceForUser(userId) {
-  return ensurePersonalWorkspace(userId);
-}
-
 export async function getWorkspaceById(workspaceId) {
   const { rows } = await query('SELECT * FROM workspaces WHERE id = $1', [workspaceId]);
   return rows[0] || null;
@@ -1623,10 +1619,6 @@ export async function completeOwnershipTransfer(actorUserId, workspaceId, transf
 }
 
 /** Alias */
-export async function executeOwnershipTransfer(actorUserId, workspaceId, transferId, opts) {
-  return completeOwnershipTransfer(actorUserId, workspaceId, transferId, opts);
-}
-
 /**
  * Reset (base only): create lifecycle request PENDING_CONFIRM; 3 phrase confirms → PENDING_GRACE 24h.
  */

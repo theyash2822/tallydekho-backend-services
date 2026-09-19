@@ -11,10 +11,6 @@ export function currentCompanyId() {
   return id == null ? null : Number(id);
 }
 
-export function currentCompanyGuid() {
-  return ingestCompanyCtx.getStore()?.companyGuid ?? null;
-}
-
 /**
  * Thin wrap retained for ingest transaction clients.
  * Does NOT mutate SQL — writers must supply company_id explicitly.

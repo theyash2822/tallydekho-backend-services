@@ -142,25 +142,3 @@ export async function assertCostCentreAccess(membershipId, _companyGuid, costCen
   );
   return true;
 }
-
-export async function getScopePolicy(membershipId) {
-  return getPolicy(membershipId);
-}
-
-export async function upsertScopePolicy(membershipId, patch = {}) {
-  const current = await getPolicy(membershipId);
-  const merged = { ...current, ...patch };
-  await query(
-    `INSERT INTO membership_scope_policy
-       (membership_id, company_mode, fy_mode, ledger_mode, godown_mode, cost_centre_mode)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (membership_id) DO UPDATE SET
-       company_mode = EXCLUDED.company_mode,
-       fy_mode = EXCLUDED.fy_mode,
-       ledger_mode = EXCLUDED.ledger_mode,
-       godown_mode = EXCLUDED.godown_mode,
-       cost_centre_mode = EXCLUDED.cost_centre_mode`,
-    [membershipId, merged.company_mode, merged.fy_mode, merged.ledger_mode, merged.godown_mode, merged.cost_centre_mode]
-  );
-  return getPolicy(membershipId);
-}

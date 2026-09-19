@@ -31,18 +31,6 @@ export function resolveAppEnv(env = process.env) {
   return 'development';
 }
 
-export function isStaging(env = process.env) {
-  return resolveAppEnv(env) === 'staging';
-}
-
-export function isProduction(env = process.env) {
-  return resolveAppEnv(env) === 'production';
-}
-
-export function isProductionLike(env = process.env) {
-  return PRODUCTION_LIKE.includes(resolveAppEnv(env));
-}
-
 /**
  * Staging exists to catch problems that only appear under production behaviour.
  * Running it with NODE_ENV=development would silently re-enable dev-only

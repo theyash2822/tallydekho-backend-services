@@ -131,10 +131,6 @@ export function ownerAdminKeys() {
   ).map((c) => c.key);
 }
 
-export function entryModeCapabilityKeys() {
-  return CAPABILITIES.filter((c) => c.supports_entry_mode).map((c) => c.key);
-}
-
 /** Sensitive field policies — Universal §19 / Mobile §19. */
 export const SENSITIVE_POLICIES = [
   { key: 'cost_price', display_name: 'Cost Price', masking: 'HIDDEN' },

@@ -110,16 +110,6 @@ export async function resolveCompanyForDevice({
   return company;
 }
 
-/** Claim sync authority for device (CID-Q003). */
-export async function claimCompanySyncAuthority({ companyId, deviceId, workspaceId }) {
-  await query(
-    `UPDATE companies
-     SET device_id = $1, is_active = TRUE
-     WHERE id = $2 AND workspace_id = $3`,
-    [deviceId, companyId, workspaceId]
-  );
-}
-
 /** Workspace-scoped availability — same GUID in another workspace is allowed (separate company). */
 export async function assertCompanyGuidAvailableForWorkspace(workspaceId, companyGuid) {
   const guid = String(companyGuid || '').trim();

@@ -19,16 +19,6 @@ pool.on('error', (err) => {
   console.error('[DB] Unexpected pool error:', err.message);
 });
 
-/** Test harness: pin every new connection to an isolated schema. */
-export function configureTestSearchPath(schemaName) {
-  if (!schemaName || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schemaName)) {
-    throw new Error('Invalid test schema name');
-  }
-  pool.on('connect', (client) => {
-    client.query(`SET search_path TO ${schemaName}`).catch(() => {});
-  });
-}
-
 export function getPool() {
   return pool;
 }

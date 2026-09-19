@@ -9,7 +9,6 @@ export {
   markFirstSyncConnected,
   getKnownLineageGuids,
   getConnectionStatus,
-  resolveWorkspaceDataMode,
   buildTallyStatusPayload,
   getTallyActionFlags,
   createPairingSession,

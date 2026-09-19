@@ -51,10 +51,6 @@ export function getGstTabsForVoucher(voucher, gstTaxpayerType = 'Regular') {
   return [...new Set(tabs)]; // deduplicate
 }
 
-export function getVouchersForGstTab(vouchers, gstTaxpayerType, selectedTab) {
-  return vouchers.filter(v => getGstTabsForVoucher(v, gstTaxpayerType).includes(selectedTab));
-}
-
 export function getClassificationReason(voucher, gstrType) {
   const vt      = voucher.voucher_type || '';
   const section = voucher.gst_section || '';

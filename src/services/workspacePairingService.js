@@ -45,21 +45,6 @@ export async function getConnectionStatus(workspaceId) {
 }
 
 /** DEMO | LIVE | LOCKED — shared data-mode for /api and /app */
-export async function resolveWorkspaceDataMode(workspaceId) {
-  const { rows } = await query(
-    `SELECT lifecycle_status, commercial_status FROM workspaces WHERE id = $1 LIMIT 1`,
-    [workspaceId]
-  );
-  const life = String(rows[0]?.lifecycle_status || '').toUpperCase();
-  const commercial = String(rows[0]?.commercial_status || '').toUpperCase();
-  if (life === 'CLOSED' || life === 'CLOSING' || commercial === 'SUSPENDED' || commercial === 'LOCKED') {
-    return 'LOCKED';
-  }
-  const status = await getConnectionStatus(workspaceId);
-  if (status === 'CONNECTED') return 'LIVE';
-  return 'DEMO';
-}
-
 export async function getTallyActionFlags(userId, workspaceId, status = null) {
   const conn = String(status || (await getConnectionStatus(workspaceId))).toUpperCase();
   const pair = await authorize({ userId, workspaceId, capability: 'tally.pair' });

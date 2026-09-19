@@ -7,8 +7,6 @@
  */
 import { query } from '../db/schema.js';
 
-export const MASTER_ENTRY_TYPES = ['party', 'bank', 'warehouse', 'item', 'alter_stock_item'];
-
 /**
  * Insert app_masters row right after write_queue insert.
  * Always regular — masters have no optional voucher semantics.

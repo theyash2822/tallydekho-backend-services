@@ -116,8 +116,4 @@ export async function deleteObject(objectKey) {
   await fsp.unlink(path.join(ROOT, objectKey)).catch(() => {});
 }
 
-export function localRoot() {
-  return ROOT;
-}
-
 export { hashToken };

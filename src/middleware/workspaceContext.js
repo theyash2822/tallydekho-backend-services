@@ -74,9 +74,6 @@ export function bindWorkspaceParam(req, res, next) {
   return resolveWorkspaceMiddleware(req, res, next);
 }
 
-/** Alias for callers that prefer attachWorkspaceContext naming. */
-export const attachWorkspaceContext = resolveWorkspaceMiddleware;
-
 /**
  * Middleware factory: require a capability key after resolveWorkspaceMiddleware.
  */
