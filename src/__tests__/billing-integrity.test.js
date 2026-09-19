@@ -93,6 +93,22 @@ describe('billing integrity', () => {
     );
   });
 
+  it('Razorpay recharge converts integer credits to integer paise', () => {
+    const src = read('services/billingService.js');
+    assert.match(src, /const amountPaise = n \* INR_PER_CREDIT \* 100/);
+    assert.match(src, /normalizeCredits\(credits, \{ integer: true \}\)/);
+    assert.ok(!/Math\.round\(amountInr \* 100\)/.test(src), 'no rupee float at the provider boundary');
+  });
+
+  it('TALLY_WRITE and PDF_GENERATE are not charged by current callers', () => {
+    const write = read('routes/tally-write.js');
+    const api = read('routes/api-v1.js');
+    assert.ok(!write.includes('deductCredits'), 'tally-write must not debit');
+    assert.ok(!api.includes('deductCredits'), 'api-v1 must not debit');
+    const hard = read('services/hardSyncService.js');
+    assert.ok(!hard.includes('deductCredits'), 'hard sync is not a credit product');
+  });
+
   it('spending credits is a single conditional statement, never read-then-write', () => {
     // balance=10 with two concurrent costs of 8 must settle at one success.
     const src = read('services/billingService.js');
