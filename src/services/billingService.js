@@ -1,11 +1,72 @@
 import { v4 as uuid } from 'uuid';
 import crypto from 'crypto';
-import { query } from '../db/schema.js';
+import { query, getClient } from '../db/schema.js';
 import { audit } from './auditService.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const SIGNUP_CREDITS = 10;
 const FIVE_YEARS_SEC = 5 * 365 * 24 * 60 * 60;
+
+/** Kinds that record where credits were consumed. Owner-global funding may omit workspace_id. */
+const USAGE_KINDS = new Set([
+  'DEBIT',
+  'ADDITIONAL_WORKSPACE',
+  'SEAT_MONTHLY',
+  'OWNERSHIP_TRANSFER_RESERVE',
+  'GST_ACTIVATION',
+  'EINVOICE_ACTIVATION',
+  'EWAY_ACTIVATION',
+]);
+
+const OWNER_FUNDING_KINDS = new Set(['CREDIT', 'TOPUP', 'SIGNUP_BONUS']);
+
+/**
+ * Exact credit quantity for PostgreSQL NUMERIC. Rejects binary-float leftovers.
+ * Recharge quantities must be integers; usage may be two-decimal (service_rates).
+ */
+export function normalizeCredits(amount, { integer = false } = {}) {
+  if (typeof amount === 'string' && amount.trim()) {
+    const s = amount.trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(s)) return null;
+    if (integer && s.includes('.')) {
+      const frac = s.split('.')[1];
+      if (Number(frac) !== 0) return null;
+      return String(parseInt(s, 10));
+    }
+    return integer ? String(parseInt(s, 10)) : s.includes('.') ? s : `${s}.00`;
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) return null;
+  if (integer) {
+    if (!Number.isInteger(amount)) return null;
+    return String(amount);
+  }
+  const cents = Math.round(amount * 100);
+  if (Math.abs(amount * 100 - cents) > 1e-6) return null;
+  return (cents / 100).toFixed(2);
+}
+
+function billingError(message, code, httpStatus) {
+  const err = new Error(message);
+  err.code = code;
+  err.httpStatus = httpStatus;
+  return err;
+}
+
+async function withBillingClient(existing, fn) {
+  const own = !existing;
+  const client = existing || await getClient();
+  try {
+    if (own) await client.query('BEGIN');
+    const result = await fn(client);
+    if (own) await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    if (own) await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    if (own) client.release();
+  }
+}
 
 /**
  * Ensures billing_accounts + wallets + signup credit lot (10 credits, 5yr expiry).
@@ -111,60 +172,79 @@ export async function listRates() {
 }
 
 /**
- * Simple debit: decrement wallet balance + write transaction. Fail closed if insufficient.
+ * Atomic debit of the owner wallet. Usage kinds require workspace_id (where
+ * consumed). Replay of the same (wallet, kind, reference) returns the prior
+ * debit and does not charge again.
+ *
+ * There is one spendable balance: the owner's wallet. workspace_id is
+ * attribution, not a second pot. See BILLING-POLICY-BLOCK.
  */
-export async function deductCredits({ userId, amount, kind, reference, workspaceId = null, meta = {} }) {
-  const credits = Number(amount);
-  if (!Number.isFinite(credits) || credits <= 0) {
-    const err = new Error('Invalid debit amount');
-    err.code = 'BILLING_INVALID_AMOUNT';
-    err.httpStatus = 400;
-    throw err;
+export async function deductCredits({
+  userId,
+  amount,
+  kind,
+  reference,
+  workspaceId = null,
+  meta = {},
+  client = null,
+}) {
+  const credits = normalizeCredits(amount);
+  if (!credits) {
+    throw billingError('Invalid debit amount', 'BILLING_INVALID_AMOUNT', 400);
+  }
+  const spendKind = kind || 'DEBIT';
+  if (USAGE_KINDS.has(spendKind) && !workspaceId) {
+    throw billingError('workspace_id required for credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
   }
   await ensureBillingAccount(userId);
   const wallet = await getWallet(userId);
   if (!wallet) {
-    const err = new Error('Wallet not found');
-    err.code = 'WALLET_NOT_FOUND';
-    err.httpStatus = 404;
-    throw err;
+    throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
   }
-  const balance = Number(wallet.balance_credits) || 0;
-  if (balance < credits) {
-    const err = new Error('Insufficient credits');
-    err.code = 'INSUFFICIENT_CREDITS';
-    err.httpStatus = 402;
-    throw err;
-  }
-  const ts = now();
-  const { rows } = await query(
-    `UPDATE wallets SET balance_credits = balance_credits - $1, updated_at = $2
-     WHERE id = $3 AND balance_credits >= $1
-     RETURNING *`,
-    [credits, ts, wallet.id]
-  );
-  if (!rows[0]) {
-    const err = new Error('Insufficient credits');
-    err.code = 'INSUFFICIENT_CREDITS';
-    err.httpStatus = 402;
-    throw err;
-  }
-  const txnId = uuid();
-  await query(
-    `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [txnId, wallet.id, workspaceId, -credits, kind || 'DEBIT', reference || null, JSON.stringify(meta || {}), ts]
-  );
-  await recordUsageEvent({
-    userId,
-    workspaceId,
-    kind: kind || 'DEBIT',
-    amount: -credits,
-    reference,
-    walletTxnId: txnId,
-    meta,
-  }).catch(() => {});
-  return rows[0];
+
+  return withBillingClient(client, async (db) => {
+    if (reference) {
+      const prior = await db.query(
+        `SELECT id FROM wallet_transactions
+          WHERE wallet_id = $1 AND kind = $2 AND reference = $3 AND amount < 0
+          LIMIT 1
+          FOR UPDATE`,
+        [wallet.id, spendKind, reference]
+      );
+      if (prior.rows[0]) {
+        const { rows: w } = await db.query(`SELECT * FROM wallets WHERE id = $1`, [wallet.id]);
+        return { ...w[0], alreadyCharged: true, transactionId: prior.rows[0].id };
+      }
+    }
+
+    const ts = now();
+    const { rows } = await db.query(
+      `UPDATE wallets SET balance_credits = balance_credits - $1::numeric, updated_at = $2
+        WHERE id = $3 AND balance_credits >= $1::numeric
+        RETURNING *`,
+      [credits, ts, wallet.id]
+    );
+    if (!rows[0]) {
+      throw billingError('Insufficient credits', 'INSUFFICIENT_CREDITS', 402);
+    }
+    const txnId = uuid();
+    await db.query(
+      `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
+       VALUES ($1,$2,$3,(-$4::numeric),$5,$6,$7,$8)`,
+      [txnId, wallet.id, workspaceId, credits, spendKind, reference || null, JSON.stringify(meta || {}), ts]
+    );
+    await recordUsageEvent({
+      userId,
+      workspaceId,
+      kind: spendKind,
+      amount: `-${credits}`,
+      reference,
+      walletTxnId: txnId,
+      meta,
+      client: db,
+    }).catch(() => {});
+    return { ...rows[0], alreadyCharged: false, transactionId: txnId };
+  });
 }
 
 export async function getBillingOverview(userId) {
@@ -190,18 +270,29 @@ export async function getBillingOverview(userId) {
 /**
  * Wallet ledger for the Owner's billing account (fail closed → []).
  */
-export async function listWalletTransactions(userId, { limit = 100 } = {}) {
+export async function listWalletTransactions(userId, { limit = 100, offset = 0, workspaceId = null } = {}) {
   try {
     await ensureBillingAccount(userId);
     const wallet = await getWallet(userId);
     if (!wallet?.id) return [];
+    const lim = Math.min(Number(limit) || 100, 200);
+    const off = Math.max(Number(offset) || 0, 0);
+    const params = [wallet.id];
+    let where = 'wallet_id = $1';
+    if (workspaceId) {
+      params.push(workspaceId);
+      // Usage for this workspace plus owner-global funding (NULL workspace_id).
+      // Other workspaces' restricted usage rows are excluded.
+      where += ` AND (workspace_id = $${params.length} OR (workspace_id IS NULL AND amount > 0))`;
+    }
+    params.push(lim, off);
     const { rows } = await query(
       `SELECT id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at
        FROM wallet_transactions
-       WHERE wallet_id = $1
+       WHERE ${where}
        ORDER BY created_at DESC
-       LIMIT $2`,
-      [wallet.id, Math.min(Number(limit) || 100, 500)]
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
     );
     return rows;
   } catch (err) {
@@ -221,49 +312,66 @@ export async function creditWallet({
   workspaceId = null,
   meta = {},
   source = 'PURCHASE',
+  client = null,
 }) {
-  const credits = Number(amount);
-  if (!Number.isFinite(credits) || credits <= 0) {
-    const err = new Error('Invalid credit amount');
-    err.code = 'BILLING_INVALID_AMOUNT';
-    err.httpStatus = 400;
-    throw err;
+  const credits = normalizeCredits(amount);
+  if (!credits) {
+    throw billingError('Invalid credit amount', 'BILLING_INVALID_AMOUNT', 400);
+  }
+  // Owner-global funding is NULL workspace_id. A workspace-restricted grant
+  // must name the workspace. We do not invent a second spendable pot here.
+  if (workspaceId && OWNER_FUNDING_KINDS.has(kind) === false && kind !== 'TOPUP') {
+    /* attribution allowed */
   }
   await ensureBillingAccount(userId);
   const wallet = await getWallet(userId);
   if (!wallet) {
-    const err = new Error('Wallet not found');
-    err.code = 'WALLET_NOT_FOUND';
-    err.httpStatus = 404;
-    throw err;
+    throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
   }
-  const ts = now();
-  const { rows } = await query(
-    `UPDATE wallets SET balance_credits = balance_credits + $1, updated_at = $2
-     WHERE id = $3 RETURNING *`,
-    [credits, ts, wallet.id]
-  );
-  const txnId = uuid();
-  await query(
-    `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [txnId, wallet.id, workspaceId, credits, kind, reference, JSON.stringify(meta || {}), ts]
-  );
-  await query(
-    `INSERT INTO credit_lots (id, wallet_id, credits_remaining, credits_original, source, expires_at, created_at)
-     VALUES ($1,$2,$3,$3,$4,$5,$6)`,
-    [uuid(), wallet.id, credits, source, ts + FIVE_YEARS_SEC, ts]
-  );
-  await recordUsageEvent({
-    userId,
-    workspaceId,
-    kind,
-    amount: credits,
-    reference,
-    walletTxnId: txnId,
-    meta,
+
+  return withBillingClient(client, async (db) => {
+    if (reference) {
+      const prior = await db.query(
+        `SELECT id FROM wallet_transactions
+          WHERE wallet_id = $1 AND kind = $2 AND reference = $3 AND amount > 0
+          LIMIT 1
+          FOR UPDATE`,
+        [wallet.id, kind, reference]
+      );
+      if (prior.rows[0]) {
+        const { rows: w } = await db.query(`SELECT * FROM wallets WHERE id = $1`, [wallet.id]);
+        return { ...w[0], alreadyCredited: true, transactionId: prior.rows[0].id };
+      }
+    }
+    const ts = now();
+    const { rows } = await db.query(
+      `UPDATE wallets SET balance_credits = balance_credits + $1::numeric, updated_at = $2
+        WHERE id = $3 RETURNING *`,
+      [credits, ts, wallet.id]
+    );
+    const txnId = uuid();
+    await db.query(
+      `INSERT INTO wallet_transactions (id, wallet_id, workspace_id, amount, kind, reference, meta_json, created_at)
+       VALUES ($1,$2,$3,$4::numeric,$5,$6,$7,$8)`,
+      [txnId, wallet.id, workspaceId, credits, kind, reference, JSON.stringify(meta || {}), ts]
+    );
+    await db.query(
+      `INSERT INTO credit_lots (id, wallet_id, credits_remaining, credits_original, source, expires_at, created_at)
+       VALUES ($1,$2,$3::numeric,$3::numeric,$4,$5,$6)`,
+      [uuid(), wallet.id, credits, source, ts + FIVE_YEARS_SEC, ts]
+    );
+    await recordUsageEvent({
+      userId,
+      workspaceId,
+      kind,
+      amount: credits,
+      reference,
+      walletTxnId: txnId,
+      meta,
+      client: db,
+    });
+    return { ...rows[0], alreadyCredited: false, transactionId: txnId };
   });
-  return rows[0];
 }
 
 /**
@@ -271,20 +379,13 @@ export async function creditWallet({
  * completePaymentOrder credits the wallet for manual/dev completion.
  */
 export async function createPaymentOrder({ userId, credits, amountInr, meta = {} }) {
-  const creditAmt = Number(credits);
-  const inr = Number(amountInr);
-  if (!Number.isFinite(creditAmt) || creditAmt <= 0) {
-    const err = new Error('credits must be a positive number');
-    err.code = 'VALIDATION_ERROR';
-    err.httpStatus = 400;
-    throw err;
+  const creditAmt = normalizeCredits(credits, { integer: true });
+  if (!creditAmt) {
+    throw billingError('credits must be a positive integer', 'VALIDATION_ERROR', 400);
   }
-  if (!Number.isFinite(inr) || inr < 0) {
-    const err = new Error('amountInr must be a non-negative number');
-    err.code = 'VALIDATION_ERROR';
-    err.httpStatus = 400;
-    throw err;
-  }
+  // Server owns ₹1 = 1 credit. Client amountInr is display-only and ignored.
+  const inr = creditAmt;
+  void amountInr;
   const billing = await ensureBillingAccount(userId);
   const orderId = uuid();
   const ts = now();
@@ -333,30 +434,45 @@ export async function completePaymentOrder(userId, orderId) {
   );
   const order = rows[0];
   if (!order) {
-    const err = new Error('Payment order not found');
-    err.code = 'ORDER_NOT_FOUND';
-    err.httpStatus = 404;
-    throw err;
+    throw billingError('Payment order not found', 'ORDER_NOT_FOUND', 404);
   }
-  if (order.status !== 'PENDING') {
-    const err = new Error(`Order is ${order.status}`);
-    err.code = 'ORDER_INVALID_STATE';
-    err.httpStatus = 409;
-    throw err;
+  if (order.status === 'PAID' || order.status === 'COMPLETED') {
+    const invoice = await createInvoiceFromOrder(userId, orderId);
+    return { order, invoice, alreadyFulfilled: true };
+  }
+  if (order.status !== 'PENDING' && order.status !== 'CREATED') {
+    throw billingError(`Order is ${order.status}`, 'ORDER_INVALID_STATE', 409);
   }
   const ts = now();
-  await creditWallet({
-    userId,
-    amount: Number(order.credits),
-    kind: 'TOPUP',
-    reference: orderId,
-    meta: { orderId, amountInr: Number(order.amount_inr), provider: order.provider },
-    source: 'PURCHASE',
-  });
-  await query(
-    `UPDATE billing_payment_orders SET status = 'COMPLETED', completed_at = $2 WHERE id = $1`,
-    [orderId, ts]
+  const claim = await query(
+    `UPDATE billing_payment_orders
+        SET status = 'COMPLETED', completed_at = $2
+      WHERE id = $1 AND owner_user_id = $3 AND status IN ('PENDING', 'CREATED')
+      RETURNING id`,
+    [orderId, ts, userId]
   );
+  if (!claim.rowCount) {
+    const { rows: again } = await query(`SELECT * FROM billing_payment_orders WHERE id = $1`, [orderId]);
+    const invoice = await createInvoiceFromOrder(userId, orderId);
+    return { order: again[0], invoice, alreadyFulfilled: true };
+  }
+  try {
+    await creditWallet({
+      userId,
+      amount: order.credits,
+      kind: 'TOPUP',
+      reference: orderId,
+      workspaceId: null,
+      meta: { orderId, amountInr: order.amount_inr, provider: order.provider },
+      source: 'PURCHASE',
+    });
+  } catch (err) {
+    await query(
+      `UPDATE billing_payment_orders SET status = $2, completed_at = NULL WHERE id = $1`,
+      [orderId, order.status]
+    ).catch(() => {});
+    throw err;
+  }
   const invoice = await createInvoiceFromOrder(userId, orderId);
   await audit(null, userId, 'billing.payment_order_completed', { orderId, invoiceId: invoice?.id });
   const { rows: updated } = await query(`SELECT * FROM billing_payment_orders WHERE id = $1`, [orderId]);
@@ -426,11 +542,13 @@ export async function recordUsageEvent({
   reference = null,
   walletTxnId = null,
   meta = {},
+  client = null,
 }) {
   try {
     const id = uuid();
     const ts = now();
-    await query(
+    const exec = client ? client.query.bind(client) : query;
+    await exec(
       `INSERT INTO usage_events
          (id, owner_user_id, workspace_id, kind, amount, reference, wallet_txn_id, meta_json, created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
@@ -495,7 +613,7 @@ export async function listUsageEvents(userId, { workspaceId, kind, limit = 100 }
     let tWhere = 'wallet_id = $1';
     if (workspaceId) {
       tParams.push(workspaceId);
-      tWhere += ` AND workspace_id = $${tParams.length}`;
+      tWhere += ` AND (workspace_id = $${tParams.length} OR (workspace_id IS NULL AND amount > 0))`;
     }
     if (kind) {
       tParams.push(kind);
@@ -537,23 +655,26 @@ function razorpayAuthHeader() {
  * Returns order payload for Mobile/Web Razorpay Checkout.
  */
 export async function createRechargeOrder(userId, { credits, workspaceId = null } = {}) {
-  const n = Number(credits);
-  if (!Number.isFinite(n) || n < 1 || n > 1_000_000) {
-    const err = new Error('credits must be between 1 and 1000000');
-    err.code = 'VALIDATION_ERROR';
-    err.httpStatus = 400;
-    throw err;
+  const creditAmt = normalizeCredits(credits, { integer: true });
+  if (!creditAmt) {
+    throw billingError('credits must be an integer between 1 and 1000000', 'VALIDATION_ERROR', 400);
+  }
+  const n = Number(creditAmt);
+  if (n < 1 || n > 1_000_000) {
+    throw billingError('credits must be an integer between 1 and 1000000', 'VALIDATION_ERROR', 400);
   }
   if (!razorpayConfigured()) {
-    const err = new Error('Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.');
-    err.code = 'PAYMENT_PROVIDER_NOT_CONFIGURED';
-    err.httpStatus = 503;
-    throw err;
+    throw billingError(
+      'Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.',
+      'PAYMENT_PROVIDER_NOT_CONFIGURED',
+      503
+    );
   }
 
   const account = await ensureBillingAccount(userId);
-  const amountInr = Math.round(n * INR_PER_CREDIT * 100) / 100;
-  const amountPaise = Math.round(amountInr * 100);
+  // ₹1 = 1 credit. Integer paise only — no rupee float at the provider boundary.
+  const amountInr = n * INR_PER_CREDIT;
+  const amountPaise = n * INR_PER_CREDIT * 100;
   const orderId = uuid();
   const ts = now();
   const receipt = `td_${orderId.replace(/-/g, '').slice(0, 20)}`;
@@ -652,10 +773,11 @@ export async function fulfillRechargePayment({
   const claim = await query(
     `UPDATE billing_payment_orders
      SET status = 'COMPLETED', completed_at = $2,
+         provider_payment_id = COALESCE(provider_payment_id, $4),
          meta_json = COALESCE(meta_json, '{}'::jsonb) || $3::jsonb
      WHERE id = $1 AND status IN ('PENDING', 'CREATED')
      RETURNING id`,
-    [order.id, ts, JSON.stringify({ providerPaymentId, fulfilledAt: ts, signature: signature || null })]
+    [order.id, ts, JSON.stringify({ providerPaymentId, fulfilledAt: ts, signature: signature || null }), providerPaymentId || null]
   );
   if (!claim.rowCount) {
     return { orderId: order.id, status: 'COMPLETED', alreadyFulfilled: true };
@@ -665,9 +787,10 @@ export async function fulfillRechargePayment({
   try {
     await creditWallet({
       userId: order.owner_user_id,
-      amount: credits,
+      amount: order.credits,
       kind: 'TOPUP',
       reference: order.id,
+      workspaceId: null,
       meta: { source: 'RAZORPAY', providerOrderId, providerPaymentId, signature },
       source: 'RECHARGE',
     });

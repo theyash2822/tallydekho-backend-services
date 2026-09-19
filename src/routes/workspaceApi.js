@@ -868,7 +868,11 @@ router.get('/billing/usage', authMiddleware, resolveWorkspaceMiddleware, require
 
 router.get('/billing/transactions', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
-    const rows = await listWalletTransactions(req.user.userId, { limit: req.query.limit });
+    const rows = await listWalletTransactions(req.user.userId, {
+      limit: req.query.limit,
+      offset: req.query.offset,
+      workspaceId: req.query.workspaceId || req.query.workspace_id || req.workspaceId || null,
+    });
     res.json({ success: true, data: rows });
   } catch (err) {
     errJson(res, err);
@@ -1559,17 +1563,16 @@ router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bin
         });
       }
     } catch (billErr) {
-      if (billErr.code === 'BILLING_INSUFFICIENT_CREDITS' || /insufficient/i.test(billErr.message || '')) {
+      if (billErr.code === 'INSUFFICIENT_CREDITS' || billErr.code === 'BILLING_INSUFFICIENT_CREDITS' || /insufficient/i.test(billErr.message || '')) {
         return res.status(402).json({
           success: false,
           error: {
-            code: 'BILLING_INSUFFICIENT_CREDITS',
+            code: 'INSUFFICIENT_CREDITS',
             message: 'This Workspace does not have enough credits. Please ask the Workspace Owner to recharge from the Web Portal.',
           },
         });
       }
-      // If billing not fully wired, still mark activated for cursor builds
-      console.warn('[integrations.activate] billing:', billErr.message);
+      return errJson(res, billErr);
     }
     const ts = Math.floor(Date.now() / 1000);
     await query(

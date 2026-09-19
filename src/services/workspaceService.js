@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'crypto';
 import { v4 as uuid } from 'uuid';
-import { query } from '../db/schema.js';
+import { query, getClient } from '../db/schema.js';
 import { audit } from './auditService.js';
 import { ensureBillingAccount, getServiceRate, deductCredits, getBillingOverview, getWallet } from './billingService.js';
 import { seedBuiltinRoles } from './roleService.js';
@@ -385,32 +385,42 @@ export async function createAdditionalWorkspace(userId, name) {
   const membershipId = uuid();
   const ts = now();
 
-  await deductCredits({
-    userId,
-    amount: cost,
-    kind: 'ADDITIONAL_WORKSPACE',
-    reference: workspaceId,
-    workspaceId,
-    meta: { rateKey: 'ADDITIONAL_WORKSPACE', version: rate?.version },
-  });
-
-  await query(
-    `INSERT INTO workspaces (id, name, owner_user_id, workspace_type, lifecycle_status, commercial_status,
-       tally_connection, setup_generation, is_base, created_at, updated_at)
-     VALUES ($1,$2,$3,'PERSONAL','ACTIVE','ACTIVE','UNPAIRED',1,FALSE,$4,$4)`,
-    [workspaceId, trimmed, userId, ts]
-  );
-  await query(
-    `INSERT INTO workspace_memberships (id, workspace_id, user_id, membership_type, role_id, status, joined_at)
-     VALUES ($1,$2,$3,'OWNER',NULL,'ACTIVE',$4)`,
-    [membershipId, workspaceId, userId, ts]
-  );
-  await query(
-    `INSERT INTO workspace_tally_bindings (id, workspace_id, lineage_id, connection_status, updated_at)
-     VALUES ($1,$2,$3,'UNPAIRED',$4)
-     ON CONFLICT (workspace_id) DO NOTHING`,
-    [uuid(), workspaceId, uuid(), ts]
-  );
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO workspaces (id, name, owner_user_id, workspace_type, lifecycle_status, commercial_status,
+         tally_connection, setup_generation, is_base, created_at, updated_at)
+       VALUES ($1,$2,$3,'PERSONAL','ACTIVE','ACTIVE','UNPAIRED',1,FALSE,$4,$4)`,
+      [workspaceId, trimmed, userId, ts]
+    );
+    await client.query(
+      `INSERT INTO workspace_memberships (id, workspace_id, user_id, membership_type, role_id, status, joined_at)
+       VALUES ($1,$2,$3,'OWNER',NULL,'ACTIVE',$4)`,
+      [membershipId, workspaceId, userId, ts]
+    );
+    await client.query(
+      `INSERT INTO workspace_tally_bindings (id, workspace_id, lineage_id, connection_status, updated_at)
+       VALUES ($1,$2,$3,'UNPAIRED',$4)
+       ON CONFLICT (workspace_id) DO NOTHING`,
+      [uuid(), workspaceId, uuid(), ts]
+    );
+    await deductCredits({
+      userId,
+      amount: cost,
+      kind: 'ADDITIONAL_WORKSPACE',
+      reference: workspaceId,
+      workspaceId,
+      meta: { rateKey: 'ADDITIONAL_WORKSPACE', version: rate?.version },
+      client,
+    });
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
   await bootstrapWorkspaceExtras(workspaceId, userId, membershipId);
   await audit(workspaceId, userId, 'workspace.created_paid', { name: trimmed, credits: cost });
   return getWorkspaceById(workspaceId);
@@ -448,22 +458,33 @@ export async function purchaseSeat(userId, workspaceId) {
   }
   const rate = await getServiceRate('SEAT_MONTHLY');
   const cost = rate ? Number(rate.credits) : 100;
-  await deductCredits({
-    userId,
-    amount: cost,
-    kind: 'SEAT_MONTHLY',
-    reference: workspaceId,
-    workspaceId,
-    meta: { rateKey: 'SEAT_MONTHLY' },
-  });
   const seatId = uuid();
   const ts = now();
   const periodEnd = ts + 30 * 24 * 60 * 60;
-  await query(
-    `INSERT INTO workspace_seats (id, workspace_id, seat_kind, status, period_start, period_end, created_at)
-     VALUES ($1,$2,'PAID','AVAILABLE',$3,$4,$3)`,
-    [seatId, workspaceId, ts, periodEnd]
-  );
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO workspace_seats (id, workspace_id, seat_kind, status, period_start, period_end, created_at)
+       VALUES ($1,$2,'PAID','AVAILABLE',$3,$4,$3)`,
+      [seatId, workspaceId, ts, periodEnd]
+    );
+    await deductCredits({
+      userId,
+      amount: cost,
+      kind: 'SEAT_MONTHLY',
+      reference: seatId,
+      workspaceId,
+      meta: { rateKey: 'SEAT_MONTHLY' },
+      client,
+    });
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
   await audit(workspaceId, userId, 'seat.purchased', { seatId, credits: cost });
   const { rows } = await query(`SELECT * FROM workspace_seats WHERE id = $1`, [seatId]);
   return rows[0];

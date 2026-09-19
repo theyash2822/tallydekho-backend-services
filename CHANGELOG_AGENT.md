@@ -1,3 +1,20 @@
+## 2026-09-19 — Billing / credits owner-wallet hardening
+
+Credits only. One spendable balance: the owner wallet. `wallet_transactions.workspace_id`
+is usage attribution (where consumed). Owner-global funding stays NULL.
+
+Atomic spend + ledger in one transaction. Replay of the same debit/credit
+reference does not charge or grant twice. Razorpay amounts are integer paise at
+₹1 = 1 credit; client `amountInr` is ignored. Integration activation no longer
+proceeds when the debit fails.
+
+Workspace-specific spendable balances are **not** implemented
+(BILLING-POLICY-BLOCK — no second pot exists to prioritize).
+
+337 historical CREDIT rows remain NULL (owner-global signup). Not backfilled.
+
+---
+
 ## 2026-09-19 — Delete unused socket user-room fallback
 
 Web and Mobile now ignore tenant events without `workspaceId`. Every

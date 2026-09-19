@@ -20,6 +20,7 @@ export const FOREIGN_KEYS = [
   ['fk_write_queue_company', 'write_queue', 'company_id', 'companies (id)', 'RESTRICT'],
   ['fk_demo_entries_workspace', 'demo_simulated_entries', 'workspace_id', 'workspaces (id)', 'CASCADE'],
   ['fk_pairing_sessions_workspace', 'desktop_pairing_sessions', 'workspace_id', 'workspaces (id)', 'CASCADE'],
+  ['fk_wallet_txn_workspace', 'wallet_transactions', 'workspace_id', 'workspaces (id)', 'RESTRICT'],
 ];
 
 /**
@@ -67,6 +68,8 @@ export const COMPOSITE_FOREIGN_KEYS = [
 export const UNIQUE_INDEXES = [
   ['uq_auth_sessions_refresh_hash', 'auth_sessions', '(refresh_token_hash)', 'refresh_token_hash IS NOT NULL'],
   ['uq_payment_orders_provider_id', 'billing_payment_orders', '(provider_order_id)', 'provider_order_id IS NOT NULL'],
+  ['uq_payment_orders_provider_payment', 'billing_payment_orders', '(provider_payment_id)', 'provider_payment_id IS NOT NULL'],
+  ['uq_wallet_txn_spend_ref', 'wallet_transactions', '(wallet_id, kind, reference)', 'reference IS NOT NULL AND amount < 0'],
 ];
 
 /** Lookup indexes for columns queried on every request but never indexed. */
@@ -74,6 +77,7 @@ export const LOOKUP_INDEXES = [
   ['idx_write_queue_workspace', 'write_queue', '(workspace_id)'],
   ['idx_pairing_sessions_workspace', 'desktop_pairing_sessions', '(workspace_id)'],
   ['idx_demo_entries_company', 'demo_simulated_entries', '(company_id)'],
+  ['idx_wallet_txn_workspace', 'wallet_transactions', '(workspace_id)'],
 ];
 
 /**

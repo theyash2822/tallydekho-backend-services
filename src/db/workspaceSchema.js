@@ -365,6 +365,7 @@ export async function applyWorkspaceSchema(client) {
       status            TEXT NOT NULL DEFAULT 'PENDING',
       provider          TEXT DEFAULT 'MANUAL',
       provider_order_id TEXT,
+      provider_payment_id TEXT,
       meta_json         JSONB,
       created_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
       completed_at      BIGINT
@@ -444,6 +445,10 @@ export async function applyWorkspaceSchema(client) {
     ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS grace_ends_at BIGINT;
     ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS completed_at BIGINT;
     ALTER TABLE workspace_ownership_transfers ADD COLUMN IF NOT EXISTS cancelled_at BIGINT;
+
+    ALTER TABLE billing_payment_orders ADD COLUMN IF NOT EXISTS provider_payment_id TEXT;
+    ALTER TABLE wallets DROP CONSTRAINT IF EXISTS chk_wallets_balance_nonneg;
+    ALTER TABLE wallets ADD CONSTRAINT chk_wallets_balance_nonneg CHECK (balance_credits >= 0);
   `);
 
   // Backfill display_name from legacy `name` if that column exists on older drafts.
