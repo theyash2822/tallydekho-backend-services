@@ -6,7 +6,10 @@ import { query } from '../db/schema.js';
 
 /**
  * Validate dispatch details, build NIC EWB payload, and (in production) submit to NIC API.
- * @param {string}  companyGuid
+ *
+ * Takes the internal company id, not the Tally GUID — see generateIRN for why.
+ *
+ * @param {number}  companyId        - companies.id that owns the voucher
  * @param {object}  voucher          - row from the vouchers table
  * @param {object}  company          - { gstin, name, pincode, state_code }
  * @param {object}  creds            - { gstin, username, … } from integration_settings.ewaybill
@@ -14,7 +17,10 @@ import { query } from '../db/schema.js';
  * @returns {Promise<{ ewbNo, ewbDate, validUpto }>}
  * @throws  Error when dispatch details are missing or EWB credentials are not provisioned
  */
-export async function generateEWB(companyGuid, voucher, company, creds, dispatchDetails) {
+export async function generateEWB(companyId, voucher, company, creds, dispatchDetails) {
+  if (!Number.isFinite(Number(companyId))) {
+    throw new Error('generateEWB: numeric companyId is required');
+  }
   // ── 1. Validate required dispatch fields ──────────────────────────────────
   const missing = [];
   if (!dispatchDetails?.dispatch_from)  missing.push('Dispatch From');
@@ -27,11 +33,11 @@ export async function generateEWB(companyGuid, voucher, company, creds, dispatch
   // ── 2. Load line items ────────────────────────────────────────────────────
   const { rows: items } = await query(
     `SELECT * FROM voucher_inventory_items WHERE voucher_guid = $1 AND company_id=$2`,
-    [voucher.guid, companyGuid]
+    [voucher.guid, companyId]
   );
   const { rows: gstRows } = await query(
     `SELECT * FROM gst_voucher_details WHERE voucher_guid = $1 AND company_id=$2`,
-    [voucher.guid, companyGuid]
+    [voucher.guid, companyId]
   );
   const g = gstRows[0] || {};
 

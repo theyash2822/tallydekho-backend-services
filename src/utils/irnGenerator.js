@@ -6,25 +6,33 @@ import { query } from '../db/schema.js';
 
 /**
  * Build and (eventually) submit the NIC e-invoice API v1.03 payload for a voucher.
- * @param {string}  companyGuid
+ *
+ * Takes the internal company id, not the Tally GUID. company_id is a bigint, so
+ * the GUID this used to receive could never match a row — the payload went to
+ * the IRP with no GST details and no line items.
+ *
+ * @param {number}  companyId      - companies.id that owns the voucher
  * @param {object}  voucher        - row from the vouchers table
  * @param {object}  company        - { gstin, name, address, city, state, state_code, pincode }
  * @param {object}  creds          - { gstin, username, client_id, client_secret, … }
  * @returns {Promise<{ irn, ackNo, ackDate, signedInvoice, qrCode }>}
  * @throws  Error when IRP credentials are not provisioned or the API call fails
  */
-export async function generateIRN(companyGuid, voucher, company, creds) {
+export async function generateIRN(companyId, voucher, company, creds) {
+  if (!Number.isFinite(Number(companyId))) {
+    throw new Error('generateIRN: numeric companyId is required');
+  }
   // ── 1. Load GST details ────────────────────────────────────────────────────
   const { rows: gstRows } = await query(
     `SELECT * FROM gst_voucher_details WHERE voucher_guid = $1 AND company_id=$2`,
-    [voucher.guid, companyGuid]
+    [voucher.guid, companyId]
   );
   const gstDetail = gstRows[0] || {};
 
   // ── 2. Load line items ─────────────────────────────────────────────────────
   const { rows: items } = await query(
     `SELECT * FROM voucher_inventory_items WHERE voucher_guid = $1 AND company_id=$2`,
-    [voucher.guid, companyGuid]
+    [voucher.guid, companyId]
   );
 
   // ── 3. Build IRP payload (NIC e-invoice API v1.03 schema) ─────────────────

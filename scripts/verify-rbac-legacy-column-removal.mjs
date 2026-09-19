@@ -58,10 +58,26 @@ async function main() {
   if (dup.length) fail(`duplicate (workspace_id, guid) pairs: ${dup.length}`);
   else console.log('OK: company identity is unique within each workspace');
 
+  // Deployment B state. Reported rather than failed: an environment that has not
+  // run the drop yet is behind, not broken.
+  const { rows: legacyCols } = await pool.query(
+    `SELECT table_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND column_name = 'user_id'
+        AND table_name IN ('companies', 'devices')
+      ORDER BY table_name`
+  );
+
   await pool.end();
   if (failed) process.exit(1);
   console.log('All legacy-column removal invariants passed (Deployment A).');
-  console.log('Deployment B (DROP COLUMN) is a separate reviewed migration — see migrations/prep-drop-legacy-user-id.md');
+  if (legacyCols.length) {
+    console.log(
+      `Deployment B pending — still present: ${legacyCols.map((r) => `${r.table_name}.user_id`).join(', ')}. ` +
+        'Run scripts/drop-legacy-user-id-columns.mjs (see migrations/prep-drop-legacy-user-id.md).'
+    );
+  } else {
+    console.log('Deployment B applied — companies.user_id and devices.user_id are gone.');
+  }
 }
 
 main().catch((err) => {

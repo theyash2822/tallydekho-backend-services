@@ -228,9 +228,11 @@ router.put('/pairing', authMiddleware, async (_req, res) => {
 // Shared unpair logic - notifies all platforms via WebSocket
 async function performUnpair(deviceId, userId) {
   const result = await unpairDevice(deviceId, userId);
-  if (_socket && (userId || result.userId || result.workspaceId)) {
+  // A Desktop unpairing itself has no user; the workspace room reaches everyone
+  // who can see that binding.
+  if (_socket && (userId || result.workspaceId)) {
     _socket.notifyUnpaired(
-      userId || result.userId,
+      userId || null,
       result.newCode,
       deviceId,
       result.workspaceId || null,

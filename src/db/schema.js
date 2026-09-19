@@ -1256,6 +1256,20 @@ export async function initSchema() {
     }
     console.log('✅ Company Identity Phase 2 additive company_id columns ensured');
 
+    // Compliance detail rows are one-per-voucher-per-company. Both writers used
+    // ON CONFLICT (voucher_guid, company_guid) against a constraint that was
+    // never created, so the IRN insert always raised and the e-Way Bill insert
+    // swallowed the same error and reported success. The identity is the
+    // internal company, not the Tally GUID, which repeats across workspaces.
+    for (const table of ['e_invoice_details', 'e_way_bill_details']) {
+      await client.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS uq_${table}_company_id_voucher
+           ON ${table} (company_id, voucher_guid)`
+      ).catch((e) => {
+        if (e.code !== '42P01') console.warn(`[CID2] unique ${table}:`, e.message);
+      });
+    }
+
     // ── Company Identity Phase 3C (local integrity) ──────────────────────
     // workspace_id NOT NULL + FK RESTRICT (no CASCADE destroy of financial data).
     // Only apply NOT NULL when zero nulls remain.

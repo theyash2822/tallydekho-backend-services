@@ -177,8 +177,9 @@ export async function pairDeviceToWorkspace({ device, userId, workspaceId = null
     throw new BindingError('DEVICE_ALREADY_PAIRED', DEVICE_ELSEWHERE_MSG, 409);
   }
 
-  // Device claimed by another user but not this workspace (legacy user-scoped row)
-  if (device.paired && device.user_id && !device.workspace_id) {
+  // A paired device with no workspace predates the binding model and cannot be
+  // attributed to a tenant, so it must be unpaired before it can be re-claimed.
+  if (device.paired && !device.workspace_id) {
     throw new BindingError('DEVICE_ALREADY_PAIRED', DEVICE_ELSEWHERE_MSG, 409);
   }
 
@@ -289,14 +290,13 @@ export async function unpairWorkspace({ workspaceId, actorUserId }) {
     newCode: result.newCode,
     deviceId: result.deviceId || deviceId,
     workspaceId,
-    userId: result.userId,
   };
 }
 
 export async function unpairDevice(deviceId, actorUserId = null) {
   const { rows } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
   const device = rows[0];
-  if (!device) return { newCode: null, userId: null, workspaceId: null, deviceId: null };
+  if (!device) return { newCode: null, workspaceId: null, deviceId: null };
 
   const ts = now();
   // Do NOT invent a claimable pairing_code here — without a PENDING session it is not
@@ -335,7 +335,7 @@ export async function unpairDevice(deviceId, actorUserId = null) {
       `UPDATE workspaces SET tally_connection = 'UNPAIRED', updated_at = $2 WHERE id = $1`,
       [device.workspace_id, ts]
     );
-    await audit(device.workspace_id, actorUserId || device.user_id, 'tally.unpair', {
+    await audit(device.workspace_id, actorUserId || null, 'tally.unpair', {
       deviceId,
       cancelledSessions: cancelledSessions || 0,
     });
@@ -347,7 +347,7 @@ export async function unpairDevice(deviceId, actorUserId = null) {
   }
 
   // Intentionally NO companies UPDATE — visibility is connection-state driven.
-  return { newCode: null, userId: device.user_id, workspaceId: device.workspace_id, deviceId };
+  return { newCode: null, workspaceId: device.workspace_id, deviceId };
 }
 
 export async function markFirstSyncConnected(workspaceId, deviceId, companies = []) {

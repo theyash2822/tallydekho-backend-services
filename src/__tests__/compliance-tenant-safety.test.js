@@ -196,6 +196,62 @@ describe('One authentication architecture', () => {
   });
 });
 
+describe('Compliance helpers take the internal company id, not the Tally GUID', () => {
+  // company_id is a bigint. Passing the GUID meant the lookups matched nothing,
+  // so the IRP payload carried no GST details and no line items.
+  it('generateIRN refuses a non-numeric company', async () => {
+    const { generateIRN } = await import('../utils/irnGenerator.js');
+    await assert.rejects(
+      () => generateIRN('dddddddd-dddd-4ddd-8ddd-000000000001', { guid: 'v1' }, {}, {}),
+      /numeric companyId is required/
+    );
+  });
+
+  it('generateEWB refuses a non-numeric company', async () => {
+    const { generateEWB } = await import('../utils/ewbGenerator.js');
+    await assert.rejects(
+      () =>
+        generateEWB('dddddddd-dddd-4ddd-8ddd-000000000001', { guid: 'v1' }, {}, {}, {
+          dispatch_from: 'A',
+          ship_to: 'B',
+          transport_mode: 'Road',
+        }),
+      /numeric companyId is required/
+    );
+  });
+
+  it('no caller hands a guid variable to either generator', () => {
+    for (const rel of ['routes/api-v1.js', 'routes/tally-write.js']) {
+      const code = readCode(rel);
+      for (const m of code.matchAll(/generate(?:IRN|EWB)\(\s*([A-Za-z_$][\w$]*)/g)) {
+        assert.ok(
+          !/guid/i.test(m[1]),
+          `${rel}: generate*(${m[1]}) passes a GUID where company_id is required`
+        );
+      }
+    }
+  });
+
+  it('compliance detail rows are keyed by company_id, not company_guid', () => {
+    const code = readCode('routes/api-v1.js');
+    const conflicts = [...code.matchAll(/ON CONFLICT \(([^)]*)\) DO UPDATE/g)].map((m) => m[1]);
+    const guidKeyed = conflicts.filter((c) => /voucher_guid/.test(c) && !/company_id/.test(c));
+    assert.deepEqual(guidKeyed, [], 'a Tally GUID repeats across workspaces and cannot key a row');
+  });
+
+  it('the e-Way Bill cancel reports 404 when it cancelled nothing', () => {
+    const code = readCode('routes/api-v1.js');
+    const route = code.slice(code.indexOf("router.post('/ewaybills/cancel'"));
+    const body = route.slice(0, route.indexOf('\n});'));
+    assert.match(body, /rowCount/, 'cancel must check that a row was actually cancelled');
+    assert.match(body, /EWB_NOT_FOUND/);
+    assert.ok(
+      !/UPDATE e_way_bill_details[^`]*`,[^)]*\)\.catch\(\(\) => \{\}\)/.test(body),
+      'the cancel UPDATE must not swallow its own failure'
+    );
+  });
+});
+
 describe('Credentials do not reach the logs', () => {
   // An OTP is valid for five minutes; a log line holding it is readable for as
   // long as the log is retained. devOtpSuffix() drops it outside development.

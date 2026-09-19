@@ -119,10 +119,10 @@ async function requestDesktopSyncAfterWrite({ userId, workspaceId = null, compan
  *  (retryOfflineEntries / desktop writeback). Without this, tally_prime_series vouchers stay
  *  number-less in the app even though Tally assigned one (TDK-SAL-2026-0052). */
 async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], reason = 'deferred_posted', rcpTdkRef = null } = {}) {
-  if (!queueId || !userId) return;
+  if (!queueId) return;
   try {
     const { rows } = await query(
-      `SELECT wq.company_id, wq.company_guid, wq.workspace_id, wq.payload, wq.tally_id, av.tdk_reference_no
+      `SELECT wq.user_id, wq.company_id, wq.company_guid, wq.workspace_id, wq.payload, wq.tally_id, av.tdk_reference_no
          FROM write_queue wq
          LEFT JOIN app_vouchers av ON av.write_queue_id = wq.id
         WHERE wq.id = $1
@@ -131,6 +131,10 @@ async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], r
     );
     const row = rows[0];
     if (!row) return;
+    // The queue row names its own author. Callers that authenticate a Desktop
+    // rather than a person have no user to pass.
+    const author = userId || row.user_id;
+    if (!author) return;
     let payload = row.payload;
     if (typeof payload === 'string') {
       try { payload = JSON.parse(payload || '{}'); } catch { payload = {}; }
@@ -146,7 +150,7 @@ async function requestSyncAfterDeferredWrite(queueId, userId, { tallyIds = [], r
       companyGuid = cos[0]?.guid || companyGuid;
     }
     await requestDesktopSyncAfterWrite({
-      userId,
+      userId: author,
       companyId: row.company_id,
       workspaceId: row.workspace_id,
       companyGuid,
@@ -464,7 +468,7 @@ const updateWriteQueue = async (id, result, error) => {
 
           if (einvoiceCreds?.gstin && coRows[0] && voucherRows[0]) {
             console.log(`[auto-IRN] Triggering for ${resolvedVoucherNumber}`);
-            await generateIRN(companyGuid, voucherRows[0], coRows[0], einvoiceCreds);
+            await generateIRN(wqCompanyId, voucherRows[0], coRows[0], einvoiceCreds);
             console.log(`[auto-IRN] Success for ${resolvedVoucherNumber}`);
             await query(
               `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id = $1 AND tally_voucher_no = $2`,
@@ -515,7 +519,7 @@ const updateWriteQueue = async (id, result, error) => {
           const { rows: ewbUserRows } = await query(`SELECT integration_settings FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
           const ewbCreds = ewbUserRows[0]?.integration_settings?.ewaybill || {};
 
-          await generateEWB(companyGuid, vRowsEWB[0], coRowsEWB[0], ewbCreds, dispatchDetails);
+          await generateEWB(wqCompanyId, vRowsEWB[0], coRowsEWB[0], ewbCreds, dispatchDetails);
           console.log(`[auto-EWB] Success for ${resolvedVoucherNumber}`);
         } catch (ewbErr) {
           console.error(`[auto-EWB] Failed for ${resolvedVoucherNumber}:`, ewbErr.message);
@@ -6068,19 +6072,29 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
 // ────────────────────────────────────────────────────────────────────────────
 const LOCK_TTL_SECONDS = 300; // 5 minutes — if desktop crashes, entry re-opens after this
 
-// Helper: resolve desktop from device-id — prefer workspace binding over personal user_id
-async function resolveDesktopUser(req, res) {
+// A paired Desktop speaks for exactly one workspace, and that binding is the
+// only thing that says which queued writes it may see. This used to fall back to
+// devices.user_id, which stopped being written long ago and covered several
+// workspaces when it was.
+async function resolveDesktopWorkspace(req, res) {
   const deviceId = req.headers['device-id'] || req.headers['x-device-id'] || req.body?.deviceId;
   if (!deviceId) { res.status(401).json({ status: false, message: 'device-id header required' }); return null; }
   const { rows } = await query(
-    `SELECT user_id, workspace_id, device_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1`,
+    `SELECT workspace_id, device_id FROM devices WHERE device_id=$1 AND paired=TRUE LIMIT 1`,
     [deviceId]
   );
   if (!rows[0]) { res.status(403).json({ status: false, message: 'Device not paired' }); return null; }
+  if (!rows[0].workspace_id) {
+    res.status(403).json({
+      status: false,
+      code: 'DEVICE_NOT_BOUND_TO_WORKSPACE',
+      message: 'Device is paired but not bound to a workspace',
+    });
+    return null;
+  }
   return {
-    userId: rows[0].user_id,
     deviceId: rows[0].device_id || deviceId,
-    workspaceId: rows[0].workspace_id || null,
+    workspaceId: rows[0].workspace_id,
   };
 }
 
@@ -6088,39 +6102,26 @@ async function resolveDesktopUser(req, res) {
 // Auth is the paired device. Backend resolves workspace. companyGuid is optional filter only.
 router.post('/desktop/writeback/pending', requireDeviceCredential, async (req, res) => {
   try {
-    const desktop = await resolveDesktopUser(req, res);
+    const desktop = await resolveDesktopWorkspace(req, res);
     if (!desktop) return;
     const { companyGuid = null, limit = 10 } = req.body || {};
     const maxLimit = Math.min(parseInt(limit) || 10, 25);
     const now = Math.floor(Date.now() / 1000);
 
-    const params = [now];
+    const params = [now, desktop.workspaceId];
     const clauses = [
+      `workspace_id = $2`,
       `status IN ('desktop_offline','failed')`,
       `attempt_count < 5`,
       `(lock_expires_at IS NULL OR lock_expires_at < $1)`,
     ];
-    if (desktop.workspaceId) {
-      params.push(desktop.workspaceId);
-      const wsIdx = params.length;
-      params.push(desktop.userId);
-      clauses.unshift(`(workspace_id = $${wsIdx} OR (workspace_id IS NULL AND user_id = $${params.length}))`);
-    } else {
-      params.push(desktop.userId);
-      clauses.unshift(`user_id = $${params.length}`);
-    }
     if (companyGuid) {
       params.push(companyGuid);
-      const gIdx = params.length;
-      if (desktop.workspaceId) {
-        params.push(desktop.workspaceId);
-        const wsForCo = params.length;
-        clauses.push(
-          `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
-        );
-      } else {
-        clauses.push(`(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx}) OR company_guid = $${gIdx})`);
-      }
+      // The same Tally GUID exists in other workspaces, so it names a company
+      // only after the workspace has been applied.
+      clauses.push(
+        `company_id IN (SELECT id FROM companies WHERE guid = $${params.length} AND workspace_id = $2)`
+      );
     }
     params.push(maxLimit);
     const { rows } = await query(
@@ -6151,7 +6152,7 @@ router.post('/desktop/writeback/pending', requireDeviceCredential, async (req, r
 // POST /tally/desktop/writeback/:outboxId/claim — lock entry + return XML for posting
 router.post('/desktop/writeback/:outboxId/claim', requireDeviceCredential, async (req, res) => {
   try {
-    const desktop = await resolveDesktopUser(req, res);
+    const desktop = await resolveDesktopWorkspace(req, res);
     if (!desktop) return;
     const { outboxId } = req.params;
     const now = Math.floor(Date.now() / 1000);
@@ -6162,14 +6163,11 @@ router.post('/desktop/writeback/:outboxId/claim', requireDeviceCredential, async
        SET locked_by_device_id=$1, locked_at=$2, lock_expires_at=$3, status='processing',
            updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
        WHERE id=$4
-         AND (
-           user_id=$5
-           OR ($6::text IS NOT NULL AND workspace_id = $6)
-         )
+         AND workspace_id=$5
          AND status IN ('desktop_offline','failed')
          AND (lock_expires_at IS NULL OR lock_expires_at < $2)
        RETURNING id, xml, payload, entry_type, company_guid`,
-      [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.userId, desktop.workspaceId]
+      [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.workspaceId]
     );
 
     if (!rows[0]) return res.status(409).json({ status: false, message: 'Entry already claimed or not found' });
@@ -6195,7 +6193,7 @@ router.post('/desktop/writeback/:outboxId/claim', requireDeviceCredential, async
 // POST /tally/desktop/writeback/:outboxId/result — desktop reports Tally result
 router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, async (req, res) => {
   try {
-    const desktop = await resolveDesktopUser(req, res);
+    const desktop = await resolveDesktopWorkspace(req, res);
     if (!desktop) return;
     const { outboxId } = req.params;
     const { success, tallyVoucherNumber, tallyVoucherGuid, tallyAlterId, errorCode, errorMessage } = req.body;
@@ -6203,12 +6201,8 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
     // Verify this device owns the lock
     const { rows: lockRows } = await query(
       `SELECT id, company_guid FROM write_queue
-       WHERE id=$1 AND locked_by_device_id=$2
-         AND (
-           user_id=$3
-           OR ($4::text IS NOT NULL AND workspace_id = $4)
-         )`,
-      [outboxId, desktop.deviceId, desktop.userId, desktop.workspaceId]
+       WHERE id=$1 AND locked_by_device_id=$2 AND workspace_id=$3`,
+      [outboxId, desktop.deviceId, desktop.workspaceId]
     );
     if (!lockRows[0]) return res.status(403).json({ status: false, message: 'Not the lock owner or not found' });
     const { company_guid } = lockRows[0];
@@ -6236,11 +6230,13 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
       }
       // Desktop completed a deferred push without going through the Sales/Purchase
       // route, so create the paired Receipt/Payment here if one is still owed.
-      const paired = await ensurePairedVoucherForQueueEntry(outboxId, desktop.userId);
+      // null author: the Desktop is the caller, so both helpers take the user
+      // from the queue row that recorded who wrote the entry.
+      const paired = await ensurePairedVoucherForQueueEntry(outboxId, null);
       // If desktop did not return a voucher number (common under tally_prime_series),
       // ask it to pull SingleVoucher so the number lands the same way as the live path.
       if (!tallyVoucherNumber) {
-        await requestSyncAfterDeferredWrite(outboxId, desktop.userId, {
+        await requestSyncAfterDeferredWrite(outboxId, null, {
           tallyIds: [tallyAlterId, paired?.tallyId],
           reason: 'writeback_posted',
           rcpTdkRef: paired?.tdkRef || null,

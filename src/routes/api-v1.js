@@ -2234,7 +2234,7 @@ router.get('/company/:guid/compliance-config', authMiddleware, async (req, res) 
     const companyId = requireResolvedCompanyId(req);
     const { rows } = await query(
       `SELECT * FROM company_compliance_config WHERE company_id=$1`,
-      [guid]
+      [companyId]
     );
     // Return defaults if not yet configured
     const defaults = {
@@ -5803,7 +5803,7 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     // Call EWB generator
-    const ewbResult = await generateEWB(companyGuid, voucher, coRows[0], ewbCreds, details).catch(e => ({ _error: e.message }));
+    const ewbResult = await generateEWB(companyId, voucher, coRows[0], ewbCreds, details).catch(e => ({ _error: e.message }));
 
     if (ewbResult._error) {
       await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no=$3`, [ewbResult._error, companyId, voucher.voucher_number]).catch(() => {});
@@ -5812,12 +5812,22 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
 
     const { ewbNo, ewbDate, validUpto } = ewbResult;
     // Store in e_way_bill_details (schema cols: ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
-    await query(
-      `INSERT INTO e_way_bill_details (voucher_guid, company_guid, ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET ewb_no=$3, ewb_date=$4, valid_till=$5`,
-      [voucherGuid, companyId, ewbNo, ewbDate, validUpto, details.transporter_id || null, details.vehicle_number || null, 'Road']
-    ).catch(() => {});
+    // Not best-effort: an e-Way Bill the government issued and we failed to
+    // record is one the user cannot cancel or show at a checkpoint.
+    try {
+      await query(
+        `INSERT INTO e_way_bill_details (voucher_guid, company_id, company_guid, ewb_no, ewb_date, valid_till, transporter_id, vehicle_no, sub_supply_type)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (company_id, voucher_guid) DO UPDATE SET ewb_no=$4, ewb_date=$5, valid_till=$6`,
+        [voucherGuid, companyId, companyGuid, ewbNo, ewbDate, validUpto, details.transporter_id || null, details.vehicle_number || null, 'Road']
+      );
+    } catch (persistErr) {
+      console.error('[ewaybills/generate] EWB issued but not recorded:', persistErr.message);
+      return res.status(500).json({
+        success: false,
+        error: { code: 'EWB_NOT_RECORDED', message: 'E-Way Bill was generated but could not be saved', ewbNo },
+      });
+    }
     await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     res.json({ success: true, data: { ewbNo, ewbDate, validUpto } });
@@ -5835,7 +5845,18 @@ router.post('/ewaybills/cancel', authMiddleware, async (req, res) => {
   const { voucherGuid, cancelReason = 1 } = req.body;
   if (!voucherGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_VOUCHER' } });
   try {
-    await query(`UPDATE e_way_bill_details SET status='cancelled' WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]).catch(() => {});
+    // Cancelling nothing is not a success — the caller would show the user a
+    // cancelled bill that is still live at the portal.
+    const cancelled = await query(
+      `UPDATE e_way_bill_details SET status='cancelled' WHERE voucher_guid=$1 AND company_id=$2`,
+      [voucherGuid, companyId]
+    );
+    if (!cancelled.rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'EWB_NOT_FOUND', message: 'No E-Way Bill for this voucher in this company' },
+      });
+    }
     await query(
       `UPDATE app_vouchers SET e_way_bill_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
        WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
@@ -5996,15 +6017,15 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
     ).catch(() => {});
 
     // -- 3. IRP API call (wire real GSP/NIC API in irnGenerator.js) -----------
-    const irnResult = await generateIRN(companyGuid, voucher, company, einvoiceCreds).catch(e => ({ error: e.message }));
+    const irnResult = await generateIRN(companyId, voucher, company, einvoiceCreds).catch(e => ({ error: e.message }));
 
     if (irnResult.error) {
       // Store failure record
       await query(
-        `INSERT INTO e_invoice_details (voucher_guid, company_guid, status, error_message, synced_at)
-         VALUES ($1, $2, 'failed', $3, NOW())
-         ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET status='failed', error_message=$3, synced_at=NOW()`,
-        [voucherGuid, companyId, irnResult.error]
+        `INSERT INTO e_invoice_details (voucher_guid, company_id, company_guid, status, error_message, synced_at)
+         VALUES ($1, $2, $3, 'failed', $4, NOW())
+         ON CONFLICT (company_id, voucher_guid) DO UPDATE SET status='failed', error_message=$4, synced_at=NOW()`,
+        [voucherGuid, companyId, companyGuid, irnResult.error]
       );
       await query(
         `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no = $3`,
@@ -6016,11 +6037,11 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
     // -- 4. Store IRN result --------------------------------------------------
     const { irn, ackNo, ackDate, signedInvoice, qrCode } = irnResult;
     await query(
-      `INSERT INTO e_invoice_details (voucher_guid, company_guid, irn, ack_no, ack_date, signed_invoice, qr_code, status, synced_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'generated',NOW())
-       ON CONFLICT (voucher_guid, company_guid) DO UPDATE SET
-         irn=$3, ack_no=$4, ack_date=$5, signed_invoice=$6, qr_code=$7, status='generated', synced_at=NOW()`,
-      [voucherGuid, companyId, irn, ackNo, ackDate, signedInvoice, qrCode]
+      `INSERT INTO e_invoice_details (voucher_guid, company_id, company_guid, irn, ack_no, ack_date, signed_invoice, qr_code, status, synced_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'generated',NOW())
+       ON CONFLICT (company_id, voucher_guid) DO UPDATE SET
+         irn=$4, ack_no=$5, ack_date=$6, signed_invoice=$7, qr_code=$8, status='generated', synced_at=NOW()`,
+      [voucherGuid, companyId, companyGuid, irn, ackNo, ackDate, signedInvoice, qrCode]
     );
     // Update vouchers table
     await query(
@@ -8800,7 +8821,7 @@ async function autoSyncBarcodeToTally(userId, companyId, stockGuid, stockName, b
     if (!co?.name) return;
     const { pushBarcodeToTally } = await import('./tally-write.js');
     const result = await pushBarcodeToTally({
-      companyGuid, userId, stockGuid, stockName, barcode, syncTarget, companyName: co.name,
+      companyGuid: co.guid, userId, stockGuid, stockName, barcode, syncTarget, companyName: co.name,
     });
     // Map Tally result → tally_sync_status
     const newStatus =
