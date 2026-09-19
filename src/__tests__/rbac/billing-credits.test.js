@@ -20,9 +20,10 @@ import {
   spendForWorkspaceAction,
   resolveWorkspacePayer,
   getBillingOverview,
+  getServiceRate,
 } from '../../services/billingService.js';
 import { createDemoEntry } from '../../services/demoSimulatedEntryService.js';
-import { completeOwnershipTransfer } from '../../services/workspaceService.js';
+import { completeOwnershipTransfer, createAdditionalWorkspace } from '../../services/workspaceService.js';
 import { unpairDevice } from '../../services/workspacePairingService.js';
 import { seedBuiltinRoles } from '../../services/roleService.js';
 
@@ -728,6 +729,30 @@ describe('Billing payer authority', () => {
     });
     assert.equal((await walletState(ownerA)).balance, 100);
     assert.equal((await walletState(ownerX)).balance, 8);
+  });
+
+  it('createAdditionalWorkspace charges the creator owner wallet in the same transaction', async () => {
+    if (!ctx) throw new Error('harness required');
+    const owner = await insertFreshUser('Paid WS Owner');
+    await insertWorkspace(owner, 'ABC base', { isBase: true });
+    const rate = await getServiceRate('ADDITIONAL_WORKSPACE');
+    const cost = rate ? Number(rate.credits) : 1000;
+    await topUpBy(owner, cost);
+    const before = await walletState(owner);
+    const ws = await createAdditionalWorkspace(owner, 'Paid extra');
+    assert.ok(ws?.id);
+    assert.equal(ws.owner_user_id, owner);
+    assert.equal(ws.is_base, false);
+    const after = await walletState(owner);
+    assert.equal(after.balance, before.balance - cost);
+    const { rows } = await query(
+      `SELECT wallet_id, workspace_id, kind FROM wallet_transactions
+        WHERE reference = $1 AND amount < 0`,
+      [ws.id]
+    );
+    assert.equal(rows[0].wallet_id, before.walletId);
+    assert.equal(rows[0].workspace_id, ws.id);
+    assert.equal(rows[0].kind, 'ADDITIONAL_WORKSPACE');
   });
 });
 

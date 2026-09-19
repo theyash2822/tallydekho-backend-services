@@ -1,3 +1,14 @@
+## 2026-09-19 — Extra-workspace charge sees the same-txn insert
+
+`createAdditionalWorkspace` inserts the workspace then charges inside one
+transaction. `resolveWorkspacePayer` now takes that client so the new row is
+visible (was `WORKSPACE_NOT_FOUND` on the pool). Standalone spend still
+provisions the owner wallet first; in-txn lookups stay on the open client.
+
+Branch snapshot: `19-09-2026-final-code`.
+
+---
+
 ## 2026-09-19 — Billing authority: active workspace owner pays
 
 Final payer rule: chargeable actions debit the owner wallet of the

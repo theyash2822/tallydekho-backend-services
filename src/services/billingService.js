@@ -196,13 +196,22 @@ export async function deductOwnerCredits({
   if (USAGE_KINDS.has(spendKind) && !workspaceId) {
     throw billingError('workspace_id required for credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
   }
-  await ensureBillingAccount(userId);
-  const wallet = await getWallet(userId);
-  if (!wallet) {
-    throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
+  if (!client) {
+    await ensureBillingAccount(userId);
   }
 
   return withBillingClient(client, async (db) => {
+    const { rows: walletRows } = await db.query(
+      `SELECT w.* FROM wallets w
+         JOIN billing_accounts ba ON ba.id = w.billing_account_id
+        WHERE ba.owner_user_id = $1 LIMIT 1
+        FOR UPDATE`,
+      [userId]
+    );
+    const wallet = walletRows[0];
+    if (!wallet) {
+      throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
+    }
     if (reference) {
       const prior = await db.query(
         `SELECT id, funding_source FROM wallet_transactions
@@ -265,11 +274,12 @@ export const deductCredits = deductOwnerCredits;
  * Payer for a chargeable workspace action: the workspace owner wallet.
  * Actor, client ownerUserId, company GUID, and role are not consulted.
  */
-export async function resolveWorkspacePayer(workspaceId) {
+export async function resolveWorkspacePayer(workspaceId, client = null) {
   if (!workspaceId) {
     throw billingError('workspace_id required for credit usage', 'BILLING_WORKSPACE_REQUIRED', 400);
   }
-  const { rows } = await query(
+  const exec = client ? client.query.bind(client) : query;
+  const { rows } = await exec(
     `SELECT id, owner_user_id FROM workspaces WHERE id = $1 LIMIT 1`,
     [workspaceId]
   );
@@ -279,14 +289,26 @@ export async function resolveWorkspacePayer(workspaceId) {
   if (!rows[0].owner_user_id) {
     throw billingError('Workspace has no owner', 'BILLING_OWNER_MISSING', 409);
   }
-  await ensureBillingAccount(rows[0].owner_user_id);
-  const wallet = await getWallet(rows[0].owner_user_id);
+  const ownerUserId = rows[0].owner_user_id;
+  let wallet = null;
+  if (client) {
+    const { rows: w } = await exec(
+      `SELECT w.* FROM wallets w
+         JOIN billing_accounts ba ON ba.id = w.billing_account_id
+        WHERE ba.owner_user_id = $1 LIMIT 1`,
+      [ownerUserId]
+    );
+    wallet = w[0] || null;
+  } else {
+    await ensureBillingAccount(ownerUserId);
+    wallet = await getWallet(ownerUserId);
+  }
   if (!wallet) {
     throw billingError('Wallet not found', 'WALLET_NOT_FOUND', 404);
   }
   return {
     workspaceId: rows[0].id,
-    ownerUserId: rows[0].owner_user_id,
+    ownerUserId,
     wallet,
   };
 }
@@ -329,9 +351,17 @@ export async function spendForWorkspaceAction({
     throw billingError('Invalid debit amount', 'BILLING_INVALID_AMOUNT', 400);
   }
   const spendKind = kind || serviceKey || 'DEBIT';
-  const payer = await resolveWorkspacePayer(workspaceId);
+
+  // When the caller already holds a txn (extra-workspace insert), the wallet
+  // must already exist — do not check out a second pool connection. For the
+  // standalone spend path, provision the owner wallet first so first-charge
+  // still auto-creates signup credits, then resolve again on the txn client.
+  if (!client) {
+    await resolveWorkspacePayer(workspaceId);
+  }
 
   return withBillingClient(client, async (db) => {
+    const payer = await resolveWorkspacePayer(workspaceId, db);
     const prior = await db.query(
       `SELECT id, wallet_id, funding_source FROM wallet_transactions
         WHERE workspace_id = $1 AND kind = $2 AND reference = $3 AND amount < 0
