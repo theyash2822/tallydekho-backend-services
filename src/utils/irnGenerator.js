@@ -77,7 +77,7 @@ export async function generateIRN(companyId, voucher, company, creds) {
       SlNo:       String(i + 1),
       PrdDesc:    item.stock_item_name || '',
       IsServc:    'N',
-      HsnCd:      item.hsn_code        || '0000',
+      HsnCd:      item.hsn             || '0000',
       Qty:        parseFloat(item.actual_qty) || 1,
       Unit:       item.unit             || 'NOS',
       UnitPrice:  parseFloat(item.rate)  || 0,
@@ -115,8 +115,11 @@ export async function generateIRN(companyId, voucher, company, creds) {
   // };
   // ─────────────────────────────────────────────────────────────────────────
 
-  // Placeholder: log payload and throw until real credentials are wired
-  console.log('[IRN] Payload ready for IRP:', JSON.stringify(irpPayload).slice(0, 200));
+  // The payload carries the buyer's GSTIN, address and invoice values, which do
+  // not belong in a retained log. Shape only.
+  console.log(
+    `[IRN] payload ready for IRP: company=${companyId} voucher=${voucher.guid} items=${irpPayload.ItemList.length}`
+  );
   throw new Error(
     'IRP credentials not yet provisioned. Configure GSP/NIC credentials in Settings → E-Invoice to enable IRN generation.'
   );

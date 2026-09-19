@@ -252,6 +252,26 @@ describe('Compliance helpers take the internal company id, not the Tally GUID', 
   });
 });
 
+describe('Compliance payloads read the columns the database actually has', () => {
+  // voucher_inventory_items stores the code in `hsn`. Reading `hsn_code` gave
+  // undefined on every line, so each item went to the portal as HSN 0000.
+  it('the generators read item.hsn', () => {
+    for (const rel of ['utils/irnGenerator.js', 'utils/ewbGenerator.js']) {
+      const code = readCode(rel);
+      assert.ok(!/item\.hsn_code/.test(code), `${rel}: voucher_inventory_items has no hsn_code column`);
+      assert.match(code, /item\.hsn\b/, `${rel}: HSN must come from item.hsn`);
+    }
+  });
+
+  it('the IRP payload is not written to the log', () => {
+    const code = readCode('utils/irnGenerator.js');
+    assert.ok(
+      !/console\.\w+\([^)]*JSON\.stringify\(irpPayload/.test(code),
+      'the payload carries buyer GSTIN, address and invoice values'
+    );
+  });
+});
+
 describe('Credentials do not reach the logs', () => {
   // An OTP is valid for five minutes; a log line holding it is readable for as
   // long as the log is retained. devOtpSuffix() drops it outside development.

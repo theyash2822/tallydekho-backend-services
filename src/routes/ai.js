@@ -239,9 +239,25 @@ export default router;
 // ── POST /ai/help — AI Help Chat with KB Retrieval + Groq ─────────────────
 // Architecture: Intent Router → KB Retrieval → Focused Context → Groq LLM
 // Token target: 500–1200 tokens/query (not 3000–10000 for full KB stuffing)
+// The body limit is 10mb and every byte here becomes a paid Groq token, so the
+// prompt is bounded before anything else looks at it.
+const MAX_MESSAGE_CHARS = 2000;
+const MAX_HISTORY_TURNS = 8;
+const MAX_HISTORY_CHARS = 1000;
+
 router.post('/help', authMiddleware, async (req, res) => {
   const { message, history = [] } = req.body || {};
   if (!message) return res.status(400).json({ success: false, error: { code: 'MISSING_MESSAGE', message: 'message required' } });
+  if (typeof message !== 'string' || message.length > MAX_MESSAGE_CHARS) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'MESSAGE_TOO_LONG', message: `message must be a string of at most ${MAX_MESSAGE_CHARS} characters` },
+    });
+  }
+  const recentHistory = (Array.isArray(history) ? history : [])
+    .slice(-MAX_HISTORY_TURNS)
+    .map((h) => ({ role: h?.role === 'user' ? 'user' : 'assistant', content: String(h?.text ?? '').slice(0, MAX_HISTORY_CHARS) }))
+    .filter((h) => h.content);
 
   const GROQ_KEY = process.env.GROQ_API_KEY;
   if (!GROQ_KEY) {
@@ -257,7 +273,8 @@ router.post('/help', authMiddleware, async (req, res) => {
 
     // ── Step 2: Semantic retrieval (Phase 2) with keyword fallback (Phase 1) ──
     const { context, modules, hasContext, method } = await retrieveKBContextSemantic(message);
-    console.log(`[AI Help] [${method}] modules: [${modules.join(', ')}] for: "${message.slice(0, 60)}"`);
+    // The question is the user's own text; log what it matched, not what it said.
+    console.log(`[AI Help] [${method}] modules: [${modules.join(', ')}] chars=${message.length}`);
 
     // ── Step 3: High-confidence KB Direct Answer Gate ───────────────────
     // (only if semanticSearch returned results with similarity scores)
@@ -272,7 +289,7 @@ router.post('/help', authMiddleware, async (req, res) => {
     // ── Step 5: Build message list (last 8 messages for continuity) ──────
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...history.slice(-8).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text })),
+      ...recentHistory,
       { role: 'user', content: message },
     ];
 

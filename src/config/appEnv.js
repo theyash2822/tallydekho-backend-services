@@ -61,6 +61,11 @@ export function assertAppEnvConsistency(env = process.env) {
   if (appEnv === 'staging' && !env.DATABASE_URL) {
     problems.push('APP_ENV=staging requires an explicit DATABASE_URL (no implicit fallback)');
   }
+  // Without a signing secret every login and every token check throws, one
+  // request at a time, as a 500. Better to refuse to start.
+  if (PRODUCTION_LIKE.includes(appEnv) && !env.JWT_SECRET) {
+    problems.push('JWT_SECRET is required — tokens cannot be signed or verified without it');
+  }
   if (problems.length) {
     throw new Error(`Environment misconfiguration:\n  - ${problems.join('\n  - ')}`);
   }

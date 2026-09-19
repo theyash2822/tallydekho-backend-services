@@ -105,8 +105,9 @@ Legacy `/app` data/companies mounts were **deleted** in Phase 5. Remaining `/app
 ```env
 PORT=3001
 JWT_SECRET=your_secret_here_change_in_production
-JWT_EXPIRES_IN=30d
-DB_PATH=./data/tallydekho.db
+JWT_ACCESS_EXPIRES_IN=15m
+JWT_REFRESH_TTL_MS=2592000000
+DATABASE_URL=postgresql://user:password@localhost:5432/tallydekho
 NODE_ENV=production
 ALLOWED_ORIGINS=https://yourapp.com,https://www.yourapp.com
 ```

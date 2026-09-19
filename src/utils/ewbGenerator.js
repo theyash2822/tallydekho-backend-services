@@ -78,7 +78,7 @@ export async function generateEWB(companyId, voucher, company, creds, dispatchDe
       itemNo:        i + 1,
       productName:   item.stock_item_name  || '',
       productDesc:   item.stock_item_name  || '',
-      hsnCode:       item.hsn_code         || '0000',
+      hsnCode:       item.hsn              || '0000',
       quantity:      parseFloat(item.actual_qty) || 1,
       qtyUnit:       item.unit              || 'NOS',
       cgstRate:      parseFloat(g.cgst_rate)   || 0,

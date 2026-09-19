@@ -151,7 +151,10 @@ export async function sendPaymentReminder({
     });
     return { success: true, data: response.data };
   } catch (err) {
-    console.error('[WhatsApp Reminder]', err?.response?.data || err.message);
-    return { success: false, error: err?.response?.data?.message || err.message };
+    // The provider echoes the request back on failure, template variables and
+    // all. Log the message it chose, not the body we sent it.
+    const msg = err?.response?.data?.message || err.message;
+    console.error(`[WhatsApp Reminder] failed | ${err?.response?.status || 'no status'} | ${msg}`);
+    return { success: false, error: msg };
   }
 }
