@@ -16,6 +16,11 @@ import {
   round3 as r3,
   QTY_EPSILON,
 } from '../utils/creditNoteContext.js';
+import {
+  validateVoucherReferences,
+  collectLineReferences,
+  collectLedgerNameReferences,
+} from '../services/voucherReferenceResolver.js';
 import { resolveDebitNoteContext } from '../utils/debitNoteContext.js';
 import { calcCreditNoteReturn } from '../utils/creditNoteTax.js';
 import { persistVoucherLineTaxes } from '../utils/creditNoteItemTax.js';
@@ -995,6 +1000,16 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
     return res.status(400).json({ status: false, message: 'companyGuid, partyLedger and items required' });
   }
 
+  // Before any XML or queue row: every master this body names must belong to
+  // the company the request resolved to.
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'salesLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+    { kind: 'ledger', value: collect_payment?.ledgerName },
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const isOpt = isOptional ? 'Yes' : 'No';
   const dt = tallyDate(date);
   const amt = parseFloat(totalAmount) || 0;
@@ -1322,6 +1337,13 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
   if (!companyGuid || !partyLedger || !items.length) {
     return res.status(400).json({ status: false, message: 'companyGuid, partyLedger and items required' });
   }
+
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'salesLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+  ], { workspaceId: req.company?.workspaceId })) return;
 
   const dt = tallyDate(date);
   const amt = parseFloat(totalAmount) || 0;
@@ -1665,6 +1687,11 @@ router.post('/voucher/payment', authMiddleware, requireTallyWriteAccess('/vouche
     return res.status(400).json({ status: false, message: 'partyLedger, ledgerAccount and amount required' });
   }
 
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    { kind: 'ledger', value: cashOrBankLedger },
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(amount) || 0;
@@ -1888,6 +1915,11 @@ router.post('/voucher/receipt', authMiddleware, requireTallyWriteAccess('/vouche
     return res.status(400).json({ status: false, message: 'partyLedger, ledgerAccount and amount required' });
   }
 
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    { kind: 'ledger', value: cashOrBankLedger },
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(amount) || 0;
@@ -2082,6 +2114,11 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
     return res.status(400).json({ status: false, message: 'drLedger, crLedger and amount required' });
   }
 
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: isPartyDr ? 'party' : undefined, value: drLedger },
+    { kind: 'ledger', role: isPartyCr ? 'party' : undefined, value: crLedger },
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
   const amt = parseFloat(amount) || 0;
@@ -2234,6 +2271,11 @@ router.post('/voucher/contra', authMiddleware, requireTallyWriteAccess('/voucher
   if (!companyGuid || !fromLedger || !toLedger || !amount) {
     return res.status(400).json({ status: false, message: 'fromLedger, toLedger and amount required' });
   }
+
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', value: fromLedger },
+    { kind: 'ledger', value: toLedger },
+  ], { workspaceId: req.company?.workspaceId })) return;
 
   const isOptional = (typeof isOptionalLegacy === 'boolean') ? isOptionalLegacy : (entryType === 'optional');
   const isOpt = isOptional ? 'Yes' : 'No';
@@ -2472,6 +2514,13 @@ router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/vo
   const amt = parseFloat(totalAmount) || 0;
   const dt = tallyDate(date);
   const dueDt = dueDate ? tallyDate(dueDate) : dt;
+
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'salesLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+  ], { workspaceId: req.company?.workspaceId })) return;
 
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'SOR', req.company?.id).catch(() => null);
 
@@ -3047,6 +3096,13 @@ router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('
 
   const persistPayload = { ...req.body, tdkRef, termsText: termsText || req.body.termsText || '', voucherType: 'Purchase Order' };
 
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'purchaseLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const poTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
   const poItems = poTagCtx.withHsn(items);
   const poExtrasXml = buildVoucherHeaderExtrasXml({
@@ -3262,6 +3318,14 @@ router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/vouch
     tdkInvoiceNo = await generateTDSeriesNumber(companyGuid, 'PUR', req.company?.id).catch(() => null);
     if (tdkInvoiceNo) effectiveVoucherNumber = tdkInvoiceNo;
   }
+
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'purchaseLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+    { kind: 'ledger', value: make_payment?.ledgerName },
+  ], { workspaceId: req.company?.workspaceId })) return;
 
   const tagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
   const itemsWithHsn = tagCtx.withHsn(items);
@@ -4456,6 +4520,13 @@ router.post('/voucher/delivery-note', authMiddleware, requireTallyWriteAccess('/
     return res.status(400).json({ status: false, message: 'Each item needs itemName' });
   }
 
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'ledger', role: 'party', value: partyLedger },
+    ...collectLineReferences(items, { ledgerField: 'salesLedger' }),
+    ...collectLedgerNameReferences(taxes),
+    ...collectLedgerNameReferences(logistics),
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   const isOpt = isOptional ? 'Yes' : 'No';
   const entryType = original_entry_type || (isOptional ? 'optional' : 'regular');
   const dt = tallyDate(date);
@@ -5185,6 +5256,18 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
     };
   });
 
+  // Raw items, not normalizedItems: the normalizer substitutes 'pcs' for a
+  // missing unit, and a default this backend chose is not a caller reference.
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'godown', value: toGodown },
+    { kind: 'godown', value: fromGodown },
+    ...(items || []).flatMap((it) => [
+      { kind: 'stock', value: it?.itemName ?? it?.name },
+      { kind: 'godown', value: it?.fromGodown ?? it?.sourceWarehouse },
+      { kind: 'unit', value: it?.unit },
+    ]),
+  ], { workspaceId: req.company?.workspaceId })) return;
+
   for (const it of normalizedItems) {
     if (!it.itemName) return res.status(400).json({ status: false, message: 'Each item needs itemName' });
     if (!it.fromGodown) return res.status(400).json({ status: false, message: `Source warehouse required for ${it.itemName}` });
@@ -5347,6 +5430,14 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
   } else {
     return res.status(400).json({ status: false, message: 'Invalid adjustmentReason' });
   }
+
+  // `unit` carries a destructuring default, so only a unit the body actually
+  // sent is a reference worth proving.
+  if (!await validateVoucherReferences(res, req.company?.id, [
+    { kind: 'stock', value: stockName },
+    { kind: 'godown', value: warehouse },
+    { kind: 'unit', value: req.body?.unit },
+  ], { workspaceId: req.company?.workspaceId })) return;
 
   const qty     = Math.abs(parseFloat(adjustmentQty));
   const qtyChange = isIncrease ? qty : -qty;
