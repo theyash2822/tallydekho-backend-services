@@ -836,7 +836,7 @@ router.get(
 
 router.get('/billing/overview', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
-    const overview = await getBillingOverview(req.user.userId);
+    const overview = await getBillingOverview(req.user.userId, { workspaceId: req.workspaceId || null });
     res.json({ success: true, data: overview });
   } catch (err) {
     errJson(res, err);
@@ -1542,24 +1542,20 @@ router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bin
     }
     // Deduct activation credits from the Owner wallet when billing is present.
     try {
-      const { deductCredits, ensureBillingAccount, getServiceRate } = await import('../services/billingService.js');
+      const { spendForWorkspaceAction, ensureBillingAccount } = await import('../services/billingService.js');
       const { rows: ws } = await query(`SELECT owner_user_id FROM workspaces WHERE id = $1`, [req.params.id]);
       const ownerId = ws[0]?.owner_user_id;
       if (ownerId) {
         await ensureBillingAccount(ownerId);
         const rateKey = domain === 'gst' ? 'GST_ACTIVATION'
           : domain === 'einvoice' ? 'EINVOICE_ACTIVATION' : 'EWAY_ACTIVATION';
-        // Price comes from service_rates; the amount was hardcoded at 100, so
-        // repricing in the rates table had no effect on what was charged.
-        const rate = await getServiceRate(rateKey);
-        const amount = Number(rate?.credits ?? 100);
-        await deductCredits({
-          userId: ownerId,
-          amount,
-          kind: rateKey,
-          reference: `${req.params.id}:${domain}`,
+        await spendForWorkspaceAction({
+          ownerUserId: ownerId,
           workspaceId: req.params.id,
-          meta: { domain, rateVersion: rate?.version ?? null },
+          serviceKey: rateKey,
+          operationId: `${req.params.id}:${domain}`,
+          kind: rateKey,
+          meta: { domain },
         });
       }
     } catch (billErr) {

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { query, getClient } from '../db/schema.js';
 import { audit } from './auditService.js';
-import { ensureBillingAccount, getServiceRate, deductCredits, getBillingOverview, getWallet } from './billingService.js';
+import { ensureBillingAccount, getServiceRate, spendForWorkspaceAction, getBillingOverview, getWallet } from './billingService.js';
 import { seedBuiltinRoles } from './roleService.js';
 import { getEffectiveAccess, loadMembership, assertCapability } from './authorizationService.js';
 import {
@@ -405,12 +405,12 @@ export async function createAdditionalWorkspace(userId, name) {
        ON CONFLICT (workspace_id) DO NOTHING`,
       [uuid(), workspaceId, uuid(), ts]
     );
-    await deductCredits({
-      userId,
-      amount: cost,
-      kind: 'ADDITIONAL_WORKSPACE',
-      reference: workspaceId,
+    await spendForWorkspaceAction({
+      ownerUserId: userId,
       workspaceId,
+      serviceKey: 'ADDITIONAL_WORKSPACE',
+      operationId: workspaceId,
+      kind: 'ADDITIONAL_WORKSPACE',
       meta: { rateKey: 'ADDITIONAL_WORKSPACE', version: rate?.version },
       client,
     });
@@ -469,12 +469,12 @@ export async function purchaseSeat(userId, workspaceId) {
        VALUES ($1,$2,'PAID','AVAILABLE',$3,$4,$3)`,
       [seatId, workspaceId, ts, periodEnd]
     );
-    await deductCredits({
-      userId,
-      amount: cost,
-      kind: 'SEAT_MONTHLY',
-      reference: seatId,
+    await spendForWorkspaceAction({
+      ownerUserId: userId,
       workspaceId,
+      serviceKey: 'SEAT_MONTHLY',
+      operationId: seatId,
+      kind: 'SEAT_MONTHLY',
       meta: { rateKey: 'SEAT_MONTHLY' },
       client,
     });
@@ -1574,14 +1574,12 @@ export async function completeOwnershipTransfer(actorUserId, workspaceId, transf
   const ts = now();
 
   if (ws?.is_base) {
-    const rate = await getServiceRate('ADDITIONAL_WORKSPACE');
-    const cost = rate ? Number(rate.credits) : 1000;
-    await deductCredits({
-      userId: fromId,
-      amount: cost,
-      kind: 'OWNERSHIP_TRANSFER_RESERVE',
-      reference: transferId,
+    await spendForWorkspaceAction({
+      ownerUserId: fromId,
       workspaceId,
+      serviceKey: 'ADDITIONAL_WORKSPACE',
+      operationId: transferId,
+      kind: 'OWNERSHIP_TRANSFER_RESERVE',
       meta: { rateKey: 'ADDITIONAL_WORKSPACE', transferId },
     });
   }
