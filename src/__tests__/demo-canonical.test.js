@@ -185,7 +185,16 @@ describe('Private simulated Demo entries', () => {
 describe('Pairing events carry their workspace', () => {
   it('paired, unpaired and synced all include workspaceId', () => {
     const src = read('socket/socketHandler.js');
-    assert.match(src, /notifyPaired: \(userId, deviceName, workspaceId = null\)/);
+    assert.match(src, /notifyPaired: \(userId, deviceName, workspaceId\)/);
+    assert.match(src, /notifySynced refused: workspaceId required/);
+    assert.ok(
+      !/client\.emit\('synced'/.test(src),
+      'user-socket fallback for synced must stay deleted'
+    );
+    assert.ok(
+      !/client\.emit\('paired'/.test(src),
+      'user-socket fallback for paired must stay deleted'
+    );
     assert.match(src, /emit\('unpaired', \{ workspaceId \}\)/);
     assert.ok(
       !/client\.emit\('unpaired', \{\}\)/.test(src),

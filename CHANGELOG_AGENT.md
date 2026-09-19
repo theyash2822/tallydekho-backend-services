@@ -1,3 +1,17 @@
+## 2026-09-19 — Delete unused socket user-room fallback
+
+Web and Mobile now ignore tenant events without `workspaceId`. Every
+`notifySynced` / `notifyPaired` caller already passes a workspace id, so the
+else-branch that fanned those events out to `connectedClients.get(mobile|web_${userId})`
+had no remaining caller. Removed it. Missing `workspaceId` now logs and returns.
+
+`notifyWorkspace` stays — that is user-addressed membership/invitation delivery,
+not the missing-workspaceId pairing fallback.
+
+`pairing_confirmed` and `/app` LEGACY-BLOCKs are unchanged.
+
+---
+
 ## 2026-09-18 (Demo + pairing hardening) — One canonical Demo, workspace-scoped pairing
 
 ### Universal Demo

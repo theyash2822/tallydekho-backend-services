@@ -272,24 +272,17 @@ export function setupSocket(io) {
 
   return {
     // Called after ingest complete — notifies mobile/web that new data is available
-    notifySynced: (userId, companyGuid, workspaceId = null) => {
-      const payload = { companyGuid, syncedAt: new Date().toISOString(), workspaceId };
-      // Room delivery when the workspace is known. The user-socket fanout that
-      // used to run unconditionally alongside it reached clients viewing a
-      // different workspace, which is how one workspace's sync toast and company
-      // reload landed on another.
-      if (workspaceId) {
-        _io?.to(`workspace:${workspaceId}`).emit('synced', payload);
-        _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
-          status: 'CONNECTED',
-          workspaceId,
-          companyGuid,
-        });
+    notifySynced: (userId, companyGuid, workspaceId) => {
+      if (!workspaceId) {
+        console.warn('[WS] notifySynced refused: workspaceId required');
         return;
       }
-      ['mobile', 'web'].forEach(type => {
-        const client = connectedClients.get(`${type}_${userId}`);
-        if (client?.connected) client.emit('synced', payload);
+      const payload = { companyGuid, syncedAt: new Date().toISOString(), workspaceId };
+      _io?.to(`workspace:${workspaceId}`).emit('synced', payload);
+      _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
+        status: 'CONNECTED',
+        workspaceId,
+        companyGuid,
       });
     },
 
@@ -303,19 +296,14 @@ export function setupSocket(io) {
      * workspace's toast while looking at the unpaired one, and the client had no
      * way to tell which workspace the event belonged to.
      */
-    notifyPaired: (userId, deviceName, workspaceId = null) => {
-      const payload = { deviceName, pairedAt: new Date().toISOString(), workspaceId };
-      if (workspaceId && _io) {
-        _io.to(`workspace:${workspaceId}`).emit('paired', payload);
-        console.log(`[WS] paired → workspace:${workspaceId}`);
+    notifyPaired: (userId, deviceName, workspaceId) => {
+      if (!workspaceId || !_io) {
+        console.warn('[WS] notifyPaired refused: workspaceId required');
         return;
       }
-      // No workspace known: still carry the null explicitly so clients can apply
-      // their "ignore workspace-ambiguous events" rule rather than guessing.
-      ['mobile', 'web'].forEach(type => {
-        const client = connectedClients.get(`${type}_${userId}`);
-        if (client?.connected) client.emit('paired', payload);
-      });
+      const payload = { deviceName, pairedAt: new Date().toISOString(), workspaceId };
+      _io.to(`workspace:${workspaceId}`).emit('paired', payload);
+      console.log(`[WS] paired → workspace:${workspaceId}`);
     },
 
     notifyDesktop: (deviceId, event, payload) => {
@@ -371,9 +359,6 @@ export function setupSocket(io) {
     // Called when device is unpaired
     // newCode: the freshly generated replacement pairing code (for desktop to display)
     notifyUnpaired: (userId, newCode, deviceId = null, workspaceId = null) => {
-      // Room delivery only for app clients. The previous user-socket emit sent a
-      // bare {} — no workspace id — so a client could not tell which workspace
-      // had been unpaired and applied it to whichever one was on screen.
       if (workspaceId) {
         _io?.to(`workspace:${workspaceId}`).emit('unpaired', { workspaceId });
         _io?.to(`workspace:${workspaceId}`).emit('tally_connection', {
@@ -381,10 +366,7 @@ export function setupSocket(io) {
           workspaceId,
         });
       } else {
-        ['mobile', 'web'].forEach(type => {
-          const client = connectedClients.get(`${type}_${userId}`);
-          if (client?.connected) client.emit('unpaired', { workspaceId: null });
-        });
+        console.warn('[WS] notifyUnpaired: no workspaceId — app clients not notified');
       }
       // Only the unbound Desktop — never wipe secrets on every LAN Desktop
       if (deviceId) {
