@@ -1,8 +1,6 @@
 /**
- * Billing / credits — owner wallet + workspace-restricted lots.
- *
- * Owner spend remains wallets.balance_credits. Workspace spend consumes
- * credit_lots.workspace_id rows. Mixed/split funding is policy-blocked.
+ * Billing / credits — the active workspace owner's wallet pays.
+ * Actor, invited-admin wallet, and other workspaces are never the payer.
  */
 import assert from 'node:assert/strict';
 import { describe, it, before, after } from 'node:test';
@@ -19,9 +17,8 @@ import {
   normalizeCredits,
   createPaymentOrder,
   completePaymentOrder,
-  grantWorkspaceCredits,
   spendForWorkspaceAction,
-  workspaceAvailableCredits,
+  resolveWorkspacePayer,
   getBillingOverview,
 } from '../../services/billingService.js';
 import { createDemoEntry } from '../../services/demoSimulatedEntryService.js';
@@ -141,7 +138,13 @@ describe('Billing credits behaviour', () => {
       [crypto.randomUUID(), ws, userId, ts]
     ).catch(() => {});
     const billing = await ensureBillingAccount(userId);
-    await query(`UPDATE wallets SET balance_credits = 5 WHERE id = $1`, [billing.walletId]);
+    await deductCredits({
+      userId,
+      amount: 5,
+      kind: 'DEBIT',
+      reference: `conc-setup-${userId}`,
+      workspaceId: ws,
+    });
     const results = await Promise.allSettled(
       Array.from({ length: 20 }, (_, i) =>
         deductCredits({
@@ -349,335 +352,243 @@ async function insertWorkspace(ownerUserId, name, { isBase = false } = {}) {
   return id;
 }
 
-async function zeroOwnerWallet(userId) {
-  const billing = await ensureBillingAccount(userId);
-  await query(`UPDATE wallets SET balance_credits = 0 WHERE id = $1`, [billing.walletId]);
-  return billing;
+async function addMember(workspaceId, userId, systemKey) {
+  const ts = Math.floor(Date.now() / 1000);
+  const { rows: roles } = await query(
+    `SELECT id FROM workspace_roles WHERE workspace_id = $1 AND system_key = $2 LIMIT 1`,
+    [workspaceId, systemKey]
+  );
+  await query(
+    `INSERT INTO workspace_memberships (id, workspace_id, user_id, membership_type, role_id, status, joined_at)
+     VALUES ($1,$2,$3,'MEMBER',$4,'ACTIVE',$5)`,
+    [crypto.randomUUID(), workspaceId, userId, roles[0]?.id || null, ts]
+  );
 }
 
-describe('Workspace-specific credits', () => {
-  it('workspace-only credits spend inside ABC and are denied in XYZ', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('WS Only Owner');
-    const abc = await insertWorkspace(userId, 'ABC pot');
-    const xyz = await insertWorkspace(userId, 'XYZ empty');
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 10, reference: `grant-abc-${abc}` });
-    for (let i = 0; i < 3; i += 1) {
-      const result = await spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: abc,
-        operationId: `abc-op-${abc}-${i}`,
-        amount: 3,
-        kind: 'DEBIT',
-      });
-      assert.equal(result.fundingSource, 'WORKSPACE');
-      assert.equal(result.alreadyCharged, false);
-    }
-    assert.equal(await workspaceAvailableCredits(abc), 1);
-    const owner = await query(
-      `SELECT w.balance_credits FROM wallets w
-         JOIN billing_accounts ba ON ba.id = w.billing_account_id
-        WHERE ba.owner_user_id = $1`,
-      [userId]
-    );
-    assert.equal(Number(owner.rows[0].balance_credits), 0);
-    const { rows: spends } = await query(
-      `SELECT count(*)::int AS n FROM wallet_transactions
-        WHERE workspace_id = $1 AND amount < 0 AND funding_source = 'WORKSPACE'`,
-      [abc]
-    );
-    assert.equal(spends[0].n, 3);
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: xyz,
-        operationId: `xyz-op-${xyz}`,
-        amount: 3,
-        kind: 'DEBIT',
-      }),
-      (e) => e.code === 'INSUFFICIENT_CREDITS'
-    );
-    assert.equal(await workspaceAvailableCredits(abc), 1);
-  });
+async function walletState(userId) {
+  const billing = await ensureBillingAccount(userId);
+  const { rows } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
+  return { walletId: billing.walletId, balance: Number(rows[0].balance_credits) };
+}
 
-  it('owner-only credits fund ABC usage with OWNER_GLOBAL source', async () => {
+async function topUpBy(userId, amount) {
+  await creditWallet({
+    userId,
+    amount,
+    kind: 'TOPUP',
+    reference: `top-${userId}-${amount}-${crypto.randomUUID()}`,
+    workspaceId: null,
+  });
+}
+
+describe('Billing payer authority', () => {
+  it('A. owner acting in own workspace charges that owner wallet', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Owner Only');
-    const abc = await insertWorkspace(userId, 'ABC owner-only');
-    const billing = await zeroOwnerWallet(userId);
-    await query(`UPDATE wallets SET balance_credits = 10 WHERE id = $1`, [billing.walletId]);
+    const owner = await insertFreshUser('Owner ABC');
+    const abc = await insertWorkspace(owner, 'ABC own');
+    await topUpBy(owner, 90);
+    const before = await walletState(owner);
     const result = await spendForWorkspaceAction({
-      ownerUserId: userId,
       workspaceId: abc,
-      operationId: `owner-only-${abc}`,
-      amount: 4,
+      actorUserId: owner,
+      operationId: `own-${abc}`,
+      amount: 5,
       kind: 'DEBIT',
     });
-    assert.equal(result.fundingSource, 'OWNER_GLOBAL');
-    const { rows: txn } = await query(
-      `SELECT workspace_id, funding_source, amount FROM wallet_transactions
-        WHERE reference = $1 AND amount < 0`,
-      [`owner-only-${abc}`]
+    assert.equal(result.alreadyCharged, false);
+    assert.equal(result.payerUserId, owner);
+    const after = await walletState(owner);
+    assert.equal(after.balance, before.balance - 5);
+    const { rows } = await query(
+      `SELECT wallet_id, workspace_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`,
+      [`own-${abc}`]
     );
-    assert.equal(txn[0].workspace_id, abc);
-    assert.equal(txn[0].funding_source, 'OWNER_GLOBAL');
-    assert.equal(await workspaceAvailableCredits(abc), 0);
+    assert.equal(rows[0].wallet_id, before.walletId);
+    assert.equal(rows[0].workspace_id, abc);
   });
 
-  it('blocks when both pots can cover — MIXED_FUNDING_PRIORITY_UNDEFINED', async () => {
+  it('B. invited Admin in XYZ charges XYZ owner, not the Admin wallet', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Mixed Owner');
-    const abc = await insertWorkspace(userId, 'ABC mixed');
-    const billing = await zeroOwnerWallet(userId);
-    await query(`UPDATE wallets SET balance_credits = 100 WHERE id = $1`, [billing.walletId]);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 20, reference: `mixed-grant-${abc}` });
+    const ownerX = await insertFreshUser('Owner X');
+    const ownerA = await insertFreshUser('Owner A');
+    const xyz = await insertWorkspace(ownerX, 'XYZ');
+    const abc = await insertWorkspace(ownerA, 'ABC');
+    await topUpBy(ownerX, 90);
+    await addMember(xyz, ownerA, 'ADMIN');
+    const xBefore = await walletState(ownerX);
+    const aBefore = await walletState(ownerA);
+    assert.equal(xBefore.balance, 100);
+    assert.equal(aBefore.balance, 10);
+    const result = await spendForWorkspaceAction({
+      workspaceId: xyz,
+      actorUserId: ownerA,
+      ownerUserId: ownerA,
+      operationId: `invited-${xyz}`,
+      amount: 5,
+      kind: 'DEBIT',
+      meta: { companyGuid: abc },
+    });
+    assert.equal(result.payerUserId, ownerX);
+    const xAfter = await walletState(ownerX);
+    const aAfter = await walletState(ownerA);
+    assert.equal(xAfter.balance, 95);
+    assert.equal(aAfter.balance, 10);
+    const { rows } = await query(
+      `SELECT wallet_id, workspace_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`,
+      [`invited-${xyz}`]
+    );
+    assert.equal(rows[0].wallet_id, xBefore.walletId);
+    assert.equal(rows[0].workspace_id, xyz);
+    void abc;
+  });
+
+  it('C. invited Admin cannot rescue an insufficient workspace owner', async () => {
+    if (!ctx) throw new Error('harness required');
+    const ownerX = await insertFreshUser('Poor X');
+    const ownerA = await insertFreshUser('Rich A');
+    const xyz = await insertWorkspace(ownerX, 'XYZ poor');
+    await insertWorkspace(ownerA, 'ABC rich');
+    await deductCredits({
+      userId: ownerX,
+      amount: 8,
+      kind: 'DEBIT',
+      reference: `down-x-${xyz}`,
+      workspaceId: xyz,
+    });
+    await topUpBy(ownerA, 90);
+    await addMember(xyz, ownerA, 'ADMIN');
+    const xBefore = await walletState(ownerX);
+    const aBefore = await walletState(ownerA);
+    assert.equal(xBefore.balance, 2);
+    assert.equal(aBefore.balance, 100);
     await assert.rejects(
       () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: abc,
-        operationId: `mixed-${abc}`,
+        workspaceId: xyz,
+        actorUserId: ownerA,
+        ownerUserId: ownerA,
+        operationId: `rescue-${xyz}`,
         amount: 5,
         kind: 'DEBIT',
       }),
-      (e) => e.code === 'MIXED_FUNDING_PRIORITY_UNDEFINED'
-    );
-    assert.equal(await workspaceAvailableCredits(abc), 20);
-    const { rows } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
-    assert.equal(Number(rows[0].balance_credits), 100);
-  });
-
-  it('blocks partial pots — no 4+6 split', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Partial Owner');
-    const abc = await insertWorkspace(userId, 'ABC partial');
-    const billing = await zeroOwnerWallet(userId);
-    await query(`UPDATE wallets SET balance_credits = 20 WHERE id = $1`, [billing.walletId]);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 4, reference: `partial-grant-${abc}` });
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: abc,
-        operationId: `partial-${abc}`,
-        amount: 10,
-        kind: 'DEBIT',
-      }),
-      (e) => e.code === 'MIXED_FUNDING_PRIORITY_UNDEFINED'
-    );
-    assert.equal(await workspaceAvailableCredits(abc), 4);
-    const { rows } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
-    assert.equal(Number(rows[0].balance_credits), 20);
-  });
-
-  it('blocks split when neither pot alone covers', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Split Owner');
-    const abc = await insertWorkspace(userId, 'ABC split');
-    const billing = await zeroOwnerWallet(userId);
-    await query(`UPDATE wallets SET balance_credits = 4 WHERE id = $1`, [billing.walletId]);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 4, reference: `split-grant-${abc}` });
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: abc,
-        operationId: `split-${abc}`,
-        amount: 6,
-        kind: 'DEBIT',
-      }),
-      (e) => e.code === 'SPLIT_FUNDING_RULE_UNDEFINED'
-    );
-  });
-
-  it('XYZ cannot consume ABC workspace credits', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Cross WS Owner');
-    const abc = await insertWorkspace(userId, 'ABC isolated');
-    const xyz = await insertWorkspace(userId, 'XYZ isolated');
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 100, reference: `iso-abc-${abc}` });
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: xyz,
-        operationId: `iso-xyz-${xyz}`,
-        amount: 1,
-        kind: 'DEBIT',
-      }),
       (e) => e.code === 'INSUFFICIENT_CREDITS'
     );
-    assert.equal(await workspaceAvailableCredits(abc), 100);
+    assert.equal((await walletState(ownerX)).balance, 2);
+    assert.equal((await walletState(ownerA)).balance, 100);
   });
 
-  it('same company GUID does not mix workspace credit pots', async () => {
+  it('D. same owner ABC+XYZ share one wallet with correct workspace_id', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('GUID Owner');
-    const abc = await insertWorkspace(userId, 'ABC guid');
-    const xyz = await insertWorkspace(userId, 'XYZ guid');
-    const guid = `shared-guid-${abc.slice(0, 8)}`;
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 8, reference: `guid-abc-${abc}` });
+    const owner = await insertFreshUser('Multi Owner');
+    const abc = await insertWorkspace(owner, 'ABC multi');
+    const xyz = await insertWorkspace(owner, 'XYZ multi');
+    const before = await walletState(owner);
+    assert.equal(before.balance, 10);
     await spendForWorkspaceAction({
-      ownerUserId: userId,
-      workspaceId: abc,
-      operationId: `guid-spend-${abc}`,
-      amount: 2,
-      kind: 'DEBIT',
-      meta: { companyGuid: guid },
+      workspaceId: abc, actorUserId: owner, operationId: `multi-abc-${abc}`, amount: 3, kind: 'DEBIT',
     });
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: xyz,
-        operationId: `guid-spend-${xyz}`,
-        amount: 2,
-        kind: 'DEBIT',
-        meta: { companyGuid: guid },
-      }),
-      (e) => e.code === 'INSUFFICIENT_CREDITS'
+    await spendForWorkspaceAction({
+      workspaceId: xyz, actorUserId: owner, operationId: `multi-xyz-${xyz}`, amount: 4, kind: 'DEBIT',
+    });
+    assert.equal((await walletState(owner)).balance, 3);
+    const abcTxn = await query(
+      `SELECT wallet_id, workspace_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`,
+      [`multi-abc-${abc}`]
     );
-    assert.equal(await workspaceAvailableCredits(abc), 6);
+    const xyzTxn = await query(
+      `SELECT wallet_id, workspace_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`,
+      [`multi-xyz-${xyz}`]
+    );
+    assert.equal(abcTxn.rows[0].wallet_id, before.walletId);
+    assert.equal(xyzTxn.rows[0].wallet_id, before.walletId);
+    assert.equal(abcTxn.rows[0].workspace_id, abc);
+    assert.equal(xyzTxn.rows[0].workspace_id, xyz);
   });
 
-  it('XYZ cannot consume ABC lots while owner wallet stays atomic', async () => {
+  it('E. different owners stay isolated under concurrency', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Dual Conc');
-    const abc = await insertWorkspace(userId, 'ABC dual');
-    const xyz = await insertWorkspace(userId, 'XYZ dual');
-    const billing = await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 5, reference: `dual-abc-${abc}` });
-    await query(`UPDATE wallets SET balance_credits = 4 WHERE id = $1`, [billing.walletId]);
-    const results = await Promise.allSettled(
-      Array.from({ length: 10 }, (_, i) =>
-        spendForWorkspaceAction({
-          ownerUserId: userId,
-          workspaceId: xyz,
-          operationId: `dual-xyz-${xyz}-${i}`,
-          amount: 1,
-          kind: 'DEBIT',
-        })
-      )
-    );
-    const xyzOk = results.filter((r) => r.status === 'fulfilled').length;
-    assert.equal(xyzOk, 4);
-    assert.equal(await workspaceAvailableCredits(abc), 5);
-    const { rows } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
-    assert.equal(Number(rows[0].balance_credits), 0);
-    await assert.rejects(
-      () => spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: xyz,
-        operationId: `dual-xyz-after-${xyz}`,
-        amount: 1,
-        kind: 'DEBIT',
-      }),
-      (e) => e.code === 'INSUFFICIENT_CREDITS'
-    );
+    const ownerA = await insertFreshUser('Iso A');
+    const ownerX = await insertFreshUser('Iso X');
+    const abc = await insertWorkspace(ownerA, 'ABC iso');
+    const xyz = await insertWorkspace(ownerX, 'XYZ iso');
+    const results = await Promise.allSettled([
+      ...Array.from({ length: 10 }, (_, i) => spendForWorkspaceAction({
+        workspaceId: abc, actorUserId: ownerA, operationId: `iso-a-${abc}-${i}`, amount: 1, kind: 'DEBIT',
+      })),
+      ...Array.from({ length: 10 }, (_, i) => spendForWorkspaceAction({
+        workspaceId: xyz, actorUserId: ownerX, operationId: `iso-x-${xyz}-${i}`, amount: 1, kind: 'DEBIT',
+      })),
+    ]);
+    const aOk = results.slice(0, 10).filter((r) => r.status === 'fulfilled').length;
+    const xOk = results.slice(10).filter((r) => r.status === 'fulfilled').length;
+    assert.equal(aOk, 10);
+    assert.equal(xOk, 10);
+    assert.equal((await walletState(ownerA)).balance, 0);
+    assert.equal((await walletState(ownerX)).balance, 0);
   });
 
-  it('20 concurrent workspace spends against 5 credits succeed five times', async () => {
+  it('F. same company GUID does not change payer', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('WS Conc');
-    const abc = await insertWorkspace(userId, 'ABC conc');
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 5, reference: `conc-grant-${abc}` });
-    const results = await Promise.allSettled(
-      Array.from({ length: 20 }, (_, i) =>
-        spendForWorkspaceAction({
-          ownerUserId: userId,
-          workspaceId: abc,
-          operationId: `ws-conc-${abc}-${i}`,
-          amount: 1,
-          kind: 'DEBIT',
-        })
-      )
+    const ownerA = await insertFreshUser('GUID A');
+    const ownerZ = await insertFreshUser('GUID Z');
+    const abc = await insertWorkspace(ownerA, 'ABC guid');
+    const xyz = await insertWorkspace(ownerZ, 'XYZ guid');
+    const guid = `same-guid-${abc.slice(0, 8)}`;
+    await spendForWorkspaceAction({
+      workspaceId: abc, actorUserId: ownerA, operationId: `g-abc-${abc}`, amount: 2, kind: 'DEBIT', meta: { companyGuid: guid },
+    });
+    await spendForWorkspaceAction({
+      workspaceId: xyz, actorUserId: ownerZ, operationId: `g-xyz-${xyz}`, amount: 2, kind: 'DEBIT', meta: { companyGuid: guid },
+    });
+    const payerA = await resolveWorkspacePayer(abc);
+    const payerZ = await resolveWorkspacePayer(xyz);
+    assert.equal(payerA.ownerUserId, ownerA);
+    assert.equal(payerZ.ownerUserId, ownerZ);
+    const { rows: aTxn } = await query(
+      `SELECT wallet_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`, [`g-abc-${abc}`]
     );
-    const ok = results.filter((r) => r.status === 'fulfilled').length;
-    const fail = results.filter((r) => r.status === 'rejected').length;
-    assert.equal(ok, 5);
-    assert.equal(fail, 15);
-    assert.equal(await workspaceAvailableCredits(abc), 0);
-    const { rows } = await query(
-      `SELECT coalesce(min(credits_remaining),0)::text AS m FROM credit_lots WHERE workspace_id = $1`,
-      [abc]
+    const { rows: zTxn } = await query(
+      `SELECT wallet_id FROM wallet_transactions WHERE reference = $1 AND amount < 0`, [`g-xyz-${xyz}`]
     );
-    assert.ok(Number(rows[0].m) >= 0);
+    assert.equal(aTxn[0].wallet_id, payerA.wallet.id);
+    assert.equal(zTxn[0].wallet_id, payerZ.wallet.id);
   });
 
-  it('workspace and owner replay keep the original funding source', async () => {
+  it('G. role authorizes only — viewer cannot spend via seat purchase', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Replay Owner');
-    const abc = await insertWorkspace(userId, 'ABC replay');
-    const billing = await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 6, reference: `replay-grant-${abc}` });
-    const wsRef = `ws-replay-${abc}`;
+    const ws = ctx.fixtures.workspaces.A;
+    const billing = await ensureBillingAccount(ctx.fixtures.users.ownerA.id);
+    const { rows: before } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
+    const res = await httpJson(ctx.baseUrl, 'POST', `/api/workspaces/${ws}/seats`, {
+      token: ctx.fixtures.tokens.memberA.accessToken,
+      headers: { 'X-Workspace-Id': ws },
+      body: {},
+    });
+    assert.ok(res.status === 403 || res.status === 401);
+    const { rows: after } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
+    assert.equal(String(after[0].balance_credits), String(before[0].balance_credits));
+  });
+
+  it('H/I. transfer changes future payer; replay does not charge the new owner', async () => {
+    if (!ctx) throw new Error('harness required');
+    const fromId = await insertFreshUser('From Payer');
+    const toId = await insertFreshUser('To Payer');
+    const abc = await insertWorkspace(fromId, 'ABC xfer', { isBase: false });
+    await addMember(abc, toId, 'ADMIN');
+    await topUpBy(fromId, 90);
+    await topUpBy(toId, 90);
+    const op = `xfer-op-${abc}`;
     const first = await spendForWorkspaceAction({
-      ownerUserId: userId,
-      workspaceId: abc,
-      operationId: wsRef,
-      amount: 2,
-      kind: 'DEBIT',
+      workspaceId: abc, actorUserId: fromId, operationId: op, amount: 5, kind: 'DEBIT',
     });
-    for (let i = 0; i < 4; i += 1) {
-      const replay = await spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: abc,
-        operationId: wsRef,
-        amount: 2,
-        kind: 'DEBIT',
-      });
-      assert.equal(replay.alreadyCharged, true);
-      assert.equal(replay.fundingSource, 'WORKSPACE');
-    }
-    assert.equal(first.fundingSource, 'WORKSPACE');
-    assert.equal(await workspaceAvailableCredits(abc), 4);
-    await query(`UPDATE wallets SET balance_credits = 10 WHERE id = $1`, [billing.walletId]);
-    const xyz = await insertWorkspace(userId, 'XYZ owner replay');
-    const ownerRef = `owner-replay-${xyz}`;
-    const ownerFirst = await spendForWorkspaceAction({
-      ownerUserId: userId,
-      workspaceId: xyz,
-      operationId: ownerRef,
-      amount: 2,
-      kind: 'DEBIT',
-    });
-    for (let i = 0; i < 4; i += 1) {
-      const replay = await spendForWorkspaceAction({
-        ownerUserId: userId,
-        workspaceId: xyz,
-        operationId: ownerRef,
-        amount: 2,
-        kind: 'DEBIT',
-      });
-      assert.equal(replay.alreadyCharged, true);
-      assert.equal(replay.fundingSource, 'OWNER_GLOBAL');
-    }
-    assert.equal(ownerFirst.fundingSource, 'OWNER_GLOBAL');
-    const { rows } = await query(
-      `SELECT count(*)::int AS n FROM wallet_transactions WHERE reference = $1 AND amount < 0`,
-      [wsRef]
-    );
-    assert.equal(rows[0].n, 1);
-  });
-
-  it('ownership transfer keeps workspace credits with the workspace', async () => {
-    if (!ctx) throw new Error('harness required');
-    const fromId = await insertFreshUser('From Owner');
-    const toId = await insertFreshUser('To Owner');
-    const abc = await insertWorkspace(fromId, 'ABC transfer', { isBase: false });
+    assert.equal(first.alreadyCharged, false);
+    const fromBefore = await walletState(fromId);
+    const toBefore = await walletState(toId);
     const ts = Math.floor(Date.now() / 1000);
-    await query(
-      `INSERT INTO workspace_memberships (id, workspace_id, user_id, membership_type, role_id, status, joined_at)
-       VALUES ($1,$2,$3,'MEMBER',NULL,'ACTIVE',$4)`,
-      [crypto.randomUUID(), abc, toId, ts]
-    );
-    const fromBilling = await zeroOwnerWallet(fromId);
-    await zeroOwnerWallet(toId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 12, reference: `xfer-grant-${abc}` });
-    const transferId = crypto.randomUUID();
     const { rows: viewer } = await query(
       `SELECT id FROM workspace_roles WHERE workspace_id = $1 AND system_key = 'VIEWER' LIMIT 1`,
       [abc]
     );
+    const transferId = crypto.randomUUID();
     await query(
       `INSERT INTO workspace_ownership_transfers
          (id, workspace_id, from_user_id, target_user_id, outgoing_role_id, status, grace_ends_at, created_at, updated_at)
@@ -685,64 +596,26 @@ describe('Workspace-specific credits', () => {
       [transferId, abc, fromId, toId, viewer[0]?.id || null, ts - 10]
     );
     await completeOwnershipTransfer(fromId, abc, transferId, { system: true });
-    assert.equal(await workspaceAvailableCredits(abc), 12);
-    const { rows: ws } = await query(`SELECT owner_user_id FROM workspaces WHERE id = $1`, [abc]);
-    assert.equal(Number(ws[0].owner_user_id), toId);
-    const { rows: fromBal } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [fromBilling.walletId]);
-    assert.equal(Number(fromBal[0].balance_credits), 0);
-    const spent = await spendForWorkspaceAction({
-      ownerUserId: toId,
-      workspaceId: abc,
-      operationId: `xfer-spend-${abc}`,
-      amount: 2,
-      kind: 'DEBIT',
+    const replay = await spendForWorkspaceAction({
+      workspaceId: abc, actorUserId: toId, operationId: op, amount: 5, kind: 'DEBIT',
     });
-    assert.equal(spent.fundingSource, 'WORKSPACE');
-    assert.equal(await workspaceAvailableCredits(abc), 10);
+    assert.equal(replay.alreadyCharged, true);
+    assert.equal((await walletState(fromId)).balance, fromBefore.balance);
+    assert.equal((await walletState(toId)).balance, toBefore.balance);
+    const later = await spendForWorkspaceAction({
+      workspaceId: abc, actorUserId: toId, operationId: `after-xfer-${abc}`, amount: 3, kind: 'DEBIT',
+    });
+    assert.equal(later.alreadyCharged, false);
+    assert.equal(later.payerUserId, toId);
+    assert.equal((await walletState(toId)).balance, toBefore.balance - 3);
+    assert.equal((await walletState(fromId)).balance, fromBefore.balance);
   });
 
-  it('unpair and desktop replace leave workspace credits unchanged', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Unpair Owner');
-    const abc = await insertWorkspace(userId, 'ABC unpair');
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 9, reference: `unpair-grant-${abc}` });
-    const deviceId = `dev-unpair-${abc.slice(0, 8)}`;
-    const ts = Math.floor(Date.now() / 1000);
-    await query(
-      `INSERT INTO devices (device_id, name, paired, workspace_id, binding_status, last_seen, created_at)
-       VALUES ($1,'Desk 1',TRUE,$2,'ACTIVE',$3,$3)`,
-      [deviceId, abc, ts]
-    );
-    await unpairDevice(deviceId, userId);
-    assert.equal(await workspaceAvailableCredits(abc), 9);
-    const device2 = `dev-restore-${abc.slice(0, 8)}`;
-    await query(
-      `INSERT INTO devices (device_id, name, paired, workspace_id, binding_status, last_seen, created_at)
-       VALUES ($1,'Desk 2',TRUE,$2,'ACTIVE',$3,$3)`,
-      [device2, abc, ts]
-    );
-    assert.equal(await workspaceAvailableCredits(abc), 9);
-    const { rows } = await query(
-      `SELECT count(*)::int AS n FROM wallet_transactions
-        WHERE workspace_id = $1 AND funding_source = 'WORKSPACE' AND amount > 0`,
-      [abc]
-    );
-    assert.equal(rows[0].n, 1);
-  });
-
-  it('Demo consumes neither owner nor workspace credits', async () => {
+  it('J. Demo writes no billing rows', async () => {
     if (!ctx) throw new Error('harness required');
     const userId = ctx.fixtures.users.ownerA.id;
     const ws = ctx.fixtures.workspaces.A;
-    const billing = await ensureBillingAccount(userId);
-    await grantWorkspaceCredits({
-      workspaceId: ws,
-      amount: 7,
-      reference: `demo-ws-${Date.now()}`,
-    });
-    const { rows: ownerBefore } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
-    const wsBefore = await workspaceAvailableCredits(ws);
+    const before = await walletState(userId);
     const { rows: txnBefore } = await query(`SELECT count(*)::int AS n FROM wallet_transactions`);
     await createDemoEntry({
       userId,
@@ -751,97 +624,110 @@ describe('Workspace-specific credits', () => {
       entryType: 'sales_invoice',
       payload: { test: true },
     }).catch(() => {});
-    const { rows: ownerAfter } = await query(`SELECT balance_credits FROM wallets WHERE id = $1`, [billing.walletId]);
-    assert.equal(String(ownerAfter[0].balance_credits), String(ownerBefore[0].balance_credits));
-    assert.equal(await workspaceAvailableCredits(ws), wsBefore);
+    assert.equal((await walletState(userId)).balance, before.balance);
     const { rows: txnAfter } = await query(`SELECT count(*)::int AS n FROM wallet_transactions`);
     assert.equal(txnAfter[0].n, txnBefore[0].n);
   });
 
-  it('RBAC: member and auditor cannot view or mutate billing', async () => {
+  it('K. same-owner two-workspace concurrency never goes negative', async () => {
     if (!ctx) throw new Error('harness required');
-    const ws = ctx.fixtures.workspaces.A;
-    const before = await workspaceAvailableCredits(ws);
-    const memberRes = await httpJson(ctx.baseUrl, 'GET', '/api/billing/overview', {
-      token: ctx.fixtures.tokens.memberA.accessToken,
-      headers: { 'X-Workspace-Id': ws },
-    });
-    assert.ok(memberRes.status === 403 || memberRes.status === 401);
-    const auditorId = await insertFreshUser('Auditor A');
-    const { rows: auditorRole } = await query(
-      `SELECT id FROM workspace_roles WHERE workspace_id = $1 AND system_key = 'AUDITOR' LIMIT 1`,
-      [ws]
+    const owner = await insertFreshUser('Conc Multi');
+    const abc = await insertWorkspace(owner, 'ABC conc');
+    const xyz = await insertWorkspace(owner, 'XYZ conc');
+    const results = await Promise.allSettled([
+      ...Array.from({ length: 10 }, (_, i) => spendForWorkspaceAction({
+        workspaceId: abc, actorUserId: owner, operationId: `cm-abc-${abc}-${i}`, amount: 1, kind: 'DEBIT',
+      })),
+      ...Array.from({ length: 10 }, (_, i) => spendForWorkspaceAction({
+        workspaceId: xyz, actorUserId: owner, operationId: `cm-xyz-${xyz}-${i}`, amount: 1, kind: 'DEBIT',
+      })),
+    ]);
+    const ok = results.filter((r) => r.status === 'fulfilled').length;
+    assert.equal(ok, 10);
+    assert.equal((await walletState(owner)).balance, 0);
+    const { rows: abcRows } = await query(
+      `SELECT count(*)::int AS n FROM wallet_transactions WHERE workspace_id = $1 AND amount < 0 AND reference LIKE $2`,
+      [abc, `cm-abc-${abc}-%`]
     );
+    const { rows: xyzRows } = await query(
+      `SELECT count(*)::int AS n FROM wallet_transactions WHERE workspace_id = $1 AND amount < 0 AND reference LIKE $2`,
+      [xyz, `cm-xyz-${xyz}-%`]
+    );
+    assert.equal(abcRows[0].n + xyzRows[0].n, 10);
+  });
+
+  it('L. Razorpay still funds the owner wallet only', async () => {
+    if (!ctx) throw new Error('harness required');
+    const owner = await insertFreshUser('Rzp Owner');
+    await insertWorkspace(owner, 'ABC rzp');
+    const billing = await ensureBillingAccount(owner);
+    const order = await createPaymentOrder({ userId: owner, credits: 4, amountInr: 999 });
+    assert.equal(Number(order.amount_inr), 4);
+    await completePaymentOrder(owner, order.id);
+    const after = await walletState(owner);
+    assert.equal(after.balance, 14);
+    assert.equal(after.walletId, billing.walletId);
+  });
+
+  it('M. historical CREDIT rows stay workspace_id NULL', async () => {
+    if (!ctx) throw new Error('harness required');
+    const { rows } = await query(
+      `SELECT count(*)::int AS n FROM wallet_transactions WHERE kind = 'CREDIT' AND workspace_id IS NOT NULL`
+    );
+    assert.equal(rows[0].n, 0);
+  });
+
+  it('unpair does not change the owner wallet', async () => {
+    if (!ctx) throw new Error('harness required');
+    const owner = await insertFreshUser('Unpair Owner');
+    const abc = await insertWorkspace(owner, 'ABC unpair');
+    const before = await walletState(owner);
+    const deviceId = `dev-auth-${abc.slice(0, 8)}`;
     const ts = Math.floor(Date.now() / 1000);
     await query(
-      `INSERT INTO workspace_memberships (id, workspace_id, user_id, membership_type, role_id, status, joined_at)
-       VALUES ($1,$2,$3,'MEMBER',$4,'ACTIVE',$5)`,
-      [crypto.randomUUID(), ws, auditorId, auditorRole[0]?.id || null, ts]
+      `INSERT INTO devices (device_id, name, paired, workspace_id, binding_status, last_seen, created_at)
+       VALUES ($1,'Desk 1',TRUE,$2,'ACTIVE',$3,$3)`,
+      [deviceId, abc, ts]
     );
-    const { createAuthSession } = await import('../../services/authSessionService.js');
-    const session = await createAuthSession(auditorId, { clientType: 'rbac-test' });
-    const auditorRes = await httpJson(ctx.baseUrl, 'GET', '/api/billing/overview', {
-      token: session.accessToken,
-      headers: { 'X-Workspace-Id': ws },
-    });
-    assert.ok(auditorRes.status === 403 || auditorRes.status === 401);
-    const seat = await httpJson(ctx.baseUrl, 'POST', `/api/workspaces/${ws}/seats`, {
-      token: ctx.fixtures.tokens.memberA.accessToken,
-      headers: { 'X-Workspace-Id': ws },
-      body: {},
-    });
-    assert.ok(seat.status === 403 || seat.status === 401 || seat.status === 404);
-    assert.equal(await workspaceAvailableCredits(ws), before);
+    await unpairDevice(deviceId, owner);
+    assert.equal((await walletState(owner)).balance, before.balance);
   });
 
-  it('IDOR: authorized XYZ user cannot read ABC workspace credits', async () => {
+  it('overview has no workspaceCredits pot', async () => {
     if (!ctx) throw new Error('harness required');
-    const abc = ctx.fixtures.workspaces.A;
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 3, reference: `idor-abc-${Date.now()}` });
+    const overview = await getBillingOverview(ctx.fixtures.users.ownerA.id);
+    assert.equal(overview.workspaceCredits, undefined);
+  });
+
+  it('IDOR: Owner B cannot read Owner A billing via Workspace A header', async () => {
+    if (!ctx) throw new Error('harness required');
     const res = await httpJson(ctx.baseUrl, 'GET', '/api/billing/overview', {
       token: ctx.fixtures.tokens.ownerB.accessToken,
-      headers: { 'X-Workspace-Id': abc },
+      headers: { 'X-Workspace-Id': ctx.fixtures.workspaces.A },
     });
     assert.ok(res.status === 403 || res.status === 404);
-    const leaked = res.json?.data?.workspaceCredits?.available;
-    assert.ok(leaked == null || leaked === 0);
   });
 
-  it('overview for a member workspace returns workspaceCredits; owner lots stay owner-scoped', async () => {
+  it('client-supplied ownerUserId cannot redirect the payer', async () => {
     if (!ctx) throw new Error('harness required');
-    const userId = ctx.fixtures.users.ownerA.id;
-    const ws = ctx.fixtures.workspaces.A;
-    await grantWorkspaceCredits({ workspaceId: ws, amount: 2, reference: `overview-${Date.now()}` });
-    const overview = await getBillingOverview(userId, { workspaceId: ws });
-    assert.ok(overview.workspaceCredits);
-    assert.equal(overview.workspaceCredits.workspaceId, ws);
-    assert.ok(overview.workspaceCredits.available >= 2);
-    assert.ok((overview.lots || []).every((lot) => !lot.workspace_id));
-  });
-
-  it('workspace lots reconcile to the workspace ledger', async () => {
-    if (!ctx) throw new Error('harness required');
-    const userId = await insertFreshUser('Reconcile Owner');
-    const abc = await insertWorkspace(userId, 'ABC recon');
-    await zeroOwnerWallet(userId);
-    await grantWorkspaceCredits({ workspaceId: abc, amount: 11, reference: `recon-grant-${abc}` });
+    const ownerX = await insertFreshUser('Trust X');
+    const ownerA = await insertFreshUser('Trust A');
+    const xyz = await insertWorkspace(ownerX, 'XYZ trust');
+    await insertWorkspace(ownerA, 'ABC trust');
+    await topUpBy(ownerA, 90);
+    const payer = await resolveWorkspacePayer(xyz);
+    assert.equal(payer.ownerUserId, ownerX);
+    assert.notEqual(payer.ownerUserId, ownerA);
     await spendForWorkspaceAction({
-      ownerUserId: userId,
-      workspaceId: abc,
-      operationId: `recon-spend-${abc}`,
-      amount: 5,
+      workspaceId: xyz,
+      actorUserId: ownerA,
+      ownerUserId: ownerA,
+      operationId: `trust-${xyz}`,
+      amount: 2,
       kind: 'DEBIT',
     });
-    const { rows: lotSum } = await query(
-      `SELECT coalesce(sum(credits_remaining),0)::text AS n FROM credit_lots WHERE workspace_id = $1`,
-      [abc]
-    );
-    const { rows: ledger } = await query(
-      `SELECT coalesce(sum(amount),0)::text AS n FROM wallet_transactions
-        WHERE workspace_id = $1 AND funding_source = 'WORKSPACE'`,
-      [abc]
-    );
-    assert.equal(Number(lotSum[0].n), Number(ledger[0].n));
-    assert.equal(Number(lotSum[0].n), 6);
+    assert.equal((await walletState(ownerA)).balance, 100);
+    assert.equal((await walletState(ownerX)).balance, 8);
   });
 });
+

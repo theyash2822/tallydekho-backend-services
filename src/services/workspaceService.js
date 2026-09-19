@@ -406,8 +406,8 @@ export async function createAdditionalWorkspace(userId, name) {
       [uuid(), workspaceId, uuid(), ts]
     );
     await spendForWorkspaceAction({
-      ownerUserId: userId,
       workspaceId,
+      actorUserId: userId,
       serviceKey: 'ADDITIONAL_WORKSPACE',
       operationId: workspaceId,
       kind: 'ADDITIONAL_WORKSPACE',
@@ -470,8 +470,8 @@ export async function purchaseSeat(userId, workspaceId) {
       [seatId, workspaceId, ts, periodEnd]
     );
     await spendForWorkspaceAction({
-      ownerUserId: userId,
       workspaceId,
+      actorUserId: userId,
       serviceKey: 'SEAT_MONTHLY',
       operationId: seatId,
       kind: 'SEAT_MONTHLY',
@@ -1575,8 +1575,8 @@ export async function completeOwnershipTransfer(actorUserId, workspaceId, transf
 
   if (ws?.is_base) {
     await spendForWorkspaceAction({
-      ownerUserId: fromId,
       workspaceId,
+      actorUserId: fromId,
       serviceKey: 'ADDITIONAL_WORKSPACE',
       operationId: transferId,
       kind: 'OWNERSHIP_TRANSFER_RESERVE',

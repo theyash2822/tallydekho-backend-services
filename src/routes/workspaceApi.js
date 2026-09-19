@@ -836,7 +836,7 @@ router.get(
 
 router.get('/billing/overview', authMiddleware, resolveWorkspaceMiddleware, requireCapability('billing.manage'), async (req, res) => {
   try {
-    const overview = await getBillingOverview(req.user.userId, { workspaceId: req.workspaceId || null });
+    const overview = await getBillingOverview(req.user.userId);
     res.json({ success: true, data: overview });
   } catch (err) {
     errJson(res, err);
@@ -1542,22 +1542,17 @@ router.post('/workspaces/:id/integrations/:domain/activate', authMiddleware, bin
     }
     // Deduct activation credits from the Owner wallet when billing is present.
     try {
-      const { spendForWorkspaceAction, ensureBillingAccount } = await import('../services/billingService.js');
-      const { rows: ws } = await query(`SELECT owner_user_id FROM workspaces WHERE id = $1`, [req.params.id]);
-      const ownerId = ws[0]?.owner_user_id;
-      if (ownerId) {
-        await ensureBillingAccount(ownerId);
-        const rateKey = domain === 'gst' ? 'GST_ACTIVATION'
-          : domain === 'einvoice' ? 'EINVOICE_ACTIVATION' : 'EWAY_ACTIVATION';
-        await spendForWorkspaceAction({
-          ownerUserId: ownerId,
-          workspaceId: req.params.id,
-          serviceKey: rateKey,
-          operationId: `${req.params.id}:${domain}`,
-          kind: rateKey,
-          meta: { domain },
-        });
-      }
+      const { spendForWorkspaceAction } = await import('../services/billingService.js');
+      const rateKey = domain === 'gst' ? 'GST_ACTIVATION'
+        : domain === 'einvoice' ? 'EINVOICE_ACTIVATION' : 'EWAY_ACTIVATION';
+      await spendForWorkspaceAction({
+        workspaceId: req.params.id,
+        actorUserId: req.user.userId,
+        serviceKey: rateKey,
+        operationId: `${req.params.id}:${domain}`,
+        kind: rateKey,
+        meta: { domain },
+      });
     } catch (billErr) {
       if (billErr.code === 'INSUFFICIENT_CREDITS' || billErr.code === 'BILLING_INSUFFICIENT_CREDITS' || /insufficient/i.test(billErr.message || '')) {
         return res.status(402).json({

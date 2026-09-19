@@ -73,6 +73,7 @@ export const UNIQUE_INDEXES = [
   ['uq_wallet_txn_spend_ref', 'wallet_transactions', '(wallet_id, kind, reference)', 'reference IS NOT NULL AND amount < 0 AND wallet_id IS NOT NULL'],
   ['uq_wallet_txn_ws_spend_ref', 'wallet_transactions', '(workspace_id, kind, reference)', "reference IS NOT NULL AND amount < 0 AND funding_source = 'WORKSPACE'"],
   ['uq_wallet_txn_ws_grant_ref', 'wallet_transactions', '(workspace_id, kind, reference)', "reference IS NOT NULL AND amount > 0 AND funding_source = 'WORKSPACE'"],
+  ['uq_wallet_txn_ws_usage_ref', 'wallet_transactions', '(workspace_id, kind, reference)', 'reference IS NOT NULL AND amount < 0 AND workspace_id IS NOT NULL'],
 ];
 
 /** Lookup indexes for columns queried on every request but never indexed. */

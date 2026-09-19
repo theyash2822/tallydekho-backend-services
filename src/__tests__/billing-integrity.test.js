@@ -109,6 +109,16 @@ describe('billing integrity', () => {
     assert.ok(!hard.includes('deductCredits') && !hard.includes('spendForWorkspaceAction'), 'hard sync is not a credit product');
   });
 
+  it('does not implement mixed or workspace-pot funding', () => {
+    const src = read('services/billingService.js');
+    assert.ok(!src.includes('MIXED_FUNDING_PRIORITY_UNDEFINED'));
+    assert.ok(!src.includes('SPLIT_FUNDING_RULE_UNDEFINED'));
+    assert.ok(!src.includes('function grantWorkspaceCredits'));
+    assert.ok(!src.includes('function deductWorkspaceCredits'));
+    assert.ok(!src.includes('function resolveFundingPolicy'));
+    assert.match(src, /resolveWorkspacePayer/);
+  });
+
   it('workspace business callers use the funding resolver, not deductCredits', () => {
     const workspace = read('services/workspaceService.js');
     assert.match(workspace, /spendForWorkspaceAction/);

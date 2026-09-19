@@ -1,3 +1,16 @@
+## 2026-09-19 — Billing authority: active workspace owner pays
+
+Final payer rule: chargeable actions debit the owner wallet of the
+**active workspace**. The actor is never the payer. Invited Admin wallets,
+other workspaces, and leftover experimental workspace lots are not spendable.
+
+`spendForWorkspaceAction` resolves `workspaces.owner_user_id` on the server.
+Client `ownerUserId` is ignored. Replay is keyed by workspace + operation so a
+later owner is not charged. Mixed/split funding and workspace-pot spend were
+removed.
+
+---
+
 ## 2026-09-19 — Workspace-specific spendable credits
 
 `credit_lots` now carries two roles: owner-wallet grant receipts
