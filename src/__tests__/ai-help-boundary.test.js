@@ -51,6 +51,22 @@ describe('AI help boundary', () => {
     assert.match(helpRoute, /slice\(0, MAX_HISTORY_CHARS\)/);
   });
 
+  // The route is safe with auth alone only while the prompt is KB text. If a
+  // company-scoped read appears here, authMiddleware stops being enough.
+  it('reads no company data, which is what lets it run on auth alone', () => {
+    assert.ok(
+      !/company_id|companyGuid|FROM vouchers|FROM ledgers|FROM stocks/i.test(helpRoute),
+      'help now touches company data and must gain verifyCompanyAccess + a capability'
+    );
+    assert.match(source, /BOUNDARY/, 'the boundary note must stay with the route');
+  });
+
+  it('insights, which does read company data, is company scoped', () => {
+    const insights = code.slice(code.indexOf("router.get('/ai-insights'"));
+    assert.match(insights.slice(0, 400), /verifyCompanyAccess/);
+    assert.match(insights.slice(0, 400), /capability/);
+  });
+
   it('does not log the question or the conversation', () => {
     for (const line of helpRoute.split('\n')) {
       if (!/console\.\w+/.test(line)) continue;

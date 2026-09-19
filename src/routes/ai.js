@@ -239,6 +239,17 @@ export default router;
 // ── POST /ai/help — AI Help Chat with KB Retrieval + Groq ─────────────────
 // Architecture: Intent Router → KB Retrieval → Focused Context → Groq LLM
 // Token target: 500–1200 tokens/query (not 3000–10000 for full KB stuffing)
+// ─── BOUNDARY ────────────────────────────────────────────────────────────────
+// /help answers from the product knowledge base only. It carries authMiddleware
+// and nothing else, which is correct precisely because no company data reaches
+// the prompt. The moment this route is given access to a customer's books —
+// ledgers, vouchers, balances, anything read by company_id — it must acquire
+// the same authorization the rest of the API uses: workspace resolution,
+// verifyCompanyAccess and a capability, exactly as GET /ai-insights does.
+// Adding company scope here before that happens would be decoration; adding
+// books without it would be a tenancy breach.
+// ─────────────────────────────────────────────────────────────────────────────
+//
 // The body limit is 10mb and every byte here becomes a paid Groq token, so the
 // prompt is bounded before anything else looks at it.
 const MAX_MESSAGE_CHARS = 2000;
