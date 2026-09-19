@@ -33,6 +33,7 @@ export async function createUploadAuthorization({ workspaceId, backupId, sizeByt
         Key: key,
         ContentType: 'application/zip',
         ContentLength: sizeBytes || undefined,
+        ServerSideEncryption: 'AES256',
       }),
       { expiresIn: 60 * 60 }
     );
