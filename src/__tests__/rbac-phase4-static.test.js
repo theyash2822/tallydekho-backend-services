@@ -93,4 +93,28 @@ describe('Phase 4 static authz guards', () => {
     }
     assert.deepEqual(hits, []);
   });
+
+  // Deployment B dropped both columns, so a query naming one now errors at
+  // runtime instead of quietly returning NULL.
+  it('Deployment B: the schema no longer declares the legacy columns', () => {
+    const schema = fs.readFileSync(path.join(root, 'src/db/schema.js'), 'utf8');
+    for (const table of ['devices', 'companies']) {
+      const start = schema.indexOf(`CREATE TABLE IF NOT EXISTS ${table} (`);
+      assert.ok(start > -1, `${table} create statement not found — update this guard`);
+      const ddl = schema.slice(start, schema.indexOf(');', start));
+      assert.ok(!/\buser_id\b/.test(ddl), `${table} still declares user_id`);
+    }
+    assert.ok(!/idx_companies_user/.test(schema), 'the index on the dropped column is back');
+  });
+
+  it('Deployment B: nothing joins a device or company to its old owner column', () => {
+    const files = walk(path.join(root, 'src'));
+    const hits = [];
+    for (const f of files) {
+      if (f.includes(`${path.sep}__tests__${path.sep}`)) continue;
+      const src = fs.readFileSync(f, 'utf8');
+      if (/\b[dc]\.user_id\b/.test(src)) hits.push(path.relative(root, f));
+    }
+    assert.deepEqual(hits, []);
+  });
 });

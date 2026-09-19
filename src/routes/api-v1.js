@@ -7407,7 +7407,7 @@ router.post('/auth/change-phone', authMiddleware, async (req, res) => {
         [newOtp, newExpires, cleanNew, now(), userId]);
 
       await sendWhatsAppOTP('+91', cleanNew, newOtp);
-      console.log(`[CHANGE-PHONE S2] OTP ${newOtp} → +91${cleanNew}`);
+      console.log(`[CHANGE-PHONE S2] OTP sent → +91${cleanNew}${devOtpSuffix(newOtp)}`);
       const r = { success: true, data: { message: 'OTP sent to new phone via WhatsApp' } };
       if (process.env.NODE_ENV !== 'production') r.data.otp = newOtp;
       return res.json(r);

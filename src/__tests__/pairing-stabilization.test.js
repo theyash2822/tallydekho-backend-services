@@ -81,8 +81,8 @@ test('21 Restore/Replace message constant matches product copy', () => {
 
 // ─── Legacy HTTP smoke ───────────────────────────────────────────────────────
 
-test('4 legacy POST /api/tally-sync/pair returns 410 or 401 (deprecated)', async () => {
-  if (!(await backendUp())) return;
+test('4 legacy POST /api/tally-sync/pair returns 410 or 401 (deprecated)', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
   const res = await http.post('/api/tally-sync/pair', { pairing_code: '000000' }, {
     headers: { Authorization: 'Bearer fake' },
   });
@@ -92,8 +92,8 @@ test('4 legacy POST /api/tally-sync/pair returns 410 or 401 (deprecated)', async
   }
 });
 
-test('4 legacy POST /api/tally-sync/unpair returns 410 or 401 (deprecated)', async () => {
-  if (!(await backendUp())) return;
+test('4 legacy POST /api/tally-sync/unpair returns 410 or 401 (deprecated)', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
   const res = await http.post('/api/tally-sync/unpair', {}, {
     headers: { Authorization: 'Bearer fake' },
   });
@@ -103,38 +103,26 @@ test('4 legacy POST /api/tally-sync/unpair returns 410 or 401 (deprecated)', asy
   }
 });
 
-test('4 legacy POST /app/pairing returns 410 or 401 (deprecated)', async () => {
-  if (!(await backendUp())) return;
-  const res = await http.post('/app/pairing', { pairingCode: '000000' }, {
-    headers: { Authorization: 'Bearer fake' },
-  });
-  assert.ok([401, 410].includes(res.status), `unexpected ${res.status}`);
-});
-
-test('4 legacy PUT /app/pairing returns 410 or 401 (deprecated)', async () => {
-  if (!(await backendUp())) return;
-  const res = await http.put('/app/pairing', { deviceId: 'x', deviceName: 'x' }, {
-    headers: { Authorization: 'Bearer fake' },
-  });
-  assert.ok([401, 410].includes(res.status), `unexpected ${res.status}`);
-  if (res.status === 410) {
-    assert.equal(res.data?.code, 'PAIRING_API_DEPRECATED');
+// The /app pairing surface was deleted, so 404 is the current answer. What must
+// never come back is a working legacy pairing endpoint.
+test('4 legacy /app/pairing is not a usable endpoint', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
+  const calls = [
+    http.post('/app/pairing', { pairingCode: '000000' }, { headers: { Authorization: 'Bearer fake' } }),
+    http.put('/app/pairing', { deviceId: 'x', deviceName: 'x' }, { headers: { Authorization: 'Bearer fake' } }),
+    http.delete('/app/pairing', { headers: { Authorization: 'Bearer fake' } }),
+  ];
+  for (const call of calls) {
+    const res = await call;
+    assert.ok([401, 404, 410].includes(res.status), `unexpected ${res.status}`);
+    if (res.status === 410) {
+      assert.equal(res.data?.error?.code || res.data?.code, 'PAIRING_API_DEPRECATED');
+    }
   }
 });
 
-test('4 legacy DELETE /app/pairing returns 410 or 401 (deprecated)', async () => {
-  if (!(await backendUp())) return;
-  const res = await http.delete('/app/pairing', {
-    headers: { Authorization: 'Bearer fake' },
-  });
-  assert.ok([401, 410].includes(res.status), `unexpected ${res.status}`);
-  if (res.status === 410) {
-    assert.equal(res.data?.code, 'PAIRING_API_DEPRECATED');
-  }
-});
-
-test('claim without approved session returns PENDING (not NOT_FOUND)', async () => {
-  if (!(await backendUp())) return;
+test('claim without approved session returns PENDING (not NOT_FOUND)', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
   const codeRes = await http.get('/desktop/pairing-code', {
     headers: { 'device-id': 'pairing-stab-test-device' },
   });
@@ -162,12 +150,12 @@ test('claim without approved session returns PENDING (not NOT_FOUND)', async () 
   }
 });
 
-test('13 claim with wrong token is denied', async () => {
-  if (!(await backendUp())) return;
+test('13 claim with wrong token is denied', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
   const again = await http.get('/desktop/pairing-code', {
     headers: { 'device-id': 'pairing-stab-test-device' },
   });
-  if (again.status !== 200) return;
+  if (again.status !== 200) return t.skip('device not registered for pairing code');
   const sessionId = again.data?.data?.sessionId;
   const claim = await http.post(`/desktop/pairing-sessions/${sessionId}/claim`, {
     claimToken: 'definitely-wrong-token',
@@ -175,8 +163,8 @@ test('13 claim with wrong token is denied', async () => {
   assert.ok([403, 409].includes(claim.status));
 });
 
-test('DELETE /desktop/paired-device without credential is rejected when hashed', async () => {
-  if (!(await backendUp())) return;
+test('DELETE /desktop/paired-device without credential is rejected when hashed', async (t) => {
+  if (!(await backendUp())) return t.skip('backend not reachable at BASE_URL');
   const res = await http.delete('/desktop/paired-device', {
     headers: { 'device-id': 'pairing-stab-test-device' },
   });

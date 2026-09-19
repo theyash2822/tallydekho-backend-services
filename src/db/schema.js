@@ -167,7 +167,6 @@ export async function initSchema() {
       CREATE TABLE IF NOT EXISTS devices (
         id            SERIAL PRIMARY KEY,
         device_id     TEXT UNIQUE NOT NULL,
-        user_id       INTEGER REFERENCES users(id),
         name          TEXT,
         os            TEXT,
         pairing_code  TEXT,
@@ -181,7 +180,6 @@ export async function initSchema() {
       CREATE TABLE IF NOT EXISTS companies (
         id          SERIAL PRIMARY KEY,
         guid        TEXT UNIQUE NOT NULL,
-        user_id     INTEGER REFERENCES users(id),
         device_id   TEXT REFERENCES devices(device_id),
         name        TEXT NOT NULL,
         formal_name TEXT,
@@ -550,7 +548,6 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_vouchers_type     ON vouchers(voucher_type);
       CREATE INDEX IF NOT EXISTS idx_vouchers_date     ON vouchers(date);
       CREATE INDEX IF NOT EXISTS idx_stocks_company    ON stocks(company_guid);
-      CREATE INDEX IF NOT EXISTS idx_companies_user    ON companies(user_id);
 
       -- Migrations for existing installs
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
@@ -1208,17 +1205,10 @@ export async function initSchema() {
     `);
 
     await applyWorkspaceSchema(client);
-    if (process.env.SKIP_WORKSPACE_BACKFILL === '1') {
-      console.log('⏭️  workspace bootstrap/backfill skipped (SKIP_WORKSPACE_BACKFILL=1)');
-    } else {
-      try {
-        const { backfillPersonalWorkspaces } = await import('../services/workspaceService.js');
-        await backfillPersonalWorkspaces();
-        console.log('✅ workspace bootstrap/backfill complete');
-      } catch (e) {
-        console.warn('[workspace] backfill skipped:', e.message);
-      }
-    }
+    // Personal-workspace backfill is a data migration, not schema setup, and it
+    // walks every user before the server can serve a request. Login and
+    // workspace resolution create the row on demand; environments that want it
+    // done up front run scripts/backfill-personal-workspaces.mjs.
 
     // Backfill historical master writes into app_masters + mark posted when synced.
     try {

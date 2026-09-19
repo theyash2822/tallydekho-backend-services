@@ -88,7 +88,7 @@ export function setupSocket(io) {
     socket.on('register', ({ token, type, deviceId, deviceSecret }) => {
       // Desktop sends: { type: 'desktop', deviceId, deviceSecret? }
       if (type === 'desktop' && deviceId) {
-        query('SELECT user_id, workspace_id, device_secret_hash, paired, binding_status FROM devices WHERE device_id=$1 LIMIT 1', [deviceId])
+        query('SELECT workspace_id, device_secret_hash, paired, binding_status FROM devices WHERE device_id=$1 LIMIT 1', [deviceId])
           .then(async ({ rows }) => {
             const d = rows[0];
             if (d?.device_secret_hash) {
@@ -113,24 +113,21 @@ export function setupSocket(io) {
             console.log(`[WS] registered desktop via register event: ${deviceId}`);
             socket.emit('registered', { status: true, privileged: true });
             if (!d || !d.paired) return;
-            if (d.workspace_id) socket.join(`workspace:${d.workspace_id}`);
-            const userId = d.user_id;
+            // A Desktop speaks for its workspace. Without a binding there is no
+            // tenant to retry for, and the queue must not be searched by user.
             const workspaceId = d.workspace_id || null;
+            if (!workspaceId) return;
+            socket.join(`workspace:${workspaceId}`);
             if (_retryOfflineEntries) {
               console.log(`[WS] desktop ${deviceId} online — auto-retrying offline entries`);
-              _retryOfflineEntries(userId, null, workspaceId);
+              _retryOfflineEntries(workspaceId);
             }
-            const pendingSql = workspaceId
-              ? `SELECT COUNT(*) AS cnt FROM write_queue
-                 WHERE (workspace_id=$1 OR (workspace_id IS NULL AND user_id=$2))
-                 AND status IN ('desktop_offline','failed') AND attempt_count < 5
-                 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`
-              : `SELECT COUNT(*) AS cnt FROM write_queue
-                 WHERE user_id=$1 AND status IN ('desktop_offline','failed') AND attempt_count < 5
-                 AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`;
             const { rows: pendingRows } = await query(
-              pendingSql,
-              workspaceId ? [workspaceId, userId] : [userId]
+              `SELECT COUNT(*) AS cnt FROM write_queue
+                WHERE workspace_id = $1
+                  AND status IN ('desktop_offline','failed') AND attempt_count < 5
+                  AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`,
+              [workspaceId]
             ).catch(() => ({ rows: [] }));
             const pendingCount = parseInt(pendingRows[0]?.cnt || 0, 10);
             if (pendingCount) {

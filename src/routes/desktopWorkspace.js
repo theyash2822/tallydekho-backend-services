@@ -22,7 +22,8 @@ export async function desktopMeHandler(req, res) {
     const { rows } = await query(
       `SELECT d.*, u.id AS uid, u.mobile, u.name AS user_name, u.email, u.language
        FROM devices d
-       LEFT JOIN users u ON u.id = d.user_id
+       LEFT JOIN workspaces w ON w.id = d.workspace_id
+       LEFT JOIN users u ON u.id = w.owner_user_id
        WHERE d.device_id = $1 LIMIT 1`,
       [deviceId]
     );

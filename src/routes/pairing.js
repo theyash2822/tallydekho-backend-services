@@ -27,7 +27,11 @@ router.get('/pairing-device', async (req, res) => {
     // Desktop path: device-id header present
     if (deviceId) {
       const { rows } = await query(
-        'SELECT d.device_id, d.name, d.user_id, d.last_seen, u.mobile, u.name as user_name FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1',
+        `SELECT d.device_id, d.name, d.last_seen, u.mobile, u.name AS user_name
+           FROM devices d
+           LEFT JOIN workspaces w ON w.id = d.workspace_id
+           LEFT JOIN users u ON u.id = w.owner_user_id
+          WHERE d.device_id = $1 AND d.paired = TRUE LIMIT 1`,
         [deviceId]
       );
       if (!rows[0]) return res.json({ status: true, data: { pairing: null } });

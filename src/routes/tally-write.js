@@ -5598,20 +5598,21 @@ export async function retrySingleEntry(entryId, userId) {
   }
 }
 
-// Phase C: per-user debounce map — prevents hammering Tally with retries
-const _retryDebounce = new Map(); // userId → lastRunMs
+// Phase C: per-workspace debounce map — prevents hammering Tally with retries
+const _retryDebounce = new Map(); // workspaceId → lastRunMs
 const RETRY_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 const RETRY_MAX_PER_RUN  = 25; // cap per startup/reconnect
 
-export async function retryOfflineEntries(userId, companyGuid, workspaceId = null) {
+export async function retryOfflineEntries(workspaceId, companyGuid = null) {
   // A Tally GUID is unique only inside one workspace, so narrowing the retry set
-  // by GUID alone could re-push another tenant's queued XML. Callers that want a
-  // company filter must say which workspace it belongs to.
-  if (companyGuid && !workspaceId) {
-    throw new Error('retryOfflineEntries: workspaceId is required when filtering by companyGuid');
+  // by GUID alone could re-push another tenant's queued XML. The workspace is the
+  // authority for which Desktop a queued write belongs to; a user id is not, since
+  // one user can own several workspaces.
+  if (!workspaceId) {
+    throw new Error('retryOfflineEntries: workspaceId is required');
   }
-  // Debounce: skip if already ran within the last 5 minutes for this workspace/user
-  const debounceKey = workspaceId || userId;
+  // Debounce: skip if already ran within the last 5 minutes for this workspace
+  const debounceKey = workspaceId;
   const lastRun = _retryDebounce.get(debounceKey) || 0;
   if (Date.now() - lastRun < RETRY_DEBOUNCE_MS) {
     console.log(`[write_queue] retryOfflineEntries debounced for ${debounceKey} (last run ${Math.round((Date.now()-lastRun)/1000)}s ago)`);
@@ -5624,30 +5625,19 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
     // Only retry 'desktop_offline' and 'failed' entries.
     // Do NOT include 'pending' or 'processing' — those are actively being forwarded
     // and picking them up here would cause duplicate entries in Tally.
-    const params = [];
+    const params = [workspaceId];
     const clauses = [
+      `workspace_id = $1`,
       `status IN ('desktop_offline','failed')`,
       `attempt_count < 5`,
       `(lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`,
     ];
-    if (workspaceId) {
-      params.push(workspaceId);
-      const wsIdx = params.length;
-      params.push(userId);
-      clauses.unshift(`(workspace_id = $${wsIdx} OR (workspace_id IS NULL AND user_id = $${params.length}))`);
-    } else {
-      params.push(userId);
-      clauses.unshift(`user_id = $${params.length}`);
-    }
     if (companyGuid) {
       params.push(companyGuid);
-      const gIdx = params.length;
-      params.push(workspaceId);
-      const wsForCo = params.length;
-      // company_guid is only trusted on rows that predate company_id, and only
-      // within the workspace already pinned by the clause above.
+      // The GUID only names a company once the workspace has been applied, so it
+      // resolves to company_id rather than matching write_queue.company_guid.
       clauses.push(
-        `(company_id IN (SELECT id FROM companies WHERE guid = $${gIdx} AND workspace_id = $${wsForCo}) OR (company_id IS NULL AND company_guid = $${gIdx}))`
+        `company_id IN (SELECT id FROM companies WHERE guid = $${params.length} AND workspace_id = $1)`
       );
     }
     const { rows } = await query(
@@ -5655,7 +5645,7 @@ export async function retryOfflineEntries(userId, companyGuid, workspaceId = nul
       params
     );
     if (!rows.length) return;
-    console.log(`[write_queue] auto-retry: ${rows.length} entries for ${workspaceId ? `workspace ${workspaceId}` : `user ${userId}`}`);
+    console.log(`[write_queue] auto-retry: ${rows.length} entries for workspace ${workspaceId}`);
     for (const entry of rows) {
       if (!entry.xml) continue;
       try {

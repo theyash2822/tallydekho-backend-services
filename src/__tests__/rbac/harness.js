@@ -42,11 +42,9 @@ async function closeHttpServer(httpServer) {
 
 async function buildHarness() {
   assertRbacDbRequired();
-  // Local DBs accumulate hundreds of users/workspaces from prior runs.
-  // initSchema → backfillPersonalWorkspaces → ensureDemoCompany would
-  // re-walk / reseed them and blow the Node test timeout. Fixtures seed
-  // their own CONNECTED workspaces; demo backfill is not required here.
-  process.env.SKIP_WORKSPACE_BACKFILL = '1';
+  // Local DBs accumulate hundreds of users/workspaces from prior runs, and
+  // reseeding demo data for all of them blows the Node test timeout. Fixtures
+  // seed their own CONNECTED workspaces.
   process.env.SKIP_DEMO_SEED = '1';
   // Prior file may have ended the shared pool for clean exit — recreate.
   if (getPool()?.ended) {

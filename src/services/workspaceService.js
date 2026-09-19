@@ -180,23 +180,6 @@ export async function backfillPersonalWorkspaces() {
     try {
       const ws = await ensurePersonalWorkspace(u.id);
       await query(
-        `UPDATE companies SET workspace_id = $1 WHERE user_id = $2 AND workspace_id IS NULL`,
-        [ws.id, u.id]
-      );
-      await query(
-        `UPDATE devices SET workspace_id = $1
-         WHERE user_id = $2 AND paired = TRUE AND workspace_id IS NULL`,
-        [ws.id, u.id]
-      );
-      await query(
-        `UPDATE workspace_tally_bindings SET active_device_id = d.device_id, connection_status = 'CONNECTED', updated_at = $3
-         FROM devices d
-         WHERE workspace_tally_bindings.workspace_id = $1
-           AND d.user_id = $2 AND d.paired = TRUE
-           AND workspace_tally_bindings.active_device_id IS NULL`,
-        [ws.id, u.id, now()]
-      ).catch(() => {});
-      await query(
         `UPDATE workspaces SET tally_connection = 'CONNECTED', updated_at = $2
          WHERE id = $1 AND EXISTS (
            SELECT 1 FROM devices WHERE workspace_id = $1 AND paired = TRUE

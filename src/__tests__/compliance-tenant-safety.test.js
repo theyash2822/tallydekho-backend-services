@@ -103,20 +103,30 @@ describe('Compliance voucher lookups are company-scoped', () => {
 });
 
 describe('write_queue retry cannot cross-route on a shared GUID', () => {
-  it('filtering by companyGuid without a workspace is refused', async () => {
+  it('a retry without a workspace is refused', async () => {
     await assert.rejects(
-      () => retryOfflineEntries(1, 'dddddddd-shared-guid'),
+      () => retryOfflineEntries(null, 'dddddddd-shared-guid'),
       /workspaceId is required/,
       'a GUID alone can match another tenant’s queued XML'
+    );
+    await assert.rejects(
+      () => retryOfflineEntries(null),
+      /workspaceId is required/,
+      'a user id is not a tenant — one user can own several workspaces'
     );
   });
 
   it('the retry query resolves companyGuid through companies scoped by workspace', () => {
     const src = read('routes/tally-write.js');
+    const fn = src.slice(src.indexOf('export async function retryOfflineEntries'));
     assert.match(
-      src,
-      /company_id IN \(SELECT id FROM companies WHERE guid = \$\$\{gIdx\}[^)]*workspace_id = \$\$\{wsForCo\}\)/,
+      fn,
+      /company_id IN \(SELECT id FROM companies WHERE guid = \$\$\{params\.length\} AND workspace_id = \$1\)/,
       'companyGuid filter must resolve through the workspace-owned company row'
+    );
+    assert.ok(
+      !/workspace_id IS NULL AND user_id/.test(fn.slice(0, fn.indexOf('\n}'))),
+      'the workspace-less retry fallback must not come back'
     );
   });
 });
@@ -183,6 +193,30 @@ describe('One authentication architecture', () => {
         `${rel}: users.token is a dead credential column`
       );
     }
+  });
+});
+
+describe('Credentials do not reach the logs', () => {
+  // An OTP is valid for five minutes; a log line holding it is readable for as
+  // long as the log is retained. devOtpSuffix() drops it outside development.
+  it('no source interpolates an OTP straight into a log line', () => {
+    const files = fs
+      .readdirSync(path.join(srcRoot, 'routes'))
+      .filter((f) => f.endsWith('.js'))
+      .map((f) => `routes/${f}`)
+      .concat(['services/sms.js', 'services/whatsapp.js', 'services/notifications.js']);
+    const hits = [];
+    for (const rel of files) {
+      const full = path.join(srcRoot, rel);
+      if (!fs.existsSync(full)) continue;
+      for (const line of readCode(rel).split('\n')) {
+        if (!/console\.(log|warn|error|info)/.test(line)) continue;
+        if (/\$\{\s*(?!devOtpSuffix)[A-Za-z_$][\w$]*[Oo][Tt][Pp][\w$]*\s*\}/.test(line)) {
+          hits.push(`${rel}: ${line.trim()}`);
+        }
+      }
+    }
+    assert.deepEqual(hits, []);
   });
 });
 
