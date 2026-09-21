@@ -665,7 +665,9 @@ async function createReceiptForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const dt = tallyDate(date);
-  const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP', req.company?.id);
+  const { rows: coRows } = await query(`SELECT id FROM companies WHERE guid=$1 LIMIT 1`, [companyGuid]).catch(() => ({ rows: [] }));
+  const companyId = coRows[0]?.id ?? null;
+  const rcpTdkRef = await generateTDKReference(companyGuid, isOptional, 'RCP', companyId);
   // A non-cash receipt carries the instrument on the bank leg, exactly like the
   // standalone Receipt route; without it Tally shows a bare bank entry.
   // The allocation amount must match the bank leg's signed AMOUNT (-amt here).
@@ -721,7 +723,7 @@ ${bankAllocXml}
 
   const label = `${partyLedger} ← ${bankLedger} (linked: ${parentTdkRef})`;
   const payload = { companyGuid, companyName, date, partyLedger, bankLedger, amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration };
-  const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml, req.company?.id).catch(() => null);
+  const qId = await logWriteQueue(userId, companyGuid, 'receipt', label, amt, payload, xml, companyId).catch(() => null);
 
   // Create child app_voucher (linked to invoice via parent_invoice_uuid).
   // 2026-07-01 R4: explicitly set created_at to match the parent Sales invoice's timestamp
@@ -731,16 +733,16 @@ ${bankAllocXml}
   let receiptUuid = null;
   if (qId) {
     const createdAtSql = parentCreatedAt
-      ? `$11::bigint`
+      ? `$12::bigint`
       : `EXTRACT(EPOCH FROM NOW())::bigint`;
-    const insertParams = [req.company?.id, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
+    const insertParams = [companyGuid, companyId, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid, created_at)
-       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10, ${createdAtSql})
+       VALUES ($1,$2,$3,$4,'receipt',$5,$6,$6,'queued','not_posted','tally_prime_series',$7,$8,$9,$10,$11, ${createdAtSql})
        RETURNING invoice_uuid`,
       insertParams
     ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -748,7 +750,7 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
+    const result = await forwardToTally(companyGuid, userId, xml, { companyId });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     return { ok: true, queued: offline, queueId: qId, tdkRef: rcpTdkRef, receiptUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
@@ -792,7 +794,9 @@ async function createPaymentForInvoice({
   const amt = parseFloat(amount);
   const isOpt = isOptional ? 'Yes' : 'No';
   const dt = tallyDate(date);
-  const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY', req.company?.id);
+  const { rows: coRowsPay } = await query(`SELECT id FROM companies WHERE guid=$1 LIMIT 1`, [companyGuid]).catch(() => ({ rows: [] }));
+  const companyIdPay = coRowsPay[0]?.id ?? null;
+  const payTdkRef = await generateTDKReference(companyGuid, isOptional, 'PAY', companyIdPay);
   const bankAllocXml = buildBankAllocationXml({
     paymentMethod, instrument, date, amount: amt, favouring: partyLedger,
     reference: reference || parentTdkRef,
@@ -849,19 +853,19 @@ ${bankAllocXml}
     amount: amt, isOptional, reference, parentInvoiceUuid, parentTdkRef, narration,
     paymentMethod: 'Bank', billAllocations: [{ billRefName: parentTdkRef, billType: 'Agst Ref', amount: amt }],
   };
-  const qId = await logWriteQueue(userId, companyGuid, 'payment', label, amt, payload, xml, req.company?.id).catch(() => null);
+  const qId = await logWriteQueue(userId, companyGuid, 'payment', label, amt, payload, xml, companyIdPay).catch(() => null);
 
   let paymentUuid = null;
   if (qId) {
-    const createdAtSql = parentCreatedAt ? `$11::bigint` : `EXTRACT(EPOCH FROM NOW())::bigint`;
-    const insertParams = [req.company?.id, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
+    const createdAtSql = parentCreatedAt ? `$12::bigint` : `EXTRACT(EPOCH FROM NOW())::bigint`;
+    const insertParams = [companyGuid, companyIdPay, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload, parent_invoice_uuid, created_at)
-       VALUES ($1,$2,$3,'payment',$4,$5,$5,'queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10, ${createdAtSql})
+       VALUES ($1,$2,$3,$4,'payment',$5,$6,$6,'queued','not_posted','tally_prime_series',$7,$8,$9,$10,$11, ${createdAtSql})
        RETURNING invoice_uuid`,
       insertParams
     ).catch(e => { console.error('[payment-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -869,7 +873,7 @@ ${bankAllocXml}
   }
 
   try {
-    const result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
+    const result = await forwardToTally(companyGuid, userId, xml, { companyId: companyIdPay });
     await updateWriteQueue(qId, result, null);
     const offline = result?.status === 'desktop_offline';
     return { ok: true, queued: offline, queueId: qId, tdkRef: payTdkRef, paymentUuid, voucherNumber: result?.voucherNumber || null, tallyId: result?.tallyId || null };
@@ -1818,11 +1822,11 @@ ${bankAllocXml}
   if (qId && tdkRef) {
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'payment',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
+       VALUES ($1,$2,$3,$4,'payment',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, partyLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[payment-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -2030,11 +2034,11 @@ ${bankAllocXml}
   if (qId && tdkRef) {
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'receipt',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10)
+       VALUES ($1,$2,$3,$4,'receipt',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, partyLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[receipt-app_voucher] insert failed:', e.message); return { rows: [] }; });
@@ -7000,10 +7004,23 @@ router.get('/invoice/:tdkRef/preview', authMiddleware, async (req, res) => {
     const { tdkRef } = req.params;
     const { companyGuid } = req.query;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    if (!(await verifyCompanyAccess(req, res, companyGuid))) return;
 
+    const companyId = req.company?.id;
+    // Legacy writers put numeric company_id into company_guid and left company_id NULL.
+    // Match either the real guid, the numeric id-as-text, or company_id.
     const { rows: avRows } = await query(
-      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
-      [tdkRef, req.company?.id, req.user.userId]
+      `SELECT * FROM app_vouchers
+       WHERE tdk_reference_no = $1
+         AND user_id = $2
+         AND (
+           ($3::bigint IS NOT NULL AND company_id = $3)
+           OR company_guid = $4
+           OR ($3::text IS NOT NULL AND company_guid = $3::text)
+         )
+       ORDER BY (company_id IS NOT NULL) DESC, created_at DESC NULLS LAST
+       LIMIT 1`,
+      [tdkRef, req.user.userId, companyId ?? null, companyGuid]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
     const av = avRows[0];
@@ -7024,11 +7041,21 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, requireTallyWriteAcces
     const { tdkRef } = req.params;
     const { companyGuid, waitForTallyNumber: shouldWait = true, maxWaitMs = 10000 } = req.body;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+    // requireTallyWriteAccess already bound req.company
 
-    // Check current state first
+    const companyId = req.company?.id;
     const { rows: avRows } = await query(
-      `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
-      [tdkRef, req.company?.id, req.user.userId]
+      `SELECT * FROM app_vouchers
+       WHERE tdk_reference_no = $1
+         AND user_id = $2
+         AND (
+           ($3::bigint IS NOT NULL AND company_id = $3)
+           OR company_guid = $4
+           OR ($3::text IS NOT NULL AND company_guid = $3::text)
+         )
+       ORDER BY (company_id IS NOT NULL) DESC, created_at DESC NULLS LAST
+       LIMIT 1`,
+      [tdkRef, req.user.userId, companyId ?? null, companyGuid]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });
     let av = avRows[0];
