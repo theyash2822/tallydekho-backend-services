@@ -6,6 +6,7 @@ import { Router } from 'express';
 import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 import { requireTallyWriteAccess, verifyCompanyAccess } from '../middleware/companyAccess.js';
+import { spendForWorkspaceAction } from '../services/billingService.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
 import {
@@ -262,6 +263,44 @@ const forwardToTally = async (companyGuid, userId, xmlBody, opts = {}) => {
 
   return { deviceId: device.device_id, jobId, status: 'desktop_offline', message: 'Desktop not connected. Entry saved — will push when desktop comes online.' };
 };
+
+/**
+ * Charge workspace owner wallet for a metered action (TALLY_WRITE / PDF_GENERATE).
+ * Idempotent on (workspace, kind, operationId). Demo mode skips. Returns false if
+ * the HTTP response was already sent (402 insufficient credits).
+ */
+async function chargeWorkspaceService(req, res, { serviceKey, operationId, meta = {} }) {
+  if (!operationId) return true;
+  if (req.authz?.demoMode) return true;
+  const workspaceId = req.workspaceId;
+  if (!workspaceId) return true;
+  try {
+    await spendForWorkspaceAction({
+      workspaceId,
+      actorUserId: req.user?.userId,
+      serviceKey,
+      operationId: String(operationId),
+      kind: serviceKey,
+      meta,
+    });
+    return true;
+  } catch (billErr) {
+    const code = billErr?.code || '';
+    if (
+      code === 'INSUFFICIENT_CREDITS'
+      || code === 'BILLING_INSUFFICIENT_CREDITS'
+      || /insufficient/i.test(billErr?.message || '')
+    ) {
+      res.status(402).json({
+        status: false,
+        message: 'This Workspace does not have enough credits. Please ask the Workspace Owner to recharge from the Web Portal.',
+        error: { code: 'INSUFFICIENT_CREDITS' },
+      });
+      return false;
+    }
+    throw billErr;
+  }
+}
 
 // ── Helper: log entry to write_queue (company_id authoritative; guid for Desktop) ─
 const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount, payload, xml, companyId = null, workspaceId = null) => {
@@ -658,6 +697,7 @@ async function createReceiptForInvoice({
   paymentMethod = '', instrument = null, voucherNumber = '',
   parentCreatedAt = null,   // 2026-07-01 R4: share timestamp with parent Sales invoice
                             // so audit-trail sort keeps Invoice → Receipt sequence.
+  req = null, res = null,
 }) {
   if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
     throw new Error('createReceiptForInvoice: missing required fields');
@@ -738,6 +778,15 @@ ${bankAllocXml}
     const insertParams = [companyGuid, companyId, userId, qId, rcpTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
+    if (req && res) {
+      if (!(await chargeWorkspaceService(req, res, {
+        serviceKey: 'TALLY_WRITE',
+        operationId: rcpTdkRef,
+        meta: { voucherType: 'receipt', paired: true },
+      }))) {
+        return { ok: false, insufficientCredits: true, queueId: qId, tdkRef: rcpTdkRef };
+      }
+    }
     const avResult = await query(
       `INSERT INTO app_vouchers
        (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
@@ -787,6 +836,7 @@ async function createPaymentForInvoice({
   isOptional = false, reference,
   paymentMethod = '', instrument = null, voucherNumber = '',
   parentCreatedAt = null,
+  req = null, res = null,
 }) {
   if (!companyGuid || !partyLedger || !bankLedger || !(parseFloat(amount) > 0)) {
     throw new Error('createPaymentForInvoice: missing required fields');
@@ -861,6 +911,15 @@ ${bankAllocXml}
     const insertParams = [companyGuid, companyIdPay, userId, qId, payTdkRef, isOptional ? 'optional' : 'regular',
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(payload), parentInvoiceUuid];
     if (parentCreatedAt) insertParams.push(parentCreatedAt);
+    if (req && res) {
+      if (!(await chargeWorkspaceService(req, res, {
+        serviceKey: 'TALLY_WRITE',
+        operationId: payTdkRef,
+        meta: { voucherType: 'payment', paired: true },
+      }))) {
+        return { ok: false, insufficientCredits: true, queueId: qId, tdkRef: payTdkRef };
+      }
+    }
     const avResult = await query(
       `INSERT INTO app_vouchers
        (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
@@ -1237,14 +1296,19 @@ ${consigneeAddrXml}
   let invoiceUuid = null;
   let invoiceCreatedAt = null;
   if (queueId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'sales_invoice' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'sales_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'sales_invoice',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid, created_at`,
-      [req.company?.id, req.user.userId, queueId, tdkRef, original_entry_type,
+      [companyGuid, req.company?.id ?? null, req.user.userId, queueId, tdkRef, original_entry_type,
        numbering_policy,
        tdkInvoiceNo || null,     // pre-set for tallydekho_series; null for tally_prime_series
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
@@ -1284,7 +1348,9 @@ ${consigneeAddrXml}
             ? { instrumentNo: collect_payment.reference }
             : null),
           parentCreatedAt: invoiceCreatedAt,   // R4: share parent Sales timestamp
+          req, res,
         });
+        if (receiptResult?.insufficientCredits) return;
         if (receiptResult?.ok) {
           console.log(`[receipt-pair] Created receipt ${receiptResult.tdkRef} for invoice ${tdkRef}`);
         }
@@ -1379,14 +1445,19 @@ router.post('/voucher/proforma', authMiddleware, requireTallyWriteAccess('/vouch
 
   let invoiceUuid = null;
   if (queueId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'proforma_invoice' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'proforma_invoice',$4,'optional','optional','queued','not_posted','tally_prime_series',$5,$6,$7,$8,$9)
+       VALUES ($1,$2,$3,$4,'proforma_invoice',$5,'optional','optional','queued','not_posted','tally_prime_series',$6,$7,$8,$9,$10)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, queueId, tdkRef,
+      [companyGuid, req.company?.id ?? null, req.user.userId, queueId, tdkRef,
        voucherNumber || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
     ).catch(e => { console.error('[app_vouchers] proforma insert failed:', e.message); return { rows: [] }; });
@@ -1633,7 +1704,9 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
             instrument: collect_payment.instrument || (collect_payment.reference
               ? { instrumentNo: collect_payment.reference }
               : null),
+            req, res,
           });
+          if (receiptResult?.insufficientCredits) return;
         } catch (rcpErr) {
           console.error(`[receipt-pair] Proforma convert receipt failed for ${tdkRef}:`, rcpErr.message);
           receiptResult = { ok: false, error: rcpErr.message };
@@ -1820,6 +1893,11 @@ ${bankAllocXml}
 
   let paymentUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'payment' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
        (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
@@ -1839,7 +1917,13 @@ ${bankAllocXml}
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -2032,6 +2116,11 @@ ${bankAllocXml}
 
   let receiptUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'receipt' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
        (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
@@ -2052,7 +2141,13 @@ ${bankAllocXml}
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -2195,14 +2290,19 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
 
   let journalUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'journal' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'journal',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'journal',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        drLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -2216,7 +2316,13 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -2438,14 +2544,19 @@ ${toBankAlloc}
 
   let contraUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'contra' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'contra',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'contra',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        fromLedger, amt, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -2459,7 +2570,13 @@ ${toBankAlloc}
     let voucherNumber = result?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -2656,14 +2773,19 @@ ${soExtrasXml}
 
   let orderUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'sales_order' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'sales_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'sales_order',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, original_entry_type,
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, original_entry_type,
        numbering_policy,
        tdkOrderNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3228,14 +3350,19 @@ ${poExtrasXml}
 
   let orderUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'purchase_order' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'purchase_order',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'purchase_order',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, original_entry_type || (isOptional ? 'optional' : 'regular'),
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, original_entry_type || (isOptional ? 'optional' : 'regular'),
        numbering_policy,
        tdkOrderNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3461,14 +3588,19 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
   let invoiceUuid = null;
   let invoiceCreatedAt = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'purchase_invoice' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'purchase_invoice',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'purchase_invoice',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid, created_at`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : (original_entry_type || 'regular'),
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : (original_entry_type || 'regular'),
        numbering_policy || 'tally_prime_series',
        tdkInvoiceNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -3495,7 +3627,9 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
             ? { instrumentNo: make_payment.reference }
             : null),
           parentCreatedAt: invoiceCreatedAt,
+          req, res,
         });
+        if (paymentResult?.insufficientCredits) return;
         if (paymentResult?.ok) {
           console.log(`[payment-pair] Created payment ${paymentResult.tdkRef} for purchase ${tdkRef}`);
         }
@@ -3963,14 +4097,19 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
     qId = await logWriteQueue(req.user.userId, companyGuid, 'credit_note', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
     if (qId && tdkRef) {
+      if (!(await chargeWorkspaceService(req, res, {
+        serviceKey: 'TALLY_WRITE',
+        operationId: tdkRef,
+        meta: { voucherType: 'credit_note' },
+      }))) return;
       const avResult = await query(
         `INSERT INTO app_vouchers
-         (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+         (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
           tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
           party_name, total_amount, voucher_date, payload)
-         VALUES ($1,$2,$3,'credit_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+         VALUES ($1,$2,$3,$4,'credit_note',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
          RETURNING invoice_uuid`,
-        [req.company?.id, req.user.userId, qId, tdkRef, entryType,
+        [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, entryType,
          numbering_policy,
          tdkCreditNoteNo || null,
          partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -4428,14 +4567,19 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
     qId = await logWriteQueue(req.user.userId, companyGuid, 'debit_note', label, amt, persistPayload, xml, req.company?.id).catch(() => null);
 
     if (qId && tdkRef) {
+      if (!(await chargeWorkspaceService(req, res, {
+        serviceKey: 'TALLY_WRITE',
+        operationId: tdkRef,
+        meta: { voucherType: 'debit_note' },
+      }))) return;
       const avResult = await query(
         `INSERT INTO app_vouchers
-         (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+         (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
           tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
           party_name, total_amount, voucher_date, payload)
-         VALUES ($1,$2,$3,'debit_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+         VALUES ($1,$2,$3,$4,'debit_note',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
          RETURNING invoice_uuid`,
-        [req.company?.id, req.user.userId, qId, tdkRef, entryType,
+        [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, entryType,
          numbering_policy,
          tdkDebitNoteNo || null,
          partyLedger, amt, date ? new Date(date) : null, JSON.stringify(persistPayload)]
@@ -4756,14 +4900,19 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
 
   let deliveryNoteUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'delivery_note' },
+    }))) return;
     const avResult = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'delivery_note',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'delivery_note',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, entryType,
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, entryType,
        numbering_policy,
        tdkDeliveryNoteNo || null,
        partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
@@ -4957,15 +5106,19 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
 
       let adjustmentId = null;
       if (qId2 && tdkRef) {
+        if (!(await chargeWorkspaceService(req, res, {
+          serviceKey: 'TALLY_WRITE',
+          operationId: tdkRef,
+          meta: { voucherType: 'stock_adjustment' },
+        }))) return;
         const { rows: av } = await query(
           `INSERT INTO app_vouchers
-           (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+           (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
             tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
             party_name, total_amount, voucher_date, payload)
-           VALUES ($1,$2,$3,'stock_adjustment',$4,'regular','regular','queued','not_posted',$5,$6,$7,$8,$9,$10)
+           VALUES ($1,$2,$3,$4,'stock_adjustment',$5,'regular','regular','queued','not_posted',$6,$7,$8,$9,$10,$11)
            RETURNING invoice_uuid`,
-          [
-            companyGuid, req.user.userId, qId2, tdkRef,
+          [companyGuid, req.company?.id ?? null, req.user.userId, qId2, tdkRef,
             numbering_policy, tdkVoucherNo || null,
             name, openVal || null,
             date ? new Date(date) : null,
@@ -5336,14 +5489,19 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
 
   let transferUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'stock_transfer' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'stock_transfer',$4,$5,$5,'queued','not_posted',$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,'stock_transfer',$5,$6,$6,'queued','not_posted',$7,$8,$9,$10,$11,$12)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef, isOptional ? 'optional' : 'regular',
        numbering_policy, tdkVoucherNo || null,
        `${labelFrom} → ${toGodown}`, transferValue || null, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -5357,7 +5515,13 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
     let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -5488,14 +5652,19 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
 
   let adjustmentUuid = null;
   if (qId && tdkRef) {
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'TALLY_WRITE',
+      operationId: tdkRef,
+      meta: { voucherType: 'stock_adjustment' },
+    }))) return;
     const av = await query(
       `INSERT INTO app_vouchers
-       (company_guid, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
+       (company_guid, company_id, user_id, write_queue_id, voucher_type, tdk_reference_no, original_entry_type, current_entry_type,
         tally_sync_status, books_impact_status, numbering_policy, tally_voucher_no,
         party_name, total_amount, voucher_date, payload)
-       VALUES ($1,$2,$3,'stock_adjustment',$4,'regular','regular','queued','not_posted',$5,$6,$7,$8,$9,$10)
+       VALUES ($1,$2,$3,$4,'stock_adjustment',$5,'regular','regular','queued','not_posted',$6,$7,$8,$9,$10,$11)
        RETURNING invoice_uuid`,
-      [req.company?.id, req.user.userId, qId, tdkRef,
+      [companyGuid, req.company?.id ?? null, req.user.userId, qId, tdkRef,
        numbering_policy, tdkVoucherNo || null,
        stockName, adjValue || null, date ? new Date(date) : null,
        JSON.stringify(persistPayload)]
@@ -5531,7 +5700,13 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
     let voucherNumber = r?.voucherNumber || effectiveVoucherNumber || null;
     if (!voucherNumber && tdkRef) {
       const { rows: avFresh } = await query(
-        `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 LIMIT 1`,
+        `SELECT tally_voucher_no FROM app_vouchers
+          WHERE tdk_reference_no=$1
+            AND (
+              ($2::bigint IS NOT NULL AND company_id=$2)
+              OR ($2::text IS NOT NULL AND company_guid=$2::text)
+            )
+          LIMIT 1`,
         [tdkRef, req.company?.id]
       ).catch(() => ({ rows: [] }));
       voucherNumber = avFresh[0]?.tally_voucher_no || null;
@@ -6858,8 +7033,14 @@ async function waitForTallyNumber(tdkRef, companyId, userId, maxWaitMs = 10000) 
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const { rows } = await query(
-      `SELECT tally_voucher_no FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
-      [tdkRef, companyId, userId]
+      `SELECT tally_voucher_no FROM app_vouchers
+        WHERE tdk_reference_no=$1 AND user_id=$3
+          AND (
+            ($2::bigint IS NOT NULL AND company_id=$2)
+            OR ($2::text IS NOT NULL AND company_guid=$2::text)
+          )
+        LIMIT 1`,
+      [tdkRef, companyId ?? null, userId]
     ).catch(() => ({ rows: [] }));
     if (rows[0]?.tally_voucher_no) return rows[0].tally_voucher_no;
     await new Promise(r => setTimeout(r, pollInterval));
@@ -7042,6 +7223,12 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, requireTallyWriteAcces
     const { companyGuid, waitForTallyNumber: shouldWait = true, maxWaitMs = 10000 } = req.body;
     if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
     // requireTallyWriteAccess already bound req.company
+
+    if (!(await chargeWorkspaceService(req, res, {
+      serviceKey: 'PDF_GENERATE',
+      operationId: `pdf:${tdkRef}`,
+      meta: { tdkRef },
+    }))) return;
 
     const companyId = req.company?.id;
     const { rows: avRows } = await query(

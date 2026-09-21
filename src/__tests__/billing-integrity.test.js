@@ -100,10 +100,13 @@ describe('billing integrity', () => {
     assert.ok(!/Math\.round\(amountInr \* 100\)/.test(src), 'no rupee float at the provider boundary');
   });
 
-  it('TALLY_WRITE and PDF_GENERATE are not charged by current callers', () => {
+  it('TALLY_WRITE and PDF_GENERATE are charged from tally-write with spendForWorkspaceAction', () => {
     const write = read('routes/tally-write.js');
+    assert.match(write, /spendForWorkspaceAction/, 'tally-write must meter via spendForWorkspaceAction');
+    assert.match(write, /serviceKey: 'TALLY_WRITE'/);
+    assert.match(write, /serviceKey: 'PDF_GENERATE'/);
+    assert.ok(!write.includes('deductCredits('), 'tally-write must not call deductCredits directly');
     const api = read('routes/api-v1.js');
-    assert.ok(!write.includes('deductCredits') && !write.includes('spendForWorkspaceAction'), 'tally-write must not debit');
     assert.ok(!api.includes('deductCredits') && !api.includes('spendForWorkspaceAction'), 'api-v1 must not debit');
     const hard = read('services/hardSyncService.js');
     assert.ok(!hard.includes('deductCredits') && !hard.includes('spendForWorkspaceAction'), 'hard sync is not a credit product');

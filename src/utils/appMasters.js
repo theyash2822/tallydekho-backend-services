@@ -98,7 +98,7 @@ export async function confirmAppMasterFromIngest(companyGuid, name, masterTypes,
               books_impact_status = 'posted',
               sync_error          = NULL,
               updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
-        WHERE company_id=$1
+        WHERE company_guid=$1
           AND LOWER(master_name) = LOWER($2)
           AND master_type = ANY($3::text[])
           AND books_impact_status = 'not_posted'`,
