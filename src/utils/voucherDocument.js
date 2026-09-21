@@ -327,10 +327,12 @@ export function buildChargeLines(payload = {}) {
   const raw = Array.isArray(payload.logistics) ? payload.logistics : [];
   const charges = [];
   let roundOff = 0;
+  let roundOffLabel = '';
   for (const l of raw) {
     if (!l?.ledgerName) continue;
     if (isRoundOffLedger(l.ledgerName)) {
       roundOff += num(l.amount);
+      roundOffLabel = l.ledgerName;
       continue;
     }
     charges.push({
@@ -344,7 +346,7 @@ export function buildChargeLines(payload = {}) {
       })),
     });
   }
-  return { charges, roundOff: round2(roundOff) };
+  return { charges, roundOff: round2(roundOff), roundOffLabel };
 }
 
 /**

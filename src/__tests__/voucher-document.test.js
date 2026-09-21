@@ -133,7 +133,7 @@ test('tax lines carry the cgst/sgst/igst split', () => {
 });
 
 test('round-off is split out of the logistics charges', () => {
-  const { charges, roundOff } = buildChargeLines({
+  const { charges, roundOff, roundOffLabel } = buildChargeLines({
     logistics: [
       { ledgerName: 'Packing Material Expenses', amount: 2000, taxes: [{ ledgerName: 'CGST', taxRate: 9, taxAmount: 180 }] },
       { ledgerName: 'Rounded Off', amount: 140, taxes: [] },
@@ -144,6 +144,7 @@ test('round-off is split out of the logistics charges', () => {
   assert.equal(charges[0].description, 'Packing Material Expenses');
   assert.equal(charges[0].taxes[0].kind, 'cgst');
   assert.equal(roundOff, 140);
+  assert.equal(roundOffLabel, 'Rounded Off');
 });
 
 test('totals include the tax split, taxable value and charge taxes', () => {

@@ -6943,8 +6943,9 @@ async function buildVoucherDocument(av, ctxOverride = null) {
 
   const items = buildItemLines(p, ctx.itemMasters);
   const taxLines = buildTaxLines(p);
-  const { charges, roundOff } = buildChargeLines(p);
+  const { charges, roundOff, roundOffLabel } = buildChargeLines(p);
   const totals = buildTotals(p, av, items, taxLines, charges, roundOff);
+  if (roundOffLabel) totals.roundOffLabel = roundOffLabel;
   const hsnSummary = HSN_SUMMARY_DOCUMENTS.has(documentType)
     ? buildHsnSummary(items, taxLines)
     : [];
