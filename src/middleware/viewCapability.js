@@ -8,7 +8,8 @@ export function resolveViewCapability(req) {
     .split('?')[0];
   if (
     u.includes('/dashboard') || u.includes('/kpi/') || u.includes('/alerts')
-    || u.includes('/reports-dashboard') || u.includes('/home-metrics') || u.includes('/home_metrics')
+    || u.includes('/reports-dashboard')     || u.includes('/home-metrics') || u.includes('/home_metrics')
+    || u.includes('/notifications')
   ) {
     return 'dashboard.view';
   }

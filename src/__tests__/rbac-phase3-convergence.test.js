@@ -42,6 +42,7 @@ describe('Phase 3 invite company_mode defaults (Q021)', () => {
     assert.ok(src.includes("policy.company_mode || 'NONE'"), 'putMemberScopes must default NONE');
     assert.ok(src.includes("company_mode: 'NONE'"), 'createInvitation must snapshot NONE');
     assert.ok(!src.match(/policy\.company_mode \|\| 'ALL'/), 'must not default company_mode to ALL');
+    assert.ok(src.includes('COMPANY_ACCESS_REQUIRED'), 'invite must reject NONE after Q021 coerce');
   });
 });
 

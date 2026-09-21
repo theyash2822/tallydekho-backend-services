@@ -933,6 +933,50 @@ export async function ensureCanonicalDemoCompany({ force = false } = {}) {
   return seedFullDemoCompany(null, SYSTEM_DEMO_WORKSPACE_ID, CANONICAL_DEMO_GUID);
 }
 
+export async function getWorkspacePairingStatus(workspaceId) {
+  const { rows: bind } = await query(
+    `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,
+    [workspaceId]
+  );
+  const { rows: ws } = await query(
+    `SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`,
+    [workspaceId]
+  );
+  return String(bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED').toUpperCase();
+}
+
+export async function loadCanonicalDemoCompany() {
+  const { rows } = await query(
+    `SELECT id, guid, workspace_id, name, device_id, is_active, is_demo, gstin
+     FROM companies
+     WHERE guid = $1 AND is_demo = TRUE
+     LIMIT 1`,
+    [CANONICAL_DEMO_GUID]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Own-workspace company, or the projected canonical Demo when this workspace
+ * is unpaired. Desktop / ingest still use workspace_id match only.
+ */
+export async function resolveCompanyForUserWorkspace(companyGuid, workspaceId) {
+  const guid = String(companyGuid || '').trim();
+  if (!guid || !workspaceId) return null;
+  const { rows } = await query(
+    `SELECT id, guid, workspace_id, name, device_id, is_active, is_demo, gstin
+     FROM companies
+     WHERE guid = $1 AND workspace_id = $2
+     LIMIT 1`,
+    [guid, workspaceId]
+  );
+  if (rows[0]) return rows[0];
+  if (!isDemoCompany(guid)) return null;
+  const status = await getWorkspacePairingStatus(workspaceId);
+  if (!isDemoEligible(status)) return null;
+  return loadCanonicalDemoCompany();
+}
+
 /**
  * The reserved workspace that owns the canonical Demo company.
  *

@@ -118,6 +118,20 @@ describe('Canonical Demo is one dataset', () => {
     );
   });
 
+  it('unpaired list and access project the system Demo company', () => {
+    const companiesRoute = read('routes/api-v1.js');
+    const getCompanies = companiesRoute.slice(companiesRoute.indexOf("router.get('/companies'"));
+    assert.match(getCompanies, /loadCanonicalDemoCompany/, 'GET /api/companies must project Demo');
+    assert.match(getCompanies, /is_demo: true/, 'the projected row must carry is_demo');
+    const access = read('middleware/companyAccess.js');
+    assert.match(access, /resolveCompanyForUserWorkspace/, 'data routes must accept the projected Demo GUID');
+    const resolver = read('services/demoDataService.js');
+    const fn = resolver.slice(resolver.indexOf('export async function resolveCompanyForUserWorkspace'));
+    const body = fn.slice(0, fn.indexOf('\nexport '));
+    assert.match(body, /isDemoEligible/, 'projected Demo is only for unpaired workspaces');
+    assert.match(body, /loadCanonicalDemoCompany/);
+  });
+
   it('the seeded row is marked is_demo', () => {
     const src = read('services/demoDataService.js');
     assert.match(src, /gst_taxpayer_type, is_demo\)/);

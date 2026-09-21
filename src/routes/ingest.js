@@ -217,7 +217,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
           const selectedFYNames = new Set(selectedYears.map(y => y.finYear || y.fin_year || y.name).filter(Boolean));
           console.log(`[DB] Years for ${c.name}: total=${allYears.length} selected=${selectedFYNames.size}`);
 
-          await query('UPDATE company_years SET is_active = FALSE WHERE company_id = $1', [companyId]).catch(() => {});
+          await query('UPDATE company_years SET is_active = FALSE, is_current = FALSE WHERE company_id = $1', [companyId]).catch(() => {});
 
           const norm = d => d && d.length === 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
           for (const y of allYears) {
@@ -231,14 +231,30 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
             const isActive = selectedFYNames.has(finYear);
             try {
               await query(`
-                INSERT INTO company_years (company_guid, company_id, fin_year, begin_date, end_date, is_active)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO company_years (company_guid, company_id, fin_year, begin_date, end_date, is_active, is_current)
+                VALUES ($1, $2, $3, $4, $5, $6, FALSE)
                 ON CONFLICT (company_id, fin_year) DO UPDATE SET
                   begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date,
                   is_active = EXCLUDED.is_active
               `, [c.guid, companyId, finYear, norm(beginDate), norm(endDate), isActive]);
             } catch (ye) { console.warn('[DB] Year insert failed:', ye.message, y); }
           }
+          try {
+            await query(`
+              UPDATE company_years SET is_current = TRUE
+              WHERE id = (
+                SELECT id FROM company_years
+                 WHERE company_id = $1
+                 ORDER BY
+                   CASE
+                     WHEN is_active AND begin_date::date <= CURRENT_DATE AND end_date::date >= CURRENT_DATE THEN 0
+                     WHEN begin_date::date <= CURRENT_DATE AND end_date::date >= CURRENT_DATE THEN 1
+                     ELSE 2
+                   END,
+                   begin_date DESC
+                 LIMIT 1
+              )`, [companyId]);
+          } catch (ye) { console.warn('[DB] is_current year mark failed:', ye.message); }
         } catch (e) {
           console.warn('[DB] Company save failed:', e.message);
         }
@@ -443,6 +459,7 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
     if (data.length > 0) {
       await processIngestedData(streamName, data, resolvedCompany.guid, userId, deviceId, {
         companyId: resolvedCompany.id,
+        uploadId,
       });
     }
 
@@ -504,9 +521,19 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       }
     }
 
+    let ingestWarnings = [];
+    if (uploadId) {
+      const { rows: warnRows } = await query(
+        `SELECT warnings FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
+        [uploadId, deviceId]
+      );
+      const raw = warnRows[0]?.warnings;
+      ingestWarnings = Array.isArray(raw) ? raw : [];
+    }
+    const ingestOutcome = ingestWarnings.length ? 'partial' : 'complete';
     await query(
       'UPDATE ingest_uploads SET status = $1, completed_at = $2 WHERE id = $3 AND device_id = $4',
-      ['complete', now(), uploadId || '', deviceId]
+      [ingestOutcome, now(), uploadId || '', deviceId]
     );
     await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
 
@@ -520,7 +547,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       // Log the sync operation
       await query(
         `INSERT INTO sync_log (device_id, user_id, company_guid, company_id, synced_at, mode, voucher_count, ledger_count, stock_count, record_count, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'success')`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           deviceId || 'unknown',
           userId || null,
@@ -532,6 +559,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
           ledgerCount  || 0,
           stockCount   || 0,
           recordCount  || 0,
+          ingestOutcome === 'partial' ? 'partial' : 'success',
         ]
       ).catch(err => console.error('[sync_log] insert failed:', err.message));
     }
@@ -661,7 +689,15 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }
 
-    res.json({ status: true, message: 'Sync complete', data: { recordCounts } });
+    const partialMessage = ingestWarnings.some((w) => w?.code === 'stock_qty_recompute')
+      ? 'Books synced. Stock quantities could not be updated.'
+      : 'Books synced. Some calculations could not be updated.';
+    res.json({
+      status: true,
+      outcome: ingestOutcome,
+      message: ingestOutcome === 'partial' ? partialMessage : 'Sync complete',
+      data: { recordCounts, warnings: ingestWarnings },
+    });
   } catch (err) {
     console.error('[INGEST] complete error:', err.message);
     res.status(500).json({ status: false, message: 'Complete failed' });

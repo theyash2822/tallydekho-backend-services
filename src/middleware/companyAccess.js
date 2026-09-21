@@ -8,7 +8,7 @@ import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { loadMembership, authorize } from '../services/authorizationService.js';
 import { assertCompanyAccess, assertFyAccess, assertLedgerAccess, assertGodownAccess, assertCostCentreAccess } from '../services/scopeService.js';
 import { applyMask, getPolicies } from '../services/sensitivePolicyService.js';
-import { isDemoCompany, isDemoEligible } from '../services/demoDataService.js';
+import { isDemoCompany, isDemoEligible, resolveCompanyForUserWorkspace } from '../services/demoDataService.js';
 
 function readWorkspaceHeader(req) {
   const h = req.headers['x-workspace-id'] || req.headers['X-Workspace-Id'] || null;
@@ -40,14 +40,7 @@ export async function ensureReqWorkspace(req) {
  * Legacy companies.user_id is NOT used for authorization (CTO Phase 2).
  */
 export async function companyInWorkspace(companyGuid, workspaceId, _userId) {
-  const { rows } = await query(
-    `SELECT c.id, c.guid, c.workspace_id, c.name, c.device_id, c.is_active
-     FROM companies c
-     WHERE c.guid = $1 AND c.workspace_id = $2
-     LIMIT 1`,
-    [companyGuid, workspaceId]
-  );
-  return rows[0] || null;
+  return resolveCompanyForUserWorkspace(companyGuid, workspaceId);
 }
 
 /**
@@ -99,16 +92,18 @@ export async function verifyCompanyAccess(req, res, companyGuid, opts = {}) {
       id: companyRow.id,
       workspaceId: companyRow.workspace_id,
       tallyGuid: companyRow.guid,
+      guid: companyRow.guid,
       name: companyRow.name,
       deviceId: companyRow.device_id,
       isActive: companyRow.is_active,
+      is_demo: companyRow.is_demo === true,
     };
 
     // Resolve pairing — Demo never elevates RBAS (product 2A).
     // CONNECTED: Demo is forbidden. UNPAIRED/RECONNECTING: Demo readable with real caps;
     // company-scope may exclude Demo GUID so skip scope for Demo only.
     let pairingStatus = 'UNPAIRED';
-    const demoRow = isDemoCompany({ guid: companyGuid });
+    const demoRow = isDemoCompany(companyRow) || isDemoCompany({ guid: companyGuid });
     {
       const { rows: bindRows } = await query(
         `SELECT connection_status FROM workspace_tally_bindings WHERE workspace_id = $1 LIMIT 1`,

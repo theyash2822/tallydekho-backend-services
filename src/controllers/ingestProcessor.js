@@ -4,12 +4,30 @@ import { getClient, query as rawDbQuery } from '../db/schema.js';
 import {
   ingestCompanyCtx,
   currentCompanyId,
+  currentUploadId,
   wrapIngestClient,
 } from '../utils/ingestCompanyDualWrite.js';
 export { ingestCompanyCtx };
 
 async function dbQuery(text, params) {
   return rawDbQuery(text, params);
+}
+
+/** Record a non-fatal ingest warning. Does not fail the sync. */
+export async function recordIngestWarning(code, message) {
+  const uploadId = currentUploadId();
+  console.error(`[INGEST] partial warning ${code}:`, message);
+  if (!uploadId) return;
+  try {
+    await rawDbQuery(
+      `UPDATE ingest_uploads
+          SET warnings = COALESCE(warnings, '[]'::jsonb) || $2::jsonb
+        WHERE id = $1`,
+      [uploadId, JSON.stringify([{ code, message: String(message || '').slice(0, 500) }])]
+    );
+  } catch (e) {
+    console.error('[INGEST] failed to persist warning:', e.message);
+  }
 }
 
 import { classifyTaxLedger, inferTransactionNature } from '../utils/taxClassifier.js';
@@ -533,7 +551,7 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
     return;
   }
 
-  return ingestCompanyCtx.run({ companyId, companyGuid }, async () =>
+  return ingestCompanyCtx.run({ companyId, companyGuid, uploadId: opts.uploadId || null }, async () =>
     processIngestedDataInner(streamName, data, companyGuid, userId, deviceId, companyId)
   );
 }
@@ -1844,7 +1862,7 @@ async function processStockTransactions(data, companyGuid) {
           closing_value = sub.net_qty * sub.last_rate
       FROM (
         SELECT
-          stock_guid, company_guid,
+          stock_guid, company_id,
           SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty,
           -- Use latest inward rate as the current rate
           (SELECT rate FROM stock_transactions t2
@@ -1853,14 +1871,14 @@ async function processStockTransactions(data, companyGuid) {
            ORDER BY t2.date DESC, t2.id DESC LIMIT 1) as last_rate
         FROM stock_transactions t1
         WHERE company_id = $1 AND qty IS NOT NULL
-        GROUP BY stock_guid, company_guid
+        GROUP BY stock_guid, company_id
       ) sub
       WHERE s.name = sub.stock_guid
         AND s.company_id = sub.company_id
     `, [currentCompanyId()]);
     console.log(`[DB] StockTx: updated ${result.rowCount} stock closing_qty for ${companyGuid}`);
   } catch (e) {
-    console.error('[DB] Stock closing_qty update failed:', e.message);
+    await recordIngestWarning('stock_qty_recompute', e.message);
   }
 
   // After transaction recompute, apply FY valuation as authoritative override.
@@ -2657,11 +2675,11 @@ async function processStockOpeningBalance(data, companyGuid) {
       SET closing_qty = s.opening_qty + COALESCE(sub.net_qty, 0),
           closing_value = (s.opening_qty + COALESCE(sub.net_qty, 0)) * NULLIF(s.opening_rate, 0)
       FROM (
-        SELECT stock_guid, company_guid,
+        SELECT stock_guid, company_id,
                SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
         FROM stock_transactions
         WHERE company_id = $1 AND ${OB_EXCL}
-        GROUP BY stock_guid, company_guid
+        GROUP BY stock_guid, company_id
       ) sub
       WHERE s.name = sub.stock_guid AND s.company_id = sub.company_id AND s.company_id = $1
     `, [currentCompanyId()]);
@@ -2678,11 +2696,11 @@ async function processStockOpeningBalance(data, companyGuid) {
       `UPDATE stocks s
        SET closing_qty = sub.net_qty
        FROM (
-         SELECT stock_guid, company_guid,
+         SELECT stock_guid, company_id,
                 SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) as net_qty
          FROM stock_transactions
          WHERE company_id = $1 AND ${OB_EXCL}
-         GROUP BY stock_guid, company_guid
+         GROUP BY stock_guid, company_id
        ) sub
        WHERE s.name = sub.stock_guid
          AND s.company_id = sub.company_id
@@ -2693,7 +2711,7 @@ async function processStockOpeningBalance(data, companyGuid) {
 
     console.log(`[DB] StockOpening: closing_qty recomputed for ${companyGuid}`);
   } catch (e) {
-    console.error('[DB] Stock closing_qty recompute failed:', e.message);
+    await recordIngestWarning('stock_qty_recompute', e.message);
   }
 }
 
@@ -2721,8 +2739,9 @@ async function applyCurrentFyClosingQty(companyGuid) {
       ) fv
       WHERE s.name = fv.stock_name
         AND s.company_id = $1
-        -- Do not replace a nonzero txn-computed qty with a FY default of 0
-        AND NOT (COALESCE(fv.closing_qty, 0) = 0 AND COALESCE(s.closing_qty, 0) <> 0)
+        -- Do not replace a nonzero txn-computed qty with a FY default of 0,
+        -- and never stamp a 0 FY valuation over an item that already has opening qty.
+        AND COALESCE(fv.closing_qty, 0) <> 0
     `, [currentCompanyId()]);
     console.log(`[DB] applyCurrentFyClosingQty: updated ${result.rowCount} stocks for ${companyGuid}`);
   } catch (e) {
@@ -2987,14 +3006,14 @@ async function processLedgerTransactions(data, companyGuid) {
       UPDATE vouchers v
       SET amount = sub.total
       FROM (
-        SELECT voucher_guid, company_guid,
+        SELECT voucher_guid, company_id,
                SUM(CASE WHEN type = 'Cr' THEN amount ELSE 0 END) as total
         FROM voucher_items
         WHERE company_id = $1
           AND amount IS NOT NULL
           AND amount::text != 'NaN'
           AND amount > 0
-        GROUP BY voucher_guid, company_guid
+        GROUP BY voucher_guid, company_id
       ) sub
       WHERE v.guid = sub.voucher_guid
         AND v.company_id = sub.company_id
@@ -3002,7 +3021,7 @@ async function processLedgerTransactions(data, companyGuid) {
     `, [currentCompanyId()]);
     console.log(`[DB] LedgerTx: updated ${result.rowCount} voucher amounts for ${companyGuid}`);
   } catch (e) {
-    console.error('[DB] Voucher amount update failed:', e.message);
+    await recordIngestWarning('voucher_amount_rollup', e.message);
   }
 }
 

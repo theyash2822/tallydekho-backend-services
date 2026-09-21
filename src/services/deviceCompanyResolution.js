@@ -4,6 +4,7 @@
  * Never trusts company GUID alone as authority.
  */
 import { query } from '../db/schema.js';
+import { resolveCompanyForUserWorkspace } from './demoDataService.js';
 
 export class CompanyResolutionError extends Error {
   constructor(code, message, httpStatus = 403) {
@@ -24,21 +25,15 @@ export async function resolveCompanyInWorkspace({ workspaceId, companyGuid }) {
   if (!guid) {
     throw new CompanyResolutionError('COMPANY_GUID_REQUIRED', 'companyGuid required', 400);
   }
-  const { rows } = await query(
-    `SELECT id, workspace_id, guid, name, device_id, is_active
-     FROM companies
-     WHERE guid = $1 AND workspace_id = $2
-     LIMIT 1`,
-    [guid, workspaceId]
-  );
-  if (!rows[0]) {
+  const row = await resolveCompanyForUserWorkspace(guid, workspaceId);
+  if (!row) {
     throw new CompanyResolutionError(
       'COMPANY_NOT_IN_WORKSPACE',
       'Company not in this workspace',
       403
     );
   }
-  return rows[0];
+  return row;
 }
 
 /**

@@ -55,10 +55,16 @@ describe('Company Identity Phase 2 containment contracts', () => {
     assert.ok(!src.includes('OR user_id'), 'user_id ownership fallback must stay deleted');
   });
 
-  it('companyInWorkspace is exported and workspace_id only', () => {
+  it('companyInWorkspace is exported and does not fall back to user_id', () => {
     const src = read('middleware/companyAccess.js');
     assert.ok(src.includes('export async function companyInWorkspace'));
-    assert.ok(src.includes('c.workspace_id = $2'));
+    assert.ok(src.includes('resolveCompanyForUserWorkspace'));
     assert.ok(!src.includes('OR c.user_id') && !src.includes('OR user_id'));
+    const resolver = read('services/demoDataService.js');
+    assert.match(
+      resolver,
+      /WHERE guid = \$1 AND workspace_id = \$2/,
+      'own-workspace match stays workspace_id + guid'
+    );
   });
 });

@@ -1,3 +1,41 @@
+## 2026-09-21 — Founder decisions: invite lock, partial sync, FY current
+
+Invite with `company_mode=NONE` is rejected (`COMPANY_ACCESS_REQUIRED`) after
+Q021 coerce, before a seat is reserved. Stock/voucher rollup SQL failures are
+logged on `ingest_uploads.warnings` and `/ingest/complete` returns
+`outcome=partial` without failing the whole sync. `company_years.is_current`
+is the single current FY; `is_active` stays “selected for sync”.
+
+---
+
+## 2026-09-19 — Paired/Demo list APIs: company_id leftovers
+
+GET `/api/ledgers` joined a groups subquery that selected `company_guid`
+then filtered on `g.company_id` (Postgres: column does not exist).
+Dashboard metrics / expense / stock-warehouse helpers declared
+`companyGuid` but bound an unbound `companyId` → 500. `/api/notifications`
+had no view capability → 403. All now use the resolved internal id.
+
+---
+
+## 2026-09-19 — Universal Demo visible and readable when unpaired
+
+Canonical Demo lives in `system-demo-workspace`. GET `/api/companies` and
+company access now project that row for UNPAIRED workspaces (`is_demo: true`)
+instead of requiring `companies.workspace_id` = the user's workspace. Paired
+workspaces still see only real books.
+
+---
+
+## 2026-09-19 — Web login verify-otp 500 on pairing hints
+
+`getUserPairingHints` joined `workspace_tally_bindings.device_id` (column
+does not exist). OTP was valid; the response still returned
+`Verification failed`. Join is now `active_device_id`. Hint failures no
+longer fail login.
+
+---
+
 ## 2026-09-19 — Extra-workspace charge sees the same-txn insert
 
 `createAdditionalWorkspace` inserts the workspace then charges inside one

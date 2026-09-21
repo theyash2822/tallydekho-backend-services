@@ -554,6 +554,9 @@ export async function initSchema() {
 
       -- company_years migrations
       ALTER TABLE company_years ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE;
+      -- is_active = selected for sync (many allowed). is_current = the one FY containing today (exactly one).
+      ALTER TABLE company_years ADD COLUMN IF NOT EXISTS is_current BOOLEAN DEFAULT FALSE;
+      ALTER TABLE ingest_uploads ADD COLUMN IF NOT EXISTS warnings JSONB DEFAULT '[]'::jsonb;
 
       -- companies migrations
       -- Authoritative Demo marker. Demo used to be inferred from the name

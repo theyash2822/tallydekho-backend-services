@@ -10,7 +10,6 @@ import {
   filterCompaniesByPairingStatus,
   isDemoCompany,
   isDemoEligible,
-  CANONICAL_DEMO_GUID,
 } from './demoDataService.js';
 import { sendOwnershipConfirmEmail, sendLifecycleConfirmEmail } from './email.js';
 import { purgeCompanyTallyData } from './companyPurge.js';
@@ -305,12 +304,9 @@ export async function getWorkspaceContext(userId, workspaceId) {
     // Demo projection: the canonical company is owned by the system workspace, so
     // it is read in explicitly rather than by workspace_id. Company scope is
     // ignored here on purpose — Demo is the same fixture for every member.
-    const { rows: demoRows } = await query(
-      `SELECT guid, name, gstin, is_active, is_demo FROM companies
-       WHERE guid = $1 AND is_demo = TRUE LIMIT 1`,
-      [CANONICAL_DEMO_GUID]
-    );
-    companies = demoRows;
+    const { loadCanonicalDemoCompany } = await import('./demoDataService.js');
+    const demo = await loadCanonicalDemoCompany();
+    companies = demo ? [demo] : [];
   } else {
     // Paired in any state — including Desktop offline or awaiting first sync —
     // means real books, with the member's company scope applied.
@@ -691,24 +687,6 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
     throw err;
   }
 
-  const { rows: seats } = await query(
-    `UPDATE workspace_seats SET status = 'RESERVED'
-     WHERE id = (
-       SELECT id FROM workspace_seats
-       WHERE workspace_id = $1 AND status = 'AVAILABLE' AND seat_kind = 'PAID'
-       ORDER BY created_at ASC LIMIT 1
-     )
-     RETURNING id`,
-    [workspaceId]
-  );
-  const reservedSeatId = seats[0]?.id || null;
-  if (!reservedSeatId) {
-    const err = new Error('No available seat — purchase a seat before inviting');
-    err.code = 'NO_SEAT_AVAILABLE';
-    err.httpStatus = 409;
-    throw err;
-  }
-
   // RBAC-Q021: never coerce missing/empty company selection to ALL.
   // Ordinary invites default to company_mode=NONE; ALL only when explicitly set
   // and the assigned role is OWNER/ADMIN-style privileged.
@@ -721,7 +699,7 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
       let allowAll = false;
       if (roleId) {
         const { rows: roleRows } = await query(
-          `SELECT system_key, membership_type FROM workspace_roles WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
+          `SELECT system_key FROM workspace_roles WHERE id = $1 AND workspace_id = $2 LIMIT 1`,
           [roleId, workspaceId]
         );
         const sk = String(roleRows[0]?.system_key || '').toUpperCase();
@@ -742,6 +720,32 @@ export async function createInvitation({ workspaceId, invitedByUserId, mobile, r
     }
   } else {
     scopeSnapshot = { companies: [], policy: { company_mode: 'NONE' } };
+  }
+
+  const resolvedCompanyMode = String(scopeSnapshot?.policy?.company_mode || 'NONE').toUpperCase();
+  if (resolvedCompanyMode === 'NONE') {
+    const err = new Error('Choose All companies or at least one company before sending the invite.');
+    err.code = 'COMPANY_ACCESS_REQUIRED';
+    err.httpStatus = 400;
+    throw err;
+  }
+
+  const { rows: seats } = await query(
+    `UPDATE workspace_seats SET status = 'RESERVED'
+     WHERE id = (
+       SELECT id FROM workspace_seats
+       WHERE workspace_id = $1 AND status = 'AVAILABLE' AND seat_kind = 'PAID'
+       ORDER BY created_at ASC LIMIT 1
+     )
+     RETURNING id`,
+    [workspaceId]
+  );
+  const reservedSeatId = seats[0]?.id || null;
+  if (!reservedSeatId) {
+    const err = new Error('No available seat — purchase a seat before inviting');
+    err.code = 'NO_SEAT_AVAILABLE';
+    err.httpStatus = 409;
+    throw err;
   }
 
   const inviteId = uuid();
@@ -943,9 +947,9 @@ export async function acceptInvitation(userId, invitationId) {
     const snap = typeof inv.scope_snapshot_json === 'string'
       ? JSON.parse(inv.scope_snapshot_json)
       : inv.scope_snapshot_json;
-    await putMemberScopes(mid, snap);
+    await putMemberScopes(mid, snap, inv.workspace_id);
   } else {
-    await putMemberScopes(mid, { policy: { company_mode: 'NONE', fy_mode: 'NONE', ledger_mode: 'NONE', godown_mode: 'NONE', cost_centre_mode: 'NONE' } });
+    await putMemberScopes(mid, { policy: { company_mode: 'NONE', fy_mode: 'NONE', ledger_mode: 'NONE', godown_mode: 'NONE', cost_centre_mode: 'NONE' } }, inv.workspace_id);
   }
   await query(
     `UPDATE workspace_invitations SET status = 'ACCEPTED', accepted_at = $2 WHERE id = $1`,

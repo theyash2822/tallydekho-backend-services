@@ -269,7 +269,15 @@ export async function resolveFYDates(companyId, from, to, fyParam) {
   }
   try {
     const { rows } = await query(
-      'SELECT begin_date, end_date, fin_year FROM company_years WHERE company_id=$1 AND is_active=TRUE ORDER BY begin_date DESC LIMIT 1',
+      `SELECT begin_date, end_date, fin_year FROM company_years
+        WHERE company_id=$1
+        ORDER BY
+          CASE WHEN is_current THEN 0
+               WHEN is_active AND begin_date::date <= CURRENT_DATE AND end_date::date >= CURRENT_DATE THEN 1
+               WHEN is_active THEN 2
+               ELSE 3 END,
+          begin_date DESC
+        LIMIT 1`,
       [companyId]
     );
     const yr = new Date().getFullYear();
@@ -776,17 +784,24 @@ router.get('/company/years', authMiddleware, async (req, res) => {
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const companyId = requireResolvedCompanyId(req);
   try {
-    const { rows } = await query('SELECT fin_year, begin_date, end_date FROM company_years WHERE company_id=$1 AND is_active = TRUE ORDER BY begin_date DESC', [companyId]);
+    const { rows } = await query(
+      `SELECT fin_year, begin_date, end_date, is_active, is_current
+         FROM company_years WHERE company_id=$1 AND is_active = TRUE
+         ORDER BY is_current DESC, begin_date DESC`,
+      [companyId]
+    );
     const fys = rows.map(r => {
-      const start = new Date(r.begin_date);
-      const end   = new Date(r.end_date);
+      const start = new Date(`${String(r.begin_date).slice(0, 10)}T12:00:00`);
+      const end   = new Date(`${String(r.end_date).slice(0, 10)}T12:00:00`);
       const sy = start.getFullYear();
       const ey = end.getFullYear();
       return {
-        fin_year:   r.fin_year,                          // e.g. '2025-2026' — for API fy= param
+        fin_year:   r.fin_year,
         begin_date: r.begin_date,
         end_date:   r.end_date,
-        label:      `FY ${sy}-${String(ey).slice(2)}`,  // e.g. 'FY 2025-26' — for display
+        is_active:  r.is_active !== false,
+        is_current: r.is_current === true,
+        label:      `FY ${sy}-${String(ey).slice(2)}`,
       };
     });
     res.json({ success: true, data: fys });
@@ -836,18 +851,34 @@ router.get('/companies', authMiddleware, async (req, res) => {
       [workspaceId]
     );
     const pairingStatus = bind[0]?.connection_status || ws[0]?.tally_connection || 'UNPAIRED';
-    if (String(pairingStatus).toUpperCase() !== 'CONNECTED' && ws[0]?.owner_user_id) {
-      const { ensureDemoCompany } = await import('../services/demoDataService.js');
-      await ensureDemoCompany(ws[0].owner_user_id, workspaceId).catch(() => {});
+    const {
+      ensureDemoCompany,
+      filterCompaniesByPairingStatus,
+      isDemoEligible,
+      loadCanonicalDemoCompany,
+    } = await import('../services/demoDataService.js');
+    if (isDemoEligible(pairingStatus)) {
+      await ensureDemoCompany(ws[0]?.owner_user_id || req.user.userId, workspaceId).catch(() => {});
+      const demo = await loadCanonicalDemoCompany();
+      return res.json({
+        success: true,
+        data: demo ? [{
+          id: demo.guid,
+          guid: demo.guid,
+          name: demo.name,
+          gstin: demo.gstin || null,
+          active: demo.is_active !== false,
+          is_demo: true,
+        }] : [],
+      });
     }
     const { rows } = await query(
-      `SELECT guid, name, gstin FROM companies
+      `SELECT guid, name, gstin, is_demo FROM companies
        WHERE workspace_id = $1 AND is_active = TRUE
        ORDER BY name ASC`,
       [workspaceId]
     );
     let scoped = await filterCompaniesByScope(req.user.userId, workspaceId, rows);
-    const { filterCompaniesByPairingStatus } = await import('../services/demoDataService.js');
     scoped = filterCompaniesByPairingStatus(scoped, pairingStatus);
     res.json({
       success: true,
@@ -857,6 +888,7 @@ router.get('/companies', authMiddleware, async (req, res) => {
         name: c.name,
         gstin: c.gstin || null,
         active: true,
+        is_demo: c.is_demo === true,
       })),
     });
   } catch (err) {
@@ -882,7 +914,7 @@ router.get('/companies/:guid/print-profile', authMiddleware, async (req, res) =>
     if (!ok) return;
     const { rows: companyRows } = await query(
       'SELECT guid, gstin, pan, email, phone FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1',
-      [guid, req.workspaceId]
+      [guid, req.company?.workspaceId || req.workspaceId]
     );
     if (!companyRows[0]) {
       return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Company not found' } });
@@ -1204,7 +1236,7 @@ function inclusiveMetricDays(from, to) {
 }
 
 /** Sales / purchase / expense totals for a window — same queries as GET /dashboard/metrics tiles. */
-async function dashboardMetricAmounts(companyGuid, from, to) {
+async function dashboardMetricAmounts(companyId, from, to) {
   const [sRes, pRes, eRes] = await Promise.all([
     query(`SELECT COALESCE(
       (SELECT SUM(ABS(vle.amount)) FROM voucher_ledger_entries vle
@@ -1268,8 +1300,8 @@ router.get('/dashboard/metrics', authMiddleware, async (req, res) => {
     const priorTo = addDays(from, -1);
     const priorFrom = addDays(priorTo, -(periodDays - 1));
     const [cur, prior] = await Promise.all([
-      dashboardMetricAmounts(companyGuid, from, to),
-      dashboardMetricAmounts(companyGuid, priorFrom, priorTo),
+      dashboardMetricAmounts(companyId, from, to),
+      dashboardMetricAmounts(companyId, priorFrom, priorTo),
     ]);
     const sTrend = computeTrendPct(cur.sales, prior.sales);
     const pTrend = computeTrendPct(cur.purchases, prior.purchases);
@@ -2007,7 +2039,7 @@ function homeMetricTrend(cur, prior, invert = false) {
   return { trend_pct, trend_positive };
 }
 
-async function sumVoucherAmount(companyGuid, filterSql, from, to) {
+async function sumVoucherAmount(companyId, filterSql, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
     `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
@@ -2016,7 +2048,7 @@ async function sumVoucherAmount(companyGuid, filterSql, from, to) {
   return +(rows?.[0]?.v ?? 0);
 }
 
-async function countVouchers(companyGuid, filterSql, from, to) {
+async function countVouchers(companyId, filterSql, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
     `SELECT COUNT(*)::int as c FROM vouchers WHERE company_id=$1 AND ${filterSql} AND is_cancelled=FALSE AND date BETWEEN $2 AND $3`,
@@ -2025,7 +2057,7 @@ async function countVouchers(companyGuid, filterSql, from, to) {
   return +(rows?.[0]?.c ?? 0);
 }
 
-async function sumNoteAmount(companyGuid, typePattern, from, to) {
+async function sumNoteAmount(companyId, typePattern, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
     `SELECT COALESCE(SUM(amount),0) as v FROM vouchers WHERE company_id=$1 AND voucher_type ILIKE $2 AND is_cancelled=FALSE AND date BETWEEN $3 AND $4`,
@@ -2034,7 +2066,7 @@ async function sumNoteAmount(companyGuid, typePattern, from, to) {
   return +(rows?.[0]?.v ?? 0);
 }
 
-async function sumLedgerOutstanding(companyGuid, side) {
+async function sumLedgerOutstanding(companyId, side) {
   const parentFilter = side === 'AR'
     ? `(parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`
     : `(parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`;
@@ -2976,9 +3008,10 @@ router.get('/ledgers', authMiddleware, async (req, res) => {
       -- DISTINCT ON: Tally can sync duplicate group rows with the same name; a plain
       -- JOIN fans out every ledger under that parent (same guid twice → React key crash).
       LEFT JOIN (
-        SELECT DISTINCT ON (company_guid, name) company_guid, name, nature
+        SELECT DISTINCT ON (company_id, name) company_id, name, nature
         FROM groups
-        ORDER BY company_guid, name
+        WHERE company_id IS NOT NULL
+        ORDER BY company_id, name
       ) g
         ON g.company_id = l.company_id AND g.name = TRIM(l.parent)
       WHERE l.company_id=$1 AND (l.name ILIKE $2 OR l.alias ILIKE $2 OR l.gstin ILIKE $2)
@@ -3245,7 +3278,7 @@ function parseCsvQueryParam(val) {
  * Warehouse filter: union of items in any selected WH; one row per item with combined qty/value.
  * Uses stock_transactions net qty per godown (same model as negative-stock breakdown).
  */
-async function applyMultiWarehouseStockFilter(companyGuid, rows, warehouseList, { fyTo = null } = {}) {
+async function applyMultiWarehouseStockFilter(companyId, rows, warehouseList, { fyTo = null } = {}) {
   if (!warehouseList.length) return rows;
 
   const normWh = (w) => (w && String(w).trim()) || 'Main Location';
@@ -3338,7 +3371,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       // FY-specific: derive closing qty from stock_transactions up to fyTo (Tally FY guide compliant)
       q = `
         SELECT s.guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
-               s.reorder_level, s.closing_rate,
+               s.reorder_level, s.closing_rate, s.opening_rate,
                (SELECT st2.warehouse FROM stock_transactions st2
                 WHERE st2.company_id = s.company_id AND st2.stock_guid = s.name
                 ORDER BY st2.date DESC LIMIT 1) AS primary_warehouse,
@@ -3356,7 +3389,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                COALESCE(s.opening_qty, 0)
                + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
                - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) AS fy_closing_qty,
-               s.closing_rate * (
+               COALESCE(NULLIF(s.closing_rate, 0), NULLIF(s.opening_rate, 0), 0) * (
                  COALESCE(s.opening_qty, 0)
                  + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
                  - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
@@ -3372,7 +3405,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         WHERE s.company_id=$1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
         GROUP BY s.guid, s.company_id, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
-                 s.reorder_level, s.closing_rate, s.opening_qty
+                 s.reorder_level, s.closing_rate, s.opening_rate, s.opening_qty
         ORDER BY fy_closing_value DESC NULLS LAST, s.name
       `;
       params = [companyId, `%${search}%`, fyTo];
@@ -3385,7 +3418,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         params.push(groupList);
       }
       const { rows: rawRows } = await query(q, params);
-      let allRows = await applyMultiWarehouseStockFilter(companyGuid, rawRows, warehouseList, { fyTo });
+      let allRows = await applyMultiWarehouseStockFilter(companyId, rawRows, warehouseList, { fyTo });
       // Apply pagination in JS after FY computation
       const totalRows = allRows.length;
       const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
@@ -3439,7 +3472,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     }
     q += ` ORDER BY closing_value DESC NULLS LAST, name`;
     const { rows: rawItems } = await query(q, params);
-    let allRows = await applyMultiWarehouseStockFilter(companyGuid, rawItems, warehouseList);
+    let allRows = await applyMultiWarehouseStockFilter(companyId, rawItems, warehouseList);
     const totalRows = allRows.length;
     const pageRows = allRows.slice(offset, offset + parseInt(limit));
     const totalValue = allRows.reduce((s, r) => s + parseFloat(r.closing_value || 0), 0);
@@ -3568,13 +3601,13 @@ router.get('/stocks/negative-stock', authMiddleware, async (req, res) => {
           ) AS warehouses
         FROM stocks s
         LEFT JOIN (
-          SELECT stock_guid, company_guid,
+          SELECT stock_guid, company_id,
                  COALESCE(NULLIF(warehouse, ''), 'Main Location') AS warehouse,
                  SUM(CASE WHEN type = 'inward' THEN qty ELSE -qty END) AS net_qty
           FROM stock_transactions
           WHERE company_id=$1 AND qty IS NOT NULL
             AND voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse movement totals
-          GROUP BY stock_guid, company_guid, COALESCE(NULLIF(warehouse, ''), 'Main Location')
+          GROUP BY stock_guid, company_id, COALESCE(NULLIF(warehouse, ''), 'Main Location')
           ${whFilter}
         ) wh ON wh.stock_guid = s.name AND wh.company_id = s.company_id
         WHERE s.company_id=$1 AND s.closing_qty < 0
@@ -6484,7 +6517,7 @@ router.get('/reports/unmatched', authMiddleware, async (req, res) => {
  * Recursive Direct/Indirect expense group tree.
  * Matches charge-ledgers pattern — ledgers under sub-groups (e.g. parent='Salary'
  * under 'Indirect Expenses') must count, not only direct children of the root.
- * $1 = company_guid in the CTE.
+ * $1 = companies.id in the CTE.
  */
 const EXPENSE_GROUPS_CTE = `
 WITH RECURSIVE expense_groups AS (
@@ -6501,7 +6534,7 @@ WITH RECURSIVE expense_groups AS (
    WHERE child.company_id=$1
 )`;
 
-async function sumExpenseAmount(companyGuid, from, to) {
+async function sumExpenseAmount(companyId, from, to) {
   if (!from || !to) return 0;
   const { rows } = await query(
     `${EXPENSE_GROUPS_CTE}
