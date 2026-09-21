@@ -2,7 +2,11 @@
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
-import { processIngestedData } from '../controllers/ingestProcessor.js';
+import { processIngestedData, backfillTaxTransactions } from '../controllers/ingestProcessor.js';
+import {
+  reconcileStockOpeningsFromTransactions,
+  backfillStockMovementVoucherTypes,
+} from '../utils/ingestPostReconcile.js';
 import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
 import { consumeApprovedHardSync } from '../services/hardSyncService.js';
 import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
@@ -475,8 +479,8 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
 router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
-  const { uploadId, isHardSync, voucherCount, ledgerCount, stockCount, recordCount } = body || {};
-  let { companyGuid } = body || {};
+  const { uploadId, isHardSync, recordCount } = body || {};
+  let { companyGuid, voucherCount, ledgerCount, stockCount } = body || {};
   const deviceId = req.headers['device-id'];
 
   try {
@@ -530,6 +534,50 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       const raw = warnRows[0]?.warnings;
       ingestWarnings = Array.isArray(raw) ? raw : [];
     }
+
+    if (resolvedCompanyId) {
+      try {
+        const { rows: sanity } = await query(
+          `SELECT
+             (SELECT COUNT(*) FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE
+                AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%')::int AS sales,
+             (SELECT COUNT(*) FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE
+                AND voucher_type ILIKE '%Purchase%' AND voucher_type NOT ILIKE '%Order%')::int AS purch,
+             (SELECT COUNT(*) FROM voucher_inventory_items WHERE company_id=$1)::int AS vii,
+             (SELECT COUNT(*) FROM stock_transactions WHERE company_id=$1
+                AND COALESCE(voucher_type,'') <> 'Opening Balance')::int AS movements,
+             (SELECT COUNT(*) FROM groups WHERE company_id=$1)::int AS groups,
+             (SELECT COUNT(*) FROM warehouses WHERE company_id=$1)::int AS warehouses,
+             (SELECT COUNT(*) FROM vouchers WHERE company_id=$1)::int AS vouchers,
+             (SELECT COUNT(*) FROM ledgers WHERE company_id=$1)::int AS ledgers,
+             (SELECT COUNT(*) FROM stocks WHERE company_id=$1)::int AS stocks`,
+          [resolvedCompanyId]
+        );
+        const s = sanity[0] || {};
+        // Do not copy live table totals into this-run import counts.
+        if ((s.sales > 0 || s.purch > 0) && s.vii === 0 && s.movements === 0) {
+          ingestWarnings.push({
+            code: 'inventory_collection_empty',
+            message: `sales=${s.sales} purchase=${s.purch} but voucher_inventory_items=0 and stock movements=0`,
+          });
+        }
+        if (s.groups === 0) {
+          ingestWarnings.push({ code: 'groups_empty', message: 'groups table has 0 rows after sync' });
+        }
+        if (s.warehouses === 0) {
+          ingestWarnings.push({ code: 'warehouses_empty', message: 'warehouses table has 0 rows after sync' });
+        }
+        if (uploadId && ingestWarnings.length) {
+          await query(
+            `UPDATE ingest_uploads SET warnings = $2::jsonb WHERE id = $1 AND device_id = $3`,
+            [uploadId, JSON.stringify(ingestWarnings), deviceId]
+          );
+        }
+      } catch (sanityErr) {
+        console.warn('[INGEST] completeness sanity failed:', sanityErr.message);
+      }
+    }
+
     const ingestOutcome = ingestWarnings.length ? 'partial' : 'complete';
     await query(
       'UPDATE ingest_uploads SET status = $1, completed_at = $2 WHERE id = $3 AND device_id = $4',
@@ -618,32 +666,44 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       }
     }
 
-    // V2 Monitoring: compute record counts from DB for validation
     let recordCounts = {};
-    if (resolvedCompanyId) {
+    let collectionCounts = {};
+    if (uploadId) {
       try {
-        const [vCount, lCount, sCount, vleCount] = await Promise.all([
-          query('SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1', [resolvedCompanyId]),
-          query('SELECT COUNT(*) as c FROM ledgers WHERE company_id=$1', [resolvedCompanyId]),
-          query('SELECT COUNT(*) as c FROM stocks WHERE company_id=$1', [resolvedCompanyId]),
-          query('SELECT COUNT(*) as c FROM voucher_ledger_entries WHERE company_id=$1', [resolvedCompanyId]),
-        ]);
+        const { rows: ccRows } = await query(
+          `SELECT collection_counts FROM ingest_uploads WHERE id = $1`,
+          [uploadId]
+        );
+        collectionCounts = ccRows[0]?.collection_counts || {};
         recordCounts = {
-          vouchers: parseInt(vCount.rows[0]?.c || 0),
-          ledgers:  parseInt(lCount.rows[0]?.c || 0),
-          stocks:   parseInt(sCount.rows[0]?.c || 0),
-          voucher_ledger_entries: parseInt(vleCount.rows[0]?.c || 0),
+          this_run: collectionCounts,
+          requested: {
+            vouchers: voucherCount || 0,
+            ledgers: ledgerCount || 0,
+            stocks: stockCount || 0,
+            records: recordCount || 0,
+          },
         };
-        if (isHardSync && recordCounts.vouchers < 10) {
-          console.warn(`[INGEST] ⚠️ Hard sync completed but only ${recordCounts.vouchers} vouchers — may indicate sync issue`);
-        }
-        console.log(`[INGEST] Record counts post-sync:`, recordCounts);
+        console.log(`[INGEST] This-run collection counts:`, collectionCounts);
       } catch (countErr) {
-        console.warn('[INGEST] Count check failed:', countErr.message);
+        console.warn('[INGEST] collection_counts read failed:', countErr.message);
       }
     }
 
     console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
+
+    if (resolvedCompanyId) {
+      try {
+        await reconcileStockOpeningsFromTransactions(resolvedCompanyId);
+      } catch (e) {
+        console.warn('[INGEST] opening reconcile at complete failed:', e.message);
+      }
+      try {
+        await backfillStockMovementVoucherTypes(resolvedCompanyId);
+      } catch (e) {
+        console.warn('[INGEST] voucher_type backfill at complete failed:', e.message);
+      }
+    }
 
     // Backfill tax_transactions.voucher_date from vouchers where it's null
     // Handles cases where tax extraction ran before the voucher date was stored
@@ -696,7 +756,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       status: true,
       outcome: ingestOutcome,
       message: ingestOutcome === 'partial' ? partialMessage : 'Sync complete',
-      data: { recordCounts, warnings: ingestWarnings },
+      data: { recordCounts, collectionCounts, warnings: ingestWarnings },
     });
   } catch (err) {
     console.error('[INGEST] complete error:', err.message);

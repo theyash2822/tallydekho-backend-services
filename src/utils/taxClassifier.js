@@ -8,6 +8,7 @@ const DEFAULT_TAX_PATTERNS = [
   { taxType: 'EXCISE_DUTY',     keywords: ['excise duty', 'excise'] },
   { taxType: 'SERVICE_TAX',     keywords: ['service tax', 'swachh bharat', 'krishi kalyan'] },
   { taxType: 'CESS',            keywords: ['cess', 'education cess', 'compensation cess'] },
+  { taxType: 'GST',             keywords: ['cgst', 'sgst', 'igst', 'utgst'] },
   { taxType: 'IMPORT_DUTY',     keywords: ['import duty', 'custom duty', 'customs duty', 'basic customs duty', 'bcd', 'igst on import'] },
   { taxType: 'EXPORT_DUTY',     keywords: ['export duty'] },
   { taxType: 'WITHHOLDING_TAX', keywords: ['withholding tax', 'withholding', 'wht'] },

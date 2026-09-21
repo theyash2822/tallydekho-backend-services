@@ -3386,11 +3386,31 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
                    AND stc.type = 'outward'
                    AND stc.date::date >= (NOW() - INTERVAL '90 days')::date
                ) AS avg_daily_consumption,
-               COALESCE(s.opening_qty, 0)
+               COALESCE(
+                 NULLIF(s.opening_qty, 0),
+                 (
+                   SELECT SUM(ABS(stob.qty))
+                   FROM stock_transactions stob
+                   WHERE stob.company_id = s.company_id
+                     AND stob.stock_guid = s.name
+                     AND stob.voucher_type = 'Opening Balance'
+                 ),
+                 0
+               )
                + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
                - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0) AS fy_closing_qty,
                COALESCE(NULLIF(s.closing_rate, 0), NULLIF(s.opening_rate, 0), 0) * (
-                 COALESCE(s.opening_qty, 0)
+                 COALESCE(
+                   NULLIF(s.opening_qty, 0),
+                   (
+                     SELECT SUM(ABS(stob.qty))
+                     FROM stock_transactions stob
+                     WHERE stob.company_id = s.company_id
+                       AND stob.stock_guid = s.name
+                       AND stob.voucher_type = 'Opening Balance'
+                   ),
+                   0
+                 )
                  + COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0)
                  - COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
                ) AS fy_closing_value
@@ -3400,8 +3420,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
         -- TODO: future — model Physical Stock as absolute stock count event (last count wins, movements apply on top)
         LEFT JOIN stock_transactions st ON st.stock_guid = s.name AND st.company_id = s.company_id
           AND st.date <= $3
-          AND st.voucher_type != 'Physical Stock'
-          AND COALESCE(st.voucher_type, '') != 'Opening Balance'
+          AND COALESCE(st.voucher_type, '') NOT IN ('Physical Stock', 'Opening Balance')
         WHERE s.company_id=$1
           AND (s.name ILIKE $2 OR s.alias ILIKE $2 OR s.hsn ILIKE $2)
         GROUP BY s.guid, s.company_id, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,

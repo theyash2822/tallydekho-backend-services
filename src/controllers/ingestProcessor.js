@@ -39,6 +39,15 @@ import {
   formatLedgerDisplayName,
   pickPartyNameFromLedgerEntries,
 } from '../utils/resolveVoucherListParty.js';
+import {
+  reconcileStockOpeningsFromTransactions,
+  backfillStockMovementVoucherTypes,
+  recordCollectionStat,
+} from '../utils/ingestPostReconcile.js';
+export {
+  reconcileStockOpeningsFromTransactions,
+  backfillStockMovementVoucherTypes,
+};
 
 /** Tally Duties & Taxes: RateOfTaxCalculation exported as TAXRATE in LedgerFull.xml */
 function extractLedgerTaxRate(r) {
@@ -163,14 +172,19 @@ function extractDispatchDetails(r) {
 // Extract and save tax transactions from voucher ledger entries.
 // Called after voucher + ledger entries are committed. Never throws — isolates
 // tax extraction failures from the main sync.
-async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRow) {
+async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRow, companyId = null) {
+  const cid = companyId != null ? Number(companyId) : currentCompanyId();
+  if (cid == null) {
+    console.warn('[TaxExtract] skipped — companyId required', voucherGuid);
+    return;
+  }
   try {
     const { rows: lines } = await dbQuery(
       `SELECT vle.ledger_name, vle.amount, vle.dr_cr, l.parent, l.nature
        FROM voucher_ledger_entries vle
        LEFT JOIN ledgers l ON l.name = vle.ledger_name AND l.company_id = vle.company_id
        WHERE vle.voucher_guid = $1 AND vle.company_id = $2`,
-      [voucherGuid, currentCompanyId()]
+      [voucherGuid, cid]
     );
 
     for (const line of lines) {
@@ -189,7 +203,7 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
           party_ledger_name, tax_type, tax_ledger_name,
           tax_ledger_parent, tax_amount, transaction_nature,
           financial_year, narration, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, $15)
-        ON CONFLICT (company_guid, voucher_guid, tax_type, tax_ledger_name, voucher_alter_id)
+        ON CONFLICT (company_id, voucher_guid, tax_type, tax_ledger_name, voucher_alter_id)
         DO UPDATE SET
           company_id = COALESCE(EXCLUDED.company_id, tax_transactions.company_id), tax_amount   = EXCLUDED.tax_amount,
           -- Never overwrite a real date with null (use COALESCE to keep existing date if new value is null)
@@ -201,7 +215,7 @@ async function extractAndSaveTaxTransactions(voucherGuid, companyGuid, voucherRo
         voucherRow.party_name, taxType, line.ledger_name,
         line.parent || null, Math.abs(parseFloat(line.amount) || 0),
         nature, voucherRow.financial_year, voucherRow.narration,
-      , currentCompanyId()]);
+                cid]);
     }
   } catch (e) {
     // Never break sync on tax extraction failure
@@ -229,7 +243,7 @@ export async function backfillTaxTransactions(companyGuid, companyId = null) {
       party_name:     v.party_name,
       financial_year: v.financial_year,
       narration:      v.narration,
-    });
+    }, id);
   }
   console.log(`[TaxBackfill] Processed ${vouchers.length} vouchers for company_id=${id}`);
   return vouchers.length;
@@ -850,6 +864,11 @@ async function processStocks(data, companyGuid) {
   for (const s of confirmedStocks) {
     await confirmAppMasterFromIngest(companyGuid, s.name, ['item', 'alter_stock_item'], s.guid);
   }
+  try {
+    await reconcileStockOpeningsFromTransactions(currentCompanyId());
+  } catch (e) {
+    console.warn('[INGEST] opening reconcile after stocks failed:', e.message);
+  }
 }
 
 async function processVouchers(data, companyGuid) {
@@ -1004,7 +1023,7 @@ async function processVouchers(data, companyGuid) {
                 parseFloat(entry.RATE || entry.Rate || 0),
                 parseFloat(entry.GSTRATE || entry.GstRate || 0),
                 entry.HSNCODE || entry.HsnCode || null,
-              , currentCompanyId()]);
+                currentCompanyId()]);
             } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
 
             // Gap 1: Extract nested Batchallocations from AllVoucher.xml inventory entries
@@ -1685,7 +1704,7 @@ async function processVouchers(data, companyGuid) {
     // Tax extraction — runs after COMMIT so ledger entries are visible
     // Never blocks or throws; failures are logged only
     for (const { guid: vGuid, row } of voucherRowsForTax) {
-      await extractAndSaveTaxTransactions(vGuid, companyGuid, row);
+      await extractAndSaveTaxTransactions(vGuid, companyGuid, row, currentCompanyId());
     }
   } catch (e) {
     await client.query('ROLLBACK');
@@ -1794,9 +1813,12 @@ async function processStockTransactions(data, companyGuid) {
           type,
           warehouse,
           now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
+      } catch (e) {
+        console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200));
+        await recordIngestWarning('stock_transaction_insert', e.message);
+      }
     }
 
     await client.query('COMMIT');
@@ -1843,6 +1865,7 @@ async function processStockTransactions(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}`);
+    await recordCollectionStat('StockTransaction.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved) });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockTx transaction failed:', e.message);
@@ -1916,9 +1939,12 @@ async function processGroupMasters(data, companyGuid) {
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
           parseInt(r.AlterId || r.ALTERID || 0), now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
-      } catch (e) { console.warn('[DB] Group insert failed:', e.message); }
+      } catch (e) {
+        console.warn('[DB] Group insert failed:', e.message);
+        await recordIngestWarning('group_insert', e.message);
+      }
     }
     await client.query('COMMIT');
     console.log(`[DB] Groups: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -2312,9 +2338,12 @@ async function processVoucherInventoryItems(data, companyGuid) {
           r.UNIT       || r.Unit       || null,
           r.HSN        || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
-      } catch (e) { console.warn('[DB] VoucherInvItem insert failed:', e.message); }
+      } catch (e) {
+        console.warn('[DB] VoucherInvItem insert failed:', e.message);
+        await recordIngestWarning('voucher_inventory_insert', e.message);
+      }
     }
     await client.query('COMMIT');
     console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -2583,7 +2612,7 @@ async function processBillOutstanding(data, companyGuid) {
           normalizeDate(r.BillDate), normalizeDate(r.DueDate),
           amount, pending,
           drCr, parseInt(r.AlterId || 0) || 0, now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }
@@ -2638,7 +2667,8 @@ async function processStockOpeningBalance(data, companyGuid) {
       const warehouse = r.GodownName || r.GODOWNNAME || r.GODOWN || 'Main Location';
       const qty       = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
       const rate      = parseFloat(r.OpeningRate    || r.OPENINGRATE    || 0);
-      const value     = parseFloat(r.OpeningValue   || r.OPENINGVALUE   || 0);
+      const rawVal    = parseFloat(r.OpeningValue   ?? r.OPENINGVALUE);
+      const value     = Number.isFinite(rawVal) ? rawVal : (Math.abs(qty) * (Number.isFinite(rate) ? rate : 0));
       if (!name || isNaN(qty) || qty === 0) continue;
 
       // synthetic voucher_guid unique per stock+warehouse for ON CONFLICT
@@ -2650,18 +2680,24 @@ async function processStockOpeningBalance(data, companyGuid) {
           ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
             qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at,
             company_id=COALESCE(EXCLUDED.company_id, stock_transactions.company_id)
-        `, [name, companyGuid, syntheticGuid, Math.abs(qty), rate, Math.abs(value), warehouse, currentCompanyId()]);
+        `, [name, companyGuid, syntheticGuid, Math.abs(qty), Number.isFinite(rate) ? rate : 0, Number.isFinite(value) ? Math.abs(value) : 0, warehouse, currentCompanyId()]);
         txInserted++;
       } catch (e) { console.warn('[DB] StockOpening tx insert failed:', e.message, name, warehouse); }
     }
 
     await client.query('COMMIT');
     console.log(`[DB] StockOpening: updated ${updated} stocks, ${txInserted} warehouse tx rows for ${companyGuid}`);
+    await recordCollectionStat('StockOpeningBalance.xml', { received: data.length, saved: txInserted, rejected: Math.max(0, data.length - txInserted) });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockOpening failed:', e.message);
   } finally {
     client.release();
+  }
+  try {
+    await reconcileStockOpeningsFromTransactions(currentCompanyId());
+  } catch (e) {
+    console.warn('[INGEST] opening reconcile after StockOpening failed:', e.message);
   }
 
   // Recompute closing_qty = opening_qty + net real movements
@@ -2874,14 +2910,17 @@ async function processStockFyValuation(data, companyGuid) {
   // Group by financial_year so each FY is handled correctly
   // (multiple FYs may arrive in one batch when several years are synced together)
   const fyGroups = {};
+  let skippedNoFy = 0;
+  let skippedNoName = 0;
   for (const r of data) {
     const fy = r._FINANCIAL_YEAR;
-    if (!fy) continue;
+    if (!fy) { skippedNoFy++; continue; }
     if (!fyGroups[fy]) fyGroups[fy] = [];
     fyGroups[fy].push(r);
   }
   if (Object.keys(fyGroups).length === 0) {
-    console.warn('[DB] StockFyValuation: no financial_year on records — skipping');
+    console.warn(`[DB] StockFyValuation: no financial_year on records — skipping ${data.length}`);
+    await recordCollectionStat('StockValuation.xml', { received: data.length, saved: 0, rejected: data.length, reason: 'missing__FINANCIAL_YEAR' });
     return;
   }
   try {
@@ -2890,8 +2929,11 @@ async function processStockFyValuation(data, companyGuid) {
 
     for (const [financialYear, records] of Object.entries(fyGroups)) {
     for (const r of records) {
-      const name = r.Name || r.NAME || '';
-      if (!name) continue;
+      const name = tallyName(r) || r.Name || r.NAME || r.STOCKITEMNAME || '';
+      if (!name) {
+        skippedNoName++;
+        continue;
+      }
 
       const openQty   = parseFloat(String(r.OpeningQty   || r.OPENINGQTY   || 0).replace(/[^0-9.-]/g, '')) || 0;
       const openRate  = parseFloat(String(r.OpeningRate  || r.OPENINGRATE  || 0).replace(/[^0-9.-]/g, '')) || 0;
@@ -2930,7 +2972,8 @@ async function processStockFyValuation(data, companyGuid) {
 
     await client.query('COMMIT');
     const fyList = Object.keys(fyGroups).join(', ');
-    console.log(`[DB] StockFyValuation: saved ${saved}/${data.length} for ${companyGuid} FYs: ${fyList}`);
+    console.log(`[DB] StockFyValuation: saved ${saved}/${data.length} for ${companyGuid} FYs: ${fyList} skippedNoFy=${skippedNoFy} skippedNoName=${skippedNoName}`);
+    await recordCollectionStat('StockValuation.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved), skippedNoFy, skippedNoName });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockFyValuation failed:', e.message);
@@ -2978,7 +3021,7 @@ async function processLedgerTransactions(data, companyGuid) {
           r.LedgerGuid || r.LEDGERGUID || null,
           Math.abs(amount),
           amount >= 0 ? 'Cr' : 'Dr',
-        , currentCompanyId()]);
+          currentCompanyId()]);
         itemsSaved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
 
@@ -3035,6 +3078,7 @@ async function processRecords(data, companyGuid, userId, deviceId) {
   }
   for (const [xml, records] of Object.entries(byXml)) {
     if (records.length === 0) continue;
+    await recordCollectionStat(xml, { received: records.length });
     const sample = records[0];
 
     if (xml === 'Voucher.xml') {
@@ -3196,6 +3240,12 @@ async function processAllVoucher(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}`);
+    await recordCollectionStat('AllVoucher.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved) });
+    try {
+      await backfillTaxTransactions(companyGuid, currentCompanyId());
+    } catch (e) {
+      console.warn('[INGEST] AllVoucher tax extract failed:', e.message);
+    }
     // Post-process: backfill gst_voucher_details from CGST/SGST ledger entries
     // This fixes cases where Tally's $$GSTTaxableValue returns 0 but ledger entries have real amounts
     await dbQuery(`
@@ -3254,11 +3304,14 @@ async function processWarehouses(data, companyGuid) {
           r.ParentGuid || null,
           r.Address || null,
           parseInt(r.AlterId || r.ALTERID || 0), now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
         const whGuid = r.Guid || r.GUID || null;
         if (whGuid) confirmedWarehouses.push({ name, guid: whGuid });
-      } catch (e) { console.warn('[DB] Warehouse insert failed:', e.message); }
+      } catch (e) {
+        console.warn('[DB] Warehouse insert failed:', e.message);
+        await recordIngestWarning('warehouse_insert', e.message);
+      }
     }
     await client.query('COMMIT');
     console.log(`[DB] Warehouses: saved ${saved}/${data.length} for ${companyGuid}`);
@@ -3275,7 +3328,7 @@ async function processUnits(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
     for (const r of data) {
-      const name = r.Name || r.NAME || '';
+      const name = tallyName(r) || r.Name || r.NAME || '';
       if (!name) continue;
       try {
         await client.query(`
@@ -3292,7 +3345,7 @@ async function processUnits(data, companyGuid) {
           r.ADDITIONAL_UNITS || null,
           r.CONVERSION || null,
           parseInt(r.ALTERID || r.AlterId || 0), now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] Unit insert failed:', e.message); }
     }
@@ -3308,7 +3361,7 @@ async function processVoucherTypes(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
     for (const r of data) {
-      const name = r.Name || r.NAME || '';
+      const name = tallyName(r) || r.Name || r.NAME || '';
       if (!name) continue;
       try {
         await client.query(`
@@ -3326,7 +3379,7 @@ async function processVoucherTypes(data, companyGuid) {
           !!(r.ISDEEMEDPOSITIVE === 'Yes' || r.ISDEEMEDPOSITIVE === '1'),
           !!(r.AFFECTSSTOCK === 'Yes' || r.AFFECTSSTOCK === '1'),
           parseInt(r.ALTERID || r.AlterId || 0), now(),
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] VoucherType insert failed:', e.message); }
     }
@@ -3410,7 +3463,7 @@ async function processBatchAllocations(data, companyGuid) {
           qty, rate,
           godownName,
           fy,
-        , currentCompanyId()]);
+          currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] BatchAllocation insert failed:', e.message, batchName); }
     }

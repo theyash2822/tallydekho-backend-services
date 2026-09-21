@@ -55,6 +55,14 @@ describe('CID query leftovers that blank Mobile/Web after pairing', () => {
     );
   });
 
+  it('FY stock items fall back to Opening Balance txs when stocks.opening_qty is 0', () => {
+    const fn = api.slice(api.indexOf("router.get('/stocks/items'"));
+    const fyPath = fn.slice(0, fn.indexOf('// No FY param'));
+    assert.match(fyPath, /voucher_type = 'Opening Balance'/);
+    assert.match(fyPath, /NULLIF\(s\.opening_qty, 0\)/);
+    assert.match(fyPath, /COALESCE\(st\.voucher_type, ''\) NOT IN \('Physical Stock', 'Opening Balance'\)/);
+  });
+
   it('negative-stock warehouse subquery projects company_id, not company_guid', () => {
     const fn = api.slice(api.indexOf("router.get('/stocks/negative-stock'"));
     const body = fn.slice(0, fn.indexOf("router.get('/stocks/expiry-schedule'"));
@@ -76,5 +84,21 @@ describe('ingest stock closing recompute uses company_id', () => {
   it('stock recompute failure records a partial warning instead of failing the sync', () => {
     assert.match(ingest, /recordIngestWarning\('stock_qty_recompute'/);
     assert.match(ingest, /async function recordIngestWarning/);
+  });
+
+  it('does not leave a hole before currentCompanyId() in ingest value arrays', () => {
+    assert.doesNotMatch(ingest, /,\s*\n\s*,\s*currentCompanyId\(\)/);
+    assert.match(ingest, /recordIngestWarning\('voucher_inventory_insert'/);
+    assert.match(ingest, /recordIngestWarning\('stock_transaction_insert'/);
+  });
+});
+
+describe('ingest complete completeness diagnostics', () => {
+  const ingestRoute = readFileSync(new URL('../routes/ingest.js', import.meta.url), 'utf8');
+
+  it('flags sales/purchase parents with zero inventory children', () => {
+    assert.match(ingestRoute, /inventory_collection_empty/);
+    assert.match(ingestRoute, /groups_empty/);
+    assert.match(ingestRoute, /warehouses_empty/);
   });
 });

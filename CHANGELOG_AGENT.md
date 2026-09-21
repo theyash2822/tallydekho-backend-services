@@ -1,3 +1,36 @@
+## 2026-09-21 — Stock opening persist, voucher_type, tax, counters
+
+After Hard Sync, Opening Balance txs existed but `stocks.opening_qty` stayed 0
+because StockOpening ran before masters. End-of-ingest now copies opening
+qty/rate/value from those txs. Movement `voucher_type` is copied from the
+parent voucher (TD1931-3-2026 = Sales). Tax extract uses
+`ON CONFLICT (company_id, …)` and receives a real company_id, so Other Taxes
+can populate. `sync_log` no longer copies live table totals as this-run
+import counts; per-collection JSON lives on `ingest_uploads.collection_counts`.
+
+---
+
+## 2026-09-21 — FY stock list qty when opening_qty is 0
+
+`GET /stocks/items?fy=` treated `stocks.opening_qty = 0` as a real opening and
+dropped movement rows whose `voucher_type` is NULL (`NULL != 'Physical Stock'`).
+After Hard Sync that made MILK GOLD −100 / then 5000 instead of Tally 4900.
+Opening now falls back to Opening Balance txs, and NULL voucher types count as
+normal inward/outward. Local API after restart: MILK GOLD 4900, Bottlle Orange
+Colour 2500.
+
+---
+
+## 2026-09-21 — Pre-release forensic: ingest company_id hole + FY tag
+
+Eleven ingest INSERTs passed `company_id` through a JS array hole (`undefined`),
+so inventory movements, groups, godowns, units, and bill outstanding were
+silently dropped while sync reported SUCCESS. `currentCompanyId()` is now the
+last real bind. `/ingest/complete` warns when sales/purchase exist but
+inventory children are 0. Opening stock `value` no longer stores NaN.
+
+---
+
 ## 2026-09-21 — Founder decisions: invite lock, partial sync, FY current
 
 Invite with `company_mode=NONE` is rejected (`COMPANY_ACCESS_REQUIRED`) after
