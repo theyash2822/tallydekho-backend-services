@@ -24,6 +24,22 @@ export function resolveViewCapability(req) {
   }
   if (u.includes('/cost-centre')) return 'ledgers.view';
   if (u.includes('/payment-mode') || u.includes('/payment_mode')) return 'vouchers.view';
+  // Picker endpoints used by Mobile create forms. Must map BEFORE the generic
+  // `/ledgers` test — `bank-ledgers` / `charge-ledgers` do NOT contain `/ledgers`
+  // (hyphen, not slash), so they previously returned null → 403 CAPABILITY_REQUIRED
+  // and every Cash / Bank / Logistics dropdown rendered empty.
+  if (
+    u.includes('/bank-ledgers')
+    || u.includes('/charge-ledgers')
+    || u.includes('/tax/ledgers')
+    || u.includes('/payment-modes')
+    || u.includes('/godowns')
+    || u.includes('/warehouses')
+    || u.includes('/cost-centres')
+    || u.includes('/cost_centres')
+  ) {
+    return 'ledgers.view';
+  }
   if (u.includes('/ledgers') || u.includes('/parties') || u.includes('/party') || u.includes('/ledger')) {
     return 'ledgers.view';
   }

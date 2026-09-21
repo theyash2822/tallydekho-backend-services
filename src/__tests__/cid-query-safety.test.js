@@ -55,6 +55,23 @@ describe('CID query leftovers that blank Mobile/Web after pairing', () => {
     );
   });
 
+  it('create-form picker routes map to ledgers.view (not null → 403)', () => {
+    for (const url of [
+      '/api/bank-ledgers?companyGuid=x&type=all',
+      '/api/charge-ledgers?companyGuid=x',
+      '/api/tax/ledgers?companyGuid=x',
+      '/api/parties?companyGuid=x',
+      '/api/godowns?companyGuid=x',
+      '/api/cost-centres?companyGuid=x',
+    ]) {
+      assert.equal(
+        resolveViewCapability({ originalUrl: url }),
+        'ledgers.view',
+        url
+      );
+    }
+  });
+
   it('FY stock items fall back to Opening Balance txs when stocks.opening_qty is 0', () => {
     const fn = api.slice(api.indexOf("router.get('/stocks/items'"));
     const fyPath = fn.slice(0, fn.indexOf('// No FY param'));
