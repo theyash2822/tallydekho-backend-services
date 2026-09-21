@@ -1,3 +1,16 @@
+## 2026-09-21 — Dual-write company fields + TALLY_WRITE / PDF metering
+
+All `app_vouchers` creates now write real `company_guid` (UUID) + `company_id`
+(numeric) — sales, purchase, orders, journal, contra, credit/debit notes,
+delivery, stock transfer/adjustment, proforma (receipt/payment already fixed).
+`GET/POST` preview/share polls tolerate legacy numeric-in-guid rows.
+Workspace owner wallet is charged **0.10** `TALLY_WRITE` per voucher create
+(idempotent on tdkRef) and **0.10** `PDF_GENERATE` on share-pdf (idempotent on
+`pdf:{tdkRef}`). `confirmAppMasterFromIngest` matches `company_guid`. Backend
+`cursor` `8494069`, server restarted on :3001.
+
+---
+
 ## 2026-09-21 — Stock opening persist, voucher_type, tax, counters
 
 After Hard Sync, Opening Balance txs existed but `stocks.opening_qty` stayed 0
