@@ -91,12 +91,32 @@ export async function buildStockDashboardInsights(query, companyId) {
   const totalValue = parseFloat(total[0]?.v || 0);
   const totalQty = parseFloat(total[0]?.qty || 0);
 
-  const { rows: low } = await query(`
+  // Low Stock tile = settings default_low_stock_level (same as mobile /stocks/low-stock)
+  const { rows: settingsRows } = await query(
+    'SELECT default_low_stock_level FROM company_inventory_settings WHERE company_id=$1 LIMIT 1',
+    [companyId]
+  );
+  const lowThreshold = Math.max(
+    0,
+    parseInt(settingsRows[0]?.default_low_stock_level ?? 20, 10) || 20,
+  );
+
+  const { rows: low } = await query(
+    `SELECT COUNT(*) as c
+     FROM stocks
+     WHERE company_id=$1
+       AND closing_qty > 0
+       AND closing_qty <= $2`,
+    [companyId, lowThreshold]
+  );
+
+  // Reorder Queue = Tally/item/group reorder_level (unchanged — separate from Low Stock)
+  const { rows: reorder } = await query(`
     SELECT COUNT(*) as c, COALESCE(SUM(s.closing_value), 0) as reorder_value
     FROM stocks s
     LEFT JOIN groups g ON g.company_id = s.company_id AND g.name = s.group_name
     WHERE s.company_id=$1
-      AND s.closing_qty > 0
+      AND s.closing_qty >= 0
       AND (
         (s.reorder_level > 0 AND s.closing_qty <= s.reorder_level)
         OR (s.reorder_level = 0 AND g.reorder_level > 0 AND s.closing_qty <= g.reorder_level)
@@ -110,7 +130,8 @@ export async function buildStockDashboardInsights(query, companyId) {
 
   const lowStock = parseInt(low[0]?.c || 0, 10);
   const outOfStock = parseInt(out[0]?.c || 0, 10);
-  const reorderValue = parseFloat(low[0]?.reorder_value || 0);
+  const reorderQueueCount = parseInt(reorder[0]?.c || 0, 10);
+  const reorderValue = parseFloat(reorder[0]?.reorder_value || 0);
 
   const { rows: wh } = await query(
     'SELECT COUNT(*) as c FROM warehouses WHERE company_id=$1',
@@ -226,7 +247,7 @@ export async function buildStockDashboardInsights(query, companyId) {
     agedInventoryValue: Math.round(agedInventoryValue * 100) / 100,
     agedInventoryDays: 90,
     recentMovements,
-    reorderQueueCount: lowStock,
+    reorderQueueCount,
     reorderValue: Math.round(reorderValue * 100) / 100,
     turnover,
     valueTrendPct,
