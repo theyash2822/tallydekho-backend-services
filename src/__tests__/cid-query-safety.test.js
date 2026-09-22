@@ -55,6 +55,23 @@ describe('CID query leftovers that blank Mobile/Web after pairing', () => {
     );
   });
 
+  it('settings and GST report routes are mapped so the owner is not CAPABILITY_REQUIRED', () => {
+    const cases = [
+      ['/api/company/x/compliance-config', '__scope_only__'],
+      ['/api/company/x/logo', '__scope_only__'],
+      ['/api/company/capabilities', '__scope_only__'],
+      ['/api/reports/unmatched', 'gst.view'],
+      ['/api/reports/other-taxes/summary', 'gst.view'],
+      ['/api/reports/other-taxes/transactions', 'gst.view'],
+      ['/api/reports/other-taxes/late-challans', 'gst.view'],
+      ['/api/reports/other-taxes/backfill', 'gst.view'],
+      ['/api/reminders/send', 'vouchers.view'],
+    ];
+    for (const [url, cap] of cases) {
+      assert.equal(resolveViewCapability({ originalUrl: url }), cap, url);
+    }
+  });
+
   it('create-form picker routes map to ledgers.view (not null → 403)', () => {
     for (const url of [
       '/api/bank-ledgers?companyGuid=x&type=all',

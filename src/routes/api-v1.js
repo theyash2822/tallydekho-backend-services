@@ -40,7 +40,9 @@ import { computeTrendPct, addDays } from '../modules/kpi/trendUtil.js';
 import { listCostCentresForCompany } from '../services/costCentreListService.js';
 import {
   resolveVoucherListParty,
+  resolveSyncedPartyName,
 } from '../utils/resolveVoucherListParty.js';
+import { voucherToAppCompanyJoinSql } from '../utils/appVoucherCompanyMatch.js';
 import {
   enrichNotification,
   stockNotification,
@@ -1650,7 +1652,7 @@ const VOUCHER_LIST_SELECT = `
       LEFT JOIN LATERAL (
         SELECT av.tdk_reference_no, av.current_entry_type, av.original_entry_type
         FROM app_vouchers av
-        WHERE av.company_id = v.company_id
+        WHERE ${voucherToAppCompanyJoinSql('v', 'av')}
           AND av.tally_voucher_no = v.voucher_number
           AND av.voucher_date::text = v.date
           AND (
@@ -2615,6 +2617,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
     let q = `
       SELECT DISTINCT
         v.*,
+        COALESCE(NULLIF(TRIM(av.party_name), ''), NULLIF(TRIM(v.party_name), '')) AS party_name,
         'posted' as _queue_status,
         wq.id as _queue_id,
         av.tdk_reference_no,
@@ -2643,7 +2646,7 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
       -- Tally rows across the years (Cartesian collision). The extra JOIN predicates collapse
       -- the fanout to exactly 1 Tally row per app_voucher.
       JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number
-        AND av.company_id = v.company_id
+        AND ${voucherToAppCompanyJoinSql('v', 'av')}
         AND av.voucher_date::text = v.date
         -- When TDK reference exists, use it as the primary identity guard.
         -- This prevents fan-out when Tally allows duplicate voucher numbers
@@ -2920,28 +2923,66 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
     );
     if (!vRows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Voucher not found' } });
     const v = vRows[0];
-    // Inventory items (for Sales/Purchase vouchers)
-    const { rows: items } = await query('SELECT * FROM voucher_inventory_items WHERE voucher_guid=$1 AND company_id=$2 ORDER BY id', [v.guid, companyId]);
+    // Inventory items — HSN often lives on the stock master, not the voucher line
+    // (AllVoucher sync does not always stamp HSNCODE on inventory entries).
+    const { rows: items } = await query(
+      `SELECT vi.*,
+              COALESCE(NULLIF(vi.hsn, ''), s.hsn, '') AS hsn
+         FROM voucher_inventory_items vi
+         LEFT JOIN stocks s
+           ON s.company_id = vi.company_id
+          AND LOWER(TRIM(s.name)) = LOWER(TRIM(vi.stock_item_name))
+        WHERE vi.voucher_guid = $1 AND vi.company_id = $2
+        ORDER BY vi.id`,
+      [v.guid, companyId]
+    );
     // GST details
     const { rows: gst } = await query('SELECT * FROM gst_voucher_details WHERE voucher_guid=$1 AND company_id=$2 LIMIT 1', [v.guid, companyId]);
     // Company info — full profile
     const { rows: co } = await query('SELECT name, formal_name, gstin, pan, phone, mobile, email, website, address, state, pincode, country FROM companies WHERE id=$1 LIMIT 1', [companyId]);
-    // Party ledger details (GSTIN, address etc) — state_name feeds Place of Supply on the print
-    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode FROM ledgers WHERE company_id=$1 AND name=$2 LIMIT 1', [companyId, v.party_name || '']);
     // Ledger entries — used to compute the TRUE party amount (not v.amount which may be wrong)
     const { rows: ledgerEntries } = await query(
       'SELECT ledger_name, amount, dr_cr FROM voucher_ledger_entries WHERE voucher_guid=$1 AND company_id=$2 ORDER BY ABS(amount) DESC',
       [v.guid, companyId]
     );
-    // Party amount = the Dr entry for the party ledger (what party owes / paid)
-    const partyEntry = ledgerEntries.find(e => e.ledger_name === v.party_name);
-    const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(v.amount||'0');
     // App voucher payload — dispatch_details, collect_payment, narration (from app, not Tally)
     const { rows: avRows } = await query(
-      `SELECT payload FROM app_vouchers WHERE tally_voucher_no=$1 AND company_id=$2 LIMIT 1`,
+      `SELECT payload, party_name FROM app_vouchers
+        WHERE tally_voucher_no=$1
+          AND (company_id::text = $2::text OR company_guid = $2::text)
+        LIMIT 1`,
       [v.voucher_number, companyId]
     ).catch(() => ({ rows: [] }));
     const avPayload = avRows[0]?.payload || null;
+    // Prefer app_vouchers party; Tally often leaves sales party NULL and stamps
+    // Receipt PartyName with the bank ledger (e.g. "Bank of India…" instead of customer).
+    const partyName = resolveSyncedPartyName({
+      voucherType: v.voucher_type,
+      storedParty: v.party_name,
+      appParty: avPayload?.partyLedger || avPayload?.partyName || avRows[0]?.party_name,
+      ledgerEntries,
+    });
+    if (partyName) v.party_name = partyName;
+    // Party ledger details (GSTIN, address etc) — state_name feeds Place of Supply on the print
+    const { rows: partyLedger } = await query('SELECT name, gstin, pan, phone, mobile, email, address, state_name, pincode FROM ledgers WHERE company_id=$1 AND name=$2 LIMIT 1', [companyId, partyName || '']);
+    // Party amount = the Dr entry for the party ledger (what party owes / paid)
+    const partyEntry = ledgerEntries.find(e => e.ledger_name === partyName);
+    const partyAmount = partyEntry ? Math.abs(parseFloat(partyEntry.amount||'0')) : parseFloat(v.amount||'0');
+    const appItems = Array.isArray(avPayload?.items) ? avPayload.items : [];
+    const fallbackLedger = avPayload?.salesLedger || avPayload?.purchaseLedger || null;
+    const itemsWithLedger = items.map((it) => {
+      const name = String(it.stock_item_name || '').trim().toLowerCase();
+      const match = appItems.find((a) =>
+        String(a.itemName || a.name || '').trim().toLowerCase() === name
+      );
+      const salesLedger = match?.salesLedger || match?.purchaseLedger || match?.ledgerName || fallbackLedger;
+      const hsn = it.hsn || match?.hsn || match?.hsnCode || '';
+      return {
+        ...it,
+        ...(salesLedger ? { sales_ledger: salesLedger } : {}),
+        ...(hsn ? { hsn } : {}),
+      };
+    });
     // Compliance acknowledgements — the IRN band and e-Way Bill line on the print.
     const [{ rows: eInv }, { rows: eWb }] = await Promise.all([
       query('SELECT irn, ack_no, ack_date, qr_code, status FROM e_invoice_details WHERE voucher_guid=$1 AND company_id=$2 LIMIT 1', [v.guid, companyId]).catch(() => ({ rows: [] })),
@@ -2951,7 +2992,7 @@ router.get('/vouchers/:id', authMiddleware, async (req, res) => {
       success: true,
       data: {
         voucher: { ...v, party_amount: partyAmount }, // party_amount = authoritative per-party amount
-        items,
+        items: itemsWithLedger,
         gst: gst[0] || null,
         company: co[0] || null,
         party: partyLedger[0] || null,
@@ -5840,7 +5881,12 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     // 8. Dispatch details (from request or from app_vouchers payload)
     let details = dispatchDetails;
     if (!details) {
-      const { rows: avRows } = await query(`SELECT payload FROM app_vouchers WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => ({ rows: [] }));
+      const { rows: avRows } = await query(
+        `SELECT payload FROM app_vouchers
+          WHERE tally_voucher_no=$2
+            AND (company_id::text = $1::text OR company_guid = $1::text)`,
+        [companyId, voucher.voucher_number]
+      ).catch(() => ({ rows: [] }));
       details = avRows[0]?.payload?.dispatch_details;
     }
     if (!details?.dispatch_from || !details?.ship_to) {
@@ -5852,13 +5898,13 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
     const ewbCreds = userRows[0]?.integration_settings?.ewaybill || userRows[0]?.integration_settings?.ewb || {};
 
     // Mark as generating
-    await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generating', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     // Call EWB generator
     const ewbResult = await generateEWB(companyId, voucher, coRows[0], ewbCreds, details).catch(e => ({ _error: e.message }));
 
     if (ewbResult._error) {
-      await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no=$3`, [ewbResult._error, companyId, voucher.voucher_number]).catch(() => {});
+      await query(`UPDATE app_vouchers SET e_way_bill_status='failed', sync_error=$1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $2::text OR company_guid = $2::text) AND tally_voucher_no=$3`, [ewbResult._error, companyId, voucher.voucher_number]).catch(() => {});
       return res.status(500).json({ success: false, error: { code: 'EWB_FAILED', message: ewbResult._error } });
     }
 
@@ -5880,7 +5926,7 @@ router.post('/ewaybills/generate', authMiddleware, async (req, res) => {
         error: { code: 'EWB_NOT_RECORDED', message: 'E-Way Bill was generated but could not be saved', ewbNo },
       });
     }
-    await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
+    await query(`UPDATE app_vouchers SET e_way_bill_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=$2`, [companyId, voucher.voucher_number]).catch(() => {});
 
     res.json({ success: true, data: { ewbNo, ewbDate, validUpto } });
   } catch (err) {
@@ -5911,7 +5957,7 @@ router.post('/ewaybills/cancel', authMiddleware, async (req, res) => {
     }
     await query(
       `UPDATE app_vouchers SET e_way_bill_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-       WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
+       WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
       [companyId, voucherGuid]
     ).catch(() => {});
     res.json({ success: true, message: 'E-Way Bill cancelled' });
@@ -6064,7 +6110,7 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
 
     // -- 2. Mark as generating ------------------------------------------------
     await query(
-      `UPDATE app_vouchers SET e_invoice_status = 'generating', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no = $2`,
+      `UPDATE app_vouchers SET e_invoice_status = 'generating', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no = $2`,
       [companyId, voucher.voucher_number]
     ).catch(() => {});
 
@@ -6080,7 +6126,7 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
         [voucherGuid, companyId, companyGuid, irnResult.error]
       );
       await query(
-        `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$2 AND tally_voucher_no = $3`,
+        `UPDATE app_vouchers SET e_invoice_status = 'failed', sync_error = $1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $2::text OR company_guid = $2::text) AND tally_voucher_no = $3`,
         [irnResult.error, companyId, voucher.voucher_number]
       ).catch(() => {});
       return res.status(500).json({ success: false, error: { code: 'IRN_FAILED', message: irnResult.error } });
@@ -6102,7 +6148,7 @@ router.post('/einvoice/generate', authMiddleware, async (req, res) => {
     );
     // Update app_vouchers
     await query(
-      `UPDATE app_vouchers SET e_invoice_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id=$1 AND tally_voucher_no=$2`,
+      `UPDATE app_vouchers SET e_invoice_status='generated', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=$2`,
       [companyId, voucher.voucher_number]
     ).catch(() => {});
 
@@ -6128,7 +6174,7 @@ router.post('/einvoice/cancel', authMiddleware, async (req, res) => {
     await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     await query(
       `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-        WHERE company_id=$1 AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
+        WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
       [companyId, voucherGuid]
     ).catch(() => {});
     res.json({ success: true, message: 'IRN cancelled successfully' });

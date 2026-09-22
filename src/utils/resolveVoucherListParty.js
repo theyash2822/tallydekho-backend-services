@@ -36,7 +36,67 @@ function ledgerPriority(name = '') {
   if (/\b(cgst|sgst|igst|utgst|gst|cess|tax)\b/i.test(n)) return 6;
   if (/\b(cash|bank)\b/i.test(n)) return 5;
   if (/\b(sales|purchase)\b/i.test(n) && !/order|return/i.test(n)) return 4;
+  if (/round\s*(ed)?\s*off|transport|freight|expense|charge/i.test(n)) return 3;
   return 0;
+}
+
+/** Tally often puts the bank/cash ledger into PartyName on Receipt / Payment. */
+export function isBankOrCashLedger(name = '') {
+  return /\b(bank|cash|petty\s*cash|od\s*a\/?c|overdraft)\b/i.test(String(name || ''));
+}
+
+function entrySide(e = {}) {
+  const side = String(e.dr_cr || e.drCr || '').toLowerCase();
+  if (side === 'dr' || side === 'debit' || side === 'd') return 'dr';
+  if (side === 'cr' || side === 'credit' || side === 'c') return 'cr';
+  const amt = parseFloat(e.amount ?? e.Amount ?? 0);
+  if (!Number.isNaN(amt) && amt !== 0) return amt < 0 ? 'dr' : 'cr';
+  return '';
+}
+
+/**
+ * Prefer the real party/customer ledger over bank/sales/tax lines.
+ * Receipt: party is usually Cr; Payment: party is usually Dr.
+ * Sales: party is Dr; Purchase: party is Cr.
+ */
+export function resolveSyncedPartyName({
+  voucherType = '',
+  storedParty = null,
+  appParty = null,
+  ledgerEntries = [],
+} = {}) {
+  const app = formatLedgerDisplayName(appParty) || String(appParty || '').trim();
+  if (app) return app;
+
+  const vt = String(voucherType || '').toLowerCase();
+  const isReceipt = vt.includes('receipt');
+  const isPayment = vt.includes('payment');
+  const isPurchase = vt.includes('purchase') || vt.includes('debit note');
+  const stored = formatLedgerDisplayName(storedParty) || String(storedParty || '').trim();
+
+  // Receipt/Payment: Tally often stamps PartyName with the bank — ignore that.
+  if (stored && !(isReceipt || isPayment) || (stored && !isBankOrCashLedger(stored))) {
+    return stored;
+  }
+
+  const preferredSide = isReceipt ? 'cr' : isPayment || !isPurchase ? 'dr' : 'cr';
+  const scored = (ledgerEntries || [])
+    .map((e) => {
+      const name = formatLedgerDisplayName(
+        e.ledger_name || e.ledgerName || e.LEDGERNAME || e.LedgerName || ''
+      );
+      const amt = Math.abs(parseFloat(e.amount ?? e.Amount ?? 0) || 0);
+      return { name, amt, pri: ledgerPriority(name), side: entrySide(e) };
+    })
+    .filter((e) => e.name && !isBankOrCashLedger(e.name));
+
+  const preferred = scored
+    .filter((e) => !e.side || e.side === preferredSide)
+    .sort((a, b) => a.pri - b.pri || b.amt - a.amt);
+  if (preferred[0]?.name) return preferred[0].name;
+
+  scored.sort((a, b) => a.pri - b.pri || b.amt - a.amt);
+  return scored[0]?.name || stored || null;
 }
 
 /**

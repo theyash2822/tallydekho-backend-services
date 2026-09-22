@@ -98,7 +98,10 @@ export async function confirmAppMasterFromIngest(companyGuid, name, masterTypes,
               books_impact_status = 'posted',
               sync_error          = NULL,
               updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
-        WHERE company_guid=$1
+        WHERE (
+            company_guid=$1
+            OR company_guid = (SELECT c.id::text FROM companies c WHERE c.guid = $1 LIMIT 1)
+          )
           AND LOWER(master_name) = LOWER($2)
           AND master_type = ANY($3::text[])
           AND books_impact_status = 'not_posted'`,
@@ -122,7 +125,7 @@ export async function backfillAppMasters(client) {
       (company_guid, user_id, write_queue_id, master_type, master_name,
        tally_sync_status, books_impact_status, payload, sync_error, created_at, updated_at)
     SELECT
-      wq.company_id,
+      COALESCE(NULLIF(wq.company_guid, ''), wq.company_id::text),
       wq.user_id,
       wq.id,
       wq.entry_type,
@@ -145,7 +148,17 @@ export async function backfillAppMasters(client) {
       )
   `).catch((e) => console.warn('[app_masters] backfill insert:', e.message));
 
-  // Party / bank → posted when real Tally ledger GUID exists (company-prefixed)
+  await q(`
+    UPDATE app_masters am
+       SET company_guid = wq.company_guid
+      FROM write_queue wq
+     WHERE wq.id = am.write_queue_id
+       AND wq.company_guid IS NOT NULL
+       AND am.company_guid ~ '^[0-9]+$'
+       AND wq.company_guid !~ '^[0-9]+$'
+  `).catch((e) => console.warn('[app_masters] guid repair:', e.message));
+
+  // Party / bank → posted when the synced ledger belongs to the same company.
   await q(`
     UPDATE app_masters am
        SET tally_guid          = l.guid,
@@ -153,11 +166,15 @@ export async function backfillAppMasters(client) {
            books_impact_status = 'posted',
            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
       FROM ledgers l
-     WHERE am.company_id = l.company_id
+     WHERE (
+            l.company_guid = am.company_guid
+            OR l.company_id::text = am.company_guid
+          )
        AND LOWER(am.master_name) = LOWER(l.name)
        AND am.master_type IN ('party','bank')
        AND am.books_impact_status = 'not_posted'
-       AND l.guid LIKE am.company_id || '%'
+       AND l.guid IS NOT NULL
+       AND TRIM(l.guid) <> ''
   `).catch((e) => console.warn('[app_masters] ledger posted backfill:', e.message));
 
   // Warehouse → posted when warehouse row has a Tally GUID
@@ -168,7 +185,10 @@ export async function backfillAppMasters(client) {
            books_impact_status = 'posted',
            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
       FROM warehouses w
-     WHERE am.company_id = w.company_id
+     WHERE (
+            w.company_guid = am.company_guid
+            OR w.company_id::text = am.company_guid
+          )
        AND LOWER(am.master_name) = LOWER(w.name)
        AND am.master_type = 'warehouse'
        AND am.books_impact_status = 'not_posted'
@@ -176,9 +196,7 @@ export async function backfillAppMasters(client) {
        AND TRIM(w.guid) <> ''
   `).catch((e) => console.warn('[app_masters] warehouse posted backfill:', e.message));
 
-  // Stock item / alter → posted when stock has company-prefixed GUID (real Tally)
-  // OR any stocks row that is not a random UUID placeholder from immediate insert
-  // (Tally GUIDs are typically companyGuid-########).
+  // Stock item / alter → posted when the stock row belongs to the same company.
   await q(`
     UPDATE app_masters am
        SET tally_guid          = s.guid,
@@ -186,13 +204,14 @@ export async function backfillAppMasters(client) {
            books_impact_status = 'posted',
            updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
       FROM stocks s
-     WHERE am.company_id = s.company_id
+     WHERE (
+            s.company_guid = am.company_guid
+            OR s.company_id::text = am.company_guid
+          )
        AND LOWER(am.master_name) = LOWER(s.name)
        AND am.master_type IN ('item','alter_stock_item')
        AND am.books_impact_status = 'not_posted'
-       AND (
-         s.guid LIKE am.company_id || '%'
-         OR s.guid LIKE '%' || am.company_id
-       )
+       AND s.guid IS NOT NULL
+       AND TRIM(s.guid) <> ''
   `).catch((e) => console.warn('[app_masters] stock posted backfill:', e.message));
 }

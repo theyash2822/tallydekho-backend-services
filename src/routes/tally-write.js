@@ -6,6 +6,7 @@ import { Router } from 'express';
 import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
 import { query } from '../db/schema.js';
 import { requireTallyWriteAccess, verifyCompanyAccess } from '../middleware/companyAccess.js';
+import { voucherToAppCompanyJoinSql } from '../utils/appVoucherCompanyMatch.js';
 import { spendForWorkspaceAction } from '../services/billingService.js';
 import { generateIRN } from '../utils/irnGenerator.js';
 import { generateEWB } from '../utils/ewbGenerator.js';
@@ -515,7 +516,7 @@ const updateWriteQueue = async (id, result, error) => {
             await generateIRN(wqCompanyId, voucherRows[0], coRows[0], einvoiceCreds);
             console.log(`[auto-IRN] Success for ${resolvedVoucherNumber}`);
             await query(
-              `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE company_id = $1 AND tally_voucher_no = $2`,
+              `UPDATE app_vouchers SET e_invoice_status = 'generated', updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no = $2`,
               [wqCompanyId, resolvedVoucherNumber]
             ).catch(() => {});
           }
@@ -542,7 +543,7 @@ const updateWriteQueue = async (id, result, error) => {
           const { rows: vRowsEWB } = await query(
             `SELECT v.*, av.payload as av_payload
              FROM vouchers v
-             LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND av.company_id = v.company_id
+             LEFT JOIN app_vouchers av ON av.tally_voucher_no = v.voucher_number AND ${voucherToAppCompanyJoinSql('v', 'av')}
              AND av.write_queue_id = $3
              AND av.voucher_date::text = v.date
              AND (
@@ -1097,7 +1098,7 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
       `SELECT id, tdk_reference_no, invoice_uuid, tally_voucher_no, tally_sync_status,
               books_impact_status, payload, write_queue_id, created_at
          FROM app_vouchers
-        WHERE company_id = $1
+        WHERE (company_id::text = $1::text OR company_guid = $1::text)
           AND voucher_type = 'sales_invoice'
           AND user_id = $2
           AND LOWER(TRIM(COALESCE(party_name,''))) = LOWER(TRIM($3))
@@ -1257,6 +1258,9 @@ ${consigneeAddrXml}
       typeOfSupply: item.typeOfSupply || master?.type_of_supply || '',
     };
   });
+  // Persist enriched HSN on the lifecycle payload so provisional preview/PDF
+  // does not depend on a later stock re-sync to fill the column.
+  const enrichedBody = { ...req.body, items: itemsWithHsn };
   // Round-off is its own ledger line in Tally, not a freight-style charge.
   const roundOffLine = logistics.find(l => l?.ledgerName && isRoundOffLedger(l.ledgerName)) || null;
   const chargeLines = logistics.filter(l => l !== roundOffLine);
@@ -1311,7 +1315,7 @@ ${consigneeAddrXml}
       [companyGuid, req.company?.id ?? null, req.user.userId, queueId, tdkRef, original_entry_type,
        numbering_policy,
        tdkInvoiceNo || null,     // pre-set for tallydekho_series; null for tally_prime_series
-       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(req.body)]
+       partyLedger, amt, date ? new Date(date) : null, JSON.stringify(enrichedBody)]
     ).catch(e => { console.error('[app_vouchers] insert failed:', e.message); return { rows: [] }; });
     invoiceUuid      = avResult?.rows?.[0]?.invoice_uuid || null;
     invoiceCreatedAt = avResult?.rows?.[0]?.created_at   || null;
@@ -1321,7 +1325,7 @@ ${consigneeAddrXml}
     await persistVoucherLineTaxes(query, {
       companyGuid,
       tdkReferenceNo: tdkRef,
-      items,
+      items: itemsWithHsn,
       taxes,
       logistics,
     }).catch(e => console.warn('[voucher_line_taxes] persist failed:', e.message));
@@ -1522,7 +1526,9 @@ router.post('/voucher/proforma/convert', authMiddleware, requireTallyWriteAccess
 
   const { rows: avRows } = await query(
     `SELECT * FROM app_vouchers
-      WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3 AND voucher_type='proforma_invoice'`,
+      WHERE tdk_reference_no=$1
+        AND (company_id::text = $2::text OR company_guid = $2::text)
+        AND user_id=$3 AND voucher_type='proforma_invoice'`,
     [tdkRef, req.company?.id, req.user.userId]
   );
   const av = avRows[0];
@@ -6537,7 +6543,10 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, requireTallyWriteAccess(
 
     // Lookup the invoice
     const { rows: avRows } = await query(
-      `SELECT invoice_uuid, books_impact_status FROM app_vouchers WHERE tdk_reference_no=$1 AND company_id=$2 AND user_id=$3`,
+      `SELECT invoice_uuid, books_impact_status FROM app_vouchers
+        WHERE tdk_reference_no=$1
+          AND (company_id::text = $2::text OR company_guid = $2::text)
+          AND user_id=$3`,
       [tdkRef, req.company?.id, req.user.userId]
     );
     if (!avRows[0]) return res.status(404).json({ status: false, message: 'Invoice not found' });

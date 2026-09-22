@@ -797,8 +797,13 @@ async function processStocks(data, companyGuid) {
           ON CONFLICT (company_id, guid) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, stocks.company_id), name=EXCLUDED.name, alias=EXCLUDED.alias, sku=EXCLUDED.sku, description=EXCLUDED.description,
             category=EXCLUDED.category,
-            group_name=EXCLUDED.group_name, unit=EXCLUDED.unit, hsn=EXCLUDED.hsn,
-            tax_rate=EXCLUDED.tax_rate,
+            group_name=EXCLUDED.group_name, unit=EXCLUDED.unit,
+            -- Never wipe a known HSN with a blank sync row (StockItemFull used to omit FETCH).
+            hsn=COALESCE(NULLIF(EXCLUDED.hsn,''), stocks.hsn),
+            tax_rate=CASE
+              WHEN EXCLUDED.tax_rate IS NOT NULL AND EXCLUDED.tax_rate > 0 THEN EXCLUDED.tax_rate
+              ELSE stocks.tax_rate
+            END,
             -- Never wipe qty/rate/value with StockItemFull zeros — txn/FY recompute owns these.
             closing_qty=stocks.closing_qty,
             closing_rate=CASE WHEN EXCLUDED.closing_rate > 0 THEN EXCLUDED.closing_rate ELSE stocks.closing_rate END,
@@ -816,8 +821,13 @@ async function processStocks(data, companyGuid) {
           r.Category || r.CATEGORY || r.STOCKCATEGORY || null,
           r.Parent || r.PARENT || r.GROUP || null,
           r.BaseUnits || r.BASEUNITS || r.UNIT || r.unit || 'Pcs',
-          r.Hsncode || r.HSNDETAILS?.[0]?.HSNCODE || r.HSN || null,
-          parseFloat(r.IGSTRate || r.GSTRATE || r.TAXRATE || 18),
+          // Tally Data Interchange uppercases Compute tags (Hsncode → HSNCODE).
+          r.HSNCODE || r.Hsncode || r.hsncode
+            || r.HSNDETAILS?.[0]?.HSNCODE || r.HSNDetails?.[0]?.HSNCode
+            || r.HSN || r.hsn || null,
+          parseFloat(
+            r.IGSTRATE || r.IGSTRate || r.GSTRATE || r.GSTRate || r.TAXRATE || r.TaxRate || 18
+          ),
           0, // closing_qty — will be set by stock transaction recompute
           0, // closing_rate
           0, // closing_value
@@ -965,6 +975,18 @@ async function processVouchers(data, companyGuid) {
           // (and flatten Tally multi-party JSON array names).
           (() => {
             const rawParty = r.PartyName || r.PartyLedgerName || r.PARTYLEDGERNAME || r.PARTYNAME || r.partyName || null;
+            const vt = String(voucherType || '');
+            // Receipt/Payment: Tally often puts the bank in PartyName. Prefer a
+            // real party ledger from AllLedgerEntries so My Entries / preview
+            // don't show "Bank of India…" instead of the customer.
+            if (/receipt|payment/i.test(vt)) {
+              const fromLedgers = pickPartyNameFromLedgerEntries(ledgerEntries);
+              if (fromLedgers) return fromLedgers;
+              if (rawParty && !/\b(bank|cash|petty\s*cash)\b/i.test(String(rawParty))) {
+                return formatLedgerDisplayName(rawParty) || rawParty;
+              }
+              return fromLedgers || (rawParty ? (formatLedgerDisplayName(rawParty) || rawParty) : null);
+            }
             if (rawParty) return formatLedgerDisplayName(rawParty) || rawParty;
             return pickPartyNameFromLedgerEntries(ledgerEntries);
           })(),
@@ -1073,7 +1095,7 @@ async function processVouchers(data, companyGuid) {
                    END,
                    updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                WHERE tdk_reference_no = $2
-                 AND company_id     = $3
+                 AND (company_id::text = $3::text OR company_guid = $3::text)
                  AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced' OR tally_voucher_no IS DISTINCT FROM $1)
                RETURNING company_guid, tdk_reference_no, current_entry_type`,
               [voucherNumber, ref, currentCompanyId()]
@@ -1093,7 +1115,8 @@ async function processVouchers(data, companyGuid) {
           ) {
             const { rows: avRows } = await dbQuery(
               `SELECT id, current_entry_type FROM app_vouchers
-               WHERE tdk_reference_no = $1 AND company_id = $2`,
+               WHERE tdk_reference_no = $1
+                 AND (company_id::text = $2::text OR company_guid = $2::text)`,
               [ref, currentCompanyId()]
             );
             if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
@@ -1137,7 +1160,7 @@ async function processVouchers(data, companyGuid) {
                  books_impact_status = 'posted',
                  updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
              WHERE tdk_reference_no = $2
-               AND company_id     = $3
+               AND (company_id::text = $3::text OR company_guid = $3::text)
                AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
              RETURNING company_guid, tdk_reference_no`,
             [voucherNumber, ref2, currentCompanyId()]
@@ -1174,7 +1197,7 @@ async function processVouchers(data, companyGuid) {
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
-                WHERE av.company_id    = $1
+                WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
                   AND av.voucher_type    = 'payment'
                   AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
@@ -1196,7 +1219,7 @@ async function processVouchers(data, companyGuid) {
             const { rows: candidateRows2 } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
-                WHERE av.company_id    = $1
+                WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
                   AND av.voucher_type    = 'payment'
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $2
@@ -1221,7 +1244,7 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_id     = $3
+                  AND (company_id::text = $3::text OR company_guid = $3::text)
                   AND voucher_type     = 'payment'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
@@ -1239,7 +1262,7 @@ async function processVouchers(data, companyGuid) {
                       sync_error        = $1,
                       updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = ANY($2::text[])
-                  AND company_id     = $3
+                  AND (company_id::text = $3::text OR company_guid = $3::text)
                   AND tally_voucher_no IS NULL`,
               [`Ambiguous payment match for party '${partyName}' (date=${date}, amount=${payAmt}) (${ambiguousRefs.length} candidates)`, ambiguousRefs, currentCompanyId()]
             ).catch(() => {});
@@ -1263,7 +1286,7 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_id     = $3
+                  AND (company_id::text = $3::text OR company_guid = $3::text)
                   AND voucher_type     = 'journal'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
@@ -1293,7 +1316,7 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_id     = $3
+                  AND (company_id::text = $3::text OR company_guid = $3::text)
                   AND voucher_type     = 'contra'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
@@ -1337,7 +1360,7 @@ async function processVouchers(data, companyGuid) {
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
-                WHERE av.company_id    = $1
+                WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
                   AND av.voucher_type    = 'receipt'
                   AND (parent.tdk_reference_no = $2 OR parent.tally_voucher_no = $2)
                   AND av.tally_voucher_no IS NULL
@@ -1358,7 +1381,7 @@ async function processVouchers(data, companyGuid) {
                           sync_error        = $1,
                           updated_at        = EXTRACT(EPOCH FROM NOW())::BIGINT
                     WHERE tdk_reference_no = ANY($2::text[])
-                      AND company_id     = $3
+                      AND (company_id::text = $3::text OR company_guid = $3::text)
                       AND tally_voucher_no IS NULL`,
                   [`Ambiguous bill-allocation match for parent ${billAlloc.bill_ref_name} (${candidateRows.length} candidates)`,
                    candidateRows.map(c => c.tdk_reference_no), currentCompanyId()]
@@ -1375,7 +1398,7 @@ async function processVouchers(data, companyGuid) {
             const { rows: candidateRows2 } = await dbQuery(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
-                WHERE av.company_id    = $1
+                WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
                   AND av.voucher_type    = 'receipt'
                   AND av.tally_voucher_no IS NULL
                   AND av.party_name      = $2
@@ -1398,7 +1421,7 @@ async function processVouchers(data, companyGuid) {
                       books_impact_status = 'posted',
                       updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
                 WHERE tdk_reference_no = $2
-                  AND company_id     = $3
+                  AND (company_id::text = $3::text OR company_guid = $3::text)
                   AND voucher_type     = 'receipt'
                   AND (tally_voucher_no IS NULL OR tally_sync_status != 'synced')
                 RETURNING company_guid, tdk_reference_no`,
@@ -1437,8 +1460,8 @@ async function processVouchers(data, companyGuid) {
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
         WHERE v.reference      = av.tdk_reference_no
-          AND v.company_guid   = av.company_guid
-          AND av.company_id  = $1
+          AND (v.company_guid = av.company_guid OR av.company_guid = v.company_id::text)
+          AND (av.company_id::text = $1::text OR av.company_guid = $1::text)
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
@@ -1465,8 +1488,8 @@ async function processVouchers(data, companyGuid) {
         FROM vouchers v
         WHERE v.bill_ref_name  = av.tdk_reference_no
           AND v.bill_type      = 'New Ref'
-          AND v.company_guid   = av.company_guid
-          AND av.company_id  = $1
+          AND (v.company_guid = av.company_guid OR av.company_guid = v.company_id::text)
+          AND (av.company_id::text = $1::text OR av.company_guid = $1::text)
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
           AND v.voucher_number != ''
@@ -1497,8 +1520,8 @@ async function processVouchers(data, companyGuid) {
             books_impact_status = 'posted',
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
-        WHERE v.company_guid   = av.company_guid
-          AND av.company_id  = $1
+        WHERE (v.company_guid = av.company_guid OR av.company_guid = v.company_id::text)
+          AND (av.company_id::text = $1::text OR av.company_guid = $1::text)
           AND av.voucher_type  = 'receipt'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
@@ -1525,8 +1548,8 @@ async function processVouchers(data, companyGuid) {
             books_impact_status = 'posted',
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
-        WHERE v.company_guid   = av.company_guid
-          AND av.company_id  = $1
+        WHERE (v.company_guid = av.company_guid OR av.company_guid = v.company_id::text)
+          AND (av.company_id::text = $1::text OR av.company_guid = $1::text)
           AND av.voucher_type  = 'payment'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
@@ -1551,8 +1574,8 @@ async function processVouchers(data, companyGuid) {
             books_impact_status = 'posted',
             updated_at          = EXTRACT(EPOCH FROM NOW())::BIGINT
         FROM vouchers v
-        WHERE v.company_guid   = av.company_guid
-          AND av.company_id  = $1
+        WHERE (v.company_guid = av.company_guid OR av.company_guid = v.company_id::text)
+          AND (av.company_id::text = $1::text OR av.company_guid = $1::text)
           AND av.voucher_type  = 'journal'
           AND av.tally_voucher_no IS NULL
           AND v.voucher_number IS NOT NULL
@@ -1580,7 +1603,7 @@ async function processVouchers(data, companyGuid) {
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
           JOIN app_vouchers parent  ON parent.invoice_uuid = av.parent_invoice_uuid
-          JOIN vouchers v ON v.company_id = av.company_id
+          JOIN vouchers v ON (v.company_id = av.company_id OR av.company_guid = v.company_id::text OR v.company_guid = av.company_guid)
                           AND v.bill_type = 'Agst Ref'
                           AND (v.bill_ref_name = parent.tdk_reference_no
                                OR v.bill_ref_name = parent.tally_voucher_no)
@@ -1589,7 +1612,7 @@ async function processVouchers(data, companyGuid) {
                           AND v.party_name = av.party_name
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
-          WHERE av.company_id    = $1
+          WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
             AND av.voucher_type    = 'receipt'
             AND av.tally_voucher_no IS NULL
         )
@@ -1624,14 +1647,14 @@ async function processVouchers(data, companyGuid) {
             v.voucher_number,
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
-          JOIN vouchers v ON v.company_id = av.company_id
+          JOIN vouchers v ON (v.company_id = av.company_id OR av.company_guid = v.company_id::text OR v.company_guid = av.company_guid)
                           AND v.party_name = av.party_name
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
                           AND v.voucher_type ILIKE 'Receipt%'
                           AND v.voucher_number IS NOT NULL
                           AND v.voucher_number != ''
-          WHERE av.company_id    = $1
+          WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
             AND av.voucher_type    = 'receipt'
             AND av.tally_voucher_no IS NULL
         )
@@ -1666,7 +1689,7 @@ async function processVouchers(data, companyGuid) {
             v.voucher_number,
             COUNT(*) OVER (PARTITION BY av.tdk_reference_no) AS match_count
           FROM app_vouchers av
-          JOIN vouchers v ON v.company_id = av.company_id
+          JOIN vouchers v ON (v.company_id = av.company_id OR av.company_guid = v.company_id::text OR v.company_guid = av.company_guid)
                           AND ABS(v.amount - av.total_amount) < 1
                           AND v.date = av.voucher_date::text
                           AND v.voucher_number IS NOT NULL

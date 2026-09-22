@@ -105,7 +105,7 @@ export async function loadDebitNoteContext(companyId, invoice) {
   const { rows: invAvRows } = await query(
     `SELECT tdk_reference_no, payload, tally_guid
        FROM app_vouchers
-      WHERE company_id=$1
+      WHERE (company_id::text = $1::text OR company_guid = $1::text)
         AND voucher_type IN ('purchase_invoice', 'purchase')
         AND (
           tally_voucher_no = $2
@@ -332,7 +332,7 @@ export async function loadDebitNoteContext(companyId, invoice) {
             books_impact_status, original_entry_type, current_entry_type,
             voucher_date, total_amount, payload, created_at
        FROM app_vouchers av
-      WHERE av.company_id=$1
+      WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
         AND av.voucher_type = 'debit_note'
         AND av.tally_sync_status <> 'failed'
         AND (

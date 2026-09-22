@@ -79,6 +79,17 @@ export function resolveViewCapability(req) {
     return 'gst.view';
   }
   if (u.includes('/voucher')) return 'vouchers.view';
+  // GST reports that do not contain the word "gst" in the path.
+  if (u.includes('/other-taxes') || u.includes('/unmatched')) return 'gst.view';
+  if (u.includes('/reminders')) return 'vouchers.view';
+  // Company profile extras used by settings. Owner must not 403 on a missing map entry.
+  if (
+    u.includes('/compliance-config')
+    || u.includes('/logo')
+    || u.includes('/company/capabilities')
+  ) {
+    return '__scope_only__';
+  }
   // Bootstrap / session: membership + company/FY scope only (Owner must not 403 here)
   if (
     /\/companies\/?$/.test(u)
