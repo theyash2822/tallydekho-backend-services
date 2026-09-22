@@ -1,3 +1,14 @@
+## 2026-09-22 — Stock dashboard lowStock = settings threshold
+
+`buildStockDashboardInsights` counts hub `lowStock` as
+`0 < closing_qty ≤ default_low_stock_level` (default 20 from
+`company_inventory_settings`). `reorderQueueCount` stays on Tally item/group
+`reorder_level`. Aligns with mobile Low Stock screen. Branch `cursor` `2e3918c`.
+
+Also: `loadVoucherTagContext` crash fix (`req` undefined) — `f9659df`.
+
+---
+
 ## 2026-09-21 — Dual-write company fields + TALLY_WRITE / PDF metering
 
 All `app_vouchers` creates now write real `company_guid` (UUID) + `company_id`
