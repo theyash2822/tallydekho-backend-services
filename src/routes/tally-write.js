@@ -639,9 +639,10 @@ async function generateTDSeriesNumber(companyGuid, voucherTypeCode = 'SAL', comp
  * The mobile app never sent these, so our vouchers printed without Place of
  * Supply, party GSTIN or HSN while native Tally entries carried all three.
  */
-async function loadVoucherTagContext(companyGuid, partyLedger, items = []) {
+async function loadVoucherTagContext(companyId, partyLedger, items = []) {
   const names = (items || []).map(i => i.itemName || i.name).filter(Boolean);
-  const ctx = await loadDocumentContext(req.company?.id, partyLedger, names).catch(() => null);
+  // companyId must be passed in — this helper has no access to `req`
+  const ctx = await loadDocumentContext(companyId, partyLedger, names).catch(() => null);
   const masters = ctx?.itemMasters || new Map();
   return {
     partyGstin: ctx?.partyRow?.gstin || '',
@@ -2661,7 +2662,7 @@ router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/vo
   // Persist terms in payload for preview/share; narration stays clean for Tally
   const persistPayload = { ...req.body, termsText: termsText || req.body.termsText || '' };
 
-  const soTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const soTagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, items);
   const soItems = soTagCtx.withHsn(items);
   const soExtrasXml = buildVoucherHeaderExtrasXml({
     placeOfSupply: req.body.placeOfSupply || soTagCtx.partyState,
@@ -3235,7 +3236,7 @@ router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('
     ...collectLedgerNameReferences(logistics),
   ], { workspaceId: req.company?.workspaceId })) return;
 
-  const poTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const poTagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, items);
   const poItems = poTagCtx.withHsn(items);
   const poExtrasXml = buildVoucherHeaderExtrasXml({
     placeOfSupply: req.body.placeOfSupply || poTagCtx.partyState,
@@ -3464,7 +3465,7 @@ router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/vouch
     { kind: 'ledger', value: make_payment?.ledgerName },
   ], { workspaceId: req.company?.workspaceId })) return;
 
-  const tagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const tagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, items);
   const itemsWithHsn = tagCtx.withHsn(items);
   const headerExtrasXml = buildVoucherHeaderExtrasXml({
     placeOfSupply: placeOfSupply || dispatch_details?.dispatch_from_state || tagCtx.partyState,
@@ -4047,7 +4048,7 @@ router.post('/voucher/credit-note', authMiddleware, requireTallyWriteAccess('/vo
       if (tdkCreditNoteNo) effectiveVoucherNumber = tdkCreditNoteNo;
     }
 
-    const cnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, normItems);
+    const cnTagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, normItems);
     const xml = buildCreditNoteXml({
       companyName: resolvedCompanyName,
       date,
@@ -4518,7 +4519,7 @@ router.post('/voucher/debit-note', authMiddleware, requireTallyWriteAccess('/vou
       if (tdkDebitNoteNo) effectiveVoucherNumber = tdkDebitNoteNo;
     }
 
-    const dnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, normItems);
+    const dnTagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, normItems);
     const xml = buildDebitNoteXml({
       companyName: resolvedCompanyName,
       date,
@@ -4755,7 +4756,7 @@ router.post('/voucher/delivery-note', authMiddleware, requireTallyWriteAccess('/
   // Delivery Note builds its own BASICSHIP* tags above, so only the e-Way Bill
   // block is borrowed from the shared dispatch builder.
   const dnEwbXml = buildDispatchXml(dispatch_details, date, { ewbOnly: true });
-  const dnTagCtx = await loadVoucherTagContext(companyGuid, partyLedger, items);
+  const dnTagCtx = await loadVoucherTagContext(req.company?.id, partyLedger, items);
   const dnItems = dnTagCtx.withHsn(items);
   const dnExtrasXml = buildVoucherHeaderExtrasXml({
     placeOfSupply: req.body.placeOfSupply || dispatch_details?.ship_to_state || dnTagCtx.partyState,
