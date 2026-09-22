@@ -438,7 +438,24 @@ export async function listMembers(workspaceId) {
 
 export async function listSeats(workspaceId) {
   const { rows } = await query(
-    `SELECT * FROM workspace_seats WHERE workspace_id = $1 ORDER BY created_at ASC`,
+    `SELECT s.*,
+            u.name AS assigned_user_name,
+            u.mobile AS assigned_user_mobile,
+            m.membership_type AS membership_type,
+            m.status AS membership_status,
+            r.system_key AS role_system_key,
+            r.display_name AS role_display_name
+       FROM workspace_seats s
+       LEFT JOIN users u ON u.id = s.assigned_user_id
+       LEFT JOIN workspace_memberships m
+         ON m.workspace_id = s.workspace_id
+        AND m.user_id = s.assigned_user_id
+        AND m.status IN ('ACTIVE','SUSPENDED')
+       LEFT JOIN workspace_roles r ON r.id = m.role_id
+      WHERE s.workspace_id = $1
+      ORDER BY
+        CASE s.seat_kind WHEN 'OWNER' THEN 0 ELSE 1 END,
+        s.created_at ASC`,
     [workspaceId]
   );
   return rows;
