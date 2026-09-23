@@ -156,6 +156,47 @@ async function getProductDisplayField(companyId) {
   }
 }
 
+/** Company Default Low Stock Level (qty threshold). Default 20. */
+async function getDefaultLowStockLevel(companyId) {
+  try {
+    const { rows } = await query(
+      `SELECT default_low_stock_level FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    );
+    const n = parseInt(rows[0]?.default_low_stock_level ?? 20, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 20;
+  } catch {
+    return 20;
+  }
+}
+
+/** Filter stock rows for Low Stock / Out / Reorder (matches hub dashboard semantics). */
+function filterStocksByHealth(rows, stockHealth, lowThreshold) {
+  const mode = String(stockHealth || '').toLowerCase();
+  if (!mode || mode === 'all') return rows;
+  const T = Number(lowThreshold) || 20;
+  return rows.filter((r) => {
+    const qty = parseFloat(r.closing_qty ?? r.fy_closing_qty ?? 0);
+    if (mode === 'low') return qty > 0 && qty <= T;
+    if (mode === 'out') return qty === 0;
+    if (mode === 'reorder') {
+      const itemReorder = parseFloat(r.reorder_level ?? 0);
+      const groupReorder = parseFloat(r.group_reorder_level ?? 0);
+      const effective = itemReorder > 0 ? itemReorder : groupReorder;
+      return effective > 0 && qty <= effective;
+    }
+    return true;
+  });
+}
+
+function countLowStockByThreshold(rows, lowThreshold) {
+  const T = Number(lowThreshold) || 20;
+  return rows.filter((r) => {
+    const qty = parseFloat(r.closing_qty ?? r.fy_closing_qty ?? 0);
+    return qty > 0 && qty <= T;
+  }).length;
+}
+
 // Compute displayName from a stock item object based on the company's display field setting.
 // Never overwrites stocks.name (Tally master). Falls back to name if chosen field is empty.
 function computeDisplayName(item, field) {
@@ -3398,7 +3439,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
   if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
   const companyId = requireResolvedCompanyId(req);
-  const { search = '', category, warehouse, group, page = 1, limit = 500 } = req.query; // Default 500
+  const { search = '', category, warehouse, group, page = 1, limit = 500, stockHealth } = req.query; // Default 500
   const warehouseList = parseCsvQueryParam(warehouse);
   const groupList = parseCsvQueryParam(group);
   const offset = (parseInt(page)-1)*parseInt(limit);
@@ -3406,6 +3447,7 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
     const displayField = await getProductDisplayField(companyId);
+    const lowThreshold = await getDefaultLowStockLevel(companyId);
 
     let q, params, idx;
     if (fyRequested) {
@@ -3413,6 +3455,8 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       q = `
         SELECT s.guid, s.name, s.alias, s.sku, s.description, s.category, s.group_name, s.unit, s.hsn, s.tax_rate,
                s.reorder_level, s.closing_rate, s.opening_rate,
+               (SELECT g.reorder_level FROM groups g
+                WHERE g.company_id = s.company_id AND g.name = s.group_name LIMIT 1) AS group_reorder_level,
                (SELECT st2.warehouse FROM stock_transactions st2
                 WHERE st2.company_id = s.company_id AND st2.stock_guid = s.name
                 ORDER BY st2.date DESC LIMIT 1) AS primary_warehouse,
@@ -3479,31 +3523,39 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
       }
       const { rows: rawRows } = await query(q, params);
       let allRows = await applyMultiWarehouseStockFilter(companyId, rawRows, warehouseList, { fyTo });
-      // Apply pagination in JS after FY computation
-      const totalRows = allRows.length;
-      const rows = allRows.slice(offset, offset + parseInt(limit)).map(r => ({
+      allRows = allRows.map(r => ({
         ...r,
-        closing_qty:          parseFloat(r.fy_closing_qty        || 0),
-        closing_value:        parseFloat(r.fy_closing_value      || 0),
-        primary_warehouse:    r.primary_warehouse                || null,
+        closing_qty:           parseFloat(r.fy_closing_qty        || 0),
+        closing_value:         parseFloat(r.fy_closing_value      || 0),
+        primary_warehouse:     r.primary_warehouse                || null,
         avg_daily_consumption: parseFloat(r.avg_daily_consumption || 0),
-        displayName:          computeDisplayName(r, displayField),
+        displayName:           computeDisplayName(r, displayField),
       }));
-      const totalValue  = allRows.reduce((s, r) => s + parseFloat(r.fy_closing_value || 0), 0);
-      const lowStockCnt = allRows.filter(r => parseFloat(r.fy_closing_qty || 0) > 0 && parseFloat(r.fy_closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
+      const lowStockCnt = countLowStockByThreshold(allRows, lowThreshold);
+      allRows = filterStocksByHealth(allRows, stockHealth, lowThreshold);
+      const totalRows = allRows.length;
+      const rows = allRows.slice(offset, offset + parseInt(limit));
+      const totalValue  = allRows.reduce((s, r) => s + parseFloat(r.closing_value || 0), 0);
       return res.json({
         success: true,
         data: {
-          summary: { total_value: `₹${(totalValue/1e5).toFixed(1)}L`, total_skus: totalRows, low_stock_count: lowStockCnt },
+          summary: {
+            total_value: `₹${(totalValue/1e5).toFixed(1)}L`,
+            total_skus: totalRows,
+            low_stock_count: lowStockCnt,
+            low_stock_threshold: lowThreshold,
+          },
           items: rows,
           financial_year: financialYear,
         },
-        meta: { total: totalRows, page: parseInt(page) }
+        meta: { total: totalRows, page: parseInt(page), stockHealth: stockHealth || null, low_stock_threshold: lowThreshold },
       });
     }
 
     // No FY param: serve stored closing_qty (current stock as of last sync)
     q = `SELECT s.*,
+      (SELECT g.reorder_level FROM groups g
+       WHERE g.company_id = s.company_id AND g.name = s.group_name LIMIT 1) AS group_reorder_level,
       (SELECT st.warehouse FROM stock_transactions st
        WHERE st.company_id = s.company_id AND st.stock_guid = s.name
        ORDER BY st.date DESC LIMIT 1) AS primary_warehouse,
@@ -3533,18 +3585,24 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     q += ` ORDER BY closing_value DESC NULLS LAST, name`;
     const { rows: rawItems } = await query(q, params);
     let allRows = await applyMultiWarehouseStockFilter(companyId, rawItems, warehouseList);
+    const lowStockCnt = countLowStockByThreshold(allRows, lowThreshold);
+    allRows = filterStocksByHealth(allRows, stockHealth, lowThreshold);
     const totalRows = allRows.length;
     const pageRows = allRows.slice(offset, offset + parseInt(limit));
     const totalValue = allRows.reduce((s, r) => s + parseFloat(r.closing_value || 0), 0);
-    const lowStockCnt = allRows.filter(r => parseFloat(r.closing_qty || 0) > 0 && parseFloat(r.closing_qty || 0) <= parseFloat(r.reorder_level || 0)).length;
     const items = pageRows.map(r => ({ ...r, displayName: computeDisplayName(r, displayField) }));
     res.json({
       success: true,
       data: {
-        summary: { total_value: `₹${(totalValue/1e5).toFixed(1)}L`, total_skus: totalRows, low_stock_count: lowStockCnt },
+        summary: {
+          total_value: `₹${(totalValue/1e5).toFixed(1)}L`,
+          total_skus: totalRows,
+          low_stock_count: lowStockCnt,
+          low_stock_threshold: lowThreshold,
+        },
         items,
       },
-      meta: { total: totalRows, page: parseInt(page) }
+      meta: { total: totalRows, page: parseInt(page), stockHealth: stockHealth || null, low_stock_threshold: lowThreshold },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -5234,9 +5292,10 @@ async function buildDerivedNotifications(companyId) {
   const weekAgo = new Date(now);
   weekAgo.setDate(weekAgo.getDate() - 7);
 
+  const lowThreshold = await getDefaultLowStockLevel(companyId);
   const { rows: lowStock } = await query(
-    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_id=$1 AND closing_qty <= reorder_level AND reorder_level > 0 LIMIT 3',
-    [companyId]
+    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_id=$1 AND closing_qty > 0 AND closing_qty <= $2 LIMIT 3',
+    [companyId, lowThreshold]
   );
   lowStock.forEach((s, i) => {
     const createdAt = new Date(now.getTime() - i * 3600000);
@@ -8420,7 +8479,7 @@ function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
 }
 
 /** Shared barcode list filters — mutates params[], returns AND-clauses (empty string if none). */
-function applyBarcodeListFilters({ period, group, status, search }, params) {
+function applyBarcodeListFilters({ period, group, status, search, lowThreshold = 20 }, params) {
   const clauses = [];
   const isAllToken = (v) => !v || ['All', 'all'].includes(String(v).trim());
 
@@ -8457,7 +8516,10 @@ function applyBarcodeListFilters({ period, group, status, search }, params) {
       if (st === 'Linked')              statusClauses.push('sb.barcode IS NOT NULL');
       else if (st === 'Unlinked')       statusClauses.push('sb.barcode IS NULL');
       else if (st === 'In Stock')       statusClauses.push('s.closing_qty > 0');
-      else if (st === 'Low Stock')      statusClauses.push('s.closing_qty > 0 AND s.reorder_level > 0 AND s.closing_qty <= s.reorder_level');
+      else if (st === 'Low Stock') {
+        params.push(Number(lowThreshold) || 20);
+        statusClauses.push(`s.closing_qty > 0 AND s.closing_qty <= $${params.length}`);
+      }
       else if (st === 'Out of Stock')   statusClauses.push('s.closing_qty <= 0');
       else if (st === 'Duplicate')      statusClauses.push("sb.status = 'duplicate'");
       else if (st === 'Invalid')        statusClauses.push("sb.status = 'invalid'");
@@ -8475,10 +8537,10 @@ function applyBarcodeListFilters({ period, group, status, search }, params) {
 }
 
 /** Build WHERE for unlinked barcode generation targets (requires sb LEFT JOIN). */
-function buildBarcodeTargetWhere(companyId, { all, stockGuids, period, group, status, search }, params) {
+function buildBarcodeTargetWhere(companyId, { all, stockGuids, period, group, status, search, lowThreshold = 20 }, params) {
   const whereParts = ['s.company_id=$1'];
   params.push(companyId);
-  const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
+  const filterSql = applyBarcodeListFilters({ period, group, status, search, lowThreshold }, params);
   if (filterSql) whereParts.push(filterSql);
   if (!all && Array.isArray(stockGuids) && stockGuids.length) {
     params.push(stockGuids);
@@ -8624,8 +8686,9 @@ router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (re
       });
     }
 
+    const lowThreshold = await getDefaultLowStockLevel(companyId);
     const targets = await fetchBarcodeGenerateTargets(companyId, {
-      all, stockGuids, period, group, status, search,
+      all, stockGuids, period, group, status, search, lowThreshold,
     });
     if (!targets.length) {
       return res.json({ success: true, data: { jobId: null, total: 0, status: 'completed', generated: 0, errors: 0 } });
@@ -8751,8 +8814,9 @@ router.post('/inventory/barcodes/generate-bulk', authMiddleware, async (req, res
   }
 
   try {
+    const lowThreshold = await getDefaultLowStockLevel(companyId);
     const targets = await fetchBarcodeGenerateTargets(companyId, {
-      all: false, stockGuids, period, group, status, search,
+      all: false, stockGuids, period, group, status, search, lowThreshold,
     });
 
     if (!targets.length)
@@ -8821,11 +8885,12 @@ router.post('/inventory/barcodes', authMiddleware, async (req, res) => {
   const companyId = requireResolvedCompanyId(req);
   try {
     const displayField = await getProductDisplayField(companyId);
+    const lowThreshold = await getDefaultLowStockLevel(companyId);
     const lim  = Math.min(parseInt(pageSize) || 50, 200);
     const off  = (Math.max(1, parseInt(page)) - 1) * lim;
     const params = [companyId];
     let where = 's.company_id=$1';
-    const filterSql = applyBarcodeListFilters({ period, group, status, search }, params);
+    const filterSql = applyBarcodeListFilters({ period, group, status, search, lowThreshold }, params);
     if (filterSql) where += ` AND ${filterSql}`;
 
     const sumRes = await query(`

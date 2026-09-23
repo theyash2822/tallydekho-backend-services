@@ -1,3 +1,12 @@
+## 2026-09-23 — stockHealth filter + unified low-stock threshold
+
+`GET /stocks/items` accepts `stockHealth=low|out|reorder` (server filter before
+pagination). Summary `low_stock_count` / `low_stock_threshold` use
+`default_low_stock_level`. Barcode “Low Stock” + derived notifications use the
+same threshold. Reorder path includes `group_reorder_level`.
+
+---
+
 ## 2026-09-22 — Stock dashboard lowStock = settings threshold
 
 `buildStockDashboardInsights` counts hub `lowStock` as
