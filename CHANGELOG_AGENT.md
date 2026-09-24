@@ -1,3 +1,11 @@
+## 2026-09-24 — Inventory settings: default unit + purchase buffer for lists
+
+`GET /inventory/settings` available_uoms = units master ∪ stocks.units.
+`GET /stocks/items` meta/summary includes `default_unit` + `purchase_buffer_days`.
+`GET /stocks/units` merges master + stock units.
+
+---
+
 ## 2026-09-23 — stockHealth filter + unified low-stock threshold
 
 `GET /stocks/items` accepts `stockHealth=low|out|reorder` (server filter before

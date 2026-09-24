@@ -170,6 +170,42 @@ async function getDefaultLowStockLevel(companyId) {
   }
 }
 
+/** App default unit when stock/voucher line unit is blank (not written to Tally). */
+async function getDefaultUnitForNewItems(companyId) {
+  try {
+    const { rows } = await query(
+      `SELECT default_unit_for_new_items FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    );
+    const u = String(rows[0]?.default_unit_for_new_items || '').trim();
+    if (u) return u;
+  } catch { /* fall through */ }
+  try {
+    const { rows } = await query(
+      `SELECT TRIM(unit) AS name FROM stocks
+       WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       GROUP BY TRIM(unit) ORDER BY COUNT(*) DESC LIMIT 1`,
+      [companyId]
+    );
+    if (rows[0]?.name) return String(rows[0].name).trim();
+  } catch { /* fall through */ }
+  return 'Nos';
+}
+
+/** Purchase buffer days for reorder suggest (app-only). Default 7. */
+async function getPurchaseBufferDays(companyId) {
+  try {
+    const { rows } = await query(
+      `SELECT purchase_buffer_days FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    );
+    const n = parseInt(rows[0]?.purchase_buffer_days ?? 7, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 7;
+  } catch {
+    return 7;
+  }
+}
+
 /** Filter stock rows for Low Stock / Out / Reorder (matches hub dashboard semantics). */
 function filterStocksByHealth(rows, stockHealth, lowThreshold) {
   const mode = String(stockHealth || '').toLowerCase();
@@ -3448,6 +3484,8 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
     const fyRequested = !!(req.query.fy || req.query.from || req.query.to);
     const displayField = await getProductDisplayField(companyId);
     const lowThreshold = await getDefaultLowStockLevel(companyId);
+    const defaultUnit = await getDefaultUnitForNewItems(companyId);
+    const purchaseBufferDays = await getPurchaseBufferDays(companyId);
 
     let q, params, idx;
     if (fyRequested) {
@@ -3544,11 +3582,20 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
             total_skus: totalRows,
             low_stock_count: lowStockCnt,
             low_stock_threshold: lowThreshold,
+            default_unit: defaultUnit,
+            purchase_buffer_days: purchaseBufferDays,
           },
           items: rows,
           financial_year: financialYear,
         },
-        meta: { total: totalRows, page: parseInt(page), stockHealth: stockHealth || null, low_stock_threshold: lowThreshold },
+        meta: {
+          total: totalRows,
+          page: parseInt(page),
+          stockHealth: stockHealth || null,
+          low_stock_threshold: lowThreshold,
+          default_unit: defaultUnit,
+          purchase_buffer_days: purchaseBufferDays,
+        },
       });
     }
 
@@ -3599,10 +3646,19 @@ router.get('/stocks/items', authMiddleware, async (req, res) => {
           total_skus: totalRows,
           low_stock_count: lowStockCnt,
           low_stock_threshold: lowThreshold,
+          default_unit: defaultUnit,
+          purchase_buffer_days: purchaseBufferDays,
         },
         items,
       },
-      meta: { total: totalRows, page: parseInt(page), stockHealth: stockHealth || null, low_stock_threshold: lowThreshold },
+      meta: {
+        total: totalRows,
+        page: parseInt(page),
+        stockHealth: stockHealth || null,
+        low_stock_threshold: lowThreshold,
+        default_unit: defaultUnit,
+        purchase_buffer_days: purchaseBufferDays,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -4447,7 +4503,13 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
       [companyId]
     );
 
-    // Tally-derived: all distinct UoMs
+    // Tally-derived: Units master ∪ units already used on stock items
+    const { rows: masterUomRows } = await query(
+      `SELECT DISTINCT TRIM(name) AS name FROM units
+       WHERE company_id=$1 AND name IS NOT NULL AND TRIM(name) != ''
+       ORDER BY TRIM(name) ASC`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
     const { rows: uomRows } = await query(
       `SELECT DISTINCT TRIM(unit) AS name FROM stocks
        WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
@@ -4470,7 +4532,11 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
       [companyId]
     );
 
-    const uoms = uomRows.map(r => r.name).filter(Boolean);
+    const fromMaster = masterUomRows.map(r => r.name).filter(Boolean);
+    const fromStocks = uomRows.map(r => r.name).filter(Boolean);
+    const uoms = [...new Set([...fromMaster, ...fromStocks])].sort((a, b) =>
+      String(a).localeCompare(String(b), undefined, { sensitivity: 'base' })
+    );
     const tallyDefaultUnit = commonUnitRows[0]?.name || uoms[0] || 'Nos';
 
     // Tally-derived: company-level batch/expiry flags (aggregate from stocks table)
@@ -4632,9 +4698,15 @@ router.get('/stocks/units', authMiddleware, async (req, res) => {
   const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
-      `SELECT DISTINCT unit as name FROM stocks
-       WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
-       ORDER BY unit ASC`,
+      `SELECT name FROM (
+         SELECT DISTINCT TRIM(name) AS name FROM units
+         WHERE company_id=$1 AND name IS NOT NULL AND TRIM(name) != ''
+         UNION
+         SELECT DISTINCT TRIM(unit) AS name FROM stocks
+         WHERE company_id=$1 AND unit IS NOT NULL AND TRIM(unit) != ''
+       ) u
+       WHERE name IS NOT NULL AND name != ''
+       ORDER BY name ASC`,
       [companyId]
     );
     res.json({ success: true, data: rows.map(r => r.name.trim()).filter(Boolean) });
