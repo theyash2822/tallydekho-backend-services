@@ -336,10 +336,14 @@ export async function initSchema() {
         parent        TEXT,
         parent_guid   TEXT,
         address       TEXT,
+        alias         TEXT,
+        aliases       JSONB DEFAULT '[]',
         alter_id      INTEGER DEFAULT 0,
         synced_at     BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
         UNIQUE(name, company_guid)
       );
+      ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS alias TEXT;
+      ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]';
 
       -- Currency masters
       CREATE TABLE IF NOT EXISTS currencies (
@@ -950,6 +954,27 @@ export async function initSchema() {
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS batch_tracking_app_enabled   BOOLEAN DEFAULT FALSE;
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS expiry_tracking_app_enabled  BOOLEAN DEFAULT FALSE;
       ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS allow_negative_stock_app     BOOLEAN DEFAULT FALSE;
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS batch_tracking_user_set      BOOLEAN DEFAULT FALSE;
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS expiry_tracking_user_set     BOOLEAN DEFAULT FALSE;
+      ALTER TABLE company_inventory_settings ADD COLUMN IF NOT EXISTS hsn_verification_enabled     BOOLEAN DEFAULT TRUE;
+
+      -- GST HSN/SAC master for existence validation (refreshed periodically)
+      CREATE TABLE IF NOT EXISTS hsn_sac_codes (
+        code          TEXT PRIMARY KEY,
+        description   TEXT,
+        code_type     TEXT DEFAULT 'hsn',
+        gst_rates     JSONB DEFAULT '[]',
+        source        TEXT,
+        updated_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_hsn_sac_code_type ON hsn_sac_codes(code_type);
+      CREATE TABLE IF NOT EXISTS hsn_sac_meta (
+        id            SERIAL PRIMARY KEY,
+        last_refresh  TIMESTAMPTZ,
+        source_url    TEXT,
+        row_count     INTEGER DEFAULT 0,
+        status        TEXT
+      );
 
       -- ── Barcode Module ────────────────────────────────────────────────────────
       CREATE TABLE IF NOT EXISTS stock_barcodes (

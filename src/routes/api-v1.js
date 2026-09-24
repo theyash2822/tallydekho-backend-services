@@ -55,6 +55,10 @@ import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.j
 import { resolveViewCapability } from '../middleware/viewCapability.js';
 import { requireResolvedCompanyId } from '../utils/companyOwnership.js';
 import { devOtpSuffix } from '../utils/otpLogging.js';
+import { pushGodownCodeAsAlias } from './tally-write.js';
+import {
+  validateHsnCode, ensureHsnBootstrap, maybeRefreshHsnMaster, normalizeHsnCode,
+} from '../services/hsnMaster.js';
 
 // Pre-auth token (scoped, 5-min) for 2FA PIN step
 const generatePreAuthToken = (userId, mobile) =>
@@ -3942,7 +3946,7 @@ router.get('/stocks/expiry-schedule', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/stocks/fast-slow — Fast vs Slow moving items based on FY outward movement
+// GET /api/stocks/fast-slow — Fast / Slow / Dead moving items (current FY)
 router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
   if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
@@ -3951,7 +3955,6 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
   try {
     const { from: fyFrom, to: fyTo, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
 
-    // Fetch all stocks + their FY movement stats
     const { rows } = await query(`
       SELECT
         s.guid, s.name, s.group_name, s.unit, s.category,
@@ -3963,6 +3966,7 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
         COALESCE(SUM(CASE WHEN st.type = 'inward'  THEN ABS(st.qty) ELSE 0 END), 0) AS total_inward_qty,
         COUNT(CASE WHEN st.type = 'outward' THEN 1 ELSE NULL END)::int AS outward_txn_count,
         COUNT(st.id)::int AS total_txn_count,
+        MAX(CASE WHEN st.type = 'outward' THEN st.date::date ELSE NULL END) AS last_outward_date,
         ROUND(
           COALESCE(SUM(CASE WHEN st.type = 'outward' THEN ABS(st.qty) ELSE 0 END), 0)
           / GREATEST(($3::date - $2::date), 1)
@@ -3973,36 +3977,64 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
        AND st.company_id = s.company_id
        AND st.date::date >= $2::date
        AND st.date::date <= $3::date
-       AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from velocity calculation
+       AND st.voucher_type != 'Physical Stock'
       WHERE s.company_id=$1
       GROUP BY s.guid, s.name, s.group_name, s.unit, s.category, s.closing_rate, s.closing_qty, s.sku, s.alias
       ORDER BY total_outward_qty DESC, s.name ASC
     `, [companyId, fyFrom, fyTo]);
 
     if (!rows.length) {
-      return res.json({ success: true, data: { fast: [], slow: [], financial_year: financialYear } });
+      return res.json({
+        success: true,
+        data: { fast: [], slow: [], dead: [], financial_year: financialYear, settings: {} },
+      });
     }
 
-    // Items that had any outward movement in the FY
-    const active   = rows.filter(r => parseFloat(r.total_outward_qty) > 0);
-    const inactive = rows.filter(r => parseFloat(r.total_outward_qty) === 0);
-
-    // Among active items, top 50% by total_outward_qty = fast, bottom 50% = slow
-    // Use company's fast_moving_top_pct setting (default 20%); fall back to 50% if not set
     const { rows: fsSettings } = await query(
       `SELECT fast_moving_top_pct, slow_moving_no_movement_days, dead_stock_no_movement_days
        FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
       [companyId]
     );
-    const fastPct    = parseInt(fsSettings[0]?.fast_moving_top_pct)  || 20;  // top X% by outward qty
-    const slowDays   = parseInt(fsSettings[0]?.slow_moving_no_movement_days) || 90;
-    const deadDays   = parseInt(fsSettings[0]?.dead_stock_no_movement_days)  || 180;
-    const fastCount  = Math.max(1, Math.ceil(active.length * fastPct / 100));
-    const fastRaw    = active.slice(0, fastCount);
-    // Slow: active items below fast threshold
-    // Dead: inactive items with no movement beyond deadDays (use transaction date proxy)
-    const slowActive = active.slice(fastCount);
-    const slowRaw    = [...slowActive, ...inactive];
+    const fastPct  = parseInt(fsSettings[0]?.fast_moving_top_pct) || 20;
+    const slowDays = parseInt(fsSettings[0]?.slow_moving_no_movement_days) || 90;
+    const deadDays = parseInt(fsSettings[0]?.dead_stock_no_movement_days) || 180;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const daysSince = (d) => {
+      if (!d) return Number.POSITIVE_INFINITY;
+      const t = new Date(d);
+      t.setHours(0, 0, 0, 0);
+      return Math.floor((today - t) / 864e5);
+    };
+
+    const active = rows.filter(r => parseFloat(r.total_outward_qty) > 0);
+    const fastCount = Math.max(1, Math.ceil(active.length * fastPct / 100));
+    const fastSet = new Set(active.slice(0, fastCount).map(r => r.guid));
+
+    const fastRaw = [];
+    const slowRaw = [];
+    const deadRaw = [];
+    for (const r of rows) {
+      const since = daysSince(r.last_outward_date);
+      if (fastSet.has(r.guid)) {
+        fastRaw.push(r);
+        continue;
+      }
+      // Dead: no outward for ≥ deadDays (or never in FY) and has on-hand stock
+      if (since >= deadDays && parseFloat(r.closing_qty) > 0) {
+        deadRaw.push(r);
+        continue;
+      }
+      // Never sold in FY and zero stock → skip noise; else slow
+      if (since >= slowDays || parseFloat(r.total_outward_qty) === 0) {
+        if (parseFloat(r.closing_qty) > 0 || parseFloat(r.total_outward_qty) > 0) {
+          slowRaw.push(r);
+        }
+        continue;
+      }
+      slowRaw.push(r);
+    }
 
     const displayField = await getProductDisplayField(companyId);
     const mapItem = (r, idx, tab) => ({
@@ -4019,7 +4051,8 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
       outward_txn_count:  parseInt(r.outward_txn_count   || 0),
       total_txn_count:    parseInt(r.total_txn_count      || 0),
       avg_daily_outward:  parseFloat(r.avg_daily_outward  || 0),
-      // Estimated days of stock remaining at current consumption rate
+      last_outward_date:  r.last_outward_date || null,
+      days_since_outward: Number.isFinite(daysSince(r.last_outward_date)) ? daysSince(r.last_outward_date) : null,
       days_remaining:     parseFloat(r.avg_daily_outward) > 0
                             ? Math.round(parseFloat(r.closing_qty) / parseFloat(r.avg_daily_outward))
                             : null,
@@ -4032,10 +4065,12 @@ router.get('/stocks/fast-slow', authMiddleware, async (req, res) => {
       data: {
         fast:           fastRaw.map((r, i) => mapItem(r, i, 'fast')),
         slow:           slowRaw.map((r, i) => mapItem(r, i, 'slow')),
+        dead:           deadRaw.map((r, i) => mapItem(r, i, 'dead')),
         total_items:    rows.length,
         active_items:   active.length,
-        inactive_items: inactive.length,
+        inactive_items: rows.length - active.length,
         financial_year: financialYear,
+        settings: { fast_moving_top_pct: fastPct, slow_moving_no_movement_days: slowDays, dead_stock_no_movement_days: deadDays },
       }
     });
   } catch (err) {
@@ -4574,10 +4609,12 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
       negative_stock_alerts:          { inApp: true,  email: true,  whatsapp: false },
       expiry_alerts:                  { inApp: true,  email: false, whatsapp: false, daysBefore: 30 },
       fast_slow_moving_alerts:        { inApp: false, email: false, whatsapp: false },
-      // App-level preferences for Tally-controlled settings
       batch_tracking_app_enabled:     false,
       expiry_tracking_app_enabled:    false,
       allow_negative_stock_app:       false,
+      batch_tracking_user_set:        false,
+      expiry_tracking_user_set:       false,
+      hsn_verification_enabled:       true,
     };
 
     // Merge saved over defaults (JSONB cols come as objects from pg driver)
@@ -4586,6 +4623,37 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
       for (const [k, v] of Object.entries(saved)) {
         if (v !== null && v !== undefined) merged[k] = v;
       }
+    }
+
+    // Sync defaults from Tally: if user never set toggle, mirror Tally batch/expiry presence
+    const syncPatches = {};
+    if (!merged.batch_tracking_user_set && tallyBatchStats.batch_enabled_count > 0 && !merged.batch_tracking_app_enabled) {
+      merged.batch_tracking_app_enabled = true;
+      syncPatches.batch_tracking_app_enabled = true;
+    }
+    if (!merged.expiry_tracking_user_set && tallyBatchStats.expiry_enabled_count > 0 && !merged.expiry_tracking_app_enabled) {
+      merged.expiry_tracking_app_enabled = true;
+      syncPatches.expiry_tracking_app_enabled = true;
+    }
+    if (Object.keys(syncPatches).length) {
+      await query(
+        `INSERT INTO company_inventory_settings (company_id, company_guid, batch_tracking_app_enabled, expiry_tracking_app_enabled, updated_at)
+         VALUES ($1,$2,$3,$4,NOW())
+         ON CONFLICT (company_id) DO UPDATE SET
+           batch_tracking_app_enabled = CASE
+             WHEN company_inventory_settings.batch_tracking_user_set THEN company_inventory_settings.batch_tracking_app_enabled
+             ELSE EXCLUDED.batch_tracking_app_enabled END,
+           expiry_tracking_app_enabled = CASE
+             WHEN company_inventory_settings.expiry_tracking_user_set THEN company_inventory_settings.expiry_tracking_app_enabled
+             ELSE EXCLUDED.expiry_tracking_app_enabled END,
+           updated_at = NOW()`,
+        [
+          companyId,
+          companyGuid,
+          syncPatches.batch_tracking_app_enabled ?? merged.batch_tracking_app_enabled,
+          syncPatches.expiry_tracking_app_enabled ?? merged.expiry_tracking_app_enabled,
+        ]
+      ).catch((e) => console.warn('[inventory/settings] sync default:', e.message));
     }
 
     res.json({
@@ -4602,7 +4670,6 @@ router.get('/inventory/settings', authMiddleware, async (req, res) => {
         tally_derived: {
           default_unit:     tallyDefaultUnit,
           batch_stats:      tallyBatchStats,
-          // Archive stock layers: TallyDekho-only, filters app-side display only (no delete)
           archive_note:     'Archive layers hides old activity from default view. Does not delete data.',
         },
       },
@@ -4621,6 +4688,14 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
   const companyId = requireResolvedCompanyId(req);
   try {
     const b = req.body;
+    const { rows: [prevSett] } = await query(
+      `SELECT warehouse_code_map, batch_tracking_app_enabled, expiry_tracking_app_enabled,
+              batch_tracking_user_set, expiry_tracking_user_set
+       FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
+    const prevCodeMap = prevSett?.warehouse_code_map || {};
+
     await query(`
       INSERT INTO company_inventory_settings (
         company_id, company_guid, product_display_field, default_unit_for_new_items,
@@ -4683,9 +4758,194 @@ router.post('/inventory/settings', authMiddleware, async (req, res) => {
       b.expiry_tracking_app_enabled   ?? false,
       b.allow_negative_stock_app      ?? false,
     ]);
-    res.json({ success: true, message: 'Inventory settings saved successfully' });
+
+    // HSN + user-override flags for batch/expiry (manual toggle = sticky)
+    const batchNext = b.batch_tracking_app_enabled ?? false;
+    const expiryNext = b.expiry_tracking_app_enabled ?? false;
+    const batchUserSet = !!(prevSett?.batch_tracking_user_set)
+      || (prevSett && batchNext !== !!prevSett.batch_tracking_app_enabled)
+      || b.batch_tracking_user_set === true;
+    const expiryUserSet = !!(prevSett?.expiry_tracking_user_set)
+      || (prevSett && expiryNext !== !!prevSett.expiry_tracking_app_enabled)
+      || b.expiry_tracking_user_set === true;
+    await query(
+      `UPDATE company_inventory_settings SET
+         hsn_verification_enabled = $2,
+         batch_tracking_user_set = $3,
+         expiry_tracking_user_set = $4,
+         updated_at = NOW()
+       WHERE company_id = $1`,
+      [
+        companyId,
+        b.hsn_verification_enabled !== false,
+        batchUserSet,
+        expiryUserSet,
+      ]
+    ).catch((e) => console.warn('[inventory/settings] extra flags:', e.message));
+
+    // Phase B: append changed warehouse codes as Tally Godown aliases (never overwrite)
+    const newCodeMap = b.warehouse_code_map || {};
+    const changedGuids = Object.keys(newCodeMap).filter((guid) => {
+      const next = String(newCodeMap[guid] || '').trim();
+      if (!next) return false;
+      return next !== String(prevCodeMap[guid] || '').trim();
+    });
+    const aliasSync = { attempted: 0, skipped: 0, queued: 0, failed: 0 };
+    if (changedGuids.length) {
+      const { rows: coRows } = await query(
+        `SELECT name FROM companies WHERE id=$1 LIMIT 1`, [companyId]
+      ).catch(() => ({ rows: [] }));
+      const companyName = coRows[0]?.name || '';
+      const { rows: whRows } = await query(
+        `SELECT guid, name, alias, aliases FROM warehouses
+         WHERE company_id=$1 AND guid = ANY($2::text[])`,
+        [companyId, changedGuids]
+      ).catch(() => ({ rows: [] }));
+      const byGuid = Object.fromEntries(whRows.map((w) => [w.guid, w]));
+      for (const guid of changedGuids) {
+        const wh = byGuid[guid];
+        if (!wh?.name) continue;
+        const code = String(newCodeMap[guid] || '').trim();
+        const prevCode = String(prevCodeMap[guid] || '').trim();
+        const existing = [];
+        if (Array.isArray(wh.aliases)) existing.push(...wh.aliases);
+        else if (wh.aliases && typeof wh.aliases === 'object') existing.push(...Object.values(wh.aliases));
+        if (wh.alias) existing.push(wh.alias);
+        if (prevCode) existing.push(prevCode);
+        aliasSync.attempted += 1;
+        try {
+          const result = await pushGodownCodeAsAlias({
+            companyGuid,
+            companyId,
+            userId: req.user.userId,
+            companyName,
+            godownName: wh.name,
+            code,
+            existingAliases: existing,
+          });
+          if (result?.status === 'skipped') aliasSync.skipped += 1;
+          else if (result?.status === 'failed') aliasSync.failed += 1;
+          else aliasSync.queued += 1;
+        } catch (e) {
+          aliasSync.failed += 1;
+          console.warn('[inventory/settings] godown alias push:', e.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Inventory settings saved successfully',
+      alias_sync: aliasSync,
+    });
   } catch (err) {
     console.error('[inventory/settings POST]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/inventory/hsn/check?code=3924 — soft validate one HSN
+router.get('/inventory/hsn/check', authMiddleware, async (req, res) => {
+  try {
+    await ensureHsnBootstrap();
+    const result = await validateHsnCode(req.query.code);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/stocks/hsn-validation — items with missing / unknown HSN (when verification enabled)
+router.get('/stocks/hsn-validation', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  try {
+    await ensureHsnBootstrap();
+    const { rows: sett } = await query(
+      `SELECT hsn_verification_enabled FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    );
+    const enabled = sett[0]?.hsn_verification_enabled !== false;
+
+    if (!enabled) {
+      return res.json({
+        success: true,
+        data: { enabled: false, items: [], counts: { missing: 0, bad_format: 0, unknown: 0, total: 0 } },
+      });
+    }
+
+    const displayField = await getProductDisplayField(companyId);
+    const { rows: codeRows } = await query(`SELECT code FROM hsn_sac_codes`);
+    const codeSet = new Set(codeRows.map((r) => r.code));
+    const hasPrefix = (c) => {
+      if (codeSet.has(c)) return true;
+      if (c.length >= 6 && codeSet.has(c.slice(0, 6))) return true;
+      if (c.length >= 4 && codeSet.has(c.slice(0, 4))) return true;
+      if (c.length === 4 || c.length === 6) {
+        for (const x of codeSet) if (x.startsWith(c)) return true;
+      }
+      return false;
+    };
+
+    const { rows } = await query(
+      `SELECT guid, name, alias, sku, hsn, group_name, unit, closing_qty, tax_rate
+       FROM stocks WHERE company_id=$1 ORDER BY name ASC`,
+      [companyId]
+    );
+
+    const items = [];
+    const counts = { missing: 0, bad_format: 0, unknown: 0, total: 0 };
+    for (const r of rows) {
+      const code = normalizeHsnCode(r.hsn);
+      let status;
+      let message;
+      if (!code) {
+        status = 'missing';
+        message = 'HSN is empty';
+      } else if (code.length < 4) {
+        status = 'bad_format';
+        message = 'HSN should be 4, 6, or 8 digits';
+      } else if (hasPrefix(code) || codeSet.has(code)) {
+        continue;
+      } else if (![4, 6, 8].includes(code.length) && code.length <= 8) {
+        status = 'bad_format';
+        message = 'HSN format not recognized';
+      } else {
+        status = 'unknown';
+        message = 'HSN not found in our list';
+      }
+      counts[status] = (counts[status] || 0) + 1;
+      counts.total += 1;
+      items.push({
+        id: r.guid,
+        name: r.name,
+        displayName: computeDisplayName(r, displayField),
+        sku: r.sku || r.alias || '',
+        hsn: r.hsn || '',
+        group: r.group_name || '',
+        unit: r.unit || '',
+        closing_qty: parseFloat(r.closing_qty || 0),
+        tax_rate: parseFloat(r.tax_rate || 0),
+        status,
+        message,
+      });
+    }
+
+    res.json({ success: true, data: { enabled: true, items, counts } });
+  } catch (err) {
+    console.error('[hsn-validation]', err.message);
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/inventory/hsn/refresh — force refresh master (admin/ops; also used by scheduler)
+router.post('/inventory/hsn/refresh', authMiddleware, async (req, res) => {
+  try {
+    const result = await maybeRefreshHsnMaster({ force: !!req.body?.force, maxAgeDays: 15 });
+    res.json({ success: true, data: result });
+  } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
@@ -4741,37 +5001,34 @@ router.get('/stocks/warehouses', authMiddleware, async (req, res) => {
   const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
-      `SELECT w.guid, w.name, w.parent, w.address,
+      `SELECT w.guid, w.name, w.parent, w.address, w.alias, w.aliases,
         COALESCE(SUM(CASE WHEN st.type='inward' THEN st.qty ELSE -st.qty END), 0) as net_qty,
         COUNT(DISTINCT st.stock_guid) as skus
        FROM warehouses w
        LEFT JOIN stock_transactions st ON st.warehouse = w.name AND st.company_id = w.company_id
          AND st.voucher_type != 'Physical Stock'  -- exclude audit counts from warehouse net qty
        WHERE w.company_id=$1
-       GROUP BY w.guid, w.name, w.parent, w.address
+       GROUP BY w.guid, w.name, w.parent, w.address, w.alias, w.aliases
        ORDER BY w.name`,
       [companyId]
     );
-    // Merge TallyDekho-only warehouse settings (code, cycle freq, archive months)
+    // Merge app warehouse code (settings map); fall back to synced Tally alias
     const { rows: settRows } = await query(
-      `SELECT warehouse_code_map, cycle_count_frequency_map, archive_stock_layers_map
+      `SELECT warehouse_code_map
        FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
       [companyId]
     );
-    const codeMap    = settRows[0]?.warehouse_code_map          || {};
-    const cycleMap   = settRows[0]?.cycle_count_frequency_map   || {};
-    const archiveMap = settRows[0]?.archive_stock_layers_map    || {};
+    const codeMap = settRows[0]?.warehouse_code_map || {};
     res.json({ success: true, data: rows.map(r => ({
-      id:                   r.guid,
-      name:                 r.name,
-      parent:               r.parent    || '',
-      address:              r.address   || '',
-      total_qty:            parseFloat(r.net_qty || 0),
-      skus:                 parseInt(r.skus || 0),
-      // TallyDekho-only settings (do not overwrite Tally godown name)
-      code:                 codeMap[r.guid]    || '',
-      cycle_count_frequency: cycleMap[r.guid]  || 'Weekly',
-      archive_layers_months: archiveMap[r.guid] || 24,
+      id:      r.guid,
+      name:    r.name,
+      parent:  r.parent  || '',
+      address: r.address || '',
+      alias:   r.alias   || '',
+      total_qty: parseFloat(r.net_qty || 0),
+      skus:      parseInt(r.skus || 0),
+      // App code → else first Tally alias (display only; never overwrites Tally name)
+      code: String(codeMap[r.guid] || r.alias || '').trim(),
     })) });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -4787,11 +5044,18 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
   try {
     // Warehouse info
     const { rows: wh } = await query(
-      'SELECT guid, name, parent, address FROM warehouses WHERE company_id=$1 AND guid=$2 LIMIT 1',
+      'SELECT guid, name, parent, address, alias, aliases FROM warehouses WHERE company_id=$1 AND guid=$2 LIMIT 1',
       [companyId, id]
     );
     if (!wh[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Warehouse not found' } });
     const whName = wh[0].name;
+
+    const { rows: settRows } = await query(
+      `SELECT warehouse_code_map FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
+    const codeMap = settRows[0]?.warehouse_code_map || {};
+    const code = String(codeMap[wh[0].guid] || wh[0].alias || '').trim();
 
     // Stock summary for this warehouse
     const { rows: summary } = await query(
@@ -4819,6 +5083,7 @@ router.get('/stocks/warehouses/:id', authMiddleware, async (req, res) => {
       success: true,
       data: {
         id: wh[0].guid, name: wh[0].name, parent: wh[0].parent, address: wh[0].address || '',
+        alias: wh[0].alias || '', code,
         total_qty: parseFloat(summary[0]?.total_qty||0),
         skus: parseInt(summary[0]?.skus||0),
         activity: activity.map(a => ({

@@ -6279,6 +6279,76 @@ router.get('/master/bank', authMiddleware, async (req, res) => {
 const escXml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 
 /**
+ * Append warehouse code as a Godown Alias in Tally without overwriting existing aliases.
+ * NAME.LIST = [primary name, ...existingAliases, code] (deduped).
+ */
+export async function pushGodownCodeAsAlias({
+  companyGuid, companyId, userId, companyName,
+  godownName, code, existingAliases = [],
+}) {
+  const name = String(godownName || '').trim();
+  const newCode = String(code || '').trim();
+  if (!name || !newCode) return null;
+
+  const codeKey = newCode.toLowerCase();
+  const alreadyHad = name.toLowerCase() === codeKey
+    || (existingAliases || []).some(a => String(a).trim().toLowerCase() === codeKey);
+  if (alreadyHad) return { status: 'skipped', message: 'Code already present as godown alias' };
+
+  const all = [];
+  const seen = new Set();
+  for (const part of [name, ...existingAliases, newCode]) {
+    const t = String(part || '').trim();
+    if (!t) continue;
+    const key = t.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    all.push(t);
+  }
+
+  const eName = escXml(name);
+  const eCompany = escXml(companyName || '');
+  const nameList = all.map(a => `<NAME>${escXml(a)}</NAME>`).join('');
+  const xml =
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>` +
+    `<STATICVARIABLES><SVCURRENTCOMPANY>${eCompany}</SVCURRENTCOMPANY></STATICVARIABLES>` +
+    `</REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">` +
+    `<GODOWN NAME="${eName}" ACTION="Alter">` +
+    `<NAME>${eName}</NAME>` +
+    `<NAME.LIST TYPE="String">${nameList}</NAME.LIST>` +
+    `</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+
+  const queueId = await logWriteQueue(
+    userId, companyGuid, 'warehouse_alias',
+    `${name} → alias ${newCode}`,
+    null, { godownName: name, code: newCode, existingAliases }, xml, companyId
+  ).catch(() => null);
+
+  let result;
+  try {
+    result = await forwardToTally(companyGuid, userId, xml, { companyId });
+  } catch (err) {
+    result = { status: 'failed', message: err.message };
+  }
+  await updateWriteQueue(queueId, result, null);
+  if (result?.status !== 'desktop_offline' && result?.status !== 'failed') {
+    setImmediate(() => {
+      requestDesktopSyncAfterWrite({
+        userId,
+        companyId,
+        companyGuid,
+        companyName,
+        tdkRef: null,
+        tallyIds: [],
+        extra: { reason: 'godown_alias', masterType: 'warehouse', masterName: name },
+      });
+    });
+  }
+  return result;
+}
+
+/**
  * Push a single barcode to TallyPrime via desktop connector.
  * syncTarget: 'tally_part_number' | 'tally_alias'
  * Returns the forwardToTally result object or null if no push needed.

@@ -1,3 +1,20 @@
+## 2026-09-24 — Items settings: Fast/Slow/Dead + HSN + UX gates
+
+Items: remove Aging + Analysis Period. Wire Fast/Slow/Dead on FY. HSN
+verification (default ON) + master table + 15-day refresh + report.
+Batch/Expiry sync-default from Tally + UX gate; negative soft-warn when OFF.
+
+---
+
+
+Phase A+B: Warehouse Code shows on list/detail/search. Saving inventory settings
+appends the code as a Godown Alias via `NAME.LIST` (keeps existing aliases —
+never overwrites). `Godown.xml` exports `OnlyAlias` + `NameList`; warehouses
+table stores `alias` / `aliases`. Cycle Count + Archive Layers removed from
+settings UI (DB columns kept). `pushGodownCodeAsAlias` in tally-write.
+
+---
+
 ## 2026-09-24 — Inventory settings: default unit + purchase buffer for lists
 
 `GET /inventory/settings` available_uoms = units master ∪ stocks.units.

@@ -3305,6 +3305,30 @@ async function processAllVoucher(data, companyGuid) {
   finally { client.release(); }
 }
 
+function parseGodownAliases(r, primaryName) {
+  const names = [];
+  const rawList = r.NameList || r.NAMELIST || r.Name_List || '';
+  if (rawList) {
+    for (const part of String(rawList).split(/[,\n|;]+/)) {
+      const t = part.trim();
+      if (t) names.push(t);
+    }
+  }
+  const onlyAlias = (r.OnlyAlias || r.ALIAS || r.Alias || '').toString().trim();
+  if (onlyAlias) names.push(onlyAlias);
+  const primary = String(primaryName || '').trim();
+  const seen = new Set();
+  const aliases = [];
+  for (const n of names) {
+    if (!n || n === primary) continue;
+    const key = n.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(n);
+  }
+  return aliases;
+}
+
 async function processWarehouses(data, companyGuid) {
   const client = wrapIngestClient(await getClient());
   const confirmedWarehouses = [];
@@ -3314,18 +3338,22 @@ async function processWarehouses(data, companyGuid) {
     for (const r of data) {
       const name = r.Name || r.NAME || '';
       if (!name) continue;
+      const aliases = parseGodownAliases(r, name);
+      const alias = aliases[0] || null;
       try {
         await client.query(`
-          INSERT INTO warehouses (guid, company_guid, name, parent, parent_guid, address, alter_id, synced_at, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+          INSERT INTO warehouses (guid, company_guid, name, parent, parent_guid, address, alias, aliases, alter_id, synced_at, company_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10, $11)
           ON CONFLICT (company_id, name) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, warehouses.company_id), guid=EXCLUDED.guid, parent=EXCLUDED.parent, parent_guid=EXCLUDED.parent_guid,
-            address=EXCLUDED.address, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
+            address=EXCLUDED.address, alias=EXCLUDED.alias, aliases=EXCLUDED.aliases, alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at
         `, [
           r.Guid || r.GUID || null, companyGuid, name,
           r.Parent || r.PARENT || null,
           r.ParentGuid || null,
           r.Address || null,
+          alias,
+          JSON.stringify(aliases),
           parseInt(r.AlterId || r.ALTERID || 0), now(),
           currentCompanyId()]);
         saved++;

@@ -48,7 +48,30 @@ export function startScheduler() {
     }
   });
 
-  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM), workspace grace (15m)');
+  // ─── HSN master — daily 3 AM; downloads only if older than 15 days ─────────
+  cron.schedule('0 3 * * *', async () => {
+    try {
+      const { maybeRefreshHsnMaster } = await import('./hsnMaster.js');
+      const result = await maybeRefreshHsnMaster({ maxAgeDays: 15 });
+      console.log('[Scheduler] HSN master:', JSON.stringify(result));
+    } catch (err) {
+      console.error('[Scheduler] HSN refresh failed:', err.message);
+    }
+  });
+
+  setImmediate(async () => {
+    try {
+      const { ensureHsnBootstrap, maybeRefreshHsnMaster } = await import('./hsnMaster.js');
+      const boot = await ensureHsnBootstrap();
+      console.log('[Scheduler] HSN bootstrap:', JSON.stringify(boot));
+      const refresh = await maybeRefreshHsnMaster({ maxAgeDays: 15 });
+      if (!refresh.skipped) console.log('[Scheduler] HSN initial refresh:', JSON.stringify(refresh));
+    } catch (e) {
+      console.warn('[Scheduler] HSN bootstrap:', e.message);
+    }
+  });
+
+  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM), workspace grace (15m), HSN (daily/15d)');
 }
 
 // ─── Payment Reminder Job ─────────────────────────────────────────────────────
