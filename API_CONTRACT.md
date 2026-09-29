@@ -170,6 +170,32 @@ Same shape as credit-note-context with Purchase naming:
 
 `remainingQty` counts synced Debit Notes (Agst Ref) + queued `app_vouchers.voucher_type='debit_note'`.
 
+### GET /api/purchase/einvoice-qr-resolve
+Auth + company ownership; capability via path (`purchase.view`).
+Query: `companyGuid`, `sellerGstin` (15 alphanumeric), `irn` (64 hex).
+Response `data`: `{ vendors: [{ guid, name, gstin, gst_registration_type, parent, state_name, isCreditor }], duplicate: { tdk_reference_no, tally_voucher_no, party_name, voucher_date, created_at } | null }`.
+Vendors are exact GSTIN matches in this company's ledgers. `duplicate` = a non-cancelled app Purchase invoice already carries this IRN.
+Errors: `INVALID_GSTIN` / `INVALID_IRN` (400).
+
+### POST /api/purchase/bill-analyze
+Body: `{ companyGuid, file }` — `file` is a data URI (`image/jpeg|png|webp` or `application/pdf`, magic bytes checked, max 6 MB).
+Reads the PDF text layer (unpdf) or runs OCR on this server (tesseract.js; no LLM / paid API), then rule-based bill scoring.
+Response `data`: `{ readable, source: 'pdf_text'|'ocr', pages? (PDF only), reason?, isBill, score, found[], missing[], extracted: { gstins, invoiceNos, totalCandidates, amounts, irns, tokens }, mime, ms }`. Full text is never returned or stored.
+OCR budget: ≤15 s queue wait + ≤20 s OCR (mobile waits 45 s). Errors: `OCR_BUSY` (503, ≥3 pending — retry), `ANALYZE_TIMEOUT` (504), `ANALYZE_FAILED` (500), `INVALID_FORMAT` / `EMPTY_FILE` (400), `TOO_LARGE` (413).
+
+### POST /api/purchase/bill-attachment
+Body: `{ companyGuid, invoiceUuid, file }` (legacy field `image` accepted). Same file rules as bill-analyze.
+Invoice must be this company's app Purchase invoice (`INVALID_INVOICE` 400, `NOT_FOUND` 404). Stored in `purchase_bill_attachments` (latest wins on read).
+Response `data`: `{ id, sizeBytes, createdAt }`.
+
+### GET /api/purchase/bill-attachment/:invoiceUuid
+Query: `companyGuid`. Response `data`: `{ image: <data URI, photo or PDF>, createdAt }` for the latest attachment; `NOT_FOUND` (404) if none.
+
+### POST /tally/voucher/purchase — e-Invoice import
+Optional `einvoiceImport: { irn, irnDate, sellerGstin, buyerGstin, docNo, docDate, docType, qrTotal, itemCount, mainHsnCode, buyerGstinMismatch }`.
+Sanitised server-side (adds `source:'einvoice_qr'`, `verification:'not_verified'`), stored in `app_vouchers.payload` only — never sent in the Tally XML.
+`409 { code: 'DUPLICATE_IRN', message }` if the IRN is already booked.
+
 ### POST /tally/voucher/debit-note
 Purchase Return only — requires `linked_invoice` (Purchase invoice GUID or number).
 Numbering prefix **DBN** (`TDK-DBN-*`; series `DBN` when `tallydekho_series`) — does not use Delivery Note `DN`.

@@ -12,7 +12,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TESSERACT_CACHE = path.resolve(__dirname, '../../.cache/tesseract');
 
+// Budget must stay under the mobile bill-analyze timeout (45s): queue wait + OCR + upload.
 const OCR_TIMEOUT_MS = 20_000;
+const OCR_QUEUE_WAIT_MS = 15_000;
+const OCR_MAX_PENDING = 3;
 const MAX_PDF_PAGES = 10;
 const MIN_TEXT_CHARS = 30;
 export const BILL_SCORE_THRESHOLD = 6;
@@ -28,24 +31,70 @@ async function getOcrWorker() {
   return _workerPromise;
 }
 
-// OCR calls share one worker; serialize so concurrent uploads don't interleave.
-let _ocrQueue = Promise.resolve();
-function withTimeout(promise, ms, label) {
-  let t;
-  return Promise.race([
-    promise.finally(() => clearTimeout(t)),
-    new Promise((_, reject) => { t = setTimeout(() => reject(new Error(`${label} timed out`)), ms); }),
-  ]);
+function ocrError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
 }
 
+// A hung recognize() would block every later job, so a timed-out worker is discarded.
+async function discardOcrWorker() {
+  const p = _workerPromise;
+  _workerPromise = null;
+  if (p) p.then((w) => w.terminate()).catch(() => {});
+}
+
+// OCR calls share one worker; serialize so concurrent uploads don't interleave.
+// The OCR timeout starts when this job reaches the worker, not while it waits in the queue.
+let _ocrQueue = Promise.resolve();
+let _ocrPending = 0;
+
 async function ocrImage(buffer) {
-  const run = _ocrQueue.then(async () => {
-    const worker = await getOcrWorker();
-    const { data } = await worker.recognize(buffer);
-    return data?.text || '';
+  if (_ocrPending >= OCR_MAX_PENDING) {
+    throw ocrError('OCR_BUSY', 'Bill reader is busy');
+  }
+  _ocrPending += 1;
+  let abandoned = false;
+  let timer;
+
+  const job = _ocrQueue.then(async () => {
+    if (abandoned) return '';
+    clearTimeout(timer);
+    const run = (async () => {
+      const worker = await getOcrWorker();
+      const { data } = await worker.recognize(buffer);
+      return data?.text || '';
+    })();
+    let ocrTimer;
+    try {
+      return await Promise.race([
+        run,
+        new Promise((_, reject) => {
+          ocrTimer = setTimeout(() => {
+            discardOcrWorker();
+            reject(ocrError('OCR_TIMEOUT', 'OCR timed out'));
+          }, OCR_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(ocrTimer);
+    }
   });
-  _ocrQueue = run.catch(() => {});
-  return withTimeout(run, OCR_TIMEOUT_MS, 'OCR');
+  _ocrQueue = job.catch(() => {});
+
+  const queueWait = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      abandoned = true;
+      reject(ocrError('OCR_BUSY', 'Bill reader is busy'));
+    }, OCR_QUEUE_WAIT_MS);
+  });
+
+  try {
+    return await Promise.race([job, queueWait]);
+  } finally {
+    clearTimeout(timer);
+    _ocrPending -= 1;
+  }
 }
 
 async function pdfText(buffer) {

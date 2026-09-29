@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-29 — QA follow-ups: stock-alert permissions, OCR budget, API docs
+
+- Daily stock-alert job sends each kind only if `authorize()` allows it for that user + company (`inventory.view`, `inventory.negative_stock.view`, `inventory.expiry.view`); companies picked `ORDER BY c.id`; email title/body HTML-escaped.
+- Bill OCR: timeout starts when the job reaches the worker; ≤15 s queue wait; ≥3 pending → `503 OCR_BUSY`; a timed-out worker is terminated so the queue can't hang.
+- `API_CONTRACT.md` documents the 4 new purchase endpoints + `einvoiceImport` / `DUPLICATE_IRN`.
+- Test: `src/__tests__/stock-alert-and-bill-guards.test.js`.
+
+---
+
 ## 2026-09-29 — e-Invoice QR import + bill photo/PDF validation
 
 - `GET /api/purchase/einvoice-qr-resolve` — vendors by seller GSTIN (company-scoped) + duplicate IRN check on `app_vouchers.payload.einvoiceImport.irn`.

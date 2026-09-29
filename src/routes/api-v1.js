@@ -5943,12 +5943,18 @@ router.post('/purchase/bill-analyze', authMiddleware, async (req, res) => {
     const result = await analyzeBillDocument({ buffer: decoded.buf, mime: decoded.mime });
     res.json({ success: true, data: { ...result, mime: decoded.mime, ms: Date.now() - t0 } });
   } catch (err) {
-    const timedOut = /timed out/i.test(err?.message || '');
+    if (err?.code === 'OCR_BUSY') {
+      return res.status(503).json({
+        success: false,
+        error: { code: 'OCR_BUSY', message: 'The bill reader is busy right now. Please try again in a few seconds.' },
+      });
+    }
+    const timedOut = err?.code === 'OCR_TIMEOUT' || /timed out/i.test(err?.message || '');
     res.status(timedOut ? 504 : 500).json({
       success: false,
       error: {
         code: timedOut ? 'ANALYZE_TIMEOUT' : 'ANALYZE_FAILED',
-        message: timedOut ? 'Reading the bill took too long. Try a clearer or smaller photo.' : 'Could not read this file.',
+        message: timedOut ? 'Reading the bill took too long. Try a clearer photo of just the bill.' : 'Could not read this file.',
       },
     });
   }

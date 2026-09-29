@@ -8,6 +8,35 @@ import { query } from '../db/schema.js';
 import { sendLowStockPush, sendPushNotification } from './push.js';
 import { sendEmail } from './email.js';
 import { sendPaymentReminder as sendWhatsAppReminder } from './whatsapp.js';
+import { authorize } from './authorizationService.js';
+
+/** Capability a member needs (per company) to receive each daily alert kind. */
+export const STOCK_ALERT_CAPABILITY = {
+  low_stock: 'inventory.view',
+  negative_stock: 'inventory.negative_stock.view',
+  expiry: 'inventory.expiry.view',
+};
+
+export function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function canReceiveStockAlert(userId, company, kind) {
+  const capability = STOCK_ALERT_CAPABILITY[kind];
+  if (!capability) return false;
+  const res = await authorize({
+    userId,
+    workspaceId: company.workspace_id,
+    capability,
+    companyGuid: company.guid,
+  });
+  return res.decision === 'ALLOW';
+}
 
 function channelOn(obj, key) {
   if (!obj || typeof obj !== 'object') return false;
@@ -117,8 +146,8 @@ export async function dispatchStockAlert({ userId, companyGuid, alertFlags = {},
       try {
         const html = `
           <div style="font-family: Arial, sans-serif; max-width: 520px; margin: auto; padding: 32px; border: 1px solid #E5E7EB; border-radius: 12px;">
-            <h2 style="color: #1A1A1A;">${payload.title || 'Stock Alert'}</h2>
-            <p style="color: #555; font-size: 15px;">${payload.body || ''}</p>
+            <h2 style="color: #1A1A1A;">${escapeHtml(payload.title || 'Stock Alert')}</h2>
+            <p style="color: #555; font-size: 15px;">${escapeHtml(payload.body)}</p>
             <hr style="border: none; border-top: 1px solid #E5E7EB; margin: 24px 0;">
             <p style="color: #AEACA8; font-size: 12px;">TallyDekho · Stock Alerts</p>
           </div>`;
@@ -171,7 +200,8 @@ export async function dispatchStockAlert({ userId, companyGuid, alertFlags = {},
 
 /**
  * Daily scan: for each active user with inventory companies, emit low/neg/expiry
- * alerts (limited per company to avoid push storms).
+ * alerts (limited per company to avoid push storms). Each kind is sent only if the
+ * member's role grants the matching capability for that company (fail closed).
  */
 export async function runStockAlertJob() {
   const { rows: users } = await query(`
@@ -187,9 +217,10 @@ export async function runStockAlertJob() {
   for (const user of users) {
     try {
       const { rows: companies } = await query(
-        `SELECT c.id, c.guid FROM companies c
+        `SELECT c.id, c.guid, c.workspace_id FROM companies c
          JOIN workspace_memberships m ON m.workspace_id = c.workspace_id
          WHERE m.user_id = $1 AND m.status = 'ACTIVE'
+         ORDER BY c.id ASC
          LIMIT 5`,
         [user.id]
       );
@@ -206,7 +237,8 @@ export async function runStockAlertJob() {
         const threshold = parseInt(sett.default_low_stock_level ?? 20, 10) || 20;
         const daysBefore = parseExpiryDays(expFlags);
 
-        if (lowFlags.inApp || lowFlags.email || lowFlags.whatsapp) {
+        if ((lowFlags.inApp || lowFlags.email || lowFlags.whatsapp)
+          && await canReceiveStockAlert(user.id, co, 'low_stock')) {
           const { rows: low } = await query(
             `SELECT name, closing_qty FROM stocks
              WHERE company_id=$1 AND closing_qty > 0 AND closing_qty <= $2
@@ -232,7 +264,8 @@ export async function runStockAlertJob() {
           }
         }
 
-        if (negFlags.inApp || negFlags.email || negFlags.whatsapp) {
+        if ((negFlags.inApp || negFlags.email || negFlags.whatsapp)
+          && await canReceiveStockAlert(user.id, co, 'negative_stock')) {
           const { rows: neg } = await query(
             `SELECT name, closing_qty FROM stocks
              WHERE company_id=$1 AND closing_qty < 0
@@ -257,7 +290,8 @@ export async function runStockAlertJob() {
           }
         }
 
-        if (expFlags.inApp || expFlags.email || expFlags.whatsapp) {
+        if ((expFlags.inApp || expFlags.email || expFlags.whatsapp)
+          && await canReceiveStockAlert(user.id, co, 'expiry')) {
           const { rows: exp } = await query(
             `SELECT ba.stock_item_name AS name, ba.batch_name, ba.expiry_date
              FROM batch_allocations ba
