@@ -1,3 +1,56 @@
+# CHANGELOG_AGENT.md — td-backend
+
+## 2026-09-29 — e-Invoice QR import + bill photo/PDF validation
+
+- `GET /api/purchase/einvoice-qr-resolve` — vendors by seller GSTIN (company-scoped) + duplicate IRN check on `app_vouchers.payload.einvoiceImport.irn`.
+- `POST /tally/voucher/purchase` — sanitises `einvoiceImport` (app DB only, never in Tally XML); `409 DUPLICATE_IRN` if already booked.
+- `POST /api/purchase/bill-analyze` — PDF text (unpdf) or OCR (tesseract.js, cache `.cache/tesseract`, 20s) → rule-based bill score (`src/services/billDocumentAnalyzer.js`, GSTIN mod-36 check + OCR look-alike repair). No LLM / paid API.
+- `POST/GET /api/purchase/bill-attachment` — stores bill (jpeg/png/webp/pdf, magic-byte checked, 6 MB) in new `purchase_bill_attachments` table.
+- QA: YELLOW (no blockers). Stock-alert dispatch logs no longer print email/phone.
+- Known: API_CONTRACT/API_USAGE not yet updated; OCR first run downloads eng traineddata.
+
+---
+
+## 2026-09-25 — LaunchAgent KeepAlive for local :3001
+
+Installed `~/Library/LaunchAgents/com.tallydekho.backend.plist` +
+`scripts/run-backend.sh` so macOS restarts the API if the process dies
+(agent shell cleanup was killing detached `nohup` starts).
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tallydekho.backend.plist`
+Verified: kill listener → KeepAlive brings health back.
+
+---
+
+## 2026-09-24 — Fix barcode → Tally push (broken req + mapping)
+
+`pushBarcodeToTally` referenced undefined `req` and wrong `logWriteQueue`
+args — sync silently failed. Now resolves `companyId` from guid/arg,
+maps Alias / Part Number (UDF→Alias), and bulk generate auto-pushes when
+Auto Sync is ON. Call sites pass `companyId`.
+
+---
+
+## 2026-09-24 — Stock alter: optimistic HSN/tax on stocks row
+
+After stock-item-alter success (or offline queue), UPDATE local `stocks.hsn`
+/ `tax_rate` so HSN validation and item detail refresh without waiting for
+StockItem sync.
+
+---
+
+## 2026-09-24 — Stock alerts: email/WA ready + push/inbox audit + dedupe UI
+
+- New `stockAlertDispatch.js`: multi-channel (Expo push / profile email / profile
+  mobile WA). Email/WA return `not_configured` until SES + `CRONBERRY_STOCK_TEMPLATE`.
+- Scheduler: daily 9AM stock alert job (was unused `sendLowStockPush`).
+- Push register: one token per device_id; prune duplicate tokens.
+- Derived inbox: remove noisy “New Sales Invoice” rows (keep stock/EWB/IRN/AR).
+- Mobile: Settings → Stock Alerts → Stocks Settings Alerts (legacy
+  `/settings/stock-alerts` redirects). Canonical prefs =
+  `company_inventory_settings`.
+
+---
+
 ## 2026-09-24 — Items settings: Fast/Slow/Dead + HSN + UX gates
 
 Items: remove Aging + Analysis Period. Wire Fast/Slow/Dead on FY. HSN

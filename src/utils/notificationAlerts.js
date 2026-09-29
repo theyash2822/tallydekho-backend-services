@@ -62,6 +62,41 @@ export function stockNotification(row, createdAt = new Date()) {
   };
 }
 
+export function negativeStockNotification(row, createdAt = new Date()) {
+  const id = `neg_${encodeURIComponent(row.name)}`;
+  return {
+    id,
+    type: 'stock',
+    category: 'Stock',
+    title: 'Negative Stock',
+    body: `${row.name} is at ${row.closing_qty} units`,
+    route: '/stocks/negative-stock',
+    actionLabel: 'View items',
+    created_at: createdAt.toISOString(),
+  };
+}
+
+export function expiryStockNotification(row, daysLeft, createdAt = new Date()) {
+  const id = `exp_${encodeURIComponent(row.stock_item_name || row.name)}_${encodeURIComponent(row.batch_name || '')}`;
+  const label = row.stock_item_name || row.name;
+  const batch = row.batch_name ? ` (batch ${row.batch_name})` : '';
+  const when = daysLeft < 0
+    ? `expired ${Math.abs(daysLeft)} day${Math.abs(daysLeft) === 1 ? '' : 's'} ago`
+    : daysLeft === 0
+      ? 'expires today'
+      : `expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`;
+  return {
+    id,
+    type: 'stock',
+    category: 'Stock',
+    title: daysLeft < 0 ? 'Stock Expired' : 'Expiry Approaching',
+    body: `${label}${batch} ${when}`,
+    route: '/stocks/expiry-schedule',
+    actionLabel: 'View expiry',
+    created_at: createdAt.toISOString(),
+  };
+}
+
 export function receivableNotification(row, createdAt = new Date()) {
   const bal = Math.round(parseFloat(row.bal) || 0);
   const id = `recv_${encodeURIComponent(row.name)}`;

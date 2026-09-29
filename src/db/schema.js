@@ -1116,6 +1116,21 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_tdk     ON invoice_pdf_versions(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_company ON invoice_pdf_versions(company_guid);
 
+      -- ── Purchase bill attachments (vendor bill photo; app DB only, never Tally) ──
+      CREATE TABLE IF NOT EXISTS purchase_bill_attachments (
+        id                  BIGSERIAL PRIMARY KEY,
+        company_id          INTEGER NOT NULL,
+        company_guid        TEXT NOT NULL,
+        user_id             INTEGER REFERENCES users(id),
+        invoice_uuid        UUID NOT NULL,
+        tdk_reference_no    TEXT,
+        mime_type           TEXT NOT NULL,
+        size_bytes          INTEGER NOT NULL,
+        data                BYTEA NOT NULL,
+        created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE INDEX IF NOT EXISTS idx_pbill_att_invoice ON purchase_bill_attachments(company_id, invoice_uuid);
+
       -- ── Geo masters (Tally country / state-emirate-province list) ───────────
       -- Seeded from data/geo_tally_states.json (TCSDV3 export). Spellings must
       -- match Tally exactly for LEDSTATENAME / COUNTRYOFRESIDENCE.

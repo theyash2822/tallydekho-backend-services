@@ -59,6 +59,17 @@ export function startScheduler() {
     }
   });
 
+  // ─── Stock alerts (low / negative / expiry) — daily 9 AM IST-ish (server TZ) ─
+  cron.schedule('0 9 * * *', async () => {
+    try {
+      const { runStockAlertJob } = await import('./stockAlertDispatch.js');
+      const result = await runStockAlertJob();
+      console.log('[Scheduler] Stock alerts:', JSON.stringify(result));
+    } catch (err) {
+      console.error('[Scheduler] Stock alert job failed:', err.message);
+    }
+  });
+
   setImmediate(async () => {
     try {
       const { ensureHsnBootstrap, maybeRefreshHsnMaster } = await import('./hsnMaster.js');
@@ -71,7 +82,7 @@ export function startScheduler() {
     }
   });
 
-  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM), workspace grace (15m), HSN (daily/15d)');
+  console.log('[Scheduler] Jobs registered: payment reminders (hourly), compliance (8AM), workspace grace (15m), HSN (daily/15d), stock alerts (9AM)');
 }
 
 // ─── Payment Reminder Job ─────────────────────────────────────────────────────

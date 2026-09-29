@@ -3416,7 +3416,54 @@ ${poExtrasXml}
 // POST /tally/voucher/purchase
 // Mirrors Sales create signs flipped for purchase (party Cr +, inventory/tax Dr −).
 // Reference: TallyPrime Purchase export — VCHTYPE Purchase, Item Invoice, BILLALLOCATIONS New Ref.
+/**
+ * Purchase e-Invoice QR header metadata — stored only in app DB payload (never Tally XML).
+ * Whitelisted + bounded; anything malformed is dropped rather than persisted.
+ */
+function sanitizeEinvoiceImport(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const str = (v, max) => (typeof v === 'string' && v.trim() && v.length <= max ? v.trim() : null);
+  const irn = str(raw.irn, 64);
+  if (!irn || !/^[0-9a-fA-F]{64}$/.test(irn)) return null;
+  const gstin = (v) => { const s = str(v, 15); return s && /^[0-9A-Za-z]{15}$/.test(s) ? s.toUpperCase() : null; };
+  const total = typeof raw.qrTotal === 'number' && Number.isFinite(raw.qrTotal) ? raw.qrTotal : null;
+  const itemCount = Number.isInteger(raw.itemCount) && raw.itemCount >= 0 && raw.itemCount < 100000 ? raw.itemCount : null;
+  return {
+    source: 'einvoice_qr',
+    verification: 'not_verified',
+    irn,
+    irnDate: str(raw.irnDate, 32),
+    sellerGstin: gstin(raw.sellerGstin),
+    buyerGstin: gstin(raw.buyerGstin),
+    docNo: str(raw.docNo, 32),
+    docDate: str(raw.docDate, 16),
+    docType: str(raw.docType, 8),
+    qrTotal: total,
+    itemCount,
+    mainHsnCode: str(raw.mainHsnCode, 10),
+    buyerGstinMismatch: raw.buyerGstinMismatch === true,
+  };
+}
+
 router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/voucher/purchase'), async (req, res) => {
+  req.body.einvoiceImport = sanitizeEinvoiceImport(req.body?.einvoiceImport);
+  if (req.body.einvoiceImport?.irn && req.company?.id) {
+    const dup = await query(
+      `SELECT tdk_reference_no FROM app_vouchers
+        WHERE company_id = $1 AND voucher_type = 'purchase_invoice'
+          AND conversion_status <> 'cancelled'
+          AND LOWER(payload->'einvoiceImport'->>'irn') = LOWER($2)
+        LIMIT 1`,
+      [req.company.id, req.body.einvoiceImport.irn],
+    ).catch(() => ({ rows: [] }));
+    if (dup.rows[0]) {
+      return res.status(409).json({
+        status: false,
+        code: 'DUPLICATE_IRN',
+        message: `This e-Invoice (IRN) is already booked as ${dup.rows[0].tdk_reference_no}.`,
+      });
+    }
+  }
   const {
     companyGuid, companyName, date, voucherNumber, reference, narration,
     partyLedger, totalAmount, items = [], taxes = [], logistics = [],
@@ -5265,9 +5312,9 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
             const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
             await query(
               `INSERT INTO stock_barcodes
-                 (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-               VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)`,
-              [req.company?.id, stockGuid, name, barcode, barcodeType || 'CODE128', syncTarget, tallyStatus]
+                 (company_id, company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+               VALUES ($1,$2,$3,$4,$5,$6,'app_generated','active',TRUE,$7,$8)`,
+              [req.company?.id, companyGuid, stockGuid, name, barcode, barcodeType || 'CODE128', syncTarget, tallyStatus]
             );
           }
         } catch (e) {
@@ -5377,10 +5424,32 @@ router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess(
       // Tally rejected (LINEERROR) — return error so mobile shows failure, not fake success
       return res.status(422).json({ status: false, queued: false, queueId: qId, message: r?.message || 'Tally rejected the update. Check stock item name and fields.' });
     }
+    // Optimistic local HSN so validation / detail update before next StockItem sync
+    if (changes.hsnCode && req.company?.id) {
+      await query(
+        `UPDATE stocks SET hsn = $1
+         WHERE company_id = $2 AND LOWER(name) = LOWER($3)`,
+        [String(changes.hsnCode).trim(), req.company.id, existingName]
+      ).catch(() => {});
+    }
+    if (changes.taxRate !== undefined && req.company?.id) {
+      await query(
+        `UPDATE stocks SET tax_rate = $1
+         WHERE company_id = $2 AND LOWER(name) = LOWER($3)`,
+        [parseFloat(changes.taxRate), req.company.id, existingName]
+      ).catch(() => {});
+    }
     const off = r?.status === 'desktop_offline';
     res.json({ status: true, queued: off, queueId: qId, message: off ? 'Saved. Will push when desktop connects.' : 'Stock item updated in Tally' });
   } catch(e) {
     await updateWriteQueue(qId, null, e.message);
+    if (changes.hsnCode && req.company?.id) {
+      await query(
+        `UPDATE stocks SET hsn = $1
+         WHERE company_id = $2 AND LOWER(name) = LOWER($3)`,
+        [String(changes.hsnCode).trim(), req.company.id, existingName]
+      ).catch(() => {});
+    }
     res.json({ status: true, queued: true, queueId: qId, message: 'Saved. Will push to Tally when desktop connects.' });
   }
 });
@@ -6350,17 +6419,28 @@ export async function pushGodownCodeAsAlias({
 
 /**
  * Push a single barcode to TallyPrime via desktop connector.
- * syncTarget: 'tally_part_number' | 'tally_alias'
+ * syncTarget: 'tally_part_number' | 'tally_alias' (tally_udf maps to alias until UDF XML ships)
  * Returns the forwardToTally result object or null if no push needed.
  */
-export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stockName, barcode, syncTarget, companyName }) {
+export async function pushBarcodeToTally({
+  companyGuid, userId, stockGuid, stockName, barcode, syncTarget, companyName, companyId: companyIdArg,
+}) {
   if (!syncTarget || syncTarget === 'app_only') return null;
 
-  // Read existing sku from stocks table so we can preserve it in Tally
+  let companyId = companyIdArg != null ? Number(companyIdArg) : null;
+  if (companyId == null && companyGuid) {
+    const { rows: [co] } = await query('SELECT id FROM companies WHERE guid=$1', [companyGuid]).catch(() => ({ rows: [] }));
+    companyId = co?.id != null ? Number(co.id) : null;
+  }
+  if (companyId == null) {
+    console.error('[pushBarcodeToTally] companyId unresolved', companyGuid);
+    return { status: 'failed', message: 'Company not found' };
+  }
+
   // stocks.sku = PartNumber / OnlyAlias synced from Tally's StockItem XML
   const { rows: [stockRow] } = await query(
     'SELECT sku FROM stocks WHERE guid=$1 AND company_id=$2',
-    [stockGuid, req.company?.id]
+    [stockGuid, companyId],
   ).catch(() => ({ rows: [{}] }));
   const existingSku = stockRow?.sku || '';
 
@@ -6377,17 +6457,18 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
     `<STOCKITEM NAME="${eName}" ACTION="Alter">${inner}</STOCKITEM>` +
     `</TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
+  // tally_udf not yet a dedicated Tally field — treat like alias so settings stay useful
+  const effectiveTarget = syncTarget === 'tally_udf' ? 'tally_alias' : syncTarget;
+
   let xml;
-  if (syncTarget === 'tally_part_number') {
+  if (effectiveTarget === 'tally_part_number') {
     // MAILINGNAME.LIST = Part Number field in Tally
-    // Preserve existing sku (if it's different from the barcode being pushed)
     const existLine = (eExisting && eExisting !== eBc)
       ? `<MAILINGNAME>${eExisting}</MAILINGNAME>` : '';
     xml = wrap(`<MAILINGNAME.LIST TYPE="String">${existLine}<MAILINGNAME>${eBc}</MAILINGNAME></MAILINGNAME.LIST>`);
 
-  } else if (syncTarget === 'tally_alias') {
+  } else if (effectiveTarget === 'tally_alias') {
     // NAME.LIST = Alias. First entry MUST be primary stock item name.
-    // Preserve existing sku alias (if different from name and barcode).
     const existLine = (eExisting && eExisting !== eName && eExisting !== eBc)
       ? `<NAME>${eExisting}</NAME>` : '';
     xml = wrap(`<NAME.LIST TYPE="String"><NAME>${eName}</NAME>${existLine}<NAME>${eBc}</NAME></NAME.LIST>`);
@@ -6397,14 +6478,14 @@ export async function pushBarcodeToTally({ companyGuid, userId, stockGuid, stock
   }
 
   const queueId = await logWriteQueue(
-    userId, req.company?.id, 'barcode_sync',
-    `${stockName} → ${barcode} (${syncTarget})`,
-    null, { stockGuid, stockName, barcode, syncTarget }, xml
+    userId, companyGuid, 'barcode_sync',
+    `${stockName} → ${barcode} (${effectiveTarget})`,
+    null, { stockGuid, stockName, barcode, syncTarget: effectiveTarget }, xml, companyId,
   ).catch(() => null);
 
   let result;
   try {
-    result = await forwardToTally(companyGuid, userId, xml, { companyId: req.company?.id });
+    result = await forwardToTally(companyGuid, userId, xml, { companyId });
   } catch (err) {
     result = { status: 'failed', message: err.message };
   }

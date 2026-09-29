@@ -46,6 +46,8 @@ import { voucherToAppCompanyJoinSql } from '../utils/appVoucherCompanyMatch.js';
 import {
   enrichNotification,
   stockNotification,
+  negativeStockNotification,
+  expiryStockNotification,
   receivableNotification,
   complianceNotification,
   invoiceNotification,
@@ -648,11 +650,24 @@ router.post('/push-token', authMiddleware, async (req, res) => {
   const { token, platform, deviceId } = req.body || {};
   if (!token) return res.status(400).json({ success: false, error: { code: 'MISSING_TOKEN', message: 'token required' } });
   try {
+    // One live token per device — drop stale rows for same device_id (token rotated)
+    if (deviceId) {
+      await query(
+        `DELETE FROM push_tokens WHERE user_id=$1 AND device_id=$2 AND token <> $3`,
+        [req.user.userId, deviceId, token]
+      ).catch(() => {});
+    }
     await query(`
       INSERT INTO push_tokens (user_id, token, platform, device_id, updated_at)
       VALUES ($1, $2, $3, $4, NOW())
       ON CONFLICT (user_id, token) DO UPDATE SET platform=$3, device_id=$4, updated_at=NOW()
     `, [req.user.userId, token, platform || null, deviceId || null]);
+    // Also prune identical-token duplicates if any slipped in
+    await query(
+      `DELETE FROM push_tokens a USING push_tokens b
+       WHERE a.user_id=$1 AND b.user_id=$1 AND a.token=b.token AND a.id < b.id`,
+      [req.user.userId]
+    ).catch(() => {});
     res.json({ success: true, data: { message: 'Push token registered' } });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'DB_ERROR', message: err.message } });
@@ -4872,7 +4887,7 @@ router.get('/stocks/hsn-validation', authMiddleware, async (req, res) => {
     if (!enabled) {
       return res.json({
         success: true,
-        data: { enabled: false, items: [], counts: { missing: 0, bad_format: 0, unknown: 0, total: 0 } },
+        data: { enabled: false, items: [], counts: { missing: 0, bad_format: 0, unknown: 0, ok: 0, total: 0 } },
       });
     }
 
@@ -4896,7 +4911,7 @@ router.get('/stocks/hsn-validation', authMiddleware, async (req, res) => {
     );
 
     const items = [];
-    const counts = { missing: 0, bad_format: 0, unknown: 0, total: 0 };
+    const counts = { missing: 0, bad_format: 0, unknown: 0, ok: 0, total: 0 };
     for (const r of rows) {
       const code = normalizeHsnCode(r.hsn);
       let status;
@@ -4908,7 +4923,8 @@ router.get('/stocks/hsn-validation', authMiddleware, async (req, res) => {
         status = 'bad_format';
         message = 'HSN should be 4, 6, or 8 digits';
       } else if (hasPrefix(code) || codeSet.has(code)) {
-        continue;
+        status = 'ok';
+        message = '';
       } else if (![4, 6, 8].includes(code.length) && code.length <= 8) {
         status = 'bad_format';
         message = 'HSN format not recognized';
@@ -5629,15 +5645,63 @@ async function buildDerivedNotifications(companyId) {
   const weekAgo = new Date(now);
   weekAgo.setDate(weekAgo.getDate() - 7);
 
-  const lowThreshold = await getDefaultLowStockLevel(companyId);
-  const { rows: lowStock } = await query(
-    'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_id=$1 AND closing_qty > 0 AND closing_qty <= $2 LIMIT 3',
-    [companyId, lowThreshold]
-  );
-  lowStock.forEach((s, i) => {
-    const createdAt = new Date(now.getTime() - i * 3600000);
-    raw.push(stockNotification(s, createdAt));
-  });
+  // Inventory alert channel prefs (In-App gates derived stock alerts)
+  const { rows: settRows } = await query(
+    `SELECT low_stock_alerts, negative_stock_alerts, expiry_alerts, fast_slow_moving_alerts
+     FROM company_inventory_settings WHERE company_id=$1 LIMIT 1`,
+    [companyId]
+  ).catch(() => ({ rows: [] }));
+  const sett = settRows[0] || {};
+  const lowAlerts = sett.low_stock_alerts || { inApp: true };
+  const negAlerts = sett.negative_stock_alerts || { inApp: true };
+  const expAlerts = sett.expiry_alerts || { inApp: true, daysBefore: 30 };
+  const daysBefore = Math.max(1, parseInt(expAlerts.daysBefore ?? 30, 10) || 30);
+
+  if (lowAlerts.inApp !== false) {
+    const lowThreshold = await getDefaultLowStockLevel(companyId);
+    const { rows: lowStock } = await query(
+      'SELECT name, closing_qty, reorder_level FROM stocks WHERE company_id=$1 AND closing_qty > 0 AND closing_qty <= $2 LIMIT 5',
+      [companyId, lowThreshold]
+    );
+    lowStock.forEach((s, i) => {
+      const createdAt = new Date(now.getTime() - i * 3600000);
+      raw.push(stockNotification(s, createdAt));
+    });
+  }
+
+  if (negAlerts.inApp !== false) {
+    const { rows: negStock } = await query(
+      `SELECT name, closing_qty FROM stocks
+       WHERE company_id=$1 AND closing_qty < 0
+       ORDER BY closing_qty ASC LIMIT 5`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
+    negStock.forEach((s, i) => {
+      raw.push(negativeStockNotification(s, new Date(now.getTime() - (i + 1) * 1800000)));
+    });
+  }
+
+  if (expAlerts.inApp !== false) {
+    const { rows: expRows } = await query(
+      `SELECT ba.stock_item_name, ba.batch_name, ba.expiry_date
+       FROM batch_allocations ba
+       WHERE ba.company_id=$1
+         AND ba.expiry_date IS NOT NULL AND TRIM(ba.expiry_date) != ''
+         AND ba.expiry_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+         AND ba.expiry_date::date <= (CURRENT_DATE + ($2::int || ' days')::interval)
+       ORDER BY ba.expiry_date ASC
+       LIMIT 8`,
+      [companyId, daysBefore]
+    ).catch(() => ({ rows: [] }));
+    expRows.forEach((r, i) => {
+      const expDate = new Date(r.expiry_date);
+      expDate.setHours(0, 0, 0, 0);
+      const today = new Date(now);
+      today.setHours(0, 0, 0, 0);
+      const daysLeft = Math.floor((expDate - today) / 864e5);
+      raw.push(expiryStockNotification(r, daysLeft, new Date(now.getTime() - i * 900000)));
+    });
+  }
 
   const { rows: overdue } = await query(
     `SELECT name, ABS(closing_balance) as bal FROM ledgers
@@ -5700,27 +5764,8 @@ async function buildDerivedNotifications(companyId) {
     }));
   }
 
-  const { rows: recentSales } = await query(
-    `SELECT voucher_number, party_name, amount, date FROM vouchers
-     WHERE company_id=$1 AND is_cancelled=FALSE
-       AND voucher_type ILIKE '%Sales%'
-       AND voucher_type NOT ILIKE '%Order%'
-       AND date >= CURRENT_DATE - INTERVAL '3 days'
-     ORDER BY date DESC LIMIT 2`,
-    [companyId]
-  ).catch(() => ({ rows: [] }));
-
-  recentSales.forEach((v, i) => {
-    const amt = Math.round(parseFloat(v.amount) || 0);
-    raw.push(invoiceNotification({
-      id: `sale_${v.voucher_number || i}`,
-      title: 'New Sales Invoice',
-      body: `${v.party_name || 'Party'} — ₹${amt.toLocaleString('en-IN')}`,
-      route: '/sales',
-      actionLabel: 'View invoice',
-      createdAt: v.date ? new Date(v.date) : now,
-    }));
-  });
+  // NOTE: per-invoice "New Sales" spam removed — inbox is for actionable alerts only
+  // (stock / receivables / EWB / IRN summaries). Sales live under Sales list.
 
   return raw;
 }
@@ -5798,6 +5843,169 @@ router.get('/parties', authMiddleware, async (req, res) => {
     q += ' ORDER BY name LIMIT 500';
     const { rows } = await query(q, params);
     res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/purchase/einvoice-qr-resolve?companyGuid=...&sellerGstin=...&irn=...
+// Purchase e-Invoice QR import: exact company-scoped vendor match by GSTIN (no name search,
+// no 500-row cap) + duplicate IRN check against this company's app purchase invoices.
+// Under /purchase so viewCapability maps it to purchase.view (not the sales einvoice.view).
+router.get('/purchase/einvoice-qr-resolve', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  const sellerGstin = String(req.query.sellerGstin || '').trim().toUpperCase();
+  const irn = String(req.query.irn || '').trim();
+  if (sellerGstin && !/^[0-9A-Z]{15}$/.test(sellerGstin)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_GSTIN', message: 'sellerGstin must be 15 alphanumeric characters' } });
+  }
+  if (irn && !/^[0-9a-fA-F]{64}$/.test(irn)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_IRN', message: 'irn must be a 64-character hex string' } });
+  }
+  try {
+    let vendors = [];
+    if (sellerGstin) {
+      const { rows } = await query(
+        `SELECT guid, name, gstin, gst_registration_type, parent, state_name
+           FROM ledgers
+          WHERE company_id = $1 AND UPPER(TRIM(gstin)) = $2
+          ORDER BY name`,
+        [companyId, sellerGstin],
+      );
+      vendors = rows.map(r => ({ ...r, isCreditor: /sundry creditor/i.test(r.parent || '') }));
+    }
+    let duplicate = null;
+    if (irn) {
+      const { rows } = await query(
+        `SELECT tdk_reference_no, tally_voucher_no, party_name, voucher_date, created_at
+           FROM app_vouchers
+          WHERE company_id = $1 AND voucher_type = 'purchase_invoice'
+            AND conversion_status <> 'cancelled'
+            AND LOWER(payload->'einvoiceImport'->>'irn') = LOWER($2)
+          ORDER BY created_at DESC LIMIT 1`,
+        [companyId, irn],
+      );
+      if (rows[0]) duplicate = rows[0];
+    }
+    res.json({ success: true, data: { vendors, duplicate } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /api/purchase/bill-attachment  { companyGuid, invoiceUuid, file: "data:image/jpeg;base64,..." | "data:application/pdf;base64,..." }
+// Vendor bill photo/PDF for an app purchase invoice. Stored in app DB only (not sent to Tally).
+const BILL_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
+const BILL_ATTACHMENT_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
+
+/** Validates a bill data URI; returns { mime, buf } or sends the error response and returns null. */
+function decodeBillDataUri(res, dataUri) {
+  const m = typeof dataUri === 'string' ? /^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(dataUri) : null;
+  if (!m || !BILL_ATTACHMENT_MIME.has(m[1].toLowerCase())) {
+    res.status(400).json({ success: false, error: { code: 'INVALID_FORMAT', message: 'File must be a JPEG/PNG/WebP photo or a PDF' } });
+    return null;
+  }
+  const mime = m[1].toLowerCase();
+  const buf = Buffer.from(m[2], 'base64');
+  if (!buf.length) {
+    res.status(400).json({ success: false, error: { code: 'EMPTY_FILE', message: 'File is empty' } });
+    return null;
+  }
+  if (buf.length > BILL_ATTACHMENT_MAX_BYTES) {
+    res.status(413).json({ success: false, error: { code: 'TOO_LARGE', message: 'File too large. Max 6 MB.' } });
+    return null;
+  }
+  const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-';
+  const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
+  const isPng = buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const isWebp = buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP';
+  const contentOk = (mime === 'application/pdf' && isPdf) || (mime === 'image/jpeg' && isJpeg)
+    || (mime === 'image/png' && isPng) || (mime === 'image/webp' && isWebp);
+  if (!contentOk) {
+    res.status(400).json({ success: false, error: { code: 'INVALID_FORMAT', message: 'File content does not match its type' } });
+    return null;
+  }
+  return { mime, buf };
+}
+
+// POST /api/purchase/bill-analyze { companyGuid, file: data URI (photo or PDF) }
+// Reads text (PDF text layer or on-server OCR), scores "is this a bill?", returns match candidates.
+router.post('/purchase/bill-analyze', authMiddleware, async (req, res) => {
+  const { companyGuid, file } = req.body || {};
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const decoded = decodeBillDataUri(res, file);
+  if (!decoded) return;
+  try {
+    const { analyzeBillDocument } = await import('../services/billDocumentAnalyzer.js');
+    const t0 = Date.now();
+    const result = await analyzeBillDocument({ buffer: decoded.buf, mime: decoded.mime });
+    res.json({ success: true, data: { ...result, mime: decoded.mime, ms: Date.now() - t0 } });
+  } catch (err) {
+    const timedOut = /timed out/i.test(err?.message || '');
+    res.status(timedOut ? 504 : 500).json({
+      success: false,
+      error: {
+        code: timedOut ? 'ANALYZE_TIMEOUT' : 'ANALYZE_FAILED',
+        message: timedOut ? 'Reading the bill took too long. Try a clearer or smaller photo.' : 'Could not read this file.',
+      },
+    });
+  }
+});
+
+router.post('/purchase/bill-attachment', authMiddleware, async (req, res) => {
+  const { companyGuid, invoiceUuid } = req.body || {};
+  const fileField = req.body?.file ?? req.body?.image;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  if (typeof invoiceUuid !== 'string' || !/^[0-9a-f-]{36}$/i.test(invoiceUuid)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INVOICE', message: 'invoiceUuid required' } });
+  }
+  const decoded = decodeBillDataUri(res, fileField);
+  if (!decoded) return;
+  const { mime, buf } = decoded;
+  try {
+    const { rows: inv } = await query(
+      `SELECT tdk_reference_no FROM app_vouchers
+        WHERE company_id = $1 AND invoice_uuid = $2 AND voucher_type = 'purchase_invoice' LIMIT 1`,
+      [companyId, invoiceUuid],
+    );
+    if (!inv[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Purchase invoice not found' } });
+    const { rows } = await query(
+      `INSERT INTO purchase_bill_attachments
+         (company_id, company_guid, user_id, invoice_uuid, tdk_reference_no, mime_type, size_bytes, data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, created_at`,
+      [companyId, companyGuid, req.user.userId, invoiceUuid, inv[0].tdk_reference_no, mime, buf.length, buf],
+    );
+    res.json({ success: true, data: { id: rows[0].id, sizeBytes: buf.length, createdAt: rows[0].created_at } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/purchase/bill-attachment/:invoiceUuid?companyGuid=...  → latest bill file as data URI
+router.get('/purchase/bill-attachment/:invoiceUuid', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  const { invoiceUuid } = req.params;
+  if (!/^[0-9a-f-]{36}$/i.test(invoiceUuid)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INVOICE', message: 'invalid invoiceUuid' } });
+  }
+  try {
+    const { rows } = await query(
+      `SELECT mime_type, data, created_at FROM purchase_bill_attachments
+        WHERE company_id = $1 AND invoice_uuid = $2
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [companyId, invoiceUuid],
+    );
+    if (!rows[0]) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'No bill photo for this invoice' } });
+    res.json({
+      success: true,
+      data: { image: `data:${rows[0].mime_type};base64,${rows[0].data.toString('base64')}`, createdAt: rows[0].created_at },
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -8785,15 +8993,16 @@ function _ean13Check(d12) {
   for (let i = 0; i < 12; i++) s += parseInt(d12[i]) * (i % 2 === 0 ? 1 : 3);
   return ((10 - (s % 10)) % 10).toString();
 }
-function generateBarcodeValue(type, companyId, seq) {
+function generateBarcodeValue(type, companyGuid, seq) {
+  const guid = String(companyGuid || '');
   if (type === 'EAN13') {
     const p  = '890';
-    const ch = _hashCode32(companyGuid).toString().padStart(4,'0').slice(0,4);
+    const ch = _hashCode32(guid).toString().padStart(4,'0').slice(0,4);
     const s  = seq.toString().padStart(5,'0').slice(-5);
     const d12 = p + ch + s;
     return d12 + _ean13Check(d12);
   }
-  const slug = companyGuid.replace(/[^A-Z0-9]/gi,'').slice(0,4).toUpperCase().padEnd(4,'X');
+  const slug = guid.replace(/[^A-Z0-9]/gi,'').slice(0,4).toUpperCase().padEnd(4,'X');
   return `TDK${slug}${seq.toString().padStart(7,'0').slice(-7)}`;
 }
 function validateBarcode(barcode, type) {
@@ -8909,7 +9118,7 @@ async function generateOneBarcodeForStock(companyId, companyGuid, item, barcodeT
   let barcode;
   let tries = 0;
   do {
-    barcode = generateBarcodeValue(barcodeType, companyId, cnt + seqOffset + tries + 1);
+    barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + seqOffset + tries + 1);
     tries++;
     const { rows: [dup] } = await query(
       `SELECT 1 FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, barcode],
@@ -8971,6 +9180,56 @@ async function processBarcodeGenerateJob(jobId) {
       `UPDATE barcode_generate_jobs SET status='completed', processed=$2, generated=$3, errors=$4, completed_at=NOW() WHERE id=$1`,
       [jobId, processed, generated, errors],
     );
+
+    // After bulk generate: push to Tally when settings say so (same path as single generate)
+    if (generated > 0 && job.sync_target && job.sync_target !== 'app_only') {
+      try {
+        const { rows: [settings] } = await query(
+          'SELECT auto_sync_to_tally FROM inventory_barcode_settings WHERE company_id=$1',
+          [job.company_id],
+        );
+        if (settings?.auto_sync_to_tally) {
+          let filters = {};
+          try {
+            filters = typeof job.filters_json === 'string'
+              ? JSON.parse(job.filters_json) : (job.filters_json || {});
+          } catch { /* ignore */ }
+          const userId = filters.userId || null;
+          if (userId) {
+            const { pushBarcodeToTally } = await import('./tally-write.js');
+            const { rows: [co] } = await query(
+              'SELECT name, guid FROM companies WHERE id=$1', [job.company_id],
+            );
+            if (co?.name) {
+              const { rows: pending } = await query(
+                `SELECT stock_guid, stock_name, barcode, sync_target FROM stock_barcodes
+                 WHERE company_id=$1 AND tally_sync_status='pending_tally' AND status='active'
+                 ORDER BY created_at DESC LIMIT 200`,
+                [job.company_id],
+              );
+              for (const row of pending) {
+                const result = await pushBarcodeToTally({
+                  companyGuid: job.company_guid, userId,
+                  stockGuid: row.stock_guid, stockName: row.stock_name,
+                  barcode: row.barcode, syncTarget: row.sync_target,
+                  companyName: co.name, companyId: job.company_id,
+                }).catch(() => null);
+                const s = !result ? 'pending_tally'
+                  : result.status === 'desktop_offline' ? 'pending_tally'
+                  : (result.status === 'success' || (result.altered > 0 && !result.errors)) ? 'synced' : 'failed';
+                await query(
+                  'UPDATE stock_barcodes SET tally_sync_status=$1 WHERE company_id=$2 AND stock_guid=$3 AND barcode=$4',
+                  [s, job.company_id, row.stock_guid, row.barcode],
+                );
+                if (s === 'pending_tally') break;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[barcode-generate-job auto-sync]', jobId, e.message);
+      }
+    }
   } catch (err) {
     console.error('[barcode-generate-job]', jobId, err.message);
     await query(
@@ -9033,7 +9292,10 @@ router.post('/inventory/barcodes/generate-bulk/start', authMiddleware, async (re
 
     const { randomUUID } = await import('crypto');
     const jobId = randomUUID();
-    const filtersJson = JSON.stringify({ all: !!all, stockGuids, period, group, status, search });
+    const filtersJson = JSON.stringify({
+      all: !!all, stockGuids, period, group, status, search,
+      userId: req.user?.userId || null,
+    });
 
     await query(`
       INSERT INTO barcode_generate_jobs
@@ -9321,7 +9583,8 @@ async function autoSyncBarcodeToTally(userId, companyId, stockGuid, stockName, b
     if (!co?.name) return;
     const { pushBarcodeToTally } = await import('./tally-write.js');
     const result = await pushBarcodeToTally({
-      companyGuid: co.guid, userId, stockGuid, stockName, barcode, syncTarget, companyName: co.name,
+      companyGuid: co.guid, userId, stockGuid, stockName, barcode, syncTarget,
+      companyName: co.name, companyId,
     });
     // Map Tally result → tally_sync_status
     const newStatus =
@@ -9351,17 +9614,20 @@ router.post('/inventory/barcodes/generate', authMiddleware, async (req, res) => 
     const { rows: [{ cnt }] } = await query(`SELECT COUNT(*)::int AS cnt FROM stock_barcodes WHERE company_id=$1`, [companyId]);
     let barcode, tries = 0;
     do {
-      barcode = generateBarcodeValue(barcodeType, companyId, cnt + tries + 1);
+      barcode = generateBarcodeValue(barcodeType, companyGuid, cnt + tries + 1);
       tries++;
       const { rows: [dup] } = await query(`SELECT 1 FROM stock_barcodes WHERE company_id=$1 AND barcode=$2`, [companyId, barcode]);
       if (!dup) break;
     } while (tries < 10);
+    if (!barcode) {
+      return res.status(500).json({ success: false, error: { code: 'GEN_FAILED', message: 'Could not allocate unique barcode' } });
+    }
     const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
     const { rows: [ins] } = await query(`
-      INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-      VALUES ($1,$2,$3,$4,$5,'app_generated','active',TRUE,$6,$7)
+      INSERT INTO stock_barcodes (company_id, company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+      VALUES ($1,$2,$3,$4,$5,$6,'app_generated','active',TRUE,$7,$8)
       RETURNING barcode, barcode_type, status, tally_sync_status`,
-      [companyId, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
+      [companyId, companyGuid, stockGuid, stock.name, barcode, barcodeType, syncTarget, tallyStatus]);
     // Auto-push to Tally if toggle is ON (fire-and-forget, non-blocking)
     autoSyncBarcodeToTally(req.user.userId, companyId, stockGuid, stock.name, ins.barcode, syncTarget).catch(() => {});
     res.json({ success: true, data: { barcode: ins.barcode, barcodeType: ins.barcode_type, status: ins.status, tallySyncStatus: ins.tally_sync_status } });
@@ -9387,9 +9653,9 @@ router.post('/inventory/barcodes/link', authMiddleware, async (req, res) => {
     if (isPrimary) await query(`UPDATE stock_barcodes SET is_primary=FALSE WHERE stock_guid=$1 AND company_id=$2 AND is_primary=TRUE`, [stockGuid, companyId]);
     const tallyStatus = syncTarget === 'app_only' ? 'not_required' : 'pending_tally';
     await query(`
-      INSERT INTO stock_barcodes (company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
-      VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9)`,
-      [companyId, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
+      INSERT INTO stock_barcodes (company_id, company_guid, stock_guid, stock_name, barcode, barcode_type, source, status, is_primary, sync_target, tally_sync_status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10)`,
+      [companyId, companyGuid, stockGuid, stock.name, barcode.trim(), barcodeType, source, isPrimary, syncTarget, tallyStatus]);
     // Auto-push to Tally if toggle is ON
     autoSyncBarcodeToTally(req.user.userId, companyId, stockGuid, stock.name, barcode.trim(), syncTarget).catch(() => {});
     res.json({ success: true, data: { status: 'active', tallySyncStatus: tallyStatus } });
@@ -9490,7 +9756,7 @@ router.post('/inventory/barcodes/bulk-import', authMiddleware, async (req, res) 
             const result = await pushBarcodeToTally({
               companyGuid, userId: req.user.userId,
               stockGuid: row.stock_guid, stockName: row.stock_name,
-              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name,
+              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name, companyId,
             }).catch(() => null);
             const s = !result ? 'pending_tally'
               : result.status === 'desktop_offline' ? 'pending_tally'
@@ -9587,7 +9853,7 @@ router.post('/inventory/barcodes/push-pending', authMiddleware, async (req, res)
           companyGuid, userId: req.user.userId,
           stockGuid: row.stock_guid, stockName: row.stock_name,
           barcode: row.barcode, syncTarget: row.sync_target,
-          companyName: co.name,
+          companyName: co.name, companyId,
         });
         const newStatus =
           !result                                ? 'pending_tally' :
@@ -9652,7 +9918,7 @@ router.post('/inventory/barcodes/settings', authMiddleware, async (req, res) => 
             const result = await pushBarcodeToTally({
               companyGuid, userId: req.user.userId,
               stockGuid: row.stock_guid, stockName: row.stock_name,
-              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name,
+              barcode: row.barcode, syncTarget: row.sync_target, companyName: co.name, companyId,
             }).catch(() => null);
             const s = !result ? 'pending_tally'
               : result.status === 'desktop_offline' ? 'pending_tally'

@@ -34,6 +34,8 @@
     "nodemailer": "^8.0.7",
     "pg": "^8.20.0",
     "socket.io": "^4.7.5",
+    "tesseract.js": "^7.0.0",
+    "unpdf": "^1.8.1",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

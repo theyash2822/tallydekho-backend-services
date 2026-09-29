@@ -16,3 +16,6 @@ data/workspace-backups/
 # Backup/restore artefacts produced by scripts/db-backup.mjs
 *.dump
 backups/
+
+# tesseract.js OCR language data (downloaded on first use)
+.cache/
