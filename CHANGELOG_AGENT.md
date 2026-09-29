@@ -1,5 +1,13 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-29 — AR/AP bills linked to vouchers (My Entries rules)
+
+- `linkBillsToVouchers` in `arApService.js`: bill → voucher by voucher number, `app_vouchers.tally_voucher_no`, or `vouchers.reference` (TDK ref). Plain bill names link only when the voucher's party matches (QA found 88/106 wrong-party links with the old "first match" fallback); TDK refs may fall back since they're unique.
+- Bills now carry `voucherType` and `tdkRef`.
+- Local check (2,006 bills): 18 linked, 0 wrong-party.
+
+---
+
 ## 2026-09-29 — QA follow-ups: stock-alert permissions, OCR budget, API docs
 
 - Daily stock-alert job sends each kind only if `authorize()` allows it for that user + company (`inventory.view`, `inventory.negative_stock.view`, `inventory.expiry.view`); companies picked `ORDER BY c.id`; email title/body HTML-escaped.

@@ -134,6 +134,81 @@ function mapBillRow(b, asOfIso, side) {
   };
 }
 
+const TDK_REF_RE = /^TDK-/i;
+
+/**
+ * Tally syncs bills without a voucher GUID, and app-posted vouchers get a Tally
+ * number that differs from the TDK bill name. Same link rules as My Entries:
+ * voucher number, app_vouchers.tally_voucher_no, or vouchers.reference (TDK ref).
+ * Non-TDK bill names ("1", "15") repeat across parties and voucher types, so they
+ * link only when the voucher's party matches; TDK refs are unique per company.
+ */
+export async function linkBillsToVouchers(companyId, bills) {
+  const refs = [...new Set(bills.filter((b) => !b.voucherGuid && b.ref).map((b) => String(b.ref)))];
+  const tdkRefs = refs.filter((r) => TDK_REF_RE.test(r));
+  const refSet = new Set(refs);
+  const tdkSet = new Set(tdkRefs);
+
+  const candidates = new Map();
+  const addCandidate = (ref, v) => {
+    if (!candidates.has(ref)) candidates.set(ref, []);
+    candidates.get(ref).push(v);
+  };
+
+  if (refs.length) {
+    const { rows } = await query(
+      `SELECT guid, voucher_number, reference, party_name
+       FROM vouchers
+       WHERE company_id=$1 AND is_cancelled = FALSE
+         AND (voucher_number = ANY($2::text[]) OR reference = ANY($3::text[]))
+       ORDER BY date DESC NULLS LAST`,
+      [companyId, refs, tdkRefs]
+    );
+    for (const v of rows) {
+      if (refSet.has(v.voucher_number)) addCandidate(v.voucher_number, v);
+      if (v.reference && tdkSet.has(v.reference)) addCandidate(v.reference, v);
+    }
+  }
+
+  if (tdkRefs.length) {
+    const { rows } = await query(
+      `SELECT av.tdk_reference_no, v.guid, v.party_name
+       FROM app_vouchers av
+       JOIN vouchers v ON v.company_id = $1 AND v.is_cancelled = FALSE AND v.voucher_number = av.tally_voucher_no
+       WHERE (av.company_id = $1 OR av.company_guid = (SELECT guid FROM companies WHERE id = $1::bigint))
+         AND av.tdk_reference_no = ANY($2::text[])
+         AND COALESCE(av.tally_voucher_no, '') <> ''`,
+      [companyId, tdkRefs]
+    );
+    for (const r of rows) addCandidate(r.tdk_reference_no, r);
+  }
+
+  const linked = bills.map((b) => {
+    if (b.voucherGuid || !b.ref) return b;
+    const list = candidates.get(String(b.ref)) || [];
+    const party = String(b.party || '').toLowerCase();
+    const hit = list.find((v) => String(v.party_name || '').toLowerCase() === party)
+      || (TDK_REF_RE.test(String(b.ref)) ? list[0] : undefined);
+    return hit ? { ...b, voucherGuid: hit.guid } : b;
+  });
+
+  const guids = [...new Set(linked.map((b) => b.voucherGuid).filter(Boolean))];
+  const typeByGuid = new Map();
+  if (guids.length) {
+    const { rows } = await query(
+      `SELECT guid, voucher_type FROM vouchers WHERE company_id=$1 AND guid = ANY($2::text[])`,
+      [companyId, guids]
+    );
+    for (const r of rows) typeByGuid.set(r.guid, r.voucher_type);
+  }
+
+  return linked.map((b) => ({
+    ...b,
+    voucherType: (b.voucherGuid && typeByGuid.get(b.voucherGuid)) || null,
+    tdkRef: b.ref && TDK_REF_RE.test(String(b.ref)) ? String(b.ref) : null,
+  }));
+}
+
 function aggregateParties(debtors, bills, asOfIso, side = 'AR') {
   const byName = new Map();
   for (const d of debtors) {
@@ -266,35 +341,7 @@ export async function buildArApPayload(companyId, side, opts = {}) {
     [companyId]
   );
 
-  let bills = billsRaw.map((b) => mapBillRow(b, asOf, side));
-
-  const missing = bills.filter((b) => !b.voucherGuid && b.ref);
-  const missingRefs = [...new Set(missing.map((b) => b.ref))];
-  if (missingRefs.length) {
-    const { rows: vrows } = await query(
-      `SELECT guid, voucher_number, party_name, voucher_type, date
-       FROM vouchers
-       WHERE company_id=$1
-         AND is_cancelled = FALSE
-         AND voucher_number = ANY($2::text[])
-       ORDER BY date DESC NULLS LAST`,
-      [companyId, missingRefs]
-    );
-    const byRefParty = new Map();
-    const byRef = new Map();
-    for (const v of vrows) {
-      const ref = String(v.voucher_number);
-      const pk = `${ref}||${String(v.party_name || '').toLowerCase()}`;
-      if (!byRefParty.has(pk)) byRefParty.set(pk, v.guid);
-      if (!byRef.has(ref)) byRef.set(ref, v.guid);
-    }
-    bills = bills.map((b) => {
-      if (b.voucherGuid || !b.ref) return b;
-      const partyKey = `${b.ref}||${String(b.party || '').toLowerCase()}`;
-      const guid = byRefParty.get(partyKey) || byRef.get(String(b.ref)) || null;
-      return guid ? { ...b, voucherGuid: guid } : b;
-    });
-  }
+  let bills = await linkBillsToVouchers(companyId, billsRaw.map((b) => mapBillRow(b, asOf, side)));
 
   // Unfiltered aging + total for snapshot / trends (real MoM baseline)
   const unfilteredAgingSource = bills.map((b) => ({
