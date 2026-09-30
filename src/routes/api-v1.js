@@ -57,6 +57,9 @@ import { verifyCompanyAccess, maskIfNeeded } from '../middleware/companyAccess.j
 import { resolveViewCapability } from '../middleware/viewCapability.js';
 import { requireResolvedCompanyId } from '../utils/companyOwnership.js';
 import { devOtpSuffix } from '../utils/otpLogging.js';
+import {
+  lockedMinutes, recordFailure, clearFailures, tooManyAttemptsBody, wrongCodeBody,
+} from '../utils/settingsAttemptLimiter.js';
 import { pushGodownCodeAsAlias } from './tally-write.js';
 import {
   validateHsnCode, ensureHsnBootstrap, maybeRefreshHsnMaster, normalizeHsnCode,
@@ -638,10 +641,15 @@ router.post('/auth/refresh', async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(err.httpStatus || 401).json({
-      success: false,
-      error: { code: err.code || 'SESSION_INVALID', message: err.message || 'Refresh failed' },
-    });
+    // Only a known-bad token is 401; a DB/server failure must not log the app out.
+    if (err.httpStatus) {
+      return res.status(err.httpStatus).json({
+        success: false,
+        error: { code: err.code || 'SESSION_INVALID', message: err.message || 'Refresh failed' },
+      });
+    }
+    console.error('[auth/refresh]', err.message);
+    res.status(503).json({ success: false, error: { code: 'REFRESH_UNAVAILABLE', message: 'Server busy, try again' } });
   }
 });
 
@@ -6034,10 +6042,10 @@ router.get('/party/outstanding-bills', authMiddleware, async (req, res) => {
     let sideFilter = '';
     if (drOnly) {
       // Receivables for Receipt: Dr type, or negative pending (legacy rows without bill_type)
-      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)`;
+      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'DR' OR (COALESCE(bill_type,'') = '' AND COALESCE(pending_amount,0) < 0))`;
     } else if (crOnly) {
       // Payables for Payment: Cr type, or positive pending (legacy rows without bill_type)
-      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'CR' OR COALESCE(pending_amount,0) > 0)`;
+      sideFilter = ` AND (UPPER(COALESCE(bill_type,'')) = 'CR' OR (COALESCE(bill_type,'') = '' AND COALESCE(pending_amount,0) > 0))`;
     }
     const { rows } = await query(
       `SELECT bill_name, bill_date, due_date, amount, pending_amount, bill_type
@@ -6302,6 +6310,105 @@ router.get('/kpi/loans-ods', authMiddleware, async (req, res) => {
 // E-WAY BILLS — with country-aware logic
 // ══════════════════════════════════════════════════════════════════════════════
 
+// GET /api/payment-reminders/log — reminders the hourly job sent (or failed to send)
+router.get('/payment-reminders/log', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  try {
+    const [{ rows }, { rows: cnt }] = await Promise.all([
+      query(
+        `SELECT id, party_name, bill_name, amount, due_date::text AS due_date, channel, status, error, sent_at
+           FROM payment_reminder_log
+          WHERE company_id = $1 AND status <> 'sending'
+          ORDER BY sent_at DESC, id DESC
+          LIMIT $2 OFFSET $3`,
+        [companyId, limit, (page - 1) * limit]
+      ),
+      query(`SELECT COUNT(*)::int AS c FROM payment_reminder_log WHERE company_id = $1 AND status <> 'sending'`, [companyId]),
+    ]);
+    res.json({
+      success: true,
+      data: rows.map((r) => ({
+        id: String(r.id),
+        partyName: r.party_name,
+        billName: r.bill_name,
+        amount: r.amount == null ? null : Number(r.amount),
+        dueDate: r.due_date,
+        channel: r.channel,
+        status: r.status,
+        error: r.error,
+        sentAt: Number(r.sent_at) || null,
+      })),
+      meta: { total: cnt[0]?.c || 0, page, limit },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// e_way_bill_details.valid_till is TEXT: NIC returns "DD/MM/YYYY hh:mm:ss AM", other
+// writers use ISO. Unparseable values yield NULL (never counted). Compared in IST.
+const EWB_VALID_TILL_TS = `(CASE
+  WHEN valid_till ~ '^\\d{4}-\\d{2}-\\d{2}' THEN LEFT(valid_till, 10)::date + INTERVAL '1 day' - INTERVAL '1 second'
+  WHEN valid_till ~ '^\\d{2}/\\d{2}/\\d{4}' THEN to_date(LEFT(valid_till, 10), 'DD/MM/YYYY') + INTERVAL '1 day' - INTERVAL '1 second'
+END)`;
+const NOW_IST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`;
+
+// GET /api/alerts — Compliance Hub counters (same rules as the EWB / e-Invoice /
+// unmatched / other-taxes screens so the hub and the detail screens agree).
+router.get('/alerts', authMiddleware, async (req, res) => {
+  const companyGuid = req.query.companyGuid || req.user.companyGuid;
+  if (!companyGuid) return res.status(400).json({ success: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
+  try {
+    const { from, to, financialYear } = await resolveFYDates(companyId, req.query.from, req.query.to, req.query.fy);
+    const salesOnly = `voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%'`;
+    const count = (r) => parseInt(r.rows[0]?.c || 0, 10);
+    const [ewbGen, ewbPending, ewbExpired, irnGen, irnPending, unmatched, otherTax] = await Promise.all([
+      query(`SELECT COUNT(*) AS c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ewb_number IS NOT NULL AND ewb_number != '' AND date BETWEEN $2 AND $3`, [companyId, from, to]),
+      query(`SELECT COUNT(*) AS c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ${salesOnly} AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`, [companyId, from, to]),
+      query(`SELECT COUNT(*) AS c FROM e_way_bill_details WHERE company_id=$1 AND ${EWB_VALID_TILL_TS} < ${NOW_IST} AND COALESCE(status,'') <> 'cancelled'`, [companyId]),
+      query(`SELECT COUNT(*) AS c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND irn IS NOT NULL AND irn != '' AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3`, [companyId, from, to]),
+      query(`SELECT COUNT(*) AS c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND ${salesOnly} AND amount >= 50000 AND (irn IS NULL OR irn='') AND irn_cancelled=FALSE AND date BETWEEN $2 AND $3 AND date >= '2020-10-01'`, [companyId, from, to]),
+      query(`SELECT COUNT(*) AS c FROM vouchers v
+             LEFT JOIN gst_voucher_details gst ON gst.voucher_guid = v.guid AND gst.company_id = v.company_id
+             WHERE v.company_id=$1 AND v.is_cancelled=FALSE AND v.voucher_type ILIKE ANY(ARRAY['%Sales%','%Purchase%'])
+               AND v.date BETWEEN $2 AND $3
+               AND (gst.id IS NULL OR COALESCE(gst.cgst_amount,0)+COALESCE(gst.sgst_amount,0)+COALESCE(gst.igst_amount,0)=0)
+               AND ABS(v.amount)>0`, [companyId, from, to]),
+      query(`SELECT tax_type, COUNT(DISTINCT voucher_guid) AS voucher_count, SUM(tax_amount) AS total
+             FROM tax_transactions
+             WHERE company_id=$1 AND (
+               (NULLIF(voucher_date,'') IS NOT NULL AND NULLIF(voucher_date,'')::date BETWEEN $2::date AND $3::date)
+               OR ((financial_year = $4 OR financial_year LIKE $5) AND (voucher_date IS NULL OR voucher_date = ''))
+             )
+             GROUP BY tax_type ORDER BY total DESC NULLS LAST`, [companyId, from, to, financialYear, fyLikePrefix(financialYear)]),
+    ]);
+    const unmatchedCount = count(unmatched);
+    res.json({
+      success: true,
+      data: {
+        ewbGeneratedCount: count(ewbGen),
+        pendingEWBCount: count(ewbPending),
+        expiredEWBCount: count(ewbExpired),
+        irnGeneratedCount: count(irnGen),
+        pendingIRNCount: count(irnPending),
+        unmatchedGSTCount: unmatchedCount,
+        otherTaxCount: otherTax.rows.reduce((s, r) => s + parseInt(r.voucher_count || 0, 10), 0),
+        otherTaxTotal: otherTax.rows.reduce((s, r) => s + parseFloat(r.total || 0), 0),
+        otherTaxTopType: otherTax.rows[0]?.tax_type || null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /api/ewaybills/status — summary: integration status + EWB counts
 router.get('/ewaybills/status', authMiddleware, async (req, res) => {
   const companyGuid = req.query.companyGuid || req.user.companyGuid;
@@ -6322,7 +6429,7 @@ router.get('/ewaybills/status', authMiddleware, async (req, res) => {
       query(`SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND is_cancelled=FALSE AND voucher_type ILIKE '%Sales%' AND voucher_type NOT ILIKE '%Order%' AND voucher_type NOT ILIKE '%Delivery%' AND voucher_type NOT ILIKE '%Quotation%' AND amount >= 50000 AND (ewb_number IS NULL OR ewb_number='') AND date BETWEEN $2 AND $3 AND date >= '2018-04-01'`, [companyId, from, to])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Expiring within 24h
-      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_id=$1 AND valid_till BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`, [companyId])
+      query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_id=$1 AND COALESCE(status,'') <> 'cancelled' AND ${EWB_VALID_TILL_TS} BETWEEN ${NOW_IST} AND ${NOW_IST} + INTERVAL '24 hours'`, [companyId])
         .catch(() => ({ rows: [{ c: 0 }] })),
       // Errors
       query(`SELECT COUNT(*) as c FROM e_way_bill_details WHERE company_id=$1 AND error_message IS NOT NULL AND error_message != ''`, [companyId])
@@ -6567,9 +6674,9 @@ router.post('/ewaybills/cancel', authMiddleware, async (req, res) => {
     }
     await query(
       `UPDATE app_vouchers SET e_way_bill_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-       WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
-      [companyId, voucherGuid]
-    ).catch(() => {});
+       WHERE (company_id = $1::bigint OR company_guid = $3) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1::bigint)`,
+      [companyId, voucherGuid, companyGuid]
+    ).catch((err) => console.error('[app_vouchers] cancel status update failed:', err.message));
     res.json({ success: true, message: 'E-Way Bill cancelled' });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -6784,9 +6891,9 @@ router.post('/einvoice/cancel', authMiddleware, async (req, res) => {
     await query(`UPDATE e_invoice_details SET status='cancelled', synced_at=NOW() WHERE voucher_guid=$1 AND company_id=$2`, [voucherGuid, companyId]);
     await query(
       `UPDATE app_vouchers SET e_invoice_status='cancelled', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-        WHERE (company_id::text = $1::text OR company_guid = $1::text) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1)`,
-      [companyId, voucherGuid]
-    ).catch(() => {});
+        WHERE (company_id = $1::bigint OR company_guid = $3) AND tally_voucher_no=(SELECT voucher_number FROM vouchers WHERE guid=$2 AND company_id=$1::bigint)`,
+      [companyId, voucherGuid, companyGuid]
+    ).catch((err) => console.error('[app_vouchers] cancel status update failed:', err.message));
     res.json({ success: true, message: 'IRN cancelled successfully' });
   } catch (err) {
     res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -7578,6 +7685,8 @@ router.get('/company/capabilities', authMiddleware, async (req, res) => {
 router.get('/sync-history', authMiddleware, async (req, res) => {
   const { companyGuid, limit = 50 } = req.query;
   if (!companyGuid) return res.status(400).json({ success: false, error: { message: 'companyGuid required' } });
+  if (!await verifyCompanyOwnership(req, res, companyGuid)) return;
+  const companyId = requireResolvedCompanyId(req);
   try {
     const { rows } = await query(
       `SELECT id, device_id, mode, synced_at, voucher_count, ledger_count, stock_count, record_count, status, error_message
@@ -8043,10 +8152,16 @@ router.post('/auth/reset-pin', preAuthMiddleware, async (req, res) => {
 router.delete('/auth/remove-pin', authMiddleware, async (req, res) => {
   const { pin } = req.body;
   if (!pin) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'PIN required' } });
+  const locked = lockedMinutes(req.user.userId, 'remove-pin');
+  if (locked) return res.status(429).json(tooManyAttemptsBody(locked));
   try {
     const { rows } = await query('SELECT two_fa_pin_hash FROM users WHERE id=$1', [req.user.userId]);
     const match = rows[0]?.two_fa_pin_hash ? await bcrypt.compare(String(pin), rows[0].two_fa_pin_hash) : true;
-    if (!match) return res.status(401).json({ success: false, error: { code: 'PIN_INVALID', message: 'Incorrect PIN' } });
+    if (!match) {
+      const left = recordFailure(req.user.userId, 'remove-pin');
+      return res.status(400).json(wrongCodeBody('PIN_INVALID', 'PIN', left));
+    }
+    clearFailures(req.user.userId, 'remove-pin');
     await query('UPDATE users SET two_fa_enabled=FALSE, two_fa_pin_hash=NULL, updated_at=$1 WHERE id=$2', [now(), req.user.userId]);
     res.json({ success: true, data: { message: '2FA disabled' } });
   } catch (err) { res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: 'Failed to disable 2FA' } }); }
@@ -8078,6 +8193,10 @@ router.get('/auth/two-fa-status', authMiddleware, async (req, res) => {
 router.post('/auth/change-phone', authMiddleware, async (req, res) => {
   const { step, currentPhone, otp, newPhone } = req.body;
   const userId = req.user.userId;
+  if (step === 2 || step === 3) {
+    const locked = lockedMinutes(userId, 'change-phone');
+    if (locked) return res.status(429).json(tooManyAttemptsBody(locked));
+  }
 
   const normalize = (p) => {
     if (!p) return '';
@@ -8117,9 +8236,10 @@ router.post('/auth/change-phone', authMiddleware, async (req, res) => {
       const { rows } = await query('SELECT phone_change_otp, phone_change_otp_expires FROM users WHERE id=$1', [userId]);
       const u = rows[0];
       if (!u || u.phone_change_otp !== String(otp))
-        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP for current phone' } });
+        return res.status(400).json(wrongCodeBody('OTP_INVALID', 'OTP', recordFailure(userId, 'change-phone')));
       if (Date.now() > Number(u.phone_change_otp_expires))
-        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+        return res.status(400).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+      clearFailures(userId, 'change-phone');
 
       const cleanNew = normalize(newPhone);
       if (!cleanNew || cleanNew.length < 10)
@@ -8150,9 +8270,10 @@ router.post('/auth/change-phone', authMiddleware, async (req, res) => {
       const { rows } = await query('SELECT phone_change_otp, phone_change_otp_expires, phone_change_new FROM users WHERE id=$1', [userId]);
       const u = rows[0];
       if (!u || u.phone_change_otp !== String(otp))
-        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP for new phone' } });
+        return res.status(400).json(wrongCodeBody('OTP_INVALID', 'OTP', recordFailure(userId, 'change-phone')));
       if (Date.now() > Number(u.phone_change_otp_expires))
-        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+        return res.status(400).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+      clearFailures(userId, 'change-phone');
       if (!u.phone_change_new)
         return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'No pending phone change' } });
 
@@ -8177,6 +8298,10 @@ router.post('/auth/change-phone', authMiddleware, async (req, res) => {
 router.post('/auth/change-email', authMiddleware, async (req, res) => {
   const { step, currentEmail, otp, newEmail } = req.body;
   const userId = req.user.userId;
+  if (step === 2) {
+    const locked = lockedMinutes(userId, 'change-email');
+    if (locked) return res.status(429).json(tooManyAttemptsBody(locked));
+  }
 
   try {
     if (step === 1) {
@@ -8203,9 +8328,10 @@ router.post('/auth/change-email', authMiddleware, async (req, res) => {
       const { rows } = await query('SELECT email_change_otp, email_change_otp_expires FROM users WHERE id=$1', [userId]);
       const u = rows[0];
       if (!u || u.email_change_otp !== String(otp))
-        return res.status(401).json({ success: false, error: { code: 'OTP_INVALID', message: 'Invalid OTP' } });
+        return res.status(400).json(wrongCodeBody('OTP_INVALID', 'OTP', recordFailure(userId, 'change-email')));
       if (Date.now() > Number(u.email_change_otp_expires))
-        return res.status(401).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+        return res.status(400).json({ success: false, error: { code: 'OTP_EXPIRED', message: 'OTP expired. Request a new one.' } });
+      clearFailures(userId, 'change-email');
 
       await query(
         'UPDATE users SET email=$1, email_change_otp=NULL, email_change_otp_expires=NULL, updated_at=$2 WHERE id=$3',

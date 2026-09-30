@@ -70,6 +70,7 @@ import { listAvailableBackups } from '../services/backupService.js';
 import { approveRestore, listWorkspaceApprovals } from '../services/restoreService.js';
 import { query } from '../db/schema.js';
 import { listCostCentresForCompany } from '../services/costCentreListService.js';
+import { requireResolvedCompanyId } from '../utils/companyOwnership.js';
 
 const router = Router();
 let _socket = null;
@@ -1173,7 +1174,7 @@ router.get(
       const companyGuid = req.params.companyGuid;
       if (!(await verifyCompanyAccess(req, res, companyGuid, { responseShape: 'api-v1' }))) return;
 
-      const rows = await listCostCentresForCompany(companyGuid);
+      const rows = await listCostCentresForCompany(requireResolvedCompanyId(req));
       res.json({ success: true, data: rows });
     } catch (err) {
       errJson(res, err);
@@ -1466,7 +1467,7 @@ router.get('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspace
       `SELECT domain, status, config_json, activated_at FROM workspace_integrations
        WHERE workspace_id = $1 AND domain = $2 LIMIT 1`,
       [req.params.id, domain]
-    ).catch(() => ({ rows: [] }));
+    );
     res.json({
       success: true,
       data: rows[0] || { domain, status: 'NOT_CONFIGURED', config_json: null, activated_at: null },
@@ -1485,12 +1486,17 @@ router.post('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspac
     const { v4: uuid } = await import('uuid');
     const id = uuid();
     const ts = Math.floor(Date.now() / 1000);
+    // Blank fields keep the saved value: the apps never pre-fill passwords/secrets.
+    const configJson = JSON.stringify(Object.fromEntries(
+      Object.entries(req.body || {}).filter(([, v]) => v !== '' && v != null),
+    ));
     await query(
       `INSERT INTO workspace_integrations (id, workspace_id, domain, status, config_json, updated_at)
        VALUES ($1,$2,$3,'CONFIGURED',$4,$5)
        ON CONFLICT (workspace_id, domain) DO UPDATE SET
-         config_json = EXCLUDED.config_json, status = 'CONFIGURED', updated_at = EXCLUDED.updated_at`,
-      [id, req.params.id, domain, JSON.stringify(req.body || {}), ts]
+         config_json = COALESCE(workspace_integrations.config_json, '{}'::jsonb) || EXCLUDED.config_json,
+         status = 'CONFIGURED', updated_at = EXCLUDED.updated_at`,
+      [id, req.params.id, domain, configJson, ts]
     ).catch(async (e) => {
       // Table may not exist yet on older DBs — create minimally
       if (String(e.message).includes('workspace_integrations')) {
@@ -1510,7 +1516,7 @@ router.post('/workspaces/:id/integrations/:domain', authMiddleware, bindWorkspac
            VALUES ($1,$2,$3,'CONFIGURED',$4,$5)
            ON CONFLICT (workspace_id, domain) DO UPDATE SET
              config_json = EXCLUDED.config_json, status = 'CONFIGURED', updated_at = EXCLUDED.updated_at`,
-          [id, req.params.id, domain, JSON.stringify(req.body || {}), ts]
+          [id, req.params.id, domain, configJson, ts]
         );
       } else throw e;
     });

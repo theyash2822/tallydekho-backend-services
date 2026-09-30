@@ -10,6 +10,9 @@ import { sendEmailVerificationOTP } from '../services/notifications.js';
 import { ensurePersonalWorkspace } from '../services/workspaceService.js';
 import { getUserPairingHints } from '../services/userPairingHints.js';
 import { devOtpSuffix } from '../utils/otpLogging.js';
+import {
+  lockedMinutes, recordFailure, clearFailures, tooManyAttemptsBody, wrongCodeBody,
+} from '../utils/settingsAttemptLimiter.js';
 import { recordLegacyAuthEvent, LEGACY_EVENTS } from '../services/legacyAuthTelemetry.js';
 
 /**
@@ -499,8 +502,14 @@ router.delete('/remove-pin', authMiddleware, async (req, res) => {
     const user = rows[0];
     if (!user?.two_fa_pin_hash) return res.json({ status: true, message: '2FA already disabled' });
 
+    const locked = lockedMinutes(req.user.userId, 'remove-pin');
+    if (locked) return res.status(429).json({ status: false, message: tooManyAttemptsBody(locked).error.message });
     const match = await bcrypt.compare(String(pin), user.two_fa_pin_hash);
-    if (!match) return res.status(401).json({ status: false, message: 'Incorrect PIN' });
+    if (!match) {
+      const left = recordFailure(req.user.userId, 'remove-pin');
+      return res.status(400).json({ status: false, message: wrongCodeBody('PIN_INVALID', 'PIN', left).error.message });
+    }
+    clearFailures(req.user.userId, 'remove-pin');
 
     await query(
       'UPDATE users SET two_fa_enabled=FALSE, two_fa_pin_hash=NULL, updated_at=$1 WHERE id=$2',

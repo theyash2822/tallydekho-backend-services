@@ -6,6 +6,7 @@
  * Snapshots still upserted as optional enrichment / future use.
  */
 import { query } from '../../db/schema.js';
+import { isSideMismatch, effectiveDueDate } from '../../utils/billOutstanding.js';
 import {
   money, isoDay, addDays, computeTrendPct, pickPriorSnapshot,
 } from '../kpi/trendUtil.js';
@@ -37,7 +38,7 @@ export function buildAgingBucketsDueBased(bills, asOfIso) {
   for (const r of bills) {
     const amt = money(r.pending_amount);
     if (!amt) continue;
-    const due = isoDay(r.due_date) || isoDay(r.bill_date);
+    const due = effectiveDueDate(isoDay(r.due_date), isoDay(r.bill_date));
     const overdueDays = due ? daysBetween(asOfIso, due) : 0;
     let key = '0-30d';
     if (overdueDays < 0) key = 'NOT_DUE';
@@ -70,7 +71,7 @@ async function upsertArApSnapshot(companyId, side, asOf, total, agingMap) {
     `INSERT INTO kpi_ar_ap_snapshots (company_id, company_guid, side, as_of, total, aging, created_at)
      VALUES (
        $1,
-       (SELECT guid FROM companies WHERE id = $1),
+       (SELECT guid FROM companies WHERE id = $1::bigint),
        $2, $3::date, $4, $5::jsonb, EXTRACT(EPOCH FROM NOW())::BIGINT
      )
      ON CONFLICT (company_id, side, as_of)
@@ -107,11 +108,17 @@ function blankAgingTrends(aging) {
   }));
 }
 
+/**
+ * Tally's BillOutstanding export currently has no due date or credit period, so a bill
+ * without one is treated as due DEFAULT_CREDIT_DAYS after its bill date (same rule as
+ * payment reminders). `date` stays on the real due/bill date so FY filters don't shift.
+ */
 function mapBillRow(b, asOfIso, side) {
-  const due = isoDay(b.due_date);
+  const explicitDue = isoDay(b.due_date);
   const billDate = isoDay(b.bill_date);
+  const due = effectiveDueDate(explicitDue, billDate);
   const pending = money(b.pending_amount);
-  const overdueDays = due ? daysBetween(asOfIso, due) : (billDate ? Math.max(0, daysBetween(asOfIso, billDate)) : 0);
+  const overdueDays = due ? daysBetween(asOfIso, due) : 0;
   let status = 'NOT_DUE';
   if (due) {
     if (overdueDays > 0) status = 'OVERDUE';
@@ -125,12 +132,14 @@ function mapBillRow(b, asOfIso, side) {
     ref: b.bill_name,
     billDate,
     dueDate: due,
-    date: due || billDate,
+    dueDateEstimated: !explicitDue && !!due,
+    date: explicitDue || billDate,
     amount: pending,
     daysOverdue: Math.max(0, overdueDays),
     status,
     billType: b.bill_type || (side === 'AR' ? 'DR' : 'CR'),
     voucherGuid: b.voucher_guid || null,
+    sideMismatch: isSideMismatch(b.bill_type, b.party_group),
   };
 }
 
@@ -192,6 +201,29 @@ export async function linkBillsToVouchers(companyId, bills) {
     return hit ? { ...b, voucherGuid: hit.guid } : b;
   });
 
+  const stillOpen = [...new Set(linked.filter((b) => !b.voucherGuid && b.ref).map((b) => String(b.ref)))];
+  if (stillOpen.length) {
+    const { rows } = await query(
+      `SELECT a.bill_name, a.ledger_name, v.guid
+       FROM voucher_bill_allocations a
+       JOIN vouchers v ON v.company_id = a.company_id AND v.guid = a.voucher_guid AND v.is_cancelled = FALSE
+       WHERE a.company_id = $1 AND a.bill_name = ANY($2::text[])
+       ORDER BY (a.bill_type = 'New Ref') DESC, v.date ASC NULLS LAST`,
+      [companyId, stillOpen]
+    ).catch((e) => { console.warn('[AR/AP] allocation link lookup failed:', e.message); return { rows: [] }; });
+    const byKey = new Map();
+    for (const r of rows) {
+      const key = `${String(r.ledger_name || '').toLowerCase()}\u0000${r.bill_name}`;
+      if (!byKey.has(key)) byKey.set(key, r.guid);
+    }
+    for (let i = 0; i < linked.length; i++) {
+      const b = linked[i];
+      if (b.voucherGuid || !b.ref) continue;
+      const guid = byKey.get(`${String(b.party || '').toLowerCase()}\u0000${String(b.ref)}`);
+      if (guid) linked[i] = { ...b, voucherGuid: guid };
+    }
+  }
+
   const guids = [...new Set(linked.map((b) => b.voucherGuid).filter(Boolean))];
   const typeByGuid = new Map();
   if (guids.length) {
@@ -206,6 +238,24 @@ export async function linkBillsToVouchers(companyId, bills) {
     ...b,
     voucherType: (b.voucherGuid && typeByGuid.get(b.voucherGuid)) || null,
     tdkRef: b.ref && TDK_REF_RE.test(String(b.ref)) ? String(b.ref) : null,
+  }));
+}
+
+/** Earliest synced voucher date (YYYY-MM-DD) — only the last 2 FYs are synced. */
+async function earliestSyncedVoucherDate(companyId) {
+  const { rows } = await query(
+    `SELECT MIN(date) AS d FROM vouchers
+     WHERE company_id=$1 AND date ~ '^\\d{4}-\\d{2}-\\d{2}'`,
+    [companyId]
+  ).catch((e) => { console.warn('[AR/AP] earliest voucher lookup failed:', e.message); return { rows: [] }; });
+  return isoDay(rows[0]?.d) || null;
+}
+
+/** Unlinked bills dated before the earliest synced voucher come from an older, unsynced FY. */
+export function markOlderYearBills(bills, earliestIso) {
+  return bills.map((b) => ({
+    ...b,
+    olderYear: Boolean(earliestIso && !b.voucherGuid && b.billDate && b.billDate < earliestIso),
   }));
 }
 
@@ -265,6 +315,35 @@ function aggregateParties(debtors, bills, asOfIso, side = 'AR') {
     .sort((a, b) => b.amount - a.amount);
 }
 
+function inPeriod(day, from, to) {
+  if (!day) return false;
+  if (from && day < from) return false;
+  if (to && day > to) return false;
+  return true;
+}
+
+/**
+ * Phone + ledger GUID for every listed party, whatever its group: a Cr bill can sit
+ * on a Sundry Debtor (advance / credit note) and still belong on Payables.
+ */
+async function fillPartyPhones(companyId, parties) {
+  const names = [...new Set(parties.map((p) => p.name).filter(Boolean))];
+  if (!names.length) return;
+  const { rows } = await query(
+    `SELECT DISTINCT ON (name) name, guid, COALESCE(NULLIF(mobile, ''), NULLIF(phone, '')) AS phone
+     FROM ledgers WHERE company_id=$1 AND name = ANY($2::text[])
+     ORDER BY name, guid`,
+    [companyId, names]
+  ).catch((e) => { console.warn('[AR/AP] party phone lookup failed:', e.message); return { rows: [] }; });
+  const byName = new Map(rows.map((r) => [r.name, r]));
+  for (const p of parties) {
+    const r = byName.get(p.name);
+    if (!r) continue;
+    if (!p.phone && r.phone) p.phone = r.phone;
+    p.ledgerGuid = r.guid || null;
+  }
+}
+
 async function loadSettlementActivity(companyId, {
   side, from, to, limit = 40,
 }) {
@@ -317,9 +396,10 @@ export async function buildArApPayload(companyId, side, opts = {}) {
   const partyClause = side === 'AR'
     ? `(parent ILIKE '%Sundry Debtor%' OR parent = 'Sundry Debtors')`
     : `(parent ILIKE '%Sundry Creditor%' OR parent = 'Sundry Creditors')`;
+  // Tally exports pending amounts unsigned, so the sign only decides when there is no Dr/Cr label.
   const billTypeClause = side === 'AR'
-    ? `(UPPER(COALESCE(bill_type,'')) = 'DR' OR COALESCE(pending_amount,0) < 0)`
-    : `(UPPER(COALESCE(bill_type,'')) = 'CR' OR COALESCE(pending_amount,0) > 0)`;
+    ? `(UPPER(COALESCE(bo.bill_type,'')) = 'DR' OR (COALESCE(bo.bill_type,'') = '' AND COALESCE(bo.pending_amount,0) < 0))`
+    : `(UPPER(COALESCE(bo.bill_type,'')) = 'CR' OR (COALESCE(bo.bill_type,'') = '' AND COALESCE(bo.pending_amount,0) > 0))`;
 
   const { rows: partiesRaw } = await query(
     `SELECT name, closing_balance, COALESCE(mobile, phone) AS mobile
@@ -332,16 +412,23 @@ export async function buildArApPayload(companyId, side, opts = {}) {
   );
 
   const { rows: billsRaw } = await query(
-    `SELECT ledger_name, bill_name, bill_date, due_date, pending_amount, bill_type, voucher_guid
-     FROM bill_outstanding
-     WHERE company_id=$1 AND ABS(COALESCE(pending_amount,0)) > 0.005
+    `SELECT bo.ledger_name, bo.bill_name, bo.bill_date, bo.due_date, bo.pending_amount, bo.bill_type, bo.voucher_guid,
+            l.parent AS party_group
+     FROM bill_outstanding bo
+     LEFT JOIN LATERAL (
+       SELECT parent FROM ledgers WHERE company_id = bo.company_id AND name = bo.ledger_name LIMIT 1
+     ) l ON TRUE
+     WHERE bo.company_id=$1 AND ABS(COALESCE(bo.pending_amount,0)) > 0.005
        AND ${billTypeClause}
-     ORDER BY COALESCE(NULLIF(due_date,''), NULLIF(bill_date,'')) ASC NULLS LAST
+     ORDER BY COALESCE(NULLIF(bo.due_date,''), NULLIF(bo.bill_date,'')) ASC NULLS LAST
      LIMIT 5000`,
     [companyId]
   );
 
-  let bills = await linkBillsToVouchers(companyId, billsRaw.map((b) => mapBillRow(b, asOf, side)));
+  let bills = markOlderYearBills(
+    await linkBillsToVouchers(companyId, billsRaw.map((b) => mapBillRow(b, asOf, side))),
+    await earliestSyncedVoucherDate(companyId),
+  );
 
   // Unfiltered aging + total for snapshot / trends (real MoM baseline)
   const unfilteredAgingSource = bills.map((b) => ({
@@ -361,14 +448,10 @@ export async function buildArApPayload(companyId, side, opts = {}) {
     console.warn('[arAp] snapshot upsert skipped:', e.message);
   }
 
+  // Only bills whose voucher (bill) date lies in the selected FY — not the due date,
+  // so a March bill due in April stays in its own year.
   if (from || to) {
-    bills = bills.filter((b) => {
-      const ref = b.dueDate || b.billDate;
-      if (!ref) return false;
-      if (from && ref < from) return false;
-      if (to && ref > to) return false;
-      return true;
-    });
+    bills = bills.filter((b) => inPeriod(b.billDate || b.date, from, to));
   }
   if (overdueOnly) {
     bills = bills.filter((b) => b.status === 'OVERDUE');
@@ -460,15 +543,11 @@ export async function buildArApPayload(companyId, side, opts = {}) {
   }
 
   let parties = aggregateParties(partiesRaw, billsRaw.filter((br) => {
+    if (!from && !to) return true;
     const mapped = mapBillRow(br, asOf, side);
-    if (from || to) {
-      const ref = mapped.dueDate || mapped.billDate;
-      if (!ref) return false;
-      if (from && ref < from) return false;
-      if (to && ref > to) return false;
-    }
-    return true;
+    return inPeriod(mapped.billDate || mapped.date, from, to);
   }), asOf, side);
+  await fillPartyPhones(companyId, parties);
 
   if (overdueOnly) {
     parties = parties.filter((p) => p.overdueOutstanding > 0.005);
@@ -503,7 +582,8 @@ export async function buildArApPayload(companyId, side, opts = {}) {
     prior_total,
     trend_source,
     parties: parties.slice(0, 80),
-    bills: bills.slice(0, 100),
+    bills: [...bills].sort((a, b) => String(b.date || '').localeCompare(String(a.date || ''))).slice(0, 100),
+    olderYearBillCount: bills.filter((b) => b.olderYear).length,
     receipts: side === 'AR' ? activity : [],
     payments: side === 'AP' ? activity : [],
     activityLabel: side === 'AR' ? 'Receipts' : 'Payments',

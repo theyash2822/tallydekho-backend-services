@@ -60,16 +60,13 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
     // Linear regression on prev weeks to forecast last 8
     const reg = linearRegression(prevSales.length >= 3 ? prevSales : actualSales);
     const forecastSales = Array.from({ length: 8 }, (_, i) =>
-      Math.round(reg.predict(prevSales.length + i))
+      Math.max(0, Math.round(reg.predict(prevSales.length + i)))
     );
 
     // Smooth actuals with 3-week moving average for cleaner chart
     const smoothedActual = movingAverage(actualSales, 3).map(v => Math.round(v));
 
-    // Week labels
-    const weekLabels = lastWeeks.length > 0
-      ? lastWeeks.map((r, i) => `Wk${i + 1}`)
-      : ['Wk1','Wk2','Wk3','Wk4','Wk5','Wk6','Wk7','Wk8'];
+    const weekLabels = ['Wk1','Wk2','Wk3','Wk4','Wk5','Wk6','Wk7','Wk8'];
 
     // Pad to 8 if less data
     while (smoothedActual.length < 8) smoothedActual.unshift(0);
@@ -171,7 +168,7 @@ router.get('/ai-insights', authMiddleware, async (req, res) => {
     const outstandingRatio = totalSalesFY > 0 ? outstanding / totalSalesFY : 0;
 
     // ── 7. Next month forecast ──────────────────────────────────────────────
-    const nextMonthForecast = Math.round(reg.predict(prevSales.length + 8));
+    const nextMonthForecast = Math.max(0, Math.round(reg.predict(prevSales.length + 8)));
     const forecastConfidence = reg.r2 ? Math.round(reg.r2 * 100) : 0;
 
     // ── 8. Generate insights ────────────────────────────────────────────────

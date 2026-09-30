@@ -13,6 +13,7 @@ export function resolveViewCapability(req) {
   ) {
     return 'dashboard.view';
   }
+  if (u.includes('/payment-reminders')) return 'financials.receivables.view';
   if (u.includes('/sales')) return 'sales.view';
   if (u.includes('/purchase')) return 'purchase.view';
   if (u.includes('/expenses')) return 'expenses.view';
@@ -96,6 +97,7 @@ export function resolveViewCapability(req) {
     || u.includes('/company/years')
     || u.includes('/company/profile')
     || u.includes('/tally-sync')
+    || u.includes('/sync-history')
     || u.includes('/me/workspaces')
     || u.includes('/workspaces/') && u.includes('/context')
   ) {

@@ -1,5 +1,47 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-30 — AR/AP: FY by bill date, phones for every party
+
+- `buildArApPayload`: bills (and parties) are limited to bills whose **bill date** lies in the selected FY (`inPeriod`), per Yash — not the due date, so a March bill due in April stays in its year. (A short-lived "open as of period end" variant was reverted the same evening.) `bills` list sorted newest first before the 100 cap.
+- `fillPartyPhones`: phone + `ledgerGuid` for every listed party whatever its group (Cr bills on Sundry Debtors land on Payables; their phones were skipped). Overdue parties with phone: AR 3 → 12, AP 0 → 14.
+- Unit 319/319.
+
+## 2026-09-30 — Overdue fallback + FY-based cash/bank chart window
+
+- Tally's bill export has no due date yet (TDL sends `DueDate` blank), so Overdue Parties was always empty. New `effectiveDueDate` in `utils/billOutstanding.js`: explicit due date, else bill date + `DEFAULT_CREDIT_DAYS` (30, now shared with the reminder job). Used by `mapBillRow`, both `buildAgingBucketsDueBased` copies and `dueTodayAmount`, so status, ageing, due-today and trends agree. Bills carry `dueDateEstimated`; FY filters still use the real due/bill date (`date`).
+- Cash in Hand / Bank Balance `daily_balance`: `seriesWindow` ends at the selected FY end (or today, whichever is earlier) and never starts before the FY start; past windows are walked back from today's book balance. Previously always "last 30 days to today", ignoring the FY.
+- Yash Ki Company: AR 7 overdue parties, AP 9; FY 2025-26 cash chart now shows 2–31 Mar 2026. Unit 316/316 + 3 new tests; RBAC 92/92.
+
+## 2026-09-30 — Workspace socket events carry workspaceId
+
+- `socketHandler.notifyWorkspaceRoom` now adds `workspaceId` to every object payload (an explicit one in the payload still wins). Web and mobile drop workspace-scoped events with no workspace id, so `hard_sync_request`, `hard_sync_status` and `restore_status` were silently ignored — no Hard Sync popup on mobile, no live refresh on web.
+- Tested: fake-io emit shows `workspaceId` on both events; unit tests 316/316.
+
+## 2026-09-29 — Production readiness (plan Phases 2–5, backend)
+
+**Phase 2**
+- `/api/alerts` real; `$1::bigint` casts on 4 inserts; EWB/IRN cancel paths; dead routes removed.
+- Wrong OTP/PIN → `400`; 5 wrong tries → `429` for 15 min (user stays logged in). Refresh-token server errors → `5xx` (not 401), so the app retries instead of logging out.
+- Payment reminders rebuilt: receivables only, pending amount, due date (fallback bill date + 30 days), IST; WhatsApp + SMS + push only (email skipped silently). New `payment_reminder_log` + `GET` endpoint. GST due-date fix. All crons `Asia/Kolkata`.
+- `POST /master/stock-item`: optional `batchNo` + `expiryDate` → batch-wise item, opening stock in that batch (`parseStockItemBatch`, test `stock-item-batch.test.js`).
+- AI weekly forecast clamped ≥ 0, always 8 week labels.
+- Integrations: GET no longer hides DB errors; POST merges into saved `config_json` (blank fields keep the saved value). **Open:** GET still returns secrets in `config_json`.
+
+**Phase 3 (data correctness)**
+- New table `voucher_bill_allocations` (company, voucher, ledger, bill, type, amount, date). Filled from each rich voucher's allocations — handles AllVoucher.xml keys (`Billallocations` / `Billname` / `BillAmount`) and Tally-native `BILLALLOCATIONS` / `NAME`. Savepoint-guarded; stubs never wipe rows. Also back-fills `vouchers.bill_ref_name` (was empty for every synced voucher).
+- `linkBillsToVouchers` rule 4: party + bill name from allocations ("New Ref" voucher first).
+- Bill side: signed pending (future TDL field `SignedPending`) → DrCr label → ledger group. Due date = explicit, else bill date + credit period. `sideMismatch` flag on AR/AP bill rows.
+- **Fix:** AR/AP bill filter treated every positive pending as Cr (Tally sends pending unsigned) → Payables listed sales bills. Sign now only decides when there's no Dr/Cr label (service + `/party-bills` endpoint).
+- `olderYear` on unlinked bills dated before the earliest synced voucher; `olderYearBillCount` in the AR/AP payload.
+- Tests: `bill-allocations.test.js`, `bill-outstanding.test.js`.
+
+**Phase 5**
+- Indexes: `vouchers(company_id, voucher_number|reference|date)`, `voucher_ledger_entries(company_id, ledger_name)`. Dropped `idx_app_vouchers_tdk` / `idx_app_vouchers_uuid` (duplicated UNIQUE constraints).
+
+**Test:** `npm run test:unit` — 316 pass. **Needs:** desktop rebuild + one Hard Sync per company to fill allocations; TDL signed-amount / group / credit-period export waits on the raw Tally capture session.
+
+---
+
 ## 2026-09-29 — AR/AP bills linked to vouchers (My Entries rules)
 
 - `linkBillsToVouchers` in `arApService.js`: bill → voucher by voucher number, `app_vouchers.tally_voucher_no`, or `vouchers.reference` (TDK ref). Plain bill names link only when the voucher's party matches (QA found 88/106 wrong-party links with the old "first match" fallback); TDK refs may fall back since they're unique.

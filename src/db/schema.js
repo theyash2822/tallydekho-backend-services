@@ -838,7 +838,6 @@ export async function initSchema() {
       -- Phase A+B+C: app_vouchers new columns (invoice_uuid, numbering_policy, tally_voucher_no)
       ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS invoice_uuid     UUID DEFAULT gen_random_uuid() UNIQUE;
       ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS numbering_policy TEXT NOT NULL DEFAULT 'tally_prime_series';
-      CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid ON app_vouchers(invoice_uuid);
 
       -- Invoice+Receipt split (2026-06-30): links a Receipt app_voucher to its parent Sales Invoice
       -- via Sales Invoice's invoice_uuid. NULL for all standalone vouchers (invoices, regular receipts).
@@ -1091,10 +1090,7 @@ export async function initSchema() {
         updated_at              BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_company ON app_vouchers(company_guid);
-      CREATE INDEX IF NOT EXISTS idx_app_vouchers_tdk     ON app_vouchers(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
-      CREATE INDEX IF NOT EXISTS idx_app_vouchers_uuid    ON app_vouchers(invoice_uuid);
-      CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent  ON app_vouchers(parent_invoice_uuid);
 
       -- ── Invoice PDF Versions (Phase C) ──────────────────────────────────────
       CREATE TABLE IF NOT EXISTS invoice_pdf_versions (
@@ -1130,6 +1126,39 @@ export async function initSchema() {
         created_at          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
       CREATE INDEX IF NOT EXISTS idx_pbill_att_invoice ON purchase_bill_attachments(company_id, invoice_uuid);
+
+      -- ── Payment reminder log (one row per bill + reminder slot + channel + day) ──
+      CREATE TABLE IF NOT EXISTS payment_reminder_log (
+        id              BIGSERIAL PRIMARY KEY,
+        company_id      BIGINT NOT NULL,
+        user_id         INTEGER NOT NULL,
+        party_name      TEXT NOT NULL,
+        bill_name       TEXT NOT NULL,
+        amount          NUMERIC,
+        due_date        DATE,
+        reminder_id     TEXT NOT NULL,
+        channel         TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        error           TEXT,
+        send_day        DATE NOT NULL,
+        sent_at         BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_reminder_log_slot
+        ON payment_reminder_log(company_id, party_name, bill_name, reminder_id, channel, send_day);
+      CREATE INDEX IF NOT EXISTS idx_payment_reminder_log_company ON payment_reminder_log(company_id, sent_at DESC);
+
+      -- ── Voucher bill allocations (every BILLALLOCATIONS line, for bill → voucher links) ──
+      CREATE TABLE IF NOT EXISTS voucher_bill_allocations (
+        company_id      BIGINT NOT NULL,
+        voucher_guid    TEXT NOT NULL,
+        ledger_name     TEXT NOT NULL,
+        bill_name       TEXT NOT NULL,
+        bill_type       TEXT,
+        amount          NUMERIC,
+        bill_date       TEXT,
+        PRIMARY KEY (company_id, voucher_guid, ledger_name, bill_name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_vba_company_bill ON voucher_bill_allocations(company_id, bill_name);
 
       -- ── Geo masters (Tally country / state-emirate-province list) ───────────
       -- Seeded from data/geo_tally_states.json (TCSDV3 export). Spellings must
@@ -1290,6 +1319,19 @@ export async function initSchema() {
       ).catch(() => {});
     }
     console.log('✅ Company Identity Phase 2 additive company_id columns ensured');
+
+    // Hot lookups are company-scoped: bill/ref linking, date ranges, ledger drill-downs.
+    // The two app_vouchers indexes duplicate the UNIQUE constraints on the same columns.
+    for (const sql of [
+      'CREATE INDEX IF NOT EXISTS idx_vouchers_cid_number ON vouchers (company_id, voucher_number)',
+      'CREATE INDEX IF NOT EXISTS idx_vouchers_cid_reference ON vouchers (company_id, reference)',
+      'CREATE INDEX IF NOT EXISTS idx_vouchers_cid_date ON vouchers (company_id, date)',
+      'CREATE INDEX IF NOT EXISTS idx_vle_cid_ledger ON voucher_ledger_entries (company_id, ledger_name)',
+      'DROP INDEX IF EXISTS idx_app_vouchers_tdk',
+      'DROP INDEX IF EXISTS idx_app_vouchers_uuid',
+    ]) {
+      await client.query(sql).catch((e) => console.warn('[schema] index step failed:', sql, e.message));
+    }
 
     // Referential and uniqueness guarantees the code assumed. Additive and
     // idempotent; scripts/schema-integrity-hardening.mjs applies the same list

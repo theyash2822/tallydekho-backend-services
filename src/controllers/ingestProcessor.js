@@ -8,6 +8,8 @@ import {
   wrapIngestClient,
 } from '../utils/ingestCompanyDualWrite.js';
 export { ingestCompanyCtx };
+import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
+import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
 
 async function dbQuery(text, params) {
   return rawDbQuery(text, params);
@@ -1023,6 +1025,7 @@ async function processVouchers(data, companyGuid) {
         const parsedLedgerEntries = parseLedgerEntries(r);
         if (parsedLedgerEntries.length > 0) {
           await saveLedgerEntries(client, guid, companyGuid, parsedLedgerEntries, r._FINANCIAL_YEAR || null);
+          await saveBillAllocations(client, guid, r);
         }
 
         // Inventory line items
@@ -2138,46 +2141,8 @@ async function processFullLedger(data, companyGuid) {
 }
 
 // Parse AllLedgerEntries from a voucher record — handles JSON string or array
-// ── Bill Allocation Extraction (Phase B, 2026-06-30) ─────────────────────────
-// Parses BILLALLOCATIONS.LIST from the FIRST party-flagged ledger entry. Returns:
-//   { bill_ref_name, bill_type, bill_allocated_amount } or null.
-// We only need the first allocation per voucher for Sales+Receipt single-bill flows;
-// multi-bill receipts (one receipt settling N invoices) are a future enhancement that
-// will need a child table.
-function extractFirstBillAllocation(r) {
-  const partyEntry = (() => {
-    const all = [
-      ...(Array.isArray(r.ALLLEDGERENTRIES) ? r.ALLLEDGERENTRIES : (r.ALLLEDGERENTRIES ? [r.ALLLEDGERENTRIES] : [])),
-      ...(Array.isArray(r.AllLedgerEntries) ? r.AllLedgerEntries : (r.AllLedgerEntries ? [r.AllLedgerEntries] : [])),
-      ...(Array.isArray(r.LEDGERENTRIES) ? r.LEDGERENTRIES : (r.LEDGERENTRIES ? [r.LEDGERENTRIES] : [])),
-      ...(Array.isArray(r.LedgerEntries) ? r.LedgerEntries : (r.LedgerEntries ? [r.LedgerEntries] : [])),
-    ];
-    // Prefer one with ISPARTYLEDGER=Yes AND a BILLALLOCATIONS.LIST present
-    for (const e of all) {
-      const isParty = e?.ISPARTYLEDGER === 'Yes' || e?.IsPartyLedger === 'Yes';
-      const ba = e?.BILLALLOCATIONS || e?.BillAllocations;
-      if (isParty && ba) return e;
-    }
-    // Fallback: first entry with allocations
-    for (const e of all) {
-      const ba = e?.BILLALLOCATIONS || e?.BillAllocations;
-      if (ba) return e;
-    }
-    return null;
-  })();
-  if (!partyEntry) return null;
-  const baRaw = partyEntry.BILLALLOCATIONS || partyEntry.BillAllocations;
-  const ba = Array.isArray(baRaw) ? baRaw[0] : baRaw;
-  if (!ba) return null;
-  const name = ba.NAME || ba.Name || ba.name;
-  const type = ba.BILLTYPE || ba.BillType || ba.billType;
-  const amtRaw = ba.AMOUNT ?? ba.Amount ?? ba.amount;
-  const amount = typeof amtRaw === 'string'
-    ? parseFloat(String(amtRaw).replace('(-)', '-').replace(/[^0-9.-]/g, ''))
-    : parseFloat(amtRaw || 0);
-  if (!name || !type) return null;
-  return { bill_ref_name: String(name).trim(), bill_type: String(type).trim(), bill_allocated_amount: isNaN(amount) ? null : amount };
-}
+// First allocation (party line preferred) for vouchers.bill_ref_name — used by the reconciler.
+const extractFirstBillAllocation = firstBillAllocation;
 
 // Parse "TDK Receipt: TDK-RCP-2026-0001 | Against Invoice: TDK-SAL-2026-0027" from narration.
 function parseTdkReceiptNarration(narration) {
@@ -2225,6 +2190,45 @@ function parseLedgerEntries(r) {
 
 // Save AllLedgerEntries for a voucher to voucher_ledger_entries table
 // V2: includes financial_year from record metadata
+// Every bill allocation line → voucher_bill_allocations (multi-bill receipts, AR/AP linking).
+// Only called for rich payloads so a SimplifiedVoucher stub never wipes stored rows.
+async function saveBillAllocations(client, voucherGuid, r) {
+  const cid = currentCompanyId();
+  if (cid == null) return;
+  const allocs = extractBillAllocations(r);
+  await client.query('SAVEPOINT bill_alloc');
+  try {
+    await writeBillAllocations(client, cid, voucherGuid, r, allocs);
+    await client.query('RELEASE SAVEPOINT bill_alloc');
+  } catch (err) {
+    await client.query('ROLLBACK TO SAVEPOINT bill_alloc');
+    console.warn('[DB] Bill allocation save failed:', err.message, voucherGuid);
+  }
+}
+
+async function writeBillAllocations(client, cid, voucherGuid, r, allocs) {
+  await client.query('DELETE FROM voucher_bill_allocations WHERE company_id=$1 AND voucher_guid=$2', [cid, voucherGuid]);
+  for (const a of allocs) {
+    if (!a.ledger) continue;
+    await client.query(
+      `INSERT INTO voucher_bill_allocations (company_id, voucher_guid, ledger_name, bill_name, bill_type, amount, bill_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT DO NOTHING`,
+      [cid, voucherGuid, a.ledger.slice(0, 500), a.name.slice(0, 500), a.type, a.amount, a.date ? String(a.date) : null]
+    );
+  }
+  const first = firstBillAllocation(r);
+  if (first) {
+    await client.query(
+      `UPDATE vouchers SET bill_ref_name = COALESCE(NULLIF(bill_ref_name, ''), $3),
+                           bill_type = COALESCE(NULLIF(bill_type, ''), $4),
+                           bill_allocated_amount = COALESCE(bill_allocated_amount, $5)
+        WHERE company_id=$1 AND guid=$2`,
+      [cid, voucherGuid, first.bill_ref_name, first.bill_type, first.bill_allocated_amount]
+    );
+  }
+}
+
 async function saveLedgerEntries(client, voucherGuid, companyGuid, entries, financialYear) {
   if (!entries || entries.length === 0) return;
   // Delete existing entries for this voucher (idempotent re-sync)
@@ -2625,14 +2629,19 @@ async function processBillOutstanding(data, companyGuid) {
       const pending = parseAmt(r.PendingAmount ?? r.PENDINGAMOUNT);
       if (Math.abs(pending) < 0.005) { skipped++; continue; }
       const amount = parseAmt(r.Amount ?? r.AMOUNT);
-      const drCr = String(r.DrCr || r.DRCR || r.BillType || r.BILLTYPE || '').trim() || null;
+      const drCr = billSide(r);
+      const billDate = normalizeDate(r.BillDate);
+      const creditPeriod = r.CreditPeriod ?? r.CREDITPERIOD ?? null;
+      // Tally can express the credit period as days or as a fixed due date.
+      const dueDate = dueDateOf(billDate, normalizeDate(r.DueDate), creditPeriod)
+        || (creditDays(creditPeriod) == null ? normalizeDate(creditPeriod) : null);
       try {
         await client.query(`
           INSERT INTO bill_outstanding (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, alter_id, synced_at, company_id)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
         `, [
           r.VoucherGuid || null, companyGuid, ledgerName, billName,
-          normalizeDate(r.BillDate), normalizeDate(r.DueDate),
+          billDate, dueDate,
           amount, pending,
           drCr, parseInt(r.AlterId || 0) || 0, now(),
           currentCompanyId()]);
@@ -3258,6 +3267,7 @@ async function processAllVoucher(data, companyGuid) {
         const parsedEntries = parseLedgerEntries(r);
         if (parsedEntries.length > 0) {
           await saveLedgerEntries(client, guid, companyGuid, parsedEntries, r._FINANCIAL_YEAR || null);
+          await saveBillAllocations(client, guid, r);
         }
       } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
     }

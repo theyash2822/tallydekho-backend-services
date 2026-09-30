@@ -3140,14 +3140,6 @@ ${mailingDetailsXml}
   }
 });
 
-// ── GET /tally/write-status/:deviceId ────────────────────────────────────────
-// Desktop polls this to get pending write requests to forward to Tally
-router.get('/write-queue/:deviceId', async (req, res) => {
-  // Placeholder — in Phase 3 this will serve pending write jobs to desktop
-  res.json({ status: true, data: { queue: [] } });
-});
-
-
 // POST /tally/master/warehouse - Create Godown/Warehouse in Tally
 router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/master/warehouse'), async (req, res) => {
   const { companyGuid, companyName, name, parentGodown = '', address = '' } = req.body;
@@ -5028,6 +5020,33 @@ router.post('/voucher/cancel', authMiddleware, requireTallyWriteAccess('/voucher
   try { const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id }); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
+const TALLY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * Create Item batch/expiry. A batch-wise item needs a batch name for its opening
+ * stock; Tally's own default is "Primary Batch". Expiry must be YYYY-MM-DD and is
+ * sent as Tally's d-Mon-yyyy EXPIRYPERIOD.
+ */
+export function parseStockItemBatch(batchNo, expiryDate) {
+  const rawName = String(batchNo || '').trim();
+  const rawExpiry = String(expiryDate || '').trim();
+  if (!rawName && !rawExpiry) return { on: false, name: '', expiryIso: null, expiryXml: '' };
+  if (rawName.length > 100) return { error: 'Batch number is too long (max 100 characters)' };
+  let expiryIso = null;
+  let expiryXml = '';
+  if (rawExpiry) {
+    const m = rawExpiry.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const d = m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : null;
+    if (!d || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) {
+      return { error: 'expiryDate must be a valid date (YYYY-MM-DD)' };
+    }
+    expiryIso = rawExpiry;
+    const tallyDay = `${+m[3]}-${TALLY_MONTHS[+m[2] - 1]}-${m[1]}`;
+    expiryXml = `<EXPIRYPERIOD P="${tallyDay}">${tallyDay}</EXPIRYPERIOD>`;
+  }
+  return { on: true, name: rawName || 'Primary Batch', expiryIso, expiryXml };
+}
+
 router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/master/stock-item'), async (req, res) => {
   const {
     companyGuid, companyName,
@@ -5045,9 +5064,17 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
     barcodeLabel = null, // { itemName?, sku?, salePrice? } — label print prefs
     barcodeType = 'CODE128',
     barcodeSyncTarget = 'app_only',
+    batchNo = '',
+    expiryDate = '',
   } = req.body;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
   if (!name) return res.status(400).json({ status: false, message: 'name required' });
+  const batch = parseStockItemBatch(batchNo, expiryDate);
+  if (batch.error) return res.status(400).json({ status: false, message: batch.error });
+  if (batch.on) {
+    req.body.batchNo = batch.name;
+    req.body.expiryDate = batch.expiryIso || '';
+  }
   const effectiveGroup = String(groupName || '').trim();
   if (!effectiveGroup) return res.status(400).json({ status: false, message: 'groupName required' });
   const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
@@ -5062,7 +5089,16 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   const godownOpening = qty > 0 && !!String(warehouse || '').trim();
   const openXml = godownOpening
     ? ''
-    : (qty > 0 ? `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>` : '');
+    : (qty > 0
+      ? `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>`
+        + (batch.on
+          ? `<BATCHALLOCATIONS.LIST><BATCHNAME>${esc(batch.name)}</BATCHNAME>${batch.expiryXml}`
+            + `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE></BATCHALLOCATIONS.LIST>`
+          : '')
+      : '');
+  const batchFlagsXml = batch.on
+    ? `<ISBATCHWISEON>Yes</ISBATCHWISEON>${batch.expiryIso ? '<ISPERISHABLEON>Yes</ISPERISHABLEON>' : ''}`
+    : '';
   const _today = new Date(); const _appFrom = `${_today.getFullYear()}${String(_today.getMonth()+1).padStart(2,'0')}${String(_today.getDate()).padStart(2,'0')}`;
   // Emit GST details whenever a rate was supplied, not only when an HSN code is
   // present. The stock-item form sends the chosen tax rate with an empty
@@ -5071,7 +5107,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   // HSNCODE itself stays optional, which is what Tally expects.
   const hasGstRate = igstRate > 0 || cgstRate > 0 || sgstRate > 0;
   const gstXml = (hsnCode || hasGstRate) ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM>${hsnCode ? `<HSNCODE>${hsnCode}</HSNCODE>` : ''}<TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${batchFlagsXml}${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
@@ -5122,6 +5158,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
         `<ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY>` +
         `<RATE>0</RATE><AMOUNT>0</AMOUNT>` +
         `<BATCHALLOCATIONS.LIST><GODOWNNAME>${esc(godown)}</GODOWNNAME>` +
+        (batch.on ? `<BATCHNAME>${esc(batch.name)}</BATCHNAME>${batch.expiryXml}` : '') +
         `<ACTUALQTY>${absQty}</ACTUALQTY><BILLEDQTY>${absQty}</BILLEDQTY><AMOUNT>0</AMOUNT>` +
         `</BATCHALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>` +
         `</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
@@ -6083,6 +6120,8 @@ router.get('/write-queue/status/:id', authMiddleware, async (req, res) => {
 router.get('/write-queue/history', authMiddleware, async (req, res) => {
   const { companyGuid, status, limit = 50, offset = 0 } = req.query;
   const companyGuidVal = companyGuid || req.user.companyGuid;
+  if (!companyGuidVal) return res.status(400).json({ status: false, error: { code: 'MISSING_COMPANY', message: 'companyGuid required' } });
+  if (!(await verifyCompanyAccess(req, res, companyGuidVal, { responseShape: 'tally' }))) return;
   try {
     let q = `SELECT id, entry_type, entry_label, amount, status, tally_voucher_number,
                     error_message, attempt_count, created_at, updated_at,
@@ -6093,8 +6132,8 @@ router.get('/write-queue/history', authMiddleware, async (req, res) => {
                       WHEN 'failed'          THEN 'failed'
                       ELSE status
                     END as v2_status
-             FROM write_queue WHERE user_id = $1 AND company_id = $2`;
-    const params = [req.user.userId, companyGuidVal];
+             FROM write_queue WHERE company_id = $1`;
+    const params = [req.company.id];
     if (status) { q += ` AND status = $${params.length + 1}`; params.push(status); }
     q += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), parseInt(offset));
@@ -6320,14 +6359,15 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
 router.get('/master/bank', authMiddleware, async (req, res) => {
   const { companyGuid } = req.query;
   if (!companyGuid) return res.status(400).json({ status: false, message: 'companyGuid required' });
+  if (!(await verifyCompanyAccess(req, res, companyGuid, { responseShape: 'tally' }))) return;
   try {
     const { rows } = await query(`
       SELECT id, payload, status, created_at
       FROM write_queue
-      WHERE user_id=$1 AND company_id=$2 AND operation='bank'
+      WHERE company_id=$1 AND entry_type='bank'
       ORDER BY created_at DESC
       LIMIT 50
-    `, [req.user.userId, req.company?.id]);
+    `, [req.company.id]);
     const accounts = rows.map(r => ({
       id: r.id.toString(),
       ...r.payload,

@@ -77,10 +77,32 @@ async function dailyBankMoves(companyId, from, to) {
   return map;
 }
 
+const SERIES_DAYS = 30;
+
+/**
+ * 30-day chart window ending at the selected FY end (or today, whichever is earlier),
+ * never starting before the FY start. Moves are fetched through today so the
+ * balance can be walked back from today's book balance.
+ */
+export function seriesWindow(today, from, to) {
+  let end = today;
+  if (to && to < end) end = to;
+  if (from && from > end) end = today;
+  let start = addDays(end, -(SERIES_DAYS - 1));
+  if (from && from > start && from <= end) start = from;
+  return { start, end };
+}
+
 /** Walk back from current book balance using daily net moves. */
-function buildDailyBalanceSeries(dayKeys, moveMap, currentBalance) {
+export function buildDailyBalanceSeries(dayKeys, moveMap, currentBalance, today = null) {
   const closingByDay = new Map();
   let cursor = currentBalance;
+  const lastKey = dayKeys[dayKeys.length - 1];
+  if (today && lastKey && lastKey < today) {
+    for (const [day, m] of moveMap) {
+      if (day > lastKey && day <= today) cursor = cursor - m.inflow + m.outflow;
+    }
+  }
   for (let i = dayKeys.length - 1; i >= 0; i--) {
     const day = dayKeys[i];
     closingByDay.set(day, cursor);
@@ -142,11 +164,11 @@ export async function buildCashInHandPayload(companyId, { from, to } = {}) {
     direction: t.direction === 'in' ? 'in' : 'out',
   }));
 
-  const seriesDays = 30;
-  const seriesFrom = addDays(today, -(seriesDays - 1));
-  const moveMap = await dailyCashMoves(companyId, seriesFrom, today);
-  const dayKeys = enumerateDays(seriesFrom, today);
-  const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, balance);
+  const win = seriesWindow(today, isoDay(from), isoDay(to));
+  const moveMap = await dailyCashMoves(companyId, win.start < yesterday ? win.start : yesterday, today);
+  const dayKeys = enumerateDays(win.start, win.end);
+  const seriesDays = dayKeys.length;
+  const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, balance, today);
 
   const lastBal = daily_balance[daily_balance.length - 1]?.balance ?? balance;
   const prevDayBal = daily_balance.length >= 2
@@ -281,11 +303,11 @@ export async function buildBankBalancePayload(companyId, { from, to } = {}) {
   }));
   const total = money(bankList.reduce((s, b) => s + b.balance, 0));
 
-  const seriesDays = 30;
-  const seriesFrom = addDays(today, -(seriesDays - 1));
-  const moveMap = await dailyBankMoves(companyId, seriesFrom, today);
-  const dayKeys = enumerateDays(seriesFrom, today);
-  const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, total);
+  const win = seriesWindow(today, isoDay(from), isoDay(to));
+  const moveMap = await dailyBankMoves(companyId, win.start < yesterday ? win.start : yesterday, today);
+  const dayKeys = enumerateDays(win.start, win.end);
+  const seriesDays = dayKeys.length;
+  const daily_balance = buildDailyBalanceSeries(dayKeys, moveMap, total, today);
 
   const lastBal = daily_balance[daily_balance.length - 1]?.balance ?? total;
   const windowStartBal = daily_balance[0]?.balance ?? null;

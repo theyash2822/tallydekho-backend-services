@@ -313,7 +313,11 @@ export function setupSocket(io) {
 
     notifyWorkspaceRoom: (workspaceId, event, payload) => {
       if (!_io || !workspaceId) return;
-      _io.to(`workspace:${workspaceId}`).emit(event, payload);
+      // Web and mobile drop workspace-scoped events that don't name their workspace.
+      const body = payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? { workspaceId: String(workspaceId), ...payload }
+        : payload;
+      _io.to(`workspace:${workspaceId}`).emit(event, body);
     },
 
     notifyWorkspace: (userId, event, payload) => {

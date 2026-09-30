@@ -539,7 +539,7 @@ export async function setCachedInsights(companyId, monthKey, metricsJson, aiOutp
       INSERT INTO ai_insights_cache (company_id, company_guid, month_key, metrics_json, ai_output_json, valid_until)
       VALUES (
         $1,
-        (SELECT guid FROM companies WHERE id = $1),
+        (SELECT guid FROM companies WHERE id = $1::bigint),
         $2, $3, $4,
         date_trunc('month', NOW()) + INTERVAL '2 months'
       )
@@ -595,7 +595,7 @@ export async function computeHistoricalSummary(companyId, financialYear, from, t
   try {
     await query(`
       INSERT INTO financial_year_summaries (company_id, company_guid, financial_year, summary_json)
-      VALUES ($1, (SELECT guid FROM companies WHERE id = $1), $2, $3)
+      VALUES ($1, (SELECT guid FROM companies WHERE id = $1::bigint), $2, $3)
       ON CONFLICT (company_id, financial_year) DO UPDATE SET
         company_id=$1, summary_json=$3, generated_at=NOW()
     `, [companyId, financialYear, JSON.stringify(summaryObj)]);

@@ -43,7 +43,9 @@ export function authMiddleware(req, res, next) {
         }
         next();
       } catch (err) {
-        return res.status(401).json({ status: false, message: 'Session validation failed' });
+        // Fail closed, but as a server error: 401 would make clients drop a valid session.
+        console.error('[auth] session check failed:', err.message);
+        return res.status(503).json({ status: false, code: 'SESSION_CHECK_UNAVAILABLE', message: 'Server busy, try again' });
       }
     })();
   } catch (err) {

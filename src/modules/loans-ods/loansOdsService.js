@@ -749,7 +749,7 @@ export async function buildLoansOdsPayload(companyId) {
       `INSERT INTO kpi_loans_snapshots (company_id, company_guid, as_of, total, loan_total, od_total, created_at)
        VALUES (
          $1,
-         (SELECT guid FROM companies WHERE id = $1),
+         (SELECT guid FROM companies WHERE id = $1::bigint),
          $2::date, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT
        )
        ON CONFLICT (company_id, as_of)

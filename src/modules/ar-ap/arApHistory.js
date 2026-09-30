@@ -18,6 +18,7 @@
  */
 import { query } from '../../db/schema.js';
 import { money, isoDay, addDays, computeTrendPct } from '../kpi/trendUtil.js';
+import { effectiveDueDate } from '../../utils/billOutstanding.js';
 
 const PARTY_SQL = {
   AR: `(l.parent ILIKE '%Sundry Debtor%' OR l.parent = 'Sundry Debtors')`,
@@ -226,7 +227,7 @@ export function buildAgingBucketsDueBased(bills, asOfIso) {
   for (const r of bills) {
     const amt = money(r.pending_amount);
     if (!amt) continue;
-    const due = isoDay(r.due_date) || isoDay(r.bill_date);
+    const due = effectiveDueDate(isoDay(r.due_date), isoDay(r.bill_date));
     const overdueDays = due ? daysBetween(asOfIso, due) : 0;
     let key = '0-30d';
     if (overdueDays < 0) key = 'NOT_DUE';
@@ -243,14 +244,14 @@ export function buildAgingBucketsDueBased(bills, asOfIso) {
   }));
 }
 
-/** Bills due on asOfIso (due_date preferred; else bill_date). */
+/** Bills due on asOfIso (due_date preferred; else bill_date + default credit period). */
 export function dueTodayAmount(bills, asOfIso) {
   let amount = 0;
   let count = 0;
   for (const r of bills) {
     const amt = money(r.pending_amount);
     if (!amt) continue;
-    const due = isoDay(r.due_date) || isoDay(r.bill_date);
+    const due = effectiveDueDate(isoDay(r.due_date), isoDay(r.bill_date));
     if (due === asOfIso) {
       amount += amt;
       count += 1;
