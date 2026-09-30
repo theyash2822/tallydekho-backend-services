@@ -6745,15 +6745,16 @@ router.post('/invoice/:tdkRef/pdf-log', authMiddleware, requireTallyWriteAccess(
 
     // Get next version number
     const { rows: vRows } = await query(
-      `SELECT COALESCE(MAX(version_no), 0) + 1 AS next_ver FROM invoice_pdf_versions WHERE tdk_reference_no=$1`,
-      [tdkRef]
+      `SELECT COALESCE(MAX(version_no), 0) + 1 AS next_ver FROM invoice_pdf_versions
+        WHERE tdk_reference_no=$1 AND company_guid=$2::text`,
+      [tdkRef, req.company?.id]
     );
     const versionNo = vRows[0]?.next_ver || 1;
 
     await query(
       `INSERT INTO invoice_pdf_versions (tdk_reference_no, invoice_uuid, company_guid, user_id, version_no, pdf_type, posting_tag, invoice_number, invoice_number_label, watermark, file_name)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT (tdk_reference_no, version_no) DO NOTHING`,
+       ON CONFLICT (company_guid, tdk_reference_no, version_no) DO NOTHING`,
       [tdkRef, avRows[0].invoice_uuid, req.company?.id, req.user.userId, versionNo,
        pdfType, avRows[0].books_impact_status === 'posted' ? 'Posted' : 'Not Posted',
        invoiceNumber || null, invoiceNumberLabel || 'Pending from TallyPrime', watermark || null, fileName || null]
@@ -7455,7 +7456,7 @@ router.post('/invoice/:tdkRef/share-pdf', authMiddleware, requireTallyWriteAcces
       if (tallyNo) {
         // Refresh row
         const { rows: fresh } = await query(
-          `SELECT * FROM app_vouchers WHERE tdk_reference_no=$1`, [tdkRef]
+          `SELECT * FROM app_vouchers WHERE id=$1`, [av.id]
         ).catch(() => ({ rows: [] }));
         if (fresh[0]) av = fresh[0];
       }

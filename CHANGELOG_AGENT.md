@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-30 — Second company's invoice had no preview (duplicate TDK ref)
+
+- **Cause:** `tdk_reference_counters` are per company, so every company issues `TDK-SAL-2026-0001`, but `app_vouchers.tdk_reference_no` was globally UNIQUE. Radhe Ram's first sale reached Tally, but its lifecycle row failed on `app_vouchers_tdk_reference_no_key` (Yash already held that ref). The insert error is caught and logged, so the route returned 200 and every `/invoice/:ref/preview` got a 404.
+- `schema.js` `applyPerCompanyTdkReferenceUnique` (runs every boot, not gated by the CID destructive flag): `app_vouchers` UNIQUE `(company_id, tdk_reference_no)`; `invoice_pdf_versions` UNIQUE `(company_guid, tdk_reference_no, version_no)`. Fresh `CREATE TABLE`s no longer declare the global uniques.
+- `pdf-log` version number and ON CONFLICT scoped by company; the `share-pdf` refresh after the Tally-number wait re-reads by `id`, not by ref alone (it could return the other company's row).
+- Local data: rebuilt the missing Radhe Ram row (app_vouchers 237, from write_queue 492, Tally voucher 1). No other successful voucher writes lack a lifecycle row.
+
 ## 2026-09-30 — Multi-company sync no longer files one company's data under another
 
 - **Cause:** desktop sends every selected company in one upload (10k-record chunks, no `company-guid` header). `/ingest/chunk` filed the whole chunk under `data[0].COMPANY_GUID`, so where one company's records ended and the next began, the second company's rows were written under the first (local DB: "Yash Ki Company" held 504 Radhe Ram vouchers, both other companies' default groups, 13 stock items). Same-name ledger/unit/godown upserts then overwrote the host company's rows.

@@ -1068,7 +1068,7 @@ export async function initSchema() {
         user_id                 INTEGER REFERENCES users(id),
         write_queue_id          INTEGER REFERENCES write_queue(id),
         voucher_type            TEXT NOT NULL,            -- 'sales_invoice', 'sales_order', etc.
-        tdk_reference_no        TEXT NOT NULL UNIQUE,     -- TDK-SAL-2026-0042
+        tdk_reference_no        TEXT NOT NULL,            -- TDK-SAL-2026-0042 (unique per company)
         tally_voucher_no        TEXT,                     -- set after Tally sync
         tally_guid              TEXT,
         original_entry_type     TEXT NOT NULL DEFAULT 'regular',   -- 'regular' | 'optional'
@@ -1106,8 +1106,7 @@ export async function initSchema() {
         invoice_number_label TEXT NOT NULL DEFAULT 'Pending from TallyPrime',
         watermark           TEXT,
         file_name           TEXT,
-        generated_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        UNIQUE (tdk_reference_no, version_no)
+        generated_at        BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_tdk     ON invoice_pdf_versions(tdk_reference_no);
       CREATE INDEX IF NOT EXISTS idx_pdf_ver_company ON invoice_pdf_versions(company_guid);
@@ -1404,6 +1403,8 @@ export async function initSchema() {
       );
     }
 
+    await applyPerCompanyTdkReferenceUnique(client);
+
     console.log('✅ PostgreSQL schema initialized');
   } finally {
     // The client goes back to a shared pool, so the role change must not.
@@ -1690,6 +1691,27 @@ async function applyCidConstraintCutover(client) {
       END $$;
     `).catch((e) => console.warn('[CID3E] workspace+guid unique:', e.message));
     console.log('✅ Company Identity Phase 3E UNIQUE(workspace_id, guid) applied');
+}
+
+async function applyPerCompanyTdkReferenceUnique(client) {
+    // TDK reference counters are per company, so two companies both issue
+    // TDK-SAL-2026-0001. A global UNIQUE made the second company's invoice row fail.
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE app_vouchers DROP CONSTRAINT IF EXISTS app_vouchers_tdk_reference_no_key;
+        BEGIN
+          ALTER TABLE app_vouchers ADD CONSTRAINT app_vouchers_company_tdk_ref_key UNIQUE (company_id, tdk_reference_no);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+                  WHEN duplicate_table THEN NULL;
+        END;
+        ALTER TABLE invoice_pdf_versions DROP CONSTRAINT IF EXISTS invoice_pdf_versions_tdk_reference_no_version_no_key;
+        BEGIN
+          ALTER TABLE invoice_pdf_versions ADD CONSTRAINT invoice_pdf_versions_company_ref_ver_key UNIQUE (company_guid, tdk_reference_no, version_no);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+                  WHEN duplicate_table THEN NULL;
+        END;
+      END $$;
+    `).catch((e) => console.warn('[TDK-REF] per-company unique:', e.message));
 }
 
 export default pool;
