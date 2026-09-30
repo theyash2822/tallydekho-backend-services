@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-30 — Multi-company sync no longer files one company's data under another
+
+- **Cause:** desktop sends every selected company in one upload (10k-record chunks, no `company-guid` header). `/ingest/chunk` filed the whole chunk under `data[0].COMPANY_GUID`, so where one company's records ended and the next began, the second company's rows were written under the first (local DB: "Yash Ki Company" held 504 Radhe Ram vouchers, both other companies' default groups, 13 stock items). Same-name ledger/unit/godown upserts then overwrote the host company's rows.
+- `/ingest/chunk`: records are grouped by their own `COMPANY_GUID` (`src/utils/ingestCompanyGroups.js`); header / upload company only fill records that lack one. Every company is resolved against the device workspace before anything is written; any failure rejects the chunk (unchanged security rule).
+- `/ingest/complete`: post-processing (completeness warnings, synced_at, sync_log, FY-anchor cascade, VLE FY backfill, stock reconcile, tax backfill, socket `synced`) runs for every company in `companyGuid` / `companies[]`, not just the last chunk's company.
+- `processBillOutstanding`: the per-company wipe runs once per upload, so bills spanning two chunks are no longer deleted by the second chunk.
+- Fixes installed desktops without an update. Existing mixed rows need a Hard Sync of the affected companies.
+- Tested: new `ingest-company-groups.test.js` (5); unit suite 324 pass; backend restarted, `/health` 200.
+
 ## 2026-09-30 — KPI strip bank account count
 
 - `/api/dashboard/kpi-strip` (bank entry) adds `account_count` so the web Dashboard stops showing a hard-coded "3 accounts". Additive; mobile ignores it.

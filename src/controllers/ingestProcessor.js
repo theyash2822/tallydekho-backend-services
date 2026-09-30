@@ -7,6 +7,7 @@ import {
   currentUploadId,
   wrapIngestClient,
 } from '../utils/ingestCompanyDualWrite.js';
+import { claimBillOutstandingPurge } from '../utils/ingestCompanyGroups.js';
 export { ingestCompanyCtx };
 import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
 import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
@@ -2619,7 +2620,9 @@ async function processBillOutstanding(data, companyGuid) {
   };
   try {
     await client.query('BEGIN');
-    await client.query('DELETE FROM bill_outstanding WHERE company_id=$1', [currentCompanyId()]);
+    if (claimBillOutstandingPurge(currentUploadId(), currentCompanyId())) {
+      await client.query('DELETE FROM bill_outstanding WHERE company_id=$1', [currentCompanyId()]);
+    }
     let saved = 0;
     let skipped = 0;
     for (const r of data) {

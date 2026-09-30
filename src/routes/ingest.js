@@ -11,6 +11,7 @@ import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
 import { consumeApprovedHardSync } from '../services/hardSyncService.js';
 import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
 import { evaluateLineage } from '../utils/tallyLineage.js';
+import { groupRecordsByCompany, completeCompanyGuids } from '../utils/ingestCompanyGroups.js';
 import { requireDeviceCredential } from '../middleware/auth.js';
 import {
   resolveCompanyForDevice,
@@ -403,20 +404,9 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
     }
     if (!Array.isArray(data)) data = data ? [data] : [];
 
-    let companyGuid = req.headers['company-guid'];
-    if (!companyGuid && data.length > 0) {
-      companyGuid = data[0]?.COMPANY_GUID || data[0]?.company_guid || null;
-    }
-    if (!companyGuid) {
-      const { rows } = await query(
-        'SELECT company_guid FROM ingest_uploads WHERE id = $1 AND device_id = $2',
-        [uploadId, deviceId]
-      );
-      companyGuid = rows[0]?.company_guid;
-    }
     // Ownership: uploadId must belong to this authenticated device
     const { rows: owned } = await query(
-      `SELECT id FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
+      `SELECT id, company_guid FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
       [uploadId, deviceId]
     );
     if (!owned[0]) {
@@ -426,22 +416,32 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
         message: 'uploadId does not belong to this device',
       });
     }
-    // CID-F002: company must belong to device workspace — no raw GUID authority
-    if (!companyGuid) {
+
+    // One upload can carry several companies and a chunk can straddle them, so each
+    // record is filed under its own COMPANY_GUID; header / upload company only fill gaps.
+    const fallbackGuid = req.headers['company-guid'] || owned[0].company_guid || null;
+    const byCompany = groupRecordsByCompany(data, fallbackGuid);
+    if (byCompany.missing > 0 || (!byCompany.groups.size && !fallbackGuid)) {
       return res.status(400).json({
         status: false,
         code: 'COMPANY_GUID_REQUIRED',
         message: 'company-guid header or payload COMPANY_GUID required',
       });
     }
-    let resolvedCompany;
+    if (!byCompany.groups.size) byCompany.groups.set(fallbackGuid, []);
+
+    // CID-F002: every company must belong to the device workspace — resolve all before writing any
+    const resolved = [];
     try {
-      resolvedCompany = await resolveCompanyForDevice({
-        deviceId,
-        companyGuid,
-        device,
-        requireSyncAuthority: true,
-      });
+      for (const [guid, records] of byCompany.groups) {
+        const company = await resolveCompanyForDevice({
+          deviceId,
+          companyGuid: guid,
+          device,
+          requireSyncAuthority: true,
+        });
+        resolved.push({ company, records });
+      }
     } catch (err) {
       if (err instanceof CompanyResolutionError) {
         return res.status(err.httpStatus || 403).json({
@@ -452,19 +452,20 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
       }
       throw err;
     }
-    await query(
-      `UPDATE ingest_uploads SET company_id = $1, company_guid = $2
-       WHERE id = $3 AND device_id = $4`,
-      [resolvedCompany.id, resolvedCompany.guid, uploadId, deviceId]
-    );
 
-    console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${resolvedCompany.guid} | companyId: ${resolvedCompany.id} | records: ${data.length}`);
-
-    if (data.length > 0) {
-      await processIngestedData(streamName, data, resolvedCompany.guid, userId, deviceId, {
-        companyId: resolvedCompany.id,
-        uploadId,
-      });
+    for (const { company, records } of resolved) {
+      await query(
+        `UPDATE ingest_uploads SET company_id = $1, company_guid = $2
+         WHERE id = $3 AND device_id = $4`,
+        [company.id, company.guid, uploadId, deviceId]
+      );
+      console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${company.guid} | companyId: ${company.id} | records: ${records.length}${resolved.length > 1 ? ` (1 of ${resolved.length} companies in chunk)` : ''}`);
+      if (records.length > 0) {
+        await processIngestedData(streamName, records, company.guid, userId, deviceId, {
+          companyId: company.id,
+          uploadId,
+        });
+      }
     }
 
     await query('UPDATE ingest_uploads SET chunks = chunks + 1 WHERE id = $1', [uploadId]);
@@ -480,10 +481,11 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
   const { uploadId, isHardSync, recordCount } = body || {};
-  let { companyGuid, voucherCount, ledgerCount, stockCount } = body || {};
+  const { voucherCount, ledgerCount, stockCount } = body || {};
   const deviceId = req.headers['device-id'];
 
   try {
+    let uploadCompanyGuid = null;
     if (uploadId) {
       const { rows: owned } = await query(
         `SELECT id, company_guid FROM ingest_uploads WHERE id = $1 AND device_id = $2 LIMIT 1`,
@@ -496,34 +498,31 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
           message: 'uploadId does not belong to this device',
         });
       }
-      if (!companyGuid) companyGuid = owned[0].company_guid;
+      uploadCompanyGuid = owned[0].company_guid;
     }
 
     const { rows: devices } = await query('SELECT * FROM devices WHERE device_id = $1', [deviceId]);
     const device = devices[0];
     const userId = device?.user_id;
 
-    let resolvedCompanyId = null;
-    if (companyGuid) {
-      try {
-        const resolved = await resolveCompanyForDevice({
-          deviceId,
-          companyGuid,
-          device,
-        });
-        companyGuid = resolved.guid;
-        resolvedCompanyId = resolved.id;
-      } catch (err) {
-        if (err instanceof CompanyResolutionError) {
-          return res.status(err.httpStatus || 403).json({
-            status: false,
-            code: err.code,
-            message: err.message,
-          });
-        }
-        throw err;
+    // A multi-company sync sends every company in `companies`; each one gets its own post-processing.
+    const companies = [];
+    try {
+      for (const guid of completeCompanyGuids(body, uploadCompanyGuid)) {
+        const resolved = await resolveCompanyForDevice({ deviceId, companyGuid: guid, device });
+        companies.push({ guid: resolved.guid, id: resolved.id });
       }
+    } catch (err) {
+      if (err instanceof CompanyResolutionError) {
+        return res.status(err.httpStatus || 403).json({
+          status: false,
+          code: err.code,
+          message: err.message,
+        });
+      }
+      throw err;
     }
+    const multiCompany = companies.length > 1;
 
     let ingestWarnings = [];
     if (uploadId) {
@@ -535,7 +534,9 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       ingestWarnings = Array.isArray(raw) ? raw : [];
     }
 
-    if (resolvedCompanyId) {
+    for (const company of companies) {
+      const resolvedCompanyId = company.id;
+      const tag = multiCompany ? { companyGuid: company.guid } : {};
       try {
         const { rows: sanity } = await query(
           `SELECT
@@ -559,23 +560,24 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
           ingestWarnings.push({
             code: 'inventory_collection_empty',
             message: `sales=${s.sales} purchase=${s.purch} but voucher_inventory_items=0 and stock movements=0`,
+            ...tag,
           });
         }
         if (s.groups === 0) {
-          ingestWarnings.push({ code: 'groups_empty', message: 'groups table has 0 rows after sync' });
+          ingestWarnings.push({ code: 'groups_empty', message: 'groups table has 0 rows after sync', ...tag });
         }
         if (s.warehouses === 0) {
-          ingestWarnings.push({ code: 'warehouses_empty', message: 'warehouses table has 0 rows after sync' });
-        }
-        if (uploadId && ingestWarnings.length) {
-          await query(
-            `UPDATE ingest_uploads SET warnings = $2::jsonb WHERE id = $1 AND device_id = $3`,
-            [uploadId, JSON.stringify(ingestWarnings), deviceId]
-          );
+          ingestWarnings.push({ code: 'warehouses_empty', message: 'warehouses table has 0 rows after sync', ...tag });
         }
       } catch (sanityErr) {
         console.warn('[INGEST] completeness sanity failed:', sanityErr.message);
       }
+    }
+    if (uploadId && ingestWarnings.length) {
+      await query(
+        `UPDATE ingest_uploads SET warnings = $2::jsonb WHERE id = $1 AND device_id = $3`,
+        [uploadId, JSON.stringify(ingestWarnings), deviceId]
+      ).catch((e) => console.warn('[INGEST] warnings write failed:', e.message));
     }
 
     const ingestOutcome = ingestWarnings.length ? 'partial' : 'complete';
@@ -585,7 +587,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     );
     await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
 
-    if (companyGuid) {
+    for (const { guid: companyGuid, id: resolvedCompanyId } of companies) {
       await query('UPDATE companies SET synced_at = $1 WHERE guid = $2 AND workspace_id = $3', [
         now(),
         companyGuid,
@@ -617,7 +619,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     // If so, invalidate (delete) ledger_fy_balances for affected FYs so they
     // get fresh anchors on the next LedgerOpeningBalance.xml sync.
     // This ensures backdated entries cascade correctly to future FY openings.
-    if (resolvedCompanyId) {
+    for (const { id: resolvedCompanyId } of companies) {
       try {
         // Find all FYs that have voucher entries newer than their fy_balance anchor
         const { rows: staleAnchors } = await query(`
@@ -648,7 +650,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     }
 
     // Backfill VLE financial_year from parent voucher (runs after every sync)
-    if (resolvedCompanyId) {
+    for (const { id: resolvedCompanyId } of companies) {
       try {
         const { rowCount } = await query(`
           UPDATE voucher_ledger_entries vle
@@ -690,9 +692,9 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       }
     }
 
-    console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | company: ${companyGuid} | user: ${userId}`);
+    console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | companies: ${companies.map((c) => c.guid).join(', ') || 'none'} | user: ${userId}`);
 
-    if (resolvedCompanyId) {
+    for (const { id: resolvedCompanyId } of companies) {
       try {
         await reconcileStockOpeningsFromTransactions(resolvedCompanyId);
       } catch (e) {
@@ -705,10 +707,10 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       }
     }
 
-    // Backfill tax_transactions.voucher_date from vouchers where it's null
-    // Handles cases where tax extraction ran before the voucher date was stored
-    try {
-      if (resolvedCompanyId) {
+    for (const { guid: companyGuid, id: resolvedCompanyId } of companies) {
+      // Backfill tax_transactions.voucher_date from vouchers where it's null
+      // Handles cases where tax extraction ran before the voucher date was stored
+      try {
         const { rowCount } = await query(`
           UPDATE tax_transactions tt
           SET voucher_date = v.date
@@ -720,22 +722,19 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
             AND v.date IS NOT NULL AND v.date != ''
         `, [resolvedCompanyId]);
         if (rowCount > 0) console.log(`[INGEST] Backfilled ${rowCount} tax_transaction dates from vouchers`);
-      }
-    } catch (e) { console.warn('[INGEST] Tax date backfill failed (non-fatal):', e.message); }
+      } catch (e) { console.warn('[INGEST] Tax date backfill failed (non-fatal):', e.message); }
 
-    // One-time tax extraction if table is empty (legacy companies synced before tax feature)
-    try {
-      if (resolvedCompanyId) {
+      // One-time tax extraction if table is empty (legacy companies synced before tax feature)
+      try {
         const { rows: tc } = await query('SELECT COUNT(*)::int AS c FROM tax_transactions WHERE company_id=$1', [resolvedCompanyId]);
         if ((tc[0]?.c || 0) === 0) {
-          const { backfillTaxTransactions } = await import('../controllers/ingestProcessor.js');
           const n = await backfillTaxTransactions(companyGuid, resolvedCompanyId);
           console.log(`[INGEST] Tax backfill: extracted from ${n} vouchers for company_id=${resolvedCompanyId}`);
         }
-      }
-    } catch (e) { console.warn('[INGEST] Tax backfill failed (non-fatal):', e.message); }
+      } catch (e) { console.warn('[INGEST] Tax backfill failed (non-fatal):', e.message); }
+    }
 
-    if (userId) {
+    if (userId && companies.length) {
       try {
         let wsId = null;
         try {
@@ -745,7 +744,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
           );
           wsId = wr[0]?.workspace_id || null;
         } catch (_) {}
-        socketService.notifySynced(userId, companyGuid, wsId);
+        companies.forEach((c) => socketService.notifySynced(userId, c.guid, wsId));
       } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }
 
