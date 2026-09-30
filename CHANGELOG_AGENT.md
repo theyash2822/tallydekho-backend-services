@@ -1,5 +1,9 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-09-30 — KPI strip bank account count
+
+- `/api/dashboard/kpi-strip` (bank entry) adds `account_count` so the web Dashboard stops showing a hard-coded "3 accounts". Additive; mobile ignores it.
+
 ## 2026-09-30 — AR/AP: FY by bill date, phones for every party
 
 - `buildArApPayload`: bills (and parties) are limited to bills whose **bill date** lies in the selected FY (`inPeriod`), per Yash — not the due date, so a March bill due in April stays in its year. (A short-lived "open as of period end" variant was reverted the same evening.) `bills` list sorted newest first before the 100 cap.

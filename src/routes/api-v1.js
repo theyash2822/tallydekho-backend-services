@@ -1269,7 +1269,7 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const pmtParams = from && to ? [companyId, from, to] : [companyId];
     const pmtDateFilter = from && to ? 'AND date BETWEEN $2 AND $3' : '';
     const { rows: cash } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Cash%' OR name ILIKE '%Cash in Hand%')`, [companyId]);
-    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyId]);
+    const { rows: bank } = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v, COUNT(*)::int as n FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Bank%' OR parent ILIKE '%Bank Account%')`, [companyId]);
     const { rows: rec }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Sundry Debtor%' OR parent='Sundry Debtors')`, [companyId]);
     const { rows: pay }  = await query(`SELECT COALESCE(SUM(ABS(closing_balance)),0) as v FROM ledgers WHERE company_id=$1 AND (parent ILIKE '%Sundry Creditor%' OR parent='Sundry Creditors')`, [companyId]);
     const { rows: loans } = await query(
@@ -1321,7 +1321,7 @@ router.get('/dashboard/kpi-strip', authMiddleware, async (req, res) => {
     const g = (rows) => +(rows?.[0]?.v ?? 0);
     const kpi = [
       { id: 'cash',       label: 'Cash In Hand', amount_raw: g(cash),  icon: 'wallet-outline',              route: '/kpi/cash-in-hand', ...cashTrend },
-      { id: 'bank',       label: 'Bank Balance', amount_raw: g(bank),  icon: 'card-outline',                route: '/kpi/bank-balance', ...bankTrend },
+      { id: 'bank',       label: 'Bank Balance', amount_raw: g(bank),  account_count: +(bank?.[0]?.n ?? 0), icon: 'card-outline', route: '/kpi/bank-balance', ...bankTrend },
       { id: 'receivable', label: 'Receivables',  amount_raw: g(rec),   icon: 'arrow-down-circle-outline',   route: '/kpi/receivables', ...arTrend },
       { id: 'payable',    label: 'Payables',     amount_raw: g(pay),   icon: 'arrow-up-circle-outline',     route: '/kpi/payables', ...apTrend },
       { id: 'loans',      label: 'Loans & ODs',  amount_raw: g(loans), icon: 'git-merge-outline',           route: '/kpi/loans-ods', ...loansTrend },
