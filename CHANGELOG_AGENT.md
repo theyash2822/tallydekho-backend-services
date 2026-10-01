@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-01 — Desktop "Remove company" hides it from mobile/web immediately
+
+- Before: Remove on the desktop only changed its local list; the company stayed active until the next `init-sync` deactivated it, and never did when the last company was removed, the rest were closed in Tally, or another device had synced it.
+- New `POST /desktop/companies/remove` (`requireDeviceCredential`, body `{ guids }`, max 100): sets `is_active = FALSE` for those GUIDs in the device's workspace (workspace-scoped, not device-scoped), returns `{ removed, notFound }`. Demo companies are never hidden; GUIDs over 128 chars are dropped. Soft only — synced data stays; re-adding on the desktop reactivates it via `init-sync`. Logic in `src/services/desktopCompanyRemoval.js`.
+- One `synced` event per request (via `notifyWorkspaceRoom`, includes `workspaceId`, `reason: 'companies_removed'`), only when the workspace is `CONNECTED`: mobile/web reload their lists and switch away from a removed selected company. Not `notifySynced` per GUID — that also emits `tally_connection CONNECTED`, and web resets the FY on it.
+- Tested: new `desktop-company-removal.test.js` (5); unit 329/329; SQL checked on the local DB in a rolled-back transaction; backend restarted, `/health` ok, unauthenticated calls refused. QA YELLOW → per-GUID events, Demo guard fixed.
+
 ## 2026-09-30 — Second company's invoice had no preview (duplicate TDK ref)
 
 - **Cause:** `tdk_reference_counters` are per company, so every company issues `TDK-SAL-2026-0001`, but `app_vouchers.tdk_reference_no` was globally UNIQUE. Radhe Ram's first sale reached Tally, but its lifecycle row failed on `app_vouchers_tdk_reference_no_key` (Yash already held that ref). The insert error is caught and logged, so the route returned 200 and every `/invoice/:ref/preview` got a 404.

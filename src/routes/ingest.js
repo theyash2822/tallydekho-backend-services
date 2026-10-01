@@ -13,6 +13,7 @@ import { markFirstSyncConnected, getKnownLineageGuids } from '../services/device
 import { evaluateLineage } from '../utils/tallyLineage.js';
 import { groupRecordsByCompany, completeCompanyGuids } from '../utils/ingestCompanyGroups.js';
 import { requireDeviceCredential } from '../middleware/auth.js';
+import { deactivateWorkspaceCompanies, CompanyRemovalError } from '../services/desktopCompanyRemoval.js';
 import {
   resolveCompanyForDevice,
   assertCompanyGuidAvailableForWorkspace,
@@ -21,7 +22,10 @@ import {
 
 let _socketService = null;
 export function setSocketService(s) { _socketService = s; }
-const socketService = { notifySynced: (...args) => _socketService?.notifySynced(...args) };
+const socketService = {
+  notifySynced: (...args) => _socketService?.notifySynced(...args),
+  notifyWorkspaceRoom: (...args) => _socketService?.notifyWorkspaceRoom(...args),
+};
 
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
@@ -301,6 +305,42 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
   } catch (err) {
     console.error('[SYNC] init-sync error:', err.message);
     res.status(500).json({ status: false, message: 'Sync init failed' });
+  }
+});
+
+// POST /desktop/companies/remove
+// Body: { guids: string[] }
+router.post('/desktop/companies/remove', requireDeviceCredential, async (req, res) => {
+  const deviceId = req.deviceId || req.headers['device-id'];
+  try {
+    const device = req.device || (await query('SELECT * FROM devices WHERE device_id = $1', [deviceId])).rows[0];
+    const workspaceId = device?.workspace_id || null;
+    const result = await deactivateWorkspaceCompanies(query, workspaceId, req.body?.guids);
+    console.log(`[COMPANY] desktop remove device=${deviceId} workspace=${workspaceId} removed=${result.removed.length} notFound=${result.notFound.length}`);
+    if (result.removed.length) {
+      // One 'synced' (not notifySynced per company, which also emits tally_connection
+      // CONNECTED): mobile/web reload their company lists on it. Clients mark the
+      // workspace CONNECTED on 'synced', so skip it until the first sync has finished;
+      // until then they show Demo data, not these companies.
+      try {
+        const { rows: ws } = await query(`SELECT tally_connection FROM workspaces WHERE id = $1 LIMIT 1`, [workspaceId]);
+        if (String(ws[0]?.tally_connection || '').toUpperCase() === 'CONNECTED') {
+          socketService.notifyWorkspaceRoom(workspaceId, 'synced', {
+            companyGuid: result.removed[0],
+            syncedAt: new Date().toISOString(),
+            reason: 'companies_removed',
+            removedGuids: result.removed,
+          });
+        }
+      } catch (e) { console.warn('[WS] company remove emit failed:', e.message); }
+    }
+    res.json({ status: true, data: result });
+  } catch (err) {
+    if (err instanceof CompanyRemovalError) {
+      return res.status(err.httpStatus).json({ status: false, code: err.code, message: err.message });
+    }
+    console.error('[COMPANY] desktop remove error:', err.message);
+    res.status(500).json({ status: false, message: 'Could not remove company' });
   }
 });
 
