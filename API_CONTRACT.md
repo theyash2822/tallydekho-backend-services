@@ -48,6 +48,8 @@ Company-scoped routes require `?companyGuid=<guid>` query param.
 | GET | /desktop/restore/status | Poll approval + download URL |
 | POST | /desktop/restore/complete | Body `{ ok, lineageGuids[], restoredFolders[] }`. Folders must overlap backup company names/folder basenames. Activates new device / revokes old |
 | PUT | /desktop/backup/objects/:token | Local object-store PUT when S3 is not configured |
+| POST | /ingest/chunk | Optional header `Bill-Snapshot-Mode: staged` — BillOutstanding.xml rows are staged until complete instead of written |
+| POST | /ingest/complete | Optional body `billSnapshots: [{ companyGuid, status, snapshotComplete, rowCount, tdlStatus, tdlVersion }]`. Bills replaced only for `SUCCESS` + `snapshotComplete` + staged count == `rowCount` (0 clears); otherwise kept. Response `data.billSnapshots[]` = `{ companyGuid, action: replaced\|cleared\|preserved, reason, staged, expected, removed, inserted }` |
 
 ## Workspace RBAS / billing (workspaceApi.js)
 Header `X-Workspace-Id` preferred; path `:id` binds workspace via `bindWorkspaceParam`.

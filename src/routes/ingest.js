@@ -14,6 +14,7 @@ import { evaluateLineage } from '../utils/tallyLineage.js';
 import { groupRecordsByCompany, completeCompanyGuids } from '../utils/ingestCompanyGroups.js';
 import { requireDeviceCredential } from '../middleware/auth.js';
 import { deactivateWorkspaceCompanies, CompanyRemovalError } from '../services/desktopCompanyRemoval.js';
+import { parseBillSnapshots, applyBillSnapshotTx, cleanupStaleBillStaging } from '../services/billSnapshot.js';
 import {
   resolveCompanyForDevice,
   assertCompanyGuidAvailableForWorkspace,
@@ -504,6 +505,8 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
         await processIngestedData(streamName, records, company.guid, userId, deviceId, {
           companyId: company.id,
           uploadId,
+          billSnapshotMode: req.headers['bill-snapshot-mode'] || null,
+          chunkKey: `${streamName}:${chunkIndex}`,
         });
       }
     }
@@ -563,6 +566,28 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       throw err;
     }
     const multiCompany = companies.length > 1;
+
+    // Staged bill snapshots (newer desktops): replace only on a confirmed complete snapshot.
+    const billSnapshotResults = [];
+    if (uploadId && Array.isArray(body?.billSnapshots)) {
+      const summaries = parseBillSnapshots(body);
+      for (const company of companies) {
+        const summary = summaries.get(company.guid);
+        const result = await applyBillSnapshotTx({ uploadId, companyId: company.id, summary });
+        billSnapshotResults.push({ companyGuid: company.guid, ...result });
+        console.log('[INGEST] bill_snapshot', JSON.stringify({
+          uploadId,
+          companyId: company.id,
+          companyGuid: company.guid,
+          status: summary?.status || null,
+          tdlStatus: summary?.tdlStatus || null,
+          tdlVersion: summary?.tdlVersion || null,
+          isHardSync: !!isHardSync,
+          ...result,
+        }));
+      }
+      cleanupStaleBillStaging().catch((e) => console.warn('[INGEST] bill staging cleanup failed:', e.message));
+    }
 
     let ingestWarnings = [];
     if (uploadId) {
@@ -795,7 +820,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       status: true,
       outcome: ingestOutcome,
       message: ingestOutcome === 'partial' ? partialMessage : 'Sync complete',
-      data: { recordCounts, collectionCounts, warnings: ingestWarnings },
+      data: { recordCounts, collectionCounts, warnings: ingestWarnings, billSnapshots: billSnapshotResults },
     });
   } catch (err) {
     console.error('[INGEST] complete error:', err.message);

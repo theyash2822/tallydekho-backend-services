@@ -153,7 +153,8 @@ export async function consumeApprovedHardSync(workspaceId, deviceId, companies, 
       `SELECT id, guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
       [reqRow.old_guid, workspaceId]
     );
-    await purgeCompaniesForHardSync([reqRow.old_guid, ...guids], workspaceId);
+    // A different Tally company takes over this record: its old bills must not survive.
+    await purgeCompaniesForHardSync([reqRow.old_guid, ...guids], workspaceId, { keepBillOutstanding: false });
     const newGuid = reqRow.new_guid || guids[0];
     await query(
       `UPDATE companies SET guid = $2 WHERE guid = $1 AND workspace_id = $3`,

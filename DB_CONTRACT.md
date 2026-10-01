@@ -94,6 +94,12 @@ GST fields per voucher
 ### bill_outstanding
 Party-wise bill outstanding
 - id, voucher_guid, company_guid, party_name, amount, due_date, pending_amount
+- Replaced per company only by a confirmed complete desktop snapshot (`services/billSnapshot.js`); Hard Sync keeps it.
+
+### bill_outstanding_staging
+Bill rows of a staged desktop upload, waiting for `/ingest/complete`
+- id, upload_id, company_id, chunk_key (`stream:chunkIndex`), skipped, then the bill_outstanding columns, created_at
+- Always emptied for the (upload, company) at complete; leftovers older than 24 h are deleted
 
 ## Stock Tables
 

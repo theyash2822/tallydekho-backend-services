@@ -1319,6 +1319,32 @@ export async function initSchema() {
     }
     console.log('✅ Company Identity Phase 2 additive company_id columns ensured');
 
+    // Bill rows of a staged desktop upload wait here until /ingest/complete confirms
+    // the company's snapshot is complete; only then do they replace bill_outstanding.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bill_outstanding_staging (
+        id              BIGSERIAL PRIMARY KEY,
+        upload_id       TEXT NOT NULL,
+        company_id      BIGINT NOT NULL,
+        chunk_key       TEXT NOT NULL,
+        skipped         BOOLEAN NOT NULL DEFAULT FALSE,
+        voucher_guid    TEXT,
+        company_guid    TEXT NOT NULL,
+        ledger_name     TEXT,
+        bill_name       TEXT,
+        bill_date       TEXT,
+        due_date        TEXT,
+        amount          DECIMAL(15,4) DEFAULT 0,
+        pending_amount  DECIMAL(15,4) DEFAULT 0,
+        bill_type       TEXT,
+        alter_id        INTEGER DEFAULT 0,
+        synced_at       BIGINT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_bill_staging_upload ON bill_outstanding_staging (upload_id, company_id);
+      CREATE INDEX IF NOT EXISTS idx_bill_staging_created ON bill_outstanding_staging (created_at);
+    `);
+
     // Hot lookups are company-scoped: bill/ref linking, date ranges, ledger drill-downs.
     // The two app_vouchers indexes duplicate the UNIQUE constraints on the same columns.
     for (const sql of [

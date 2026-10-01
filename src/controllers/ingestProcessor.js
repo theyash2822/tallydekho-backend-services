@@ -5,9 +5,12 @@ import {
   ingestCompanyCtx,
   currentCompanyId,
   currentUploadId,
+  currentBillSnapshotMode,
+  currentChunkKey,
   wrapIngestClient,
 } from '../utils/ingestCompanyDualWrite.js';
 import { claimBillOutstandingPurge } from '../utils/ingestCompanyGroups.js';
+import { isStagedMode, stageBillRows } from '../services/billSnapshot.js';
 export { ingestCompanyCtx };
 import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
 import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
@@ -568,7 +571,14 @@ export async function processIngestedData(streamName, data, companyGuid, userId,
     return;
   }
 
-  return ingestCompanyCtx.run({ companyId, companyGuid, uploadId: opts.uploadId || null }, async () =>
+  const ctx = {
+    companyId,
+    companyGuid,
+    uploadId: opts.uploadId || null,
+    billSnapshotMode: opts.billSnapshotMode || null,
+    chunkKey: opts.chunkKey || null,
+  };
+  return ingestCompanyCtx.run(ctx, async () =>
     processIngestedDataInner(streamName, data, companyGuid, userId, deviceId, companyId)
   );
 }
@@ -2611,13 +2621,73 @@ async function processGSTDetails(data, companyGuid) {
   finally { client.release(); }
 }
 
-async function processBillOutstanding(data, companyGuid) {
-  const client = wrapIngestClient(await getClient());
-  const parseAmt = (v) => {
-    if (v == null || v === '') return 0;
-    const n = parseFloat(String(v).replace(/,/g, '').trim());
-    return Number.isFinite(n) ? n : 0;
+const parseBillAmt = (v) => {
+  if (v == null || v === '') return 0;
+  const n = parseFloat(String(v).replace(/,/g, '').trim());
+  return Number.isFinite(n) ? n : 0;
+};
+
+/** One BillOutstanding.xml record → bill_outstanding columns; skipped when the live table would not keep it. */
+function billOutstandingRow(r, companyGuid) {
+  const ledgerName = String(r.LedgerName || r.LEDGERNAME || '').trim();
+  const billName = String(r.BillName || r.BILLNAME || '').trim();
+  const pending = parseBillAmt(r.PendingAmount ?? r.PENDINGAMOUNT);
+  if (!ledgerName || !billName || Math.abs(pending) < 0.005) {
+    return { skipped: true, company_guid: companyGuid, ledger_name: ledgerName || null, bill_name: billName || null };
+  }
+  const billDate = normalizeDate(r.BillDate);
+  const creditPeriod = r.CreditPeriod ?? r.CREDITPERIOD ?? null;
+  // Tally can express the credit period as days or as a fixed due date.
+  const dueDate = dueDateOf(billDate, normalizeDate(r.DueDate), creditPeriod)
+    || (creditDays(creditPeriod) == null ? normalizeDate(creditPeriod) : null);
+  return {
+    skipped: false,
+    voucher_guid: r.VoucherGuid || null,
+    company_guid: companyGuid,
+    ledger_name: ledgerName,
+    bill_name: billName,
+    bill_date: billDate,
+    due_date: dueDate,
+    amount: parseBillAmt(r.Amount ?? r.AMOUNT),
+    pending_amount: pending,
+    bill_type: billSide(r),
+    alter_id: parseInt(r.AlterId || 0) || 0,
+    synced_at: now(),
   };
+}
+
+/** Staged upload: park rows until /ingest/complete confirms the snapshot (services/billSnapshot.js). */
+async function stageBillOutstanding(data, companyGuid) {
+  const uploadId = currentUploadId();
+  const companyId = currentCompanyId();
+  const chunkKey = currentChunkKey();
+  if (!uploadId || companyId == null || !chunkKey) {
+    console.error('[DB] BillOutstanding staged chunk missing upload/company/chunk — rows not staged', { uploadId, companyId, chunkKey });
+    return;
+  }
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const rows = data.map((r) => billOutstandingRow(r, companyGuid));
+    await stageBillRows(client, { uploadId, companyId, chunkKey, rows });
+    await client.query('COMMIT');
+    const skipped = rows.filter((r) => r.skipped).length;
+    console.log(`[DB] BillOutstanding: staged ${rows.length} (skippable ${skipped}) for ${companyGuid} chunk ${chunkKey}`);
+  } catch (e) {
+    // Nothing staged for this chunk → the staged count will not match and the old bills stay.
+    await client.query('ROLLBACK').catch(() => {});
+    await recordIngestWarning('bill_staging_failed', `Outstanding bills kept from the last sync: ${e.message}`);
+  } finally {
+    client.release();
+  }
+}
+
+async function processBillOutstanding(data, companyGuid) {
+  if (isStagedMode(currentBillSnapshotMode())) {
+    return stageBillOutstanding(data, companyGuid);
+  }
+  const client = wrapIngestClient(await getClient());
+  const parseAmt = parseBillAmt;
   try {
     await client.query('BEGIN');
     if (claimBillOutstandingPurge(currentUploadId(), currentCompanyId())) {

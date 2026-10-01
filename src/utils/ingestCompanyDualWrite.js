@@ -15,6 +15,14 @@ export function currentUploadId() {
   return ingestCompanyCtx.getStore()?.uploadId || null;
 }
 
+export function currentBillSnapshotMode() {
+  return ingestCompanyCtx.getStore()?.billSnapshotMode || null;
+}
+
+export function currentChunkKey() {
+  return ingestCompanyCtx.getStore()?.chunkKey || null;
+}
+
 /**
  * Thin wrap retained for ingest transaction clients.
  * Does NOT mutate SQL — writers must supply company_id explicitly.

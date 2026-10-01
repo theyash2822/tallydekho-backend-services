@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-01 — Bill Outstanding replaced only on a confirmed complete snapshot (branch `tdl`)
+
+- Before: bills were deleted on the first bill chunk of an upload, so a failed or partial fetch could leave partial data; a company whose bills were all settled kept stale bills forever; Hard Sync wiped bills before refetching them.
+- New table `bill_outstanding_staging` (schema.js, boot). Chunks with header `Bill-Snapshot-Mode: staged` stage bill rows per `(upload, company, stream:chunkIndex)` — retries replace the same chunk, rows the live table would skip are staged with `skipped=true` so the total can be checked.
+- `/ingest/complete` with `billSnapshots[]` (`src/services/billSnapshot.js`): per company, in one transaction with a per-company advisory lock — `SUCCESS` + `snapshotComplete` + staged count == `rowCount` → delete + insert from staging (`rowCount` 0 clears); anything else (failure status, mismatch, missing summary, error) keeps the previous bills. Staging is always discarded; stale staging (>24 h) cleaned on complete. Results logged as `[INGEST] bill_snapshot` and returned in `data.billSnapshots`.
+- Older desktops (no header / no `billSnapshots`) keep the legacy first-chunk purge.
+- Hard Sync purge (`purgeCompaniesForHardSync`) now keeps `bill_outstanding`; GUID replacement and workspace reset/delete still wipe it.
+- Tested: new `bill-snapshot.test.js` (19); unit 348/348; rbac 92/92; swap SQL run on the local DB in a rolled-back transaction (failure kept 2,008 bills, multi-chunk replaced, zero cleared).
+
 ## 2026-10-01 — Desktop "Remove company" hides it from mobile/web immediately
 
 - Before: Remove on the desktop only changed its local list; the company stayed active until the next `init-sync` deactivated it, and never did when the last company was removed, the rest were closed in Tally, or another device had synced it.
