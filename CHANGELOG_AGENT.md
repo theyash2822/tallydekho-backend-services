@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-03 — Vouchers deleted in Tally are removed; StockValuation saves again (branch `tdl`)
+
+- **StockValuation:** `processStockFyValuation` INSERT had 12 placeholders but 11 params (`company_id` missing since the Company Identity work, 2026-09-18), so every row failed (`bind message supplies 11 parameters`) and `stock_fy_valuation` got no current-FY row / closing values. Added `currentCompanyId()`. New `ingest-bind-count.test.js` checks every inline `client.query` in ingestProcessor (params == highest `$n`); fails on the old code.
+- **Deleted vouchers:** normal sync only added/updated vouchers, so a voucher deleted in Tally stayed in the DB (seen: Laveena Sales 1 after deletion). New `src/services/voucherDeletion.js`, run per company in `/ingest/complete` after bill snapshots, from the desktop's `voucherLists` (+ `syncRunId`). Deletes a voucher only when the list is `complete`, its GUID starts with `<companyGuid>-` (app-created never match), it is not cancelled, it belongs to a listed FY (date in range or dateless stub with that `YEAR_ID`), it was last written before the sync run started (earlier of `sync_runs.started_at` and upload start), and its suffix is absent. Child rows (VLE, inventory, items, line taxes, bill allocations, batches, GST, tax, e-invoice, e-way, stock transactions) go first; `bill_outstanding` untouched. FY losing >50% and >25 vouchers → nothing deleted. One transaction + advisory lock; errors roll back. `VOUCHER_DELETION_MODE` on (default) | dry_run | off. Logged `[INGEST] voucher_deletions`; response `data.voucherDeletions`. Older desktops (no `voucherLists`) unaffected.
+- Tested: `voucher-deletion.test.js` (13, real SQL in rolled-back transactions); dry run on Laveena data removed exactly the deleted Sales 1 (rolled back); unit suite green. QA YELLOW → cutoff moved to sync-run start, dry_run/off switch added.
+- Known: vouchers cancelled in Tally are left out of both AllVoucher and the list, so they are now removed (with their e-invoice rows) rather than flagged.
+
 ## 2026-10-01 — Bill Outstanding replaced only on a confirmed complete snapshot (branch `tdl`)
 
 - Before: bills were deleted on the first bill chunk of an upload, so a failed or partial fetch could leave partial data; a company whose bills were all settled kept stale bills forever; Hard Sync wiped bills before refetching them.

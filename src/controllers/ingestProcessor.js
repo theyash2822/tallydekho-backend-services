@@ -3066,7 +3066,7 @@ async function processStockFyValuation(data, companyGuid) {
              synced_at     = EXCLUDED.synced_at`,
           [companyGuid, financialYear, name, guid,
            openQty, openRate, openVal,
-           closeQty, closeRate, closeVal, now]
+           closeQty, closeRate, closeVal, now, currentCompanyId()]
         );
         saved++;
       } catch (e) {

@@ -15,6 +15,7 @@ import { groupRecordsByCompany, completeCompanyGuids } from '../utils/ingestComp
 import { requireDeviceCredential } from '../middleware/auth.js';
 import { deactivateWorkspaceCompanies, CompanyRemovalError } from '../services/desktopCompanyRemoval.js';
 import { parseBillSnapshots, applyBillSnapshotTx, cleanupStaleBillStaging } from '../services/billSnapshot.js';
+import { parseVoucherLists, reconcileDeletedVouchersTx } from '../services/voucherDeletion.js';
 import {
   resolveCompanyForDevice,
   assertCompanyGuidAvailableForWorkspace,
@@ -589,6 +590,29 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       cleanupStaleBillStaging().catch((e) => console.warn('[INGEST] bill staging cleanup failed:', e.message));
     }
 
+    // Vouchers deleted in Tally: only from a complete, company-verified list (services/voucherDeletion.js).
+    const voucherDeletionResults = [];
+    if (uploadId && Array.isArray(body?.voucherLists)) {
+      const lists = parseVoucherLists(body);
+      for (const company of companies) {
+        const result = await reconcileDeletedVouchersTx({
+          uploadId,
+          syncRunId: body?.syncRunId || null,
+          companyId: company.id,
+          companyGuid: company.guid,
+          summary: lists.get(company.guid),
+        });
+        voucherDeletionResults.push({ companyGuid: company.guid, ...result });
+        console.log('[INGEST] voucher_deletions', JSON.stringify({
+          uploadId,
+          companyId: company.id,
+          companyGuid: company.guid,
+          isHardSync: !!isHardSync,
+          ...result,
+        }));
+      }
+    }
+
     let ingestWarnings = [];
     if (uploadId) {
       const { rows: warnRows } = await query(
@@ -820,7 +844,13 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       status: true,
       outcome: ingestOutcome,
       message: ingestOutcome === 'partial' ? partialMessage : 'Sync complete',
-      data: { recordCounts, collectionCounts, warnings: ingestWarnings, billSnapshots: billSnapshotResults },
+      data: {
+        recordCounts,
+        collectionCounts,
+        warnings: ingestWarnings,
+        billSnapshots: billSnapshotResults,
+        voucherDeletions: voucherDeletionResults,
+      },
     });
   } catch (err) {
     console.error('[INGEST] complete error:', err.message);
