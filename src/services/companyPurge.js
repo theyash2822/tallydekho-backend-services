@@ -36,6 +36,7 @@ const TALLY_PROJECTION_TABLES = [
   'raw_tally_records',
   'financial_year_summaries',
   'ai_insights_cache',
+  'voucher_sync_watermarks',
   // Intentionally NOT purged (app-layer / settings):
   // stock_barcodes, barcode_import_jobs, write_queue, app_vouchers,
   // company_inventory_settings, inventory_barcode_settings, companies

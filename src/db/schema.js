@@ -1345,6 +1345,19 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_bill_staging_created ON bill_outstanding_staging (created_at);
     `);
 
+    // Per-FY Tally AlterID up to which a clean full sync fetched every voucher collection
+    // (services/voucherWatermarks.js). Single-voucher post-write ingests never move it.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS voucher_sync_watermarks (
+        company_id  BIGINT NOT NULL,
+        fin_year    TEXT NOT NULL,
+        alter_id    BIGINT NOT NULL,
+        upload_id   TEXT,
+        updated_at  BIGINT NOT NULL,
+        PRIMARY KEY (company_id, fin_year)
+      );
+    `);
+
     // Hot lookups are company-scoped: bill/ref linking, date ranges, ledger drill-downs.
     // The two app_vouchers indexes duplicate the UNIQUE constraints on the same columns.
     for (const sql of [

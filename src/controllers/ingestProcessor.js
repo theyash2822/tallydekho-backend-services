@@ -49,7 +49,9 @@ import {
   reconcileStockOpeningsFromTransactions,
   backfillStockMovementVoucherTypes,
   recordCollectionStat,
+  addCollectionTotals,
 } from '../utils/ingestPostReconcile.js';
+import { findRenamedMasters, clearVoucherWatermarks, RESET_MARKER } from '../services/voucherWatermarks.js';
 export {
   reconcileStockOpeningsFromTransactions,
   backfillStockMovementVoucherTypes,
@@ -776,6 +778,50 @@ async function processMasters(data, companyGuid) {
   }
 }
 
+const unwrapMaster = (raw, keys) => {
+  for (const k of keys) {
+    const v = raw?.[k];
+    if (v) {
+      try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return raw; }
+    }
+  }
+  return raw;
+};
+
+/**
+ * Voucher rows keep master NAMES (party, ledger, stock item, godown, voucher type) and a
+ * rename does not move voucher AlterIds, so incremental sync would keep the old name.
+ * On a rename, drop the voucher watermarks: the next sync re-fetches every FY.
+ */
+class WatermarkResetError extends Error {
+  constructor(cause) {
+    super(`voucher watermark reset failed: ${cause?.message || cause}`);
+    this.name = 'WatermarkResetError';
+  }
+}
+
+async function noteMasterRenames(table, pairs) {
+  const companyId = currentCompanyId();
+  if (!companyId) return;
+  let renamed = 0;
+  try {
+    renamed = (await findRenamedMasters({ query: rawDbQuery }, { table, companyId, rows: pairs })).length;
+  } catch (e) {
+    console.warn('[INGEST] master rename check failed — resetting voucher watermarks:', e.message);
+    renamed = 1;
+  }
+  if (!renamed) return;
+  // Both must persist, or this chunk fails (the old watermarks would skip the renamed names).
+  // Callers' catch blocks rethrow WatermarkResetError.
+  try {
+    await clearVoucherWatermarks({ query: rawDbQuery }, companyId);
+    await addCollectionTotals(RESET_MARKER, { saved: renamed });
+  } catch (e) {
+    throw new WatermarkResetError(e);
+  }
+  console.log(`[INGEST] ${renamed} renamed in ${table} — voucher watermarks reset, next sync re-fetches all years`);
+}
+
 async function processStocks(data, companyGuid) {
   const client = wrapIngestClient(await getClient());
   const confirmedStocks = [];
@@ -793,6 +839,10 @@ async function processStocks(data, companyGuid) {
         console.log('[INGEST] Stocks expanded:', expandedStockData.length, 'items');
       }
     }
+    await noteMasterRenames('stocks', expandedStockData.map((raw) => {
+      const r = unwrapMaster(raw, ['STOCKITEM', 'StockItem']);
+      return { guid: r.GUID || r.Guid || r.guid, name: tallyName(r) };
+    }));
     for (const rawItem of expandedStockData) {
       let r = rawItem;
       const stockVal = rawItem.STOCKITEM ?? rawItem.StockItem;
@@ -881,6 +931,7 @@ async function processStocks(data, companyGuid) {
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] Stocks transaction failed:', e.message);
+    if (e instanceof WatermarkResetError) throw e;
   } finally {
     client.release();
   }
@@ -1858,7 +1909,8 @@ async function processStockTransactions(data, companyGuid) {
       }
     }
 
-    await client.query('COMMIT');
+    // An earlier failed statement aborts the transaction; COMMIT then reports ROLLBACK without throwing.
+    const stCommitted = (await client.query('COMMIT'))?.command !== 'ROLLBACK';
     // Post-insert direction correction: join with vouchers table to fix
     // Purchase/Receipt vouchers stored as 'outward' (SimplifiedVoucher.xml sends
     // negative qty for purchase batch allocations, tripping the qty<0 check).
@@ -1901,10 +1953,14 @@ async function processStockTransactions(data, companyGuid) {
     }
 
     await client.query('COMMIT');
-    console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}`);
+    console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}${stCommitted ? '' : ' — ROLLED BACK'}`);
     await recordCollectionStat('StockTransaction.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved) });
+    await addCollectionTotals('StockTransaction.xml', stCommitted
+      ? { saved, rejected: Math.max(0, data.length - saved) }
+      : { saved: 0, rejected: data.length });
   } catch (e) {
     await client.query('ROLLBACK');
+    await addCollectionTotals('StockTransaction.xml', { saved: 0, rejected: data.length });
     console.error('[DB] StockTx transaction failed:', e.message);
   } finally {
     client.release();
@@ -2048,6 +2104,10 @@ async function processFullLedger(data, companyGuid) {
         console.log('[INGEST] FullLedger raw data[0] (no LEDGER found):', JSON.stringify(data[0]).slice(0, 1200));
       }
     }
+    await noteMasterRenames('ledgers', expandedData.map((raw) => {
+      const r = unwrapMaster(raw, ['LEDGER', 'Ledger']);
+      return { guid: r.GUID || r.Guid, name: tallyName(r) };
+    }));
     for (const raw of expandedData) {
       let r = raw;
       const ledgerVal = raw.LEDGER ?? raw.Ledger;
@@ -2134,7 +2194,10 @@ async function processFullLedger(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] FullLedger: saved ${saved}/${data.length} for ${companyGuid}`);
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message); }
+  } catch (e) {
+    await client.query('ROLLBACK'); console.error('[DB] FullLedger failed:', e.message);
+    if (e instanceof WatermarkResetError) throw e;
+  }
   finally { client.release(); }
 
   // Confirm after release — avoid holding a pool client across pool.query calls
@@ -2383,14 +2446,20 @@ async function processVoucherInventoryItems(data, companyGuid) {
         await recordIngestWarning('voucher_inventory_insert', e.message);
       }
     }
-    await client.query('COMMIT');
-    console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}`);
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] VoucherInventoryItems failed:', e.message); }
+    const viiCommitted = (await client.query('COMMIT'))?.command !== 'ROLLBACK';
+    console.log(`[DB] VoucherInventoryItems: saved ${saved}/${data.length} for ${companyGuid}${viiCommitted ? '' : ' — ROLLED BACK'}`);
+    if (!viiCommitted) await addCollectionTotals('VoucherInventoryDetail.xml', { rejected: data.length });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    await addCollectionTotals('VoucherInventoryDetail.xml', { rejected: data.length });
+    console.error('[DB] VoucherInventoryItems failed:', e.message);
+  }
   finally { client.release(); }
 }
 
 async function processGSTDetails(data, companyGuid) {
   const client = wrapIngestClient(await getClient());
+  let gstCommitChecked = false;
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -2448,8 +2517,10 @@ async function processGSTDetails(data, companyGuid) {
         saved++;
       } catch (e) { console.warn('[DB] GSTDetail insert failed:', e.message); }
     }
-    await client.query('COMMIT');
-    console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}`);
+    const gstCommitted = (await client.query('COMMIT'))?.command !== 'ROLLBACK';
+    console.log(`[DB] GSTDetails: saved ${saved}/${data.length} for ${companyGuid}${gstCommitted ? '' : ' — ROLLED BACK'}`);
+    if (!gstCommitted) await addCollectionTotals('GSTDetails.xml', { rejected: data.length });
+    gstCommitChecked = true;
     // Post-process: update vouchers classification from gst_voucher_details
     try {
       // Every classification below filters on voucher_type_parent, so heal any row
@@ -2617,7 +2688,11 @@ async function processGSTDetails(data, companyGuid) {
       `, [currentCompanyId()]);
       console.log(`[DB] GSTDetails: is_import + itc_eligibility + all derived fields propagated for ${companyGuid}`);
     } catch (pe) { console.warn('[DB] GSTDetails post-process voucher update failed:', pe.message); }
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] GSTDetails failed:', e.message); }
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (!gstCommitChecked) await addCollectionTotals('GSTDetails.xml', { rejected: data.length });
+    console.error('[DB] GSTDetails failed:', e.message);
+  }
   finally { client.release(); }
 }
 
@@ -3139,10 +3214,12 @@ async function processLedgerTransactions(data, companyGuid) {
       }
     }
 
-    await client.query('COMMIT');
-    console.log(`[DB] LedgerTx: ${itemsSaved} items saved for ${companyGuid}`);
+    const ltCommitted = (await client.query('COMMIT'))?.command !== 'ROLLBACK';
+    console.log(`[DB] LedgerTx: ${itemsSaved} items saved for ${companyGuid}${ltCommitted ? '' : ' — ROLLED BACK'}`);
+    if (!ltCommitted) await addCollectionTotals('LedgerTransaction.xml', { rejected: data.length });
   } catch (e) {
     await client.query('ROLLBACK');
+    await addCollectionTotals('LedgerTransaction.xml', { rejected: data.length });
     console.error('[DB] LedgerTx transaction failed:', e.message);
   } finally {
     client.release();
@@ -3259,6 +3336,7 @@ async function processAllVoucher(data, companyGuid) {
   // NOTE: AllVoucher.xml LINE has <XMLTAG>Voucher</XMLTAG> so Tally wraps each row in <Voucher>
   // normalizeEnvelope returns { Voucher: { guid, Date, ... } } — we must unwrap it
   const client = wrapIngestClient(await getClient());
+  let avTotalsRecorded = false;
   try {
     await client.query('BEGIN');
     let saved = 0;
@@ -3344,9 +3422,13 @@ async function processAllVoucher(data, companyGuid) {
         }
       } catch (e) { console.warn('[DB] AllVoucher insert failed:', e.message); }
     }
-    await client.query('COMMIT');
-    console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}`);
+    const avCommitted = (await client.query('COMMIT'))?.command !== 'ROLLBACK';
+    console.log(`[DB] AllVoucher: saved ${saved}/${data.length} for ${companyGuid}${avCommitted ? '' : ' — ROLLED BACK'}`);
     await recordCollectionStat('AllVoucher.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved) });
+    await addCollectionTotals('AllVoucher.xml', avCommitted
+      ? { saved, rejected: Math.max(0, data.length - saved) }
+      : { saved: 0, rejected: data.length });
+    avTotalsRecorded = true;
     try {
       await backfillTaxTransactions(companyGuid, currentCompanyId());
     } catch (e) {
@@ -3384,7 +3466,11 @@ async function processAllVoucher(data, companyGuid) {
         AND v.financial_year IS NOT NULL
     `, [currentCompanyId()]).catch(e => console.warn('[DB] VLE FY backfill warning:', e.message));
 
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] AllVoucher failed:', e.message); }
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (!avTotalsRecorded) await addCollectionTotals('AllVoucher.xml', { saved: 0, rejected: data.length });
+    console.error('[DB] AllVoucher failed:', e.message);
+  }
   finally { client.release(); }
 }
 
@@ -3418,6 +3504,7 @@ async function processWarehouses(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
+    await noteMasterRenames('warehouses', data.map((r) => ({ guid: r.Guid || r.GUID, name: r.Name || r.NAME })));
     for (const r of data) {
       const name = r.Name || r.NAME || '';
       if (!name) continue;
@@ -3452,7 +3539,10 @@ async function processWarehouses(data, companyGuid) {
     for (const w of confirmedWarehouses) {
       await confirmAppMasterFromIngest(companyGuid, w.name, ['warehouse'], w.guid);
     }
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] Warehouses failed:', e.message); }
+  } catch (e) {
+    await client.query('ROLLBACK'); console.error('[DB] Warehouses failed:', e.message);
+    if (e instanceof WatermarkResetError) throw e;
+  }
   finally { client.release(); }
 }
 
@@ -3494,6 +3584,7 @@ async function processVoucherTypes(data, companyGuid) {
   try {
     await client.query('BEGIN');
     let saved = 0;
+    await noteMasterRenames('voucher_types', data.map((r) => ({ guid: r.Guid, name: tallyName(r) || r.Name || r.NAME })));
     for (const r of data) {
       const name = tallyName(r) || r.Name || r.NAME || '';
       if (!name) continue;
@@ -3519,7 +3610,10 @@ async function processVoucherTypes(data, companyGuid) {
     }
     await client.query('COMMIT');
     console.log(`[DB] VoucherTypes: saved ${saved}/${data.length} for ${companyGuid}`);
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] VoucherTypes failed:', e.message); }
+  } catch (e) {
+    await client.query('ROLLBACK'); console.error('[DB] VoucherTypes failed:', e.message);
+    if (e instanceof WatermarkResetError) throw e;
+  }
   finally { client.release(); }
 }
 

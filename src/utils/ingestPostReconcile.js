@@ -5,6 +5,7 @@
  */
 import { query } from '../db/schema.js';
 import { currentUploadId } from './ingestCompanyDualWrite.js';
+import { RESET_MARKER } from '../services/voucherWatermarks.js';
 
 export async function reconcileStockOpeningsFromTransactions(companyId) {
   const cid = Number(companyId);
@@ -54,6 +55,36 @@ export async function backfillStockMovementVoucherTypes(companyId) {
   );
   console.log(`[INGEST] Movement voucher_type backfill: ${rowCount} rows for company_id=${cid}`);
   return { updated: rowCount || 0 };
+}
+
+/**
+ * Upload-wide running totals (collection_counts._cumulative[xml]) — summed across chunks,
+ * unlike recordCollectionStat which keeps the last chunk. Used by voucher watermarks.
+ */
+export async function addCollectionTotals(xml, { saved = 0, rejected = 0 }) {
+  const uploadId = currentUploadId();
+  if (!uploadId || !xml) return;
+  try {
+    await query(
+      `UPDATE ingest_uploads
+          SET collection_counts = jsonb_set(
+                COALESCE(collection_counts, '{}'::jsonb),
+                '{_cumulative}',
+                COALESCE(collection_counts->'_cumulative', '{}'::jsonb) || jsonb_build_object(
+                  $2::text, jsonb_build_object(
+                    'saved',    COALESCE((collection_counts->'_cumulative'->$2->>'saved')::bigint, 0) + $3::bigint,
+                    'rejected', COALESCE((collection_counts->'_cumulative'->$2->>'rejected')::bigint, 0) + $4::bigint
+                  )
+                )
+              )
+        WHERE id = $1`,
+      [uploadId, String(xml), Math.max(0, Number(saved) || 0), Math.max(0, Number(rejected) || 0)]
+    );
+  } catch (e) {
+    console.warn('[INGEST] collection totals persist failed:', e.message);
+    // A lost rejection or reset marker would let voucher watermarks advance past missing rows.
+    if (Number(rejected) > 0 || xml === RESET_MARKER) throw e;
+  }
 }
 
 export async function recordCollectionStat(xml, patch) {

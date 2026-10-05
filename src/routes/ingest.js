@@ -17,6 +17,13 @@ import { deactivateWorkspaceCompanies, CompanyRemovalError } from '../services/d
 import { parseBillSnapshots, applyBillSnapshotTx, cleanupStaleBillStaging } from '../services/billSnapshot.js';
 import { parseVoucherLists, reconcileDeletedVouchersTx } from '../services/voucherDeletion.js';
 import {
+  readVoucherWatermarks,
+  effectiveWatermark,
+  clearVoucherWatermarks,
+  parseVoucherWatermarks,
+  applyVoucherWatermarks,
+} from '../services/voucherWatermarks.js';
+import {
   resolveCompanyForDevice,
   assertCompanyGuidAvailableForWorkspace,
   CompanyResolutionError,
@@ -31,6 +38,14 @@ const socketService = {
 
 const router = Router();
 const now = () => Math.floor(Date.now() / 1000);
+
+/** Tally FY bound ('20260401' or '2026-04-01') → 'YYYY-MM-DD'; anything else → fallback. */
+export function isoYearDate(raw, fallback) {
+  const s = String(raw ?? '').trim();
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return fallback;
+}
 
 function normalizeGstType(raw) {
   if (!raw) return 'Regular';
@@ -53,6 +68,8 @@ function normalizeGstType(raw) {
 router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
   const deviceId = req.deviceId || req.headers['device-id'];
   const { companies, isHardSync = false } = req.body || {};
+  // Desktops that send voucherWatermarks on /ingest/complete (services/voucherWatermarks.js).
+  const watermarkSync = req.body?.watermarkSync === true;
 
   try {
     const device = req.device || (await query('SELECT * FROM devices WHERE device_id = $1', [deviceId])).rows[0];
@@ -209,16 +226,29 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
           console.log(`[DB] Company saved: ${c.name || c.guid} id=${companyId}`);
 
           const { rows: lRows } = await query('SELECT MAX(alter_id) as max FROM ledgers WHERE company_id = $1', [companyId]);
+          if (isHardSync === true) await clearVoucherWatermarks({ query }, companyId);
+          const watermarks = await readVoucherWatermarks({ query }, companyId).catch(() => new Map());
           const voucherByYear = {};
           const allYearsForAlter = c.allYears || c.years || [];
           for (const y of allYearsForAlter) {
             const finYear = y.finYear || y.fin_year || y.name;
             if (!finYear) continue;
+            // vouchers.date is TEXT 'YYYY-MM-DD'; FY bounds arrive dashless, so normalise them.
             const { rows: yvRows } = await query(
+              `SELECT MAX(alter_id) as max FROM vouchers WHERE company_id = $1 AND date >= $2 AND date <= $3`,
+              [companyId, isoYearDate(y.begin || y.beginDate, '2000-01-01'), isoYearDate(y.end || y.endDate, '2099-12-31')]
+            ).catch(() => ({ rows: [{ max: 0 }] }));
+            if (watermarkSync) {
+              voucherByYear[finYear] = effectiveWatermark(watermarks.get(finYear), yvRows[0]?.max);
+              continue;
+            }
+            // Older desktops: keep the legacy value exactly (raw bounds compared as text, which
+            // re-fetches the current FY in full) — they still delta-fetch opening balances.
+            const { rows: legacyRows } = await query(
               `SELECT MAX(alter_id) as max FROM vouchers WHERE company_id = $1 AND date >= $2 AND date <= $3`,
               [companyId, y.begin || y.beginDate || '2000-01-01', y.end || y.endDate || '2099-12-31']
             ).catch(() => ({ rows: [{ max: 0 }] }));
-            voucherByYear[finYear] = yvRows[0]?.max || 0;
+            voucherByYear[finYear] = legacyRows[0]?.max || 0;
           }
           alterIds[c.guid] = { master: lRows[0]?.max || 0, voucher: voucherByYear };
 
@@ -781,6 +811,23 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       }
     }
 
+    const voucherWatermarkResults = [];
+    if (uploadId && Array.isArray(body?.voucherWatermarks)) {
+      const marks = parseVoucherWatermarks(body);
+      for (const company of companies) {
+        const result = await applyVoucherWatermarks({ query }, {
+          uploadId,
+          companyId: company.id,
+          summary: marks.get(company.guid),
+          collectionCounts,
+          outcome: ingestOutcome,
+          nowSec: now(),
+        }).catch((e) => ({ action: 'kept', reason: `error:${e.message}`, years: 0 }));
+        voucherWatermarkResults.push({ companyGuid: company.guid, ...result });
+        console.log('[INGEST] voucher_watermarks', JSON.stringify({ uploadId, companyId: company.id, isHardSync: !!isHardSync, ...result }));
+      }
+    }
+
     console.log(`[INGEST] ✅ Sync complete | device: ${deviceId} | companies: ${companies.map((c) => c.guid).join(', ') || 'none'} | user: ${userId}`);
 
     for (const { id: resolvedCompanyId } of companies) {
@@ -850,6 +897,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
         warnings: ingestWarnings,
         billSnapshots: billSnapshotResults,
         voucherDeletions: voucherDeletionResults,
+        voucherWatermarks: voucherWatermarkResults,
       },
     });
   } catch (err) {

@@ -1,5 +1,17 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-05 — Normal sync fetches only changed vouchers (per-FY watermarks) (branch `tdl`)
+
+- **Cause:** `/desktop/init-sync` per-FY `MAX(alter_id)` compared `vouchers.date` (TEXT `YYYY-MM-DD`) with the desktop's dashless FY bounds (`20260401`), so the current FY always got 0 and every manual/auto sync re-downloaded the whole current year.
+- **New table `voucher_sync_watermarks`** (schema.js, boot) + `src/services/voucherWatermarks.js`. Desktops sending `watermarkSync: true` get `min(stored watermark, MAX(alter_id) held in the FY with ISO bounds)`; no row → 0 (full FY). Older desktops keep the legacy query unchanged.
+- **Advance only at `/ingest/complete`** from the desktop's `voucherWatermarks` (per-FY max AlterId Tally listed before the fetch, only clean years) when: outcome `complete`; cumulative AllVoucher/StockTransaction `saved >= sent` and `rejected == 0`; no rejected LedgerTransaction/VoucherInventoryDetail/GSTDetails batch; no master rename. Logged `[INGEST] voucher_watermarks`; response `data.voucherWatermarks`.
+- **Totals:** `addCollectionTotals` (ingestPostReconcile.js) sums into `collection_counts._cumulative` across chunks. Processors check `COMMIT`'s result (`command === 'ROLLBACK'` = aborted transaction, which does not throw) and count rolled-back batches as rejected.
+- **Reset (→ full re-fetch):** hard sync, company purge (`TALLY_PROJECTION_TABLES`), restore complete, and a stock/ledger/godown/voucher-type rename (old names live on in voucher rows).
+- Fail closed: `addCollectionTotals` rethrows when it can't record a rejection or the reset marker; a failed rename reset (`WatermarkResetError`) is rethrown by the stocks/ledger/godown/voucher-type processors → chunk 500 → no `/ingest/complete`.
+- Tested: `voucher-watermarks.test.js`, `init-sync-alter-ids.test.js`; unit 380/380. QA: RED (chunk split, fixed on desktop) → YELLOW.
+- Known (pre-existing, not watermark-related): `stock_transactions` ON CONFLICT (stock, voucher, godown, type) overwrites two same-item same-godown lines in one voucher; LedgerTransaction DELETE also clears Voucher.xml `voucher_items` rows.
+- Needs a backend restart to create the table. First sync after updating the desktop is a one-time full fetch.
+
 ## 2026-10-03 — Vouchers deleted in Tally are removed; StockValuation saves again (branch `tdl`)
 
 - **StockValuation:** `processStockFyValuation` INSERT had 12 placeholders but 11 params (`company_id` missing since the Company Identity work, 2026-09-18), so every row failed (`bind message supplies 11 parameters`) and `stock_fy_valuation` got no current-FY row / closing values. Added `currentCompanyId()`. New `ingest-bind-count.test.js` checks every inline `client.query` in ingestProcessor (params == highest `$n`); fails on the old code.

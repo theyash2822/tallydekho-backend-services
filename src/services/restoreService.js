@@ -234,6 +234,11 @@ export async function completeRestore({ deviceId, ok, lineageGuids = [], restore
     `UPDATE workspaces SET tally_connection = 'CONNECTED', updated_at = $2 WHERE id = $1`,
     [session.workspace_id, now()]
   );
+  // Restored Tally data carries older AlterIds than the voucher watermarks: re-fetch every FY.
+  await query(
+    `DELETE FROM voucher_sync_watermarks WHERE company_id IN (SELECT id FROM companies WHERE workspace_id = $1)`,
+    [session.workspace_id]
+  ).catch((e) => console.warn('[RESTORE] voucher watermark reset failed:', e.message));
   await query(
     `UPDATE restore_sessions SET status = 'COMPLETED', completed_at = $2 WHERE id = $1`,
     [session.id, now()]
