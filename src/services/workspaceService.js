@@ -2493,31 +2493,40 @@ export async function putPaymentModeMap(workspaceId, companyGuid, userId, mappin
   const { resolveCompanyInWorkspace } = await import('./deviceCompanyResolution.js');
   const company = await resolveCompanyInWorkspace({ workspaceId, companyGuid });
   const list = Array.isArray(mappings) ? mappings : [];
-  await query(
-    `DELETE FROM payment_mode_posting_map WHERE workspace_id = $1 AND company_id = $2`,
-    [workspaceId, company.id]
-  );
+  // Last entry wins per mode. Replacing inside one transaction keeps the save independent of
+  // the (workspace_id, company_guid, payment_mode) unique constraint, which older databases lack.
+  const byMode = new Map();
   for (const m of list) {
     const paymentMode = String(m.paymentMode || m.payment_mode || '').trim();
     if (!paymentMode) continue;
-    await query(
-      `INSERT INTO payment_mode_posting_map
-         (id, workspace_id, company_guid, company_id, payment_mode, ledger_guid, ledger_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (workspace_id, company_guid, payment_mode) DO UPDATE SET
-         company_id = EXCLUDED.company_id,
-         ledger_guid = EXCLUDED.ledger_guid,
-         ledger_name = EXCLUDED.ledger_name`,
-      [
-        uuid(),
-        workspaceId,
-        company.guid,
-        company.id,
-        paymentMode,
-        m.ledgerGuid || m.ledger_guid || null,
-        m.ledgerName || m.ledger_name || null,
-      ]
+    byMode.set(paymentMode, {
+      ledgerGuid: m.ledgerGuid || m.ledger_guid || null,
+      ledgerName: m.ledgerName || m.ledger_name || null,
+    });
+  }
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM payment_mode_posting_map
+        WHERE workspace_id = $1
+          AND (company_id = $2 OR (company_id IS NULL AND company_guid = $3))`,
+      [workspaceId, company.id, company.guid]
     );
+    for (const [paymentMode, { ledgerGuid, ledgerName }] of byMode) {
+      await client.query(
+        `INSERT INTO payment_mode_posting_map
+           (id, workspace_id, company_guid, company_id, payment_mode, ledger_guid, ledger_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [uuid(), workspaceId, company.guid, company.id, paymentMode, ledgerGuid, ledgerName]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
   await audit(workspaceId, userId, 'payment_mode_map.updated', {
     companyGuid,

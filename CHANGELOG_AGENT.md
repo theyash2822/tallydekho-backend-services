@@ -1,5 +1,21 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P2 ingest integrity, chunk receipts, sync runs, write-back safety (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **Truthful batches (X3):** `wrapIngestClient` refuses COMMIT of an aborted transaction and records it; `processIngestedData` throws `IngestBatchError`; `/ingest/chunk` → 500 `INGEST_BATCH_FAILED` instead of 200.
+- **Chunk receipts + strict parsing (10, X11):** new `ingest_chunk_receipts` (`utils/chunkReceipts.js`): duplicate replay acked, 409 `CHUNK_CONTENT_CONFLICT` / `CHUNK_IN_PROGRESS`, stale-claim takeover; NDJSON errors give the line number only.
+- **Thin stubs (X2):** Simplified rows no longer delete inventory items or overwrite voucher number / cancelled flag.
+- **Reconciliation (X4):** app-voucher reconciliation uses the voucher transaction; socket emits deferred until COMMIT.
+- **Duplicate lines (X5, partial):** `utils/inventoryLineAggregate.js` merges repeated item/godown/batch lines within a batch (VII + stock_transactions).
+- **Ledger contacts (X6):** omitted/empty contact fields keep stored values; delete-by-name only removes app placeholder rows.
+- **Sync runs (S7):** `utils/syncRuns.js`; owner + heartbeat lease + fenced completion + sweeper; new `/ingest/sync-run/heartbeat`; `companies.synced_at` = last verified success; `last_sync_attempt_at`, `last_sync_outcome`.
+- **Write-back (X1, X9):** retry `userId` from the entry; 20 s ack timeout → `outcome_unknown` (new column), never auto-retried, manual retry needs `confirmOutcomeUnknown`, late ack settles the row.
+- **Escaping (W3):** `utils/xmlEscape.js` used across `tally-write.js` / `salesLikeVoucherXml.js`.
+- **Events (W1 server):** `workspaceId` + `tdkRef` on posting events.
+- **Payment-mode map (X10):** transactional replace without ON CONFLICT; guarded unique index.
+- Tested: DB-free 88/88 (p2 unit/contract, bind count, escape, sales-like, golden, credit/debit note); isolated PG `p2-integrity` 10/10. Not run: real DB, `critical.test.js`, Windows/Tally.
+- Risks: chunks that used to "succeed" with silent row failures now fail visibly; X5 cross-chunk split remains.
+
 ## 2026-10-05 — Normal sync fetches only changed vouchers (per-FY watermarks) (branch `tdl`)
 
 - **Cause:** `/desktop/init-sync` per-FY `MAX(alter_id)` compared `vouchers.date` (TEXT `YYYY-MM-DD`) with the desktop's dashless FY bounds (`20260401`), so the current FY always got 0 and every manual/auto sync re-downloaded the whole current year.

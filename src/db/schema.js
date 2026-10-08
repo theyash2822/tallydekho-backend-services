@@ -315,6 +315,20 @@ export async function initSchema() {
         completed_at  BIGINT
       );
 
+      -- Durable chunk receipts: a retried chunk with the same content is acknowledged
+      -- without re-applying; different content under the same index is refused.
+      CREATE TABLE IF NOT EXISTS ingest_chunk_receipts (
+        upload_id       TEXT NOT NULL,
+        stream          TEXT NOT NULL,
+        chunk_index     INTEGER NOT NULL,
+        content_sha256  TEXT NOT NULL,
+        record_count    INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'applying' CHECK (status IN ('applying', 'applied')),
+        claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        applied_at      TIMESTAMPTZ,
+        PRIMARY KEY (upload_id, stream, chunk_index)
+      );
+
       -- Company financial years (multi-year support)
       CREATE TABLE IF NOT EXISTS company_years (
         id            SERIAL PRIMARY KEY,
@@ -517,6 +531,8 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_wq_status    ON write_queue(status);
       CREATE INDEX IF NOT EXISTS idx_wq_created   ON write_queue(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_wq_lock      ON write_queue(status, lock_expires_at) WHERE status IN ('desktop_offline','pending');
+      -- The desktop never answered: Tally may or may not have the entry, so it must not be re-pushed.
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS outcome_unknown BOOLEAN NOT NULL DEFAULT FALSE;
 
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
@@ -672,6 +688,23 @@ export async function initSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_sync_runs_company ON sync_runs(company_guid);
       CREATE INDEX IF NOT EXISTS idx_sync_runs_status  ON sync_runs(status);
+      ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS device_id    TEXT;
+      ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conrelid = 'sync_runs'::regclass AND conname = 'sync_runs_status_check'
+             AND pg_get_constraintdef(oid) LIKE '%abandoned%'
+        ) THEN
+          ALTER TABLE sync_runs DROP CONSTRAINT IF EXISTS sync_runs_status_check;
+          ALTER TABLE sync_runs ADD CONSTRAINT sync_runs_status_check
+            CHECK (status IN ('running', 'completed', 'partial', 'failed', 'abandoned'));
+        END IF;
+      END $$;
+      -- synced_at is the last verified successful sync; attempts are tracked separately.
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS last_sync_attempt_at BIGINT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS last_sync_outcome    TEXT;
 
       -- V2: ledger_fy_balances — per-FY opening balance from LedgerOpeningBalance.xml
       CREATE TABLE IF NOT EXISTS ledger_fy_balances (

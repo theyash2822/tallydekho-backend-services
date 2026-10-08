@@ -14,6 +14,8 @@
  * GUID-only Alter in the same company Creates a duplicate (Tally import overwrite=No).
  */
 
+import { xmlText, xmlAttr } from './xmlEscape.js';
+
 /** Tally voucher GUID = `{companyGuid}-{MASTERID as 8-char hex}`. MASTERID 8559 → …-0000216f */
 export function tallyVoucherGuidFromMasterId(companyGuid, masterId) {
   const n = parseInt(String(masterId ?? '').trim(), 10);
@@ -29,9 +31,7 @@ export function tallyMasterIdFromVoucherGuid(companyGuid, guid) {
   return Number.isFinite(n) && n > 0 ? String(n) : '';
 }
 
-function xmlEsc(s) {
-  return String(s ?? '').replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
-}
+const xmlEsc = xmlText;
 
 function dispatchToTallyDate(d) {
   if (!d) return '';
@@ -250,9 +250,9 @@ export function buildSalesVoucherLinesXml({
     <STOCKITEMNAME>${xmlEsc(item.itemName)}</STOCKITEMNAME>
     <GSTOVRDNTYPEOFSUPPLY>${typeOfSupplyFor(item)}</GSTOVRDNTYPEOFSUPPLY>
     <AMOUNT>${itemAmt}</AMOUNT>
-    <ACTUALQTY>${qtyXml}</ACTUALQTY>
-    <BILLEDQTY>${billedXml}</BILLEDQTY>
-    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
+    <ACTUALQTY>${xmlEsc(qtyXml)}</ACTUALQTY>
+    <BILLEDQTY>${xmlEsc(billedXml)}</BILLEDQTY>
+    <RATE>${xmlEsc(rateWithUnit(item.rate || 0, unit))}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -265,8 +265,8 @@ export function buildSalesVoucherLinesXml({
       <GODOWNNAME>${xmlEsc(item.godown || 'Main Location')}</GODOWNNAME>
       ${againstOrderNo ? `<ORDERNO>${xmlEsc(againstOrderNo)}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${itemAmt}</AMOUNT>
-      <ACTUALQTY>${qtyXml}</ACTUALQTY>
-      <BILLEDQTY>${billedXml}</BILLEDQTY>
+      <ACTUALQTY>${xmlEsc(qtyXml)}</ACTUALQTY>
+      <BILLEDQTY>${xmlEsc(billedXml)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
   </ALLINVENTORYENTRIES.LIST>`;
   }
@@ -341,24 +341,24 @@ export function buildSalesLikeVoucherXml({
   const amt = parseFloat(partyAmt) || 0;
   const vn = voucherNumber || '';
   const isAlter = String(action).toLowerCase() === 'alter';
-  const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
+  const remoteAttr = guid ? ` REMOTEID="${xmlAttr(guid)}"` : '';
   const dateAttr = dt ? ` DATE="${dt}"` : '';
   // TallyHelp: Alter identity = Master ID + voucher type + date (not GUID re-import).
-  const tagAttr = (isAlter && masterId) ? ` TAGNAME="MasterID" TAGVALUE="${masterId}"` : '';
-  const guidXml = guid ? `\n  <GUID>${guid}</GUID>` : '';
-  const masterXml = masterId ? `\n  <MASTERID>${masterId}</MASTERID>` : '';
+  const tagAttr = (isAlter && masterId) ? ` TAGNAME="MasterID" TAGVALUE="${xmlAttr(masterId)}"` : '';
+  const guidXml = guid ? `\n  <GUID>${xmlEsc(guid)}</GUID>` : '';
+  const masterXml = masterId ? `\n  <MASTERID>${xmlEsc(masterId)}</MASTERID>` : '';
 
   let xml = `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlEsc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${vchType}" ACTION="${action}" OBJVIEW="Invoice Voucher View">
-  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${xmlAttr(vchType)}" ACTION="${xmlAttr(action)}" OBJVIEW="Invoice Voucher View">
+  <VOUCHERTYPENAME>${xmlEsc(vchType)}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERNUMBER>${xmlEsc(vn)}</VOUCHERNUMBER>
@@ -410,9 +410,9 @@ ${[headerExtrasXml, topLevelDispatchXml].filter(Boolean).join('\n')}
     <STOCKITEMNAME>${xmlEsc(item.itemName)}</STOCKITEMNAME>
     <GSTOVRDNTYPEOFSUPPLY>${typeOfSupplyFor(item)}</GSTOVRDNTYPEOFSUPPLY>
     <AMOUNT>${itemAmt}</AMOUNT>
-    <ACTUALQTY>${qtyXml}</ACTUALQTY>
-    <BILLEDQTY>${billedXml}</BILLEDQTY>
-    <RATE>${rateWithUnit(item.rate || 0, unit)}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
+    <ACTUALQTY>${xmlEsc(qtyXml)}</ACTUALQTY>
+    <BILLEDQTY>${xmlEsc(billedXml)}</BILLEDQTY>
+    <RATE>${xmlEsc(rateWithUnit(item.rate || 0, unit))}</RATE>${itemHsnDiscountXml(item)}${gstRateXml}
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
@@ -425,8 +425,8 @@ ${[headerExtrasXml, topLevelDispatchXml].filter(Boolean).join('\n')}
       <GODOWNNAME>${xmlEsc(item.godown || 'Main Location')}</GODOWNNAME>
       ${againstOrderNo ? `<ORDERNO>${xmlEsc(againstOrderNo)}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${itemAmt}</AMOUNT>
-      <ACTUALQTY>${qtyXml}</ACTUALQTY>
-      <BILLEDQTY>${billedXml}</BILLEDQTY>
+      <ACTUALQTY>${xmlEsc(qtyXml)}</ACTUALQTY>
+      <BILLEDQTY>${xmlEsc(billedXml)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
   </ALLINVENTORYENTRIES.LIST>`;
   }
@@ -501,11 +501,11 @@ export function buildMinimalVoucherAlterXml({
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlEsc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER DATE="${dt}" TAGNAME="${tagName}" TAGVALUE="${masterId}" ACTION="Alter" VCHTYPE="${vchType}">${inner}
+<VOUCHER DATE="${xmlAttr(dt)}" TAGNAME="${xmlAttr(tagName)}" TAGVALUE="${xmlAttr(masterId)}" ACTION="Alter" VCHTYPE="${xmlAttr(vchType)}">${inner}
 </VOUCHER>
 </TALLYMESSAGE>
 </REQUESTDATA>
@@ -514,22 +514,22 @@ export function buildMinimalVoucherAlterXml({
 
 /** Cancel a voucher Tally just created by mistake (Alter that became Create). */
 export function buildVoucherCancelXml({ companyName, vchType = 'Sales', dt, masterId, guid = '', voucherNumber = '' }) {
-  const remoteAttr = guid ? ` REMOTEID="${guid}"` : '';
+  const remoteAttr = guid ? ` REMOTEID="${xmlAttr(guid)}"` : '';
   const dateAttr = dt ? ` DATE="${dt}"` : '';
-  const tagAttr = masterId ? ` TAGNAME="MasterID" TAGVALUE="${masterId}"` : '';
+  const tagAttr = masterId ? ` TAGNAME="MasterID" TAGVALUE="${xmlAttr(masterId)}"` : '';
   return `<ENVELOPE>
 <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlEsc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${vchType}" ACTION="Cancel">
-  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+<VOUCHER${remoteAttr}${dateAttr}${tagAttr} VCHTYPE="${xmlAttr(vchType)}" ACTION="Cancel">
+  <VOUCHERTYPENAME>${xmlEsc(vchType)}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
-  ${voucherNumber ? `<VOUCHERNUMBER>${voucherNumber}</VOUCHERNUMBER>` : ''}
+  ${voucherNumber ? `<VOUCHERNUMBER>${xmlEsc(voucherNumber)}</VOUCHERNUMBER>` : ''}
   <ISCANCELLED>Yes</ISCANCELLED>
 </VOUCHER>
 </TALLYMESSAGE>

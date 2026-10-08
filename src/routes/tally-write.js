@@ -34,6 +34,7 @@ import {
   buildVoucherHeaderExtrasXml,
   tallyMasterIdFromVoucherGuid,
 } from '../utils/salesLikeVoucherXml.js';
+import { xmlText, xmlAttr } from '../utils/xmlEscape.js';
 import {
   loadDocumentContext,
   buildCompanyBlock,
@@ -201,12 +202,38 @@ const buildXML = (template, vars) => {
 };
 
 // ── Helper: escape XML special characters ────────────────────────────────────
-const escapeXml = (value = '') => String(value)
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;')
-  .replace(/'/g, '&apos;');
+const escapeXml = xmlText;
+
+const TALLY_WRITE_ACK_TIMEOUT_MS = 20000;
+const OUTCOME_UNKNOWN_PREFIX = 'OUTCOME_UNKNOWN';
+
+/** The desktop got the XML but did not answer in time; Tally may already have the entry. */
+const outcomeUnknownError = () => {
+  const err = new Error(`${OUTCOME_UNKNOWN_PREFIX}: Tally did not confirm in time. Check Tally before posting again.`);
+  err.code = 'TALLY_WRITE_OUTCOME_UNKNOWN';
+  return err;
+};
+
+/** A desktop answer that arrives after the timeout settles the queued row it belongs to. */
+const settleLateTallyAck = async (xmlBody, result, attempt = 0) => {
+  const { rows } = await query(
+    `SELECT id FROM write_queue
+      WHERE xml = $1 AND outcome_unknown = TRUE
+      ORDER BY updated_at DESC LIMIT 1`,
+    [xmlBody]
+  );
+  if (!rows[0]) {
+    if (attempt === 0) setTimeout(() => settleLateTallyAck(xmlBody, result, 1).catch(() => {}), 2000);
+    else console.warn('[write_queue] late Tally ack with no matching outcome-unknown entry');
+    return;
+  }
+  await query(`UPDATE write_queue SET outcome_unknown = FALSE WHERE id = $1`, [rows[0].id]);
+  const settled = result && result.status
+    ? result
+    : { status: false, message: (result && result.message) || 'Tally write failed' };
+  await updateWriteQueue(rows[0].id, settled, null);
+  console.log(`[write_queue] entry ${rows[0].id} settled by late Tally ack → ${settled.status === false ? 'failed' : 'success'}`);
+};
 
 // ── Helper: forward to Tally via device ──────────────────────────────────────
 const forwardToTally = async (companyGuid, userId, xmlBody, opts = {}) => {
@@ -250,10 +277,16 @@ const forwardToTally = async (companyGuid, userId, xmlBody, opts = {}) => {
     const desktopSocket = _socketService.connectedClients.get('desktop_' + device.device_id);
     if (desktopSocket && desktopSocket.connected) {
       return new Promise((resolve, reject) => {
+        let timedOut = false;
         const timeout = setTimeout(() => {
-          reject(new Error('Tally write timeout - is Tally Prime running?'));
-        }, 20000);
+          timedOut = true;
+          reject(outcomeUnknownError());
+        }, TALLY_WRITE_ACK_TIMEOUT_MS);
         desktopSocket.emit('tally:write', { jobId, xml: xmlBody }, (result) => {
+          if (timedOut) {
+            settleLateTallyAck(xmlBody, result).catch((e) => console.warn('[write_queue] late ack:', e.message));
+            return;
+          }
           clearTimeout(timeout);
           if (result && result.status) resolve(result);
           else reject(new Error((result && result.message) || 'Tally write failed'));
@@ -346,6 +379,19 @@ const logWriteQueue = async (userId, companyGuid, entryType, entryLabel, amount,
 // ── Helper: update write_queue after Tally response ───────────────────────────
 const updateWriteQueue = async (id, result, error) => {
   if (!id) return;
+  if (error && String(error).startsWith(OUTCOME_UNKNOWN_PREFIX)) {
+    await query(
+      `UPDATE write_queue SET status = 'failed', outcome_unknown = TRUE, error_message = $2,
+       attempt_count = attempt_count + 1, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = $1`,
+      [id, String(error)]
+    );
+    await query(
+      `UPDATE app_vouchers SET sync_error = $2, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+        WHERE write_queue_id = $1`,
+      [id, String(error).slice(0, 500)]
+    ).catch(() => {});
+    return;
+  }
   if (error) {
     await query(
       `UPDATE write_queue SET status = CASE WHEN $2 ILIKE '%Desktop not connected%' OR $2 ILIKE '%desktop_offline%' OR $2 ILIKE '%not reachable%' THEN 'desktop_offline' ELSE 'failed' END,
@@ -726,7 +772,7 @@ async function createReceiptForInvoice({
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -735,24 +781,24 @@ async function createReceiptForInvoice({
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
   ${voucherNumber ? `<VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>` : ''}
-  <NARRATION>${narration}</NARRATION>
+  <NARRATION>${xmlText(narration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <REFERENCE>${reference || rcpTdkRef || ''}</REFERENCE>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <REFERENCE>${xmlText(reference || rcpTdkRef || '')}</REFERENCE>
+  <PARTYLEDGERNAME>${xmlText(partyLedger)}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(partyLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
     <BILLALLOCATIONS.LIST>
-      <NAME>${parentTdkRef}</NAME>
+      <NAME>${xmlText(parentTdkRef)}</NAME>
       <BILLTYPE>Agst Ref</BILLTYPE>
       <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
       <AMOUNT>${amt}</AMOUNT>
     </BILLALLOCATIONS.LIST>
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${bankLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(bankLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>No</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
@@ -862,7 +908,7 @@ async function createPaymentForInvoice({
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -871,24 +917,24 @@ async function createPaymentForInvoice({
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
   <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
   ${voucherNumber ? `<VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>` : ''}
-  <NARRATION>${narration}</NARRATION>
+  <NARRATION>${xmlText(narration)}</NARRATION>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <REFERENCE>${reference || payTdkRef || ''}</REFERENCE>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <REFERENCE>${xmlText(reference || payTdkRef || '')}</REFERENCE>
+  <PARTYLEDGERNAME>${xmlText(partyLedger)}</PARTYLEDGERNAME>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(partyLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${-amt}</AMOUNT>
     <BILLALLOCATIONS.LIST>
-      <NAME>${parentTdkRef}</NAME>
+      <NAME>${xmlText(parentTdkRef)}</NAME>
       <BILLTYPE>Agst Ref</BILLTYPE>
       <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
       <AMOUNT>${-amt}</AMOUNT>
     </BILLALLOCATIONS.LIST>
   </ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST>
-    <LEDGERNAME>${bankLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(bankLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <AMOUNT>${amt}</AMOUNT>
@@ -1167,10 +1213,10 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
     const dispatchDate = toTallyDate(dd.transport_doc_date || date); // fallback to invoice date if no transport doc date
     topLevelDispatchXml = [
       dispatchDate          ? `  <BILLOFLADINGDATE>${dispatchDate}</BILLOFLADINGDATE>` : '',
-      tallySimpleMode       ? `  <BASICSHIPPEDBY>${tallySimpleMode}</BASICSHIPPEDBY>` : '',
-      dd.transport_doc_no   ? `  <BASICSHIPDOCUMENTNO>${dd.transport_doc_no}</BASICSHIPDOCUMENTNO>` : '',
-      dd.ship_to            ? `  <BASICFINALDESTINATION>${dd.ship_to}</BASICFINALDESTINATION>` : '',
-      dd.vehicle_number     ? `  <BASICSHIPVESSELNO>${dd.vehicle_number}</BASICSHIPVESSELNO>` : '',
+      tallySimpleMode       ? `  <BASICSHIPPEDBY>${xmlText(tallySimpleMode)}</BASICSHIPPEDBY>` : '',
+      dd.transport_doc_no   ? `  <BASICSHIPDOCUMENTNO>${xmlText(dd.transport_doc_no)}</BASICSHIPDOCUMENTNO>` : '',
+      dd.ship_to            ? `  <BASICFINALDESTINATION>${xmlText(dd.ship_to)}</BASICFINALDESTINATION>` : '',
+      dd.vehicle_number     ? `  <BASICSHIPVESSELNO>${xmlText(dd.vehicle_number)}</BASICSHIPVESSELNO>` : '',
     ].filter(Boolean).join('\n');
 
     // 2. EWAYBILLDETAILS.LIST with nested TRANSPORTDETAILS.LIST (validated against real TallyPrime export)
@@ -1180,11 +1226,11 @@ router.post('/voucher/sales', authMiddleware, requireTallyWriteAccess('/voucher/
     const consignorLines = [dd.dispatch_from_address1, dd.dispatch_from_address2].map(l => (l || '').trim()).filter(Boolean);
     const consigneeLines = [dd.ship_to_address1,       dd.ship_to_address2      ].map(l => (l || '').trim()).filter(Boolean);
     const consignorAddrXml = consignorLines.length
-      ? consignorLines.map(l => `      <CONSIGNORADDRESS>${l}</CONSIGNORADDRESS>`).join('\n')
-      : `      <CONSIGNORADDRESS>${dd.dispatch_from || ''}</CONSIGNORADDRESS>`;
+      ? consignorLines.map(l => `      <CONSIGNORADDRESS>${xmlText(l)}</CONSIGNORADDRESS>`).join('\n')
+      : `      <CONSIGNORADDRESS>${xmlText(dd.dispatch_from || '')}</CONSIGNORADDRESS>`;
     const consigneeAddrXml = consigneeLines.length
-      ? consigneeLines.map(l => `      <CONSIGNEEADDRESS>${l}</CONSIGNEEADDRESS>`).join('\n')
-      : `      <CONSIGNEEADDRESS>${dd.ship_to || ''}</CONSIGNEEADDRESS>`;
+      ? consigneeLines.map(l => `      <CONSIGNEEADDRESS>${xmlText(l)}</CONSIGNEEADDRESS>`).join('\n')
+      : `      <CONSIGNEEADDRESS>${xmlText(dd.ship_to || '')}</CONSIGNEEADDRESS>`;
 
     ewbDetailsXml = `
   <EWAYBILLDETAILS.LIST>
@@ -1196,12 +1242,12 @@ ${consigneeAddrXml}
     </CONSIGNEEADDRESS.LIST>
     <DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
     <SUBTYPE>Supply</SUBTYPE>
-    <CONSIGNORPLACE>${dd.dispatch_from || ''}</CONSIGNORPLACE>
-    <CONSIGNEEPLACE>${dd.ship_to || ''}</CONSIGNEEPLACE>
-    <CONSIGNORPINCODE>${dd.dispatch_from_pincode || ''}</CONSIGNORPINCODE>
-    <CONSIGNEEPINCODE>${dd.ship_to_pincode || ''}</CONSIGNEEPINCODE>
-    <SHIPPEDFROMSTATE>${dd.dispatch_from_state || ''}</SHIPPEDFROMSTATE>
-    <SHIPPEDTOSTATE>${dd.ship_to_state || ''}</SHIPPEDTOSTATE>
+    <CONSIGNORPLACE>${xmlText(dd.dispatch_from || '')}</CONSIGNORPLACE>
+    <CONSIGNEEPLACE>${xmlText(dd.ship_to || '')}</CONSIGNEEPLACE>
+    <CONSIGNORPINCODE>${xmlText(dd.dispatch_from_pincode || '')}</CONSIGNORPINCODE>
+    <CONSIGNEEPINCODE>${xmlText(dd.ship_to_pincode || '')}</CONSIGNEEPINCODE>
+    <SHIPPEDFROMSTATE>${xmlText(dd.dispatch_from_state || '')}</SHIPPEDFROMSTATE>
+    <SHIPPEDTOSTATE>${xmlText(dd.ship_to_state || '')}</SHIPPEDTOSTATE>
     <ISCANCELLED>No</ISCANCELLED>
     <IGNOREGSTINVALIDATION>No</IGNOREGSTINVALIDATION>
     <ISCANCELPENDING>No</ISCANCELPENDING>
@@ -1210,12 +1256,12 @@ ${consigneeAddrXml}
     <INTRASTATEAPPLICABILITY>No</INTRASTATEAPPLICABILITY>${hasTransport ? `
     <TRANSPORTDETAILS.LIST>
       <DOCUMENTDATE>${dispatchDate}</DOCUMENTDATE>
-      <TRANSPORTERID>${dd.transporter_id || ''}</TRANSPORTERID>
-      <TRANSPORTERNAME>${dd.transporter_name || ''}</TRANSPORTERNAME>
-      <TRANSPORTMODE>${tallyCodedMode}</TRANSPORTMODE>
-      <VEHICLENUMBER>${dd.vehicle_number || ''}</VEHICLENUMBER>
-      <OLDVEHICLETYPE>${tallyVehicleType}</OLDVEHICLETYPE>
-      <VEHICLETYPE>${tallyVehicleType}</VEHICLETYPE>
+      <TRANSPORTERID>${xmlText(dd.transporter_id || '')}</TRANSPORTERID>
+      <TRANSPORTERNAME>${xmlText(dd.transporter_name || '')}</TRANSPORTERNAME>
+      <TRANSPORTMODE>${xmlText(tallyCodedMode)}</TRANSPORTMODE>
+      <VEHICLENUMBER>${xmlText(dd.vehicle_number || '')}</VEHICLENUMBER>
+      <OLDVEHICLETYPE>${xmlText(tallyVehicleType)}</OLDVEHICLETYPE>
+      <VEHICLETYPE>${xmlText(tallyVehicleType)}</VEHICLETYPE>
       <IGNOREVEHICLENOVALIDATION>No</IGNOREVEHICLENOVALIDATION>
       <ISTRANSIDPENDING>No</ISTRANSIDPENDING>
       <ISTRANSIDUPDATED>No</ISTRANSIDUPDATED>
@@ -1792,7 +1838,7 @@ router.post('/voucher/payment', authMiddleware, requireTallyWriteAccess('/vouche
   // Keep narration user/business-friendly (no TDK ids).
   const fullNarration = narration || '';
 
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
   const blocksRaw = Array.isArray(billAllocations) ? billAllocations : [];
   // Merge duplicate Agst Ref names (bill_outstanding can have duplicate bill_name rows).
   // Tally rejects Payment imports that repeat the same bill NAME → CREATED=0 / false Posted.
@@ -2031,7 +2077,7 @@ router.post('/voucher/receipt', authMiddleware, requireTallyWriteAccess('/vouche
   // Keep narration user/business-friendly (no TDK ids).
   const fullNarration = narration || '';
 
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
   // Same Advance NAME rule as Payment (Tally requires <NAME> for Advance leftover).
   const autoAdvNameRcp = () => {
     const seq = (tdkRef || '').split('-').pop() || String(Date.now()).slice(-4);
@@ -2232,7 +2278,7 @@ router.post('/voucher/journal', authMiddleware, requireTallyWriteAccess('/vouche
     return res.status(400).json({ status: false, message: 'amount must be greater than 0' });
   }
   const dt = tallyDate(date);
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
 
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'JOR', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
@@ -2401,7 +2447,7 @@ router.post('/voucher/contra', authMiddleware, requireTallyWriteAccess('/voucher
     return res.status(400).json({ status: false, message: 'amount must be greater than 0' });
   }
   const dt = tallyDate(date);
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
 
   const tdkRef = await generateTDKReference(companyGuid, isOptional, 'CON', req.company?.id).catch(() => null);
   let tdkVoucherNo = null;
@@ -2677,7 +2723,7 @@ router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/vo
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -2685,22 +2731,22 @@ router.post('/voucher/sales-order', authMiddleware, requireTallyWriteAccess('/vo
   <VOUCHERTYPENAME>Sales Order</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
+  <VOUCHERNUMBER>${xmlText(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  <REFERENCE>${xmlText(tdkRef || reference || '')}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
   <ISPOSTDATED>No</ISPOSTDATED>
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <NARRATION>${narration || ''}</NARRATION>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <NARRATION>${xmlText(narration || '')}</NARRATION>
+  <PARTYLEDGERNAME>${xmlText(partyLedger)}</PARTYLEDGERNAME>
 ${soExtrasXml}
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(partyLedger)}</LEDGERNAME>
     <AMOUNT>${-amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
@@ -2710,26 +2756,26 @@ ${soExtrasXml}
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
+    <STOCKITEMNAME>${xmlText(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${itemAmt}</AMOUNT>
-    <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
-    <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
-    <RATE>${item.rate || 0}</RATE>
+    <ACTUALQTY>${xmlText(item.actualQty || item.billedQty || 1)}</ACTUALQTY>
+    <BILLEDQTY>${xmlText(item.billedQty || 1)}</BILLEDQTY>
+    <RATE>${xmlText(item.rate || 0)}</RATE>
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
       <LEDGERFROMITEM>No</LEDGERFROMITEM>
-      <LEDGERNAME>${item.salesLedger || 'Sales Account GST'}</LEDGERNAME>
+      <LEDGERNAME>${xmlText(item.salesLedger || 'Sales Account GST')}</LEDGERNAME>
       <AMOUNT>${itemAmt}</AMOUNT>
     </ACCOUNTINGALLOCATIONS.LIST>
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
-      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      ${orderNoTag ? `<ORDERNO>${orderNoTag}</ORDERNO>` : '<ORDERNO/>'}
+      <GODOWNNAME>${xmlText(item.godown || 'Main Location')}</GODOWNNAME>
+      ${orderNoTag ? `<ORDERNO>${xmlText(orderNoTag)}</ORDERNO>` : '<ORDERNO/>'}
       <ORDERDUEDATE>${dueDt}</ORDERDUEDATE>
       <AMOUNT>${itemAmt}</AMOUNT>
-      <ACTUALQTY>${item.actualQty || item.billedQty || 1}</ACTUALQTY>
-      <BILLEDQTY>${item.billedQty || 1}</BILLEDQTY>
+      <ACTUALQTY>${xmlText(item.actualQty || item.billedQty || 1)}</ACTUALQTY>
+      <BILLEDQTY>${xmlText(item.billedQty || 1)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
   </ALLINVENTORYENTRIES.LIST>`;
   }
@@ -2741,7 +2787,7 @@ ${soExtrasXml}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(tax.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(tax.taxAmount) || 0}</AMOUNT>
     <VATASSESSABLEVALUE>${parseFloat(tax.taxableValue) || 0}</VATASSESSABLEVALUE>
   </LEDGERENTRIES.LIST>`;
@@ -2753,7 +2799,7 @@ ${soExtrasXml}
   <LEDGERENTRIES.LIST>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lg.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(lg.amount) || 0}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     for (const lt of (lg.taxes || [])) {
@@ -2763,7 +2809,7 @@ ${soExtrasXml}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lt.ledgerName)}</LEDGERNAME>
     <AMOUNT>${parseFloat(lt.taxAmount)}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     }
@@ -3079,7 +3125,7 @@ ${website ? `<WEBSITE>${escapeXml(website)}</WEBSITE>`               : ''}
 ${website ? `<LEDGERWEBSITE>${escapeXml(website)}</LEDGERWEBSITE>`   : ''}
 ${website ? `<CONTACTWEBSITE>${escapeXml(website)}</CONTACTWEBSITE>` : ''}
 ${website ? `<HOMEPAGE>${escapeXml(website)}</HOMEPAGE>`             : ''}
-<ISBILLWISEON>${isBillWise}</ISBILLWISEON>
+<ISBILLWISEON>${xmlText(isBillWise)}</ISBILLWISEON>
 ${obAmt !== 0 ? `<OPENINGBALANCE>${obFormatted}</OPENINGBALANCE>` : ''}
 ${vatXml}
 ${gstDetailsXml}
@@ -3144,12 +3190,12 @@ ${mailingDetailsXml}
 router.post('/master/warehouse', authMiddleware, requireTallyWriteAccess('/master/warehouse'), async (req, res) => {
   const { companyGuid, companyName, name, parentGodown = '', address = '' } = req.body;
   if (!companyGuid || !name) return res.status(400).json({ status: false, message: 'companyGuid and name required' });
-  const addressXml = address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${address}</ADDRESS></ADDRESS.LIST>` : '';
+  const addressXml = address ? `<ADDRESS.LIST TYPE="String"><ADDRESS>${xmlText(address)}</ADDRESS></ADDRESS.LIST>` : '';
   // Skip <PARENT> if empty or 'Primary' — Tally auto-assigns to root. Sending 'Primary' causes
   // "Godown does not exist" error if the user's Tally doesn't have a godown named 'Primary'.
   const effectiveParent = (parentGodown && parentGodown.toLowerCase() !== 'primary') ? parentGodown : '';
-  const parentXml = effectiveParent ? `<PARENT>${effectiveParent}</PARENT>` : '';
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><GODOWN NAME="${name}" ACTION="Create"><NAME>${name}</NAME>${parentXml}${addressXml}</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const parentXml = effectiveParent ? `<PARENT>${xmlText(effectiveParent)}</PARENT>` : '';
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><GODOWN NAME="${xmlAttr(name)}" ACTION="Create"><NAME>${xmlText(name)}</NAME>${parentXml}${addressXml}</GODOWN></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'warehouse', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
@@ -3243,7 +3289,7 @@ router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -3251,22 +3297,22 @@ router.post('/voucher/purchase-order', authMiddleware, requireTallyWriteAccess('
   <VOUCHERTYPENAME>Purchase Order</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
+  <VOUCHERNUMBER>${xmlText(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  <REFERENCE>${xmlText(tdkRef || reference || '')}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
   <ISPOSTDATED>No</ISPOSTDATED>
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <NARRATION>${narration || ''}</NARRATION>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <NARRATION>${xmlText(narration || '')}</NARRATION>
+  <PARTYLEDGERNAME>${xmlText(partyLedger)}</PARTYLEDGERNAME>
 ${poExtrasXml}
   <LEDGERENTRIES.LIST>
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(partyLedger)}</LEDGERNAME>
     <AMOUNT>${amt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
 
@@ -3278,26 +3324,26 @@ ${poExtrasXml}
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
+    <STOCKITEMNAME>${xmlText(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${-itemAmt}</AMOUNT>
-    <ACTUALQTY>${qty}</ACTUALQTY>
-    <BILLEDQTY>${billed}</BILLEDQTY>
-    <RATE>${item.rate || 0}</RATE>
+    <ACTUALQTY>${xmlText(qty)}</ACTUALQTY>
+    <BILLEDQTY>${xmlText(billed)}</BILLEDQTY>
+    <RATE>${xmlText(item.rate || 0)}</RATE>
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <LEDGERFROMITEM>No</LEDGERFROMITEM>
-      <LEDGERNAME>${item.purchaseLedger || 'Purchase Account GST'}</LEDGERNAME>
+      <LEDGERNAME>${xmlText(item.purchaseLedger || 'Purchase Account GST')}</LEDGERNAME>
       <AMOUNT>${-itemAmt}</AMOUNT>
     </ACCOUNTINGALLOCATIONS.LIST>
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
-      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      ${orderNoTag ? `<ORDERNO>${orderNoTag}</ORDERNO>` : '<ORDERNO/>'}
+      <GODOWNNAME>${xmlText(item.godown || 'Main Location')}</GODOWNNAME>
+      ${orderNoTag ? `<ORDERNO>${xmlText(orderNoTag)}</ORDERNO>` : '<ORDERNO/>'}
       <ORDERDUEDATE>${dueDt}</ORDERDUEDATE>
       <AMOUNT>${-itemAmt}</AMOUNT>
-      <ACTUALQTY>${qty}</ACTUALQTY>
-      <BILLEDQTY>${billed}</BILLEDQTY>
+      <ACTUALQTY>${xmlText(qty)}</ACTUALQTY>
+      <BILLEDQTY>${xmlText(billed)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
   </ALLINVENTORYENTRIES.LIST>`;
   }
@@ -3309,7 +3355,7 @@ ${poExtrasXml}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(tax.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT>
     <VATASSESSABLEVALUE>${-Math.abs(parseFloat(tax.taxableValue) || 0)}</VATASSESSABLEVALUE>
   </LEDGERENTRIES.LIST>`;
@@ -3322,7 +3368,7 @@ ${poExtrasXml}
   <LEDGERENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lg.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-lgAmt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     for (const lt of (lg.taxes || [])) {
@@ -3332,7 +3378,7 @@ ${poExtrasXml}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lt.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-parseFloat(lt.taxAmount)}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     }
@@ -3520,23 +3566,23 @@ router.post('/voucher/purchase', authMiddleware, requireTallyWriteAccess('/vouch
 <BODY><IMPORTDATA>
 <REQUESTDESC>
   <REPORTNAME>Vouchers</REPORTNAME>
-  <STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES>
+  <STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES>
 </REQUESTDESC>
 <REQUESTDATA>
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
-<VOUCHER VCHTYPE="${vchType}" ACTION="Create" OBJVIEW="Invoice Voucher View">
-  <VOUCHERTYPENAME>${vchType}</VOUCHERTYPENAME>
+<VOUCHER VCHTYPE="${xmlAttr(vchType)}" ACTION="Create" OBJVIEW="Invoice Voucher View">
+  <VOUCHERTYPENAME>${xmlText(vchType)}</VOUCHERTYPENAME>
   <DATE>${dt}</DATE>
   <EFFECTIVEDATE>${dt}</EFFECTIVEDATE>
-  <VOUCHERNUMBER>${effectiveVoucherNumber}</VOUCHERNUMBER>
-  <REFERENCE>${tdkRef || reference || ''}</REFERENCE>
+  <VOUCHERNUMBER>${xmlText(effectiveVoucherNumber)}</VOUCHERNUMBER>
+  <REFERENCE>${xmlText(tdkRef || reference || '')}</REFERENCE>
   <ISINVOICE>Yes</ISINVOICE>
   <ISCANCELLED>No</ISCANCELLED>
   <ISPOSTDATED>No</ISPOSTDATED>
   <DIFFACTUALQTY>No</DIFFACTUALQTY>
   <ISOPTIONAL>${isOpt}</ISOPTIONAL>
-  <NARRATION>${fullNarration || ''}</NARRATION>
-  <PARTYLEDGERNAME>${partyLedger}</PARTYLEDGERNAME>
+  <NARRATION>${xmlText(fullNarration || '')}</NARRATION>
+  <PARTYLEDGERNAME>${xmlText(partyLedger)}</PARTYLEDGERNAME>
   <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
 ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
@@ -3546,10 +3592,10 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
     <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${partyLedger}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(partyLedger)}</LEDGERNAME>
     <AMOUNT>${amt}</AMOUNT>${tdkRef ? `
     <BILLALLOCATIONS.LIST>
-      <NAME>${tdkRef}</NAME>
+      <NAME>${xmlText(tdkRef)}</NAME>
       <BILLTYPE>New Ref</BILLTYPE>
       <TDSDEDUCTEEISSPECIALRATE>No</TDSDEDUCTEEISSPECIALRATE>
       <AMOUNT>${amt}</AMOUNT>
@@ -3563,25 +3609,25 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
     xml += `
   <ALLINVENTORYENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-    <STOCKITEMNAME>${item.itemName}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
+    <STOCKITEMNAME>${xmlText(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <AMOUNT>${-ia}</AMOUNT>
-    <ACTUALQTY>${qty}</ACTUALQTY>
-    <BILLEDQTY>${billed}</BILLEDQTY>
-    <RATE>${item.rate || 0}</RATE>
+    <ACTUALQTY>${xmlText(qty)}</ACTUALQTY>
+    <BILLEDQTY>${xmlText(billed)}</BILLEDQTY>
+    <RATE>${xmlText(item.rate || 0)}</RATE>
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <LEDGERFROMITEM>No</LEDGERFROMITEM>
-      <LEDGERNAME>${item.purchaseLedger || 'Purchase Account GST'}</LEDGERNAME>
+      <LEDGERNAME>${xmlText(item.purchaseLedger || 'Purchase Account GST')}</LEDGERNAME>
       <AMOUNT>${-ia}</AMOUNT>
     </ACCOUNTINGALLOCATIONS.LIST>
     <BATCHALLOCATIONS.LIST>
       <BATCHNAME>Primary Batch</BATCHNAME>
-      <GODOWNNAME>${item.godown || 'Main Location'}</GODOWNNAME>
-      ${againstOrderNo ? `<ORDERNO>${againstOrderNo}</ORDERNO>` : '<ORDERNO/>'}
+      <GODOWNNAME>${xmlText(item.godown || 'Main Location')}</GODOWNNAME>
+      ${againstOrderNo ? `<ORDERNO>${xmlText(againstOrderNo)}</ORDERNO>` : '<ORDERNO/>'}
       <AMOUNT>${-ia}</AMOUNT>
-      <ACTUALQTY>${qty}</ACTUALQTY>
-      <BILLEDQTY>${billed}</BILLEDQTY>
+      <ACTUALQTY>${xmlText(qty)}</ACTUALQTY>
+      <BILLEDQTY>${xmlText(billed)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
   </ALLINVENTORYENTRIES.LIST>`;
   }
@@ -3593,7 +3639,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${tax.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(tax.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-parseFloat(tax.taxAmount)}</AMOUNT>
     <VATASSESSABLEVALUE>${-Math.abs(parseFloat(tax.taxableValue) || 0)}</VATASSESSABLEVALUE>
   </LEDGERENTRIES.LIST>`;
@@ -3606,7 +3652,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
   <LEDGERENTRIES.LIST>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lg.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lg.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-lgAmt}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     for (const lt of (lg.taxes || [])) {
@@ -3616,7 +3662,7 @@ ${[headerExtrasXml, purchaseDispatchXml].filter(Boolean).join('\n')}
     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <LEDGERFROMITEM>No</LEDGERFROMITEM>
-    <LEDGERNAME>${lt.ledgerName}</LEDGERNAME>
+    <LEDGERNAME>${xmlText(lt.ledgerName)}</LEDGERNAME>
     <AMOUNT>${-parseFloat(lt.taxAmount)}</AMOUNT>
   </LEDGERENTRIES.LIST>`;
     }
@@ -4864,15 +4910,15 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
     <STOCKITEMNAME>${escapeXml(item.itemName)}</STOCKITEMNAME>${inventoryHsnDiscountXml(item)}
     <RATE>${escapeXml(rateXml)}</RATE>
     <AMOUNT>${itemAmt}</AMOUNT>
-    <ACTUALQTY>${actualQty}</ACTUALQTY>
-    <BILLEDQTY>${billedQty}</BILLEDQTY>
+    <ACTUALQTY>${xmlText(actualQty)}</ACTUALQTY>
+    <BILLEDQTY>${xmlText(billedQty)}</BILLEDQTY>
     <BATCHALLOCATIONS.LIST>
       <GODOWNNAME>${escapeXml(item.godown || 'Main Location')}</GODOWNNAME>
       <BATCHNAME>Primary Batch</BATCHNAME>${track ? `
       <TRACKINGNUMBER>${escapeXml(track)}</TRACKINGNUMBER>` : ''}
       <AMOUNT>${itemAmt}</AMOUNT>
-      <ACTUALQTY>${actualQty}</ACTUALQTY>
-      <BILLEDQTY>${billedQty}</BILLEDQTY>
+      <ACTUALQTY>${xmlText(actualQty)}</ACTUALQTY>
+      <BILLEDQTY>${xmlText(billedQty)}</BILLEDQTY>
     </BATCHALLOCATIONS.LIST>
     <ACCOUNTINGALLOCATIONS.LIST>
       <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>
@@ -5016,7 +5062,7 @@ ${[dispatchXml, dnExtrasXml, dnEwbXml].filter(Boolean).join('\n')}
 router.post('/voucher/cancel', authMiddleware, requireTallyWriteAccess('/voucher/cancel'), async (req, res) => {
   const { companyGuid, companyName, voucherGuid, voucherType, voucherNumber, date } = req.body;
   if (!companyGuid || !voucherGuid) return res.status(400).json({ status: false, message: 'voucherGuid required' });
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${voucherType}" ACTION="Cancel"><DATE>${tallyDate(date)}</DATE><VOUCHERTYPENAME>${voucherType}</VOUCHERTYPENAME><VOUCHERNUMBER>${voucherNumber||''}</VOUCHERNUMBER><GUID>${voucherGuid}</GUID></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="${xmlAttr(voucherType)}" ACTION="Cancel"><DATE>${tallyDate(date)}</DATE><VOUCHERTYPENAME>${xmlText(voucherType)}</VOUCHERTYPENAME><VOUCHERNUMBER>${xmlText(voucherNumber||'')}</VOUCHERNUMBER><GUID>${xmlText(voucherGuid)}</GUID></VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   try { const r = await forwardToTally(companyGuid, req.user.userId, xml, { companyId: req.company?.id }); res.json({ status: true, message: 'Voucher cancelled in Tally', data: r, voucherNumber: r?.voucherNumber || null, tallyId: r?.tallyId || null }); } catch(e) { res.status(500).json({ status: false, message: e.message }); }
 });
 
@@ -5077,7 +5123,7 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   }
   const effectiveGroup = String(groupName || '').trim();
   if (!effectiveGroup) return res.status(400).json({ status: false, message: 'groupName required' });
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
   const parentXml = `<PARENT>${esc(effectiveGroup)}</PARENT>`;
 
   const qty = Math.max(0, Math.abs(parseFloat(openingQty) || 0));
@@ -5090,10 +5136,10 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   const openXml = godownOpening
     ? ''
     : (qty > 0
-      ? `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>`
+      ? `<OPENINGBALANCE>${qty} ${esc(unit)}</OPENINGBALANCE><OPENINGRATE>${rate} /${esc(unit)}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE>`
         + (batch.on
           ? `<BATCHALLOCATIONS.LIST><BATCHNAME>${esc(batch.name)}</BATCHNAME>${batch.expiryXml}`
-            + `<OPENINGBALANCE>${qty} ${unit}</OPENINGBALANCE><OPENINGRATE>${rate} /${unit}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE></BATCHALLOCATIONS.LIST>`
+            + `<OPENINGBALANCE>${qty} ${esc(unit)}</OPENINGBALANCE><OPENINGRATE>${rate} /${esc(unit)}</OPENINGRATE><OPENINGVALUE>${openVal}</OPENINGVALUE></BATCHALLOCATIONS.LIST>`
           : '')
       : '');
   const batchFlagsXml = batch.on
@@ -5106,8 +5152,8 @@ router.post('/master/stock-item', authMiddleware, requireTallyWriteAccess('/mast
   // item reached Tally with no GST configured while the UI reported success.
   // HSNCODE itself stays optional, which is what Tally expects.
   const hasGstRate = igstRate > 0 || cgstRate > 0 || sgstRate > 0;
-  const gstXml = (hsnCode || hasGstRate) ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM>${hsnCode ? `<HSNCODE>${hsnCode}</HSNCODE>` : ''}<TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${igstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${cgstRate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${sgstRate}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${name}</NAME>${parentXml}${category?`<CATEGORY>${category}</CATEGORY>`:''}<BASEUNITS>${unit}</BASEUNITS>${batchFlagsXml}${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const gstXml = (hsnCode || hasGstRate) ? `<GSTAPPLICABLE>${gstAppl}</GSTAPPLICABLE><GSTDETAILS.LIST><APPLICABLEFROM>${_appFrom}</APPLICABLEFROM>${hsnCode ? `<HSNCODE>${esc(hsnCode)}</HSNCODE>` : ''}<TAXABILITY>Taxable</TAXABILITY><STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${esc(igstRate)}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${esc(cgstRate)}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${esc(sgstRate)}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST></GSTDETAILS.LIST>` : '';
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${esc(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Create"><NAME>${esc(name)}</NAME>${parentXml}${category?`<CATEGORY>${esc(category)}</CATEGORY>`:''}<BASEUNITS>${esc(unit)}</BASEUNITS>${batchFlagsXml}${openXml}${gstXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'item', name, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
     await insertAppMaster({
@@ -5421,10 +5467,10 @@ router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess(
   // Two separate GSTDETAILS.LIST in the same STOCKITEM Alter causes Tally to
   // throw "Duplicate Entry!" because it treats the second block as a new record.
   let fieldsXml = '';
-  if (changes.name)         fieldsXml += `<NAME>${changes.name}</NAME>`;
-  if (changes.unit)         fieldsXml += `<BASEUNITS>${changes.unit}</BASEUNITS>`;
-  if (changes.reorderLevel !== undefined) fieldsXml += `<REORDERLEVEL>${changes.reorderLevel}</REORDERLEVEL>`;
-  if (changes.groupName)    fieldsXml += `<PARENT>${changes.groupName}</PARENT>`;
+  if (changes.name)         fieldsXml += `<NAME>${xmlText(changes.name)}</NAME>`;
+  if (changes.unit)         fieldsXml += `<BASEUNITS>${xmlText(changes.unit)}</BASEUNITS>`;
+  if (changes.reorderLevel !== undefined) fieldsXml += `<REORDERLEVEL>${xmlText(changes.reorderLevel)}</REORDERLEVEL>`;
+  if (changes.groupName)    fieldsXml += `<PARENT>${xmlText(changes.groupName)}</PARENT>`;
   // Merge hsnCode + taxRate into a single GSTDETAILS.LIST.
   // Use today's date as APPLICABLEFROM so Tally adds a new effective rule
   // that overrides the old one (hardcoded 20170701 gets ignored by Tally if already exists).
@@ -5437,11 +5483,11 @@ router.post('/master/stock-item-alter', authMiddleware, requireTallyWriteAccess(
     const rateXml = rate !== null
       ? `<STATEWISEDETAILS.LIST><STATENAME>Any State</STATENAME><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Integrated Tax</GSTRATEDUTYHEAD><GSTRATE>${rate}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>Central Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST><RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Tax</GSTRATEDUTYHEAD><GSTRATE>${rate/2}</GSTRATE></RATEDETAILS.LIST></STATEWISEDETAILS.LIST>`
       : '';
-    const hsnXml = hsn ? `<HSNCODE>${hsn}</HSNCODE>` : '';
+    const hsnXml = hsn ? `<HSNCODE>${xmlText(hsn)}</HSNCODE>` : '';
     fieldsXml += `<GSTDETAILS.LIST><APPLICABLEFROM>${applicableFrom}</APPLICABLEFROM>${hsnXml}<TAXABILITY>Taxable</TAXABILITY>${rateXml}</GSTDETAILS.LIST>`;
   }
 
-  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${companyName}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${existingName}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const xml = `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${xmlText(companyName)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM ACTION="Alter" NAME="${xmlAttr(existingName)}">${fieldsXml}</STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 
   const qId = await logWriteQueue(req.user.userId, companyGuid, 'alter_stock_item', existingName, null, req.body, xml, req.company?.id).catch(() => null);
   if (qId) {
@@ -5509,7 +5555,7 @@ router.post('/voucher/stock-transfer', authMiddleware, requireTallyWriteAccess('
     return res.status(400).json({ status: false, message: 'items[] required' });
   }
 
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
   const dt = tallyDate(date);
   const isOpt = isOptional ? 'Yes' : 'No';
   const fullNarration = narration || note || '';
@@ -5695,7 +5741,7 @@ router.post('/voucher/stock-adjustment', authMiddleware, requireTallyWriteAccess
     return res.status(400).json({ status: false, message: 'stockName, adjustmentQty, adjustmentReason required' });
   }
 
-  const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;' }[c]));
+  const esc = xmlText;
 
   // ── Determine direction ─────────────────────────────────────────────────────
   const REDUCE_REASONS = ['Damage', 'Shortage', 'Expired', 'Lost'];
@@ -5898,7 +5944,12 @@ router.get('/audit-trail', authMiddleware, async (req, res) => {
 router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await retrySingleEntry(id, req.user.userId);
+    const result = await retrySingleEntry(id, req.user.userId, {
+      confirmOutcomeUnknown: req.body?.confirmOutcomeUnknown === true,
+    });
+    if (result.outcomeUnknown) {
+      return res.status(409).json({ status: false, code: result.code, outcomeUnknown: true, message: result.message });
+    }
     if (result.alreadySuccess) {
       return res.json({ status: true, message: result.message, alreadySuccess: true, voucherNumber: result.voucherNumber || null });
     }
@@ -5929,24 +5980,34 @@ router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
 // Atomic claim: only desktop_offline / failed rows can be claimed. Concurrent
 // Audit Trail taps on a queued row used to re-forward the same XML and create
 // duplicate vouchers in Tally — the WHERE clause prevents that race.
-export async function retrySingleEntry(entryId, userId) {
+export async function retrySingleEntry(entryId, userId, { confirmOutcomeUnknown = false } = {}) {
   try {
     const { rows: claimed } = await query(
       `UPDATE write_queue
           SET status='processing',
               error_message=NULL,
+              outcome_unknown=FALSE,
               updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
         WHERE id=$1 AND user_id=$2
           AND status IN ('desktop_offline', 'failed', 'pending')
           AND xml IS NOT NULL
+          AND (outcome_unknown IS NOT TRUE OR $3::boolean)
         RETURNING *`,
-      [entryId, userId]
+      [entryId, userId, confirmOutcomeUnknown === true]
     );
     const entry = claimed[0];
     if (!entry) {
-      const { rows } = await query(`SELECT id, status, xml, tally_voucher_number FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
+      const { rows } = await query(`SELECT id, status, xml, tally_voucher_number, outcome_unknown FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
       const existing = rows[0];
       if (!existing) return { success: false, message: 'Entry not found' };
+      if (existing.outcome_unknown) {
+        return {
+          success: false,
+          outcomeUnknown: true,
+          code: 'OUTCOME_UNKNOWN',
+          message: 'Tally may already have this entry. Check Tally first; retry only if it is missing.',
+        };
+      }
       if (existing.status === 'success') {
         return { success: true, alreadySuccess: true, message: 'Already pushed to Tally', voucherNumber: existing.tally_voucher_number || null };
       }
@@ -6039,11 +6100,12 @@ export async function retryOfflineEntries(workspaceId, companyGuid = null) {
         // Atomic claim — skip if another retry already grabbed this row
         const { rows: claimed } = await query(
           `UPDATE write_queue SET status='processing', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
-            WHERE id=$1 AND status IN ('desktop_offline','failed')
+            WHERE id=$1 AND status IN ('desktop_offline','failed') AND outcome_unknown IS NOT TRUE
             RETURNING id`,
           [entry.id]
         );
         if (!claimed[0]) continue;
+        const userId = entry.actor_user_id ?? entry.user_id ?? null;
         if (entry.tally_voucher_number) {
           await query(`UPDATE write_queue SET status='success', updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$1`, [entry.id]);
           // Already posted to Tally without re-running the Sales/Purchase route —
@@ -6219,7 +6281,7 @@ ${ifscCode ? `    <IFSCODE>${escapeXml(ifscCode)}</IFSCODE>` : ''}
 <TALLYMESSAGE xmlns:UDF="TallyUDF">
 <LEDGER NAME="${escapeXml(ledgerName)}" ACTION="${tallyAction}">
   <NAME>${escapeXml(ledgerName)}</NAME>
-  <PARENT>${parentGroup}</PARENT>
+  <PARENT>${xmlText(parentGroup)}</PARENT>
   <OPENINGBALANCE>${openBalXml}</OPENINGBALANCE>
   <DESCRIPTION>${escapeXml(typeDesc)}</DESCRIPTION>
   ${holderName ? `<BANKACCHOLDERNAME>${escapeXml(holderName)}</BANKACCHOLDERNAME>` : ''}
@@ -6385,7 +6447,7 @@ router.get('/master/bank', authMiddleware, async (req, res) => {
 // UDF intentionally skipped (requires TDL/TCP — future phase).
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const escXml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+const escXml = xmlText;
 
 /**
  * Append warehouse code as a Godown Alias in Tally without overwriting existing aliases.
@@ -6580,6 +6642,7 @@ router.post('/desktop/writeback/pending', requireDeviceCredential, async (req, r
     const clauses = [
       `workspace_id = $2`,
       `status IN ('desktop_offline','failed')`,
+      `outcome_unknown IS NOT TRUE`,
       `attempt_count < 5`,
       `(lock_expires_at IS NULL OR lock_expires_at < $1)`,
     ];
@@ -6633,6 +6696,7 @@ router.post('/desktop/writeback/:outboxId/claim', requireDeviceCredential, async
        WHERE id=$4
          AND workspace_id=$5
          AND status IN ('desktop_offline','failed')
+         AND outcome_unknown IS NOT TRUE
          AND (lock_expires_at IS NULL OR lock_expires_at < $2)
        RETURNING id, xml, payload, entry_type, company_guid`,
       [desktop.deviceId, now, lockExpiresAt, outboxId, desktop.workspaceId]

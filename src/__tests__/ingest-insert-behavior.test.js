@@ -6,12 +6,17 @@ describe('BEHAVIORAL: ingest writers bind company_id', () => {
   let client;
   const otherCid = 12689001;
   const guid = 'behavior-test-group-guid';
+  // Company 12689 exists only in the shared development database; skip elsewhere.
+  let fixturePresent = false;
 
   before(async () => {
     ({ query } = await import('../db/schema.js'));
     const pool = (await import('../db/schema.js'));
     const { getClient } = pool;
     client = await getClient();
+    const { rows: fixture } = await client.query('SELECT 1 FROM companies WHERE id = $1', [12689]);
+    fixturePresent = fixture.length > 0;
+    if (!fixturePresent) return;
     await client.query('BEGIN');
     await client.query(
       `INSERT INTO groups (guid, company_guid, name, parent, company_id)
@@ -26,7 +31,8 @@ describe('BEHAVIORAL: ingest writers bind company_id', () => {
     try { client.release(); } catch {}
   });
 
-  it('inserted group belongs to company 12689 and not another company_id', async () => {
+  it('inserted group belongs to company 12689 and not another company_id', async (t) => {
+    if (!fixturePresent) return t.skip('company 12689 fixture not present');
     const { rows } = await client.query(
       `SELECT company_id, name FROM groups WHERE name = $1 AND company_id = ANY($2::int[])`,
       ['__tdk_behavior_group__', [12689, otherCid]]
@@ -36,7 +42,8 @@ describe('BEHAVIORAL: ingest writers bind company_id', () => {
     assert.ok(rows[0].company_id != null);
   });
 
-  it('same GUID in another company_id is not created by this insert', async () => {
+  it('same GUID in another company_id is not created by this insert', async (t) => {
+    if (!fixturePresent) return t.skip('company 12689 fixture not present');
     const { rows } = await client.query(
       `SELECT COUNT(*)::int AS c FROM groups WHERE guid = $1 AND company_id = $2`,
       [guid, otherCid]

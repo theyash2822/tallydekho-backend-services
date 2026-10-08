@@ -32,47 +32,61 @@ async function resolveCompanyRoomId(companyGuid, { companyId = null, workspaceId
   return rows[0]?.id ?? null;
 }
 
-function emitCompanyEvent(companyId, companyGuid, event, payload) {
+/** Clients drop company events that do not name their active workspace. */
+async function resolveCompanyWorkspaceId(companyId, workspaceId) {
+  if (workspaceId) return workspaceId;
+  if (companyId == null) return null;
+  const { rows } = await query(`SELECT workspace_id FROM companies WHERE id = $1 LIMIT 1`, [companyId]);
+  return rows[0]?.workspace_id ?? null;
+}
+
+function emitCompanyEvent(companyId, companyGuid, event, payload, workspaceId = null) {
   if (!_io || companyId == null) return;
   _io.to(`company:${companyId}`).emit(event, {
     ...payload,
     companyId,
     companyGuid,
+    workspaceId,
   });
 }
 
 export async function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
   if (!_io) return;
   const companyId = await resolveCompanyRoomId(companyGuid, opts);
+  const workspaceId = await resolveCompanyWorkspaceId(companyId, opts.workspaceId);
   emitCompanyEvent(companyId, companyGuid, 'voucher:regularized', {
     tdkReferenceNo: tdkRef,
+    tdkRef,
     tallyVoucherNo,
     currentEntryType: 'regular',
     booksImpactStatus: 'posted',
     conversionStatus: 'converted',
     timestamp: new Date().toISOString(),
-  });
+  }, workspaceId);
   console.log(`[socket] voucher:regularized emitted for ${tdkRef} room=company:${companyId}`);
 }
 
 export async function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
   if (!_io) return;
   const companyId = await resolveCompanyRoomId(companyGuid, opts);
+  const workspaceId = await resolveCompanyWorkspaceId(companyId, opts.workspaceId);
   emitCompanyEvent(companyId, companyGuid, 'voucher:tallySynced', {
     tdkReferenceNo: tdkRef,
+    tdkRef,
     tallyVoucherNo,
     tallySyncStatus: 'synced',
     booksImpactStatus: 'posted',
     timestamp: new Date().toISOString(),
-  });
+  }, workspaceId);
   // Spec-compliant event for the invoice preview/share flow
   emitCompanyEvent(companyId, companyGuid, 'invoice_posting_updated', {
     referenceNumber: tdkRef,
+    tdkRef,
     postingTag: 'Posted',
     invoiceNumberLabel: tallyVoucherNo,
     tallyVoucherNo,
     timestamp: new Date().toISOString(),
-  });
+  }, workspaceId);
   console.log(`[socket] voucher:tallySynced + invoice_posting_updated emitted for ${tdkRef}`);
 }
 
@@ -125,7 +139,7 @@ export function setupSocket(io) {
             const { rows: pendingRows } = await query(
               `SELECT COUNT(*) AS cnt FROM write_queue
                 WHERE workspace_id = $1
-                  AND status IN ('desktop_offline','failed') AND attempt_count < 5
+                  AND status IN ('desktop_offline','failed') AND outcome_unknown IS NOT TRUE AND attempt_count < 5
                   AND (lock_expires_at IS NULL OR lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)`,
               [workspaceId]
             ).catch(() => ({ rows: [] }));

@@ -178,6 +178,24 @@ export async function applyWorkspaceSchema(client) {
       ledger_name     TEXT,
       UNIQUE (workspace_id, company_guid, payment_mode)
     );
+    -- Databases created before the UNIQUE clause lack it; add it only when existing rows allow.
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+         WHERE i.indrelid = 'payment_mode_posting_map'::regclass AND i.indisunique
+           AND (SELECT array_agg(a.attname::text ORDER BY k.ord)
+                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum)
+               = ARRAY['workspace_id', 'company_guid', 'payment_mode']
+      ) AND NOT EXISTS (
+        SELECT 1 FROM payment_mode_posting_map
+         GROUP BY workspace_id, company_guid, payment_mode HAVING COUNT(*) > 1
+      ) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_mode_posting_map_mode
+          ON payment_mode_posting_map (workspace_id, company_guid, payment_mode);
+      END IF;
+    END $$;
 
     CREATE TABLE IF NOT EXISTS cost_centres (
       guid            TEXT NOT NULL,

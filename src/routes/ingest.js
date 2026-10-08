@@ -3,6 +3,22 @@ import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
 import { processIngestedData, backfillTaxTransactions } from '../controllers/ingestProcessor.js';
+import { IngestBatchError } from '../utils/ingestCompanyDualWrite.js';
+import {
+  parseChunkBody,
+  ChunkBodyError,
+  chunkContentHash,
+  claimChunk,
+  markChunkApplied,
+  releaseChunkClaim,
+} from '../utils/chunkReceipts.js';
+import {
+  startSyncRun,
+  heartbeatSyncRun,
+  finishSyncRun,
+  normalizeTerminalStatus,
+  isVerifiedSyncSuccess,
+} from '../utils/syncRuns.js';
 import {
   reconcileStockOpeningsFromTransactions,
   backfillStockMovementVoucherTypes,
@@ -197,7 +213,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
               device_id = EXCLUDED.device_id,
               name = EXCLUDED.name, formal_name = EXCLUDED.formal_name,
               gstin = COALESCE(EXCLUDED.gstin, companies.gstin), fy_start = EXCLUDED.fy_start,
-              fy_end = EXCLUDED.fy_end, synced_at = EXCLUDED.synced_at,
+              fy_end = EXCLUDED.fy_end,
               is_active = TRUE,
               gst_taxpayer_type = EXCLUDED.gst_taxpayer_type,
               pan     = COALESCE(EXCLUDED.pan,     companies.pan),
@@ -211,7 +227,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
               country = COALESCE(EXCLUDED.country, companies.country)
             RETURNING id
           `, [c.guid, deviceId, workspaceId, c.name || c.NAME || 'Unknown', c.formalName || c.name || '',
-              c.gstin || c.GSTIN || c.gstNumber || null, c.startingFrom || null, c.endingAt || null, now(),
+              c.gstin || c.GSTIN || c.gstNumber || null, c.startingFrom || null, c.endingAt || null, null,
               normalizeGstType(c.GSTREGISTRATIONTYPE || c.GstRegistrationType || c.TAXPAYERTYPE || c.TaxpayerType || null),
               c.incomeTaxNumber || c.INCOMETAXNUMBER || null,
               c.phoneNumber || c.PHONENUMBER || null,
@@ -401,12 +417,13 @@ router.post('/ingest/sync-run/start', requireDeviceCredential, async (req, res) 
       companyGuid,
       device: req.device,
     });
-    const { rows } = await query(
-      `INSERT INTO sync_runs (company_guid, company_id, sync_type, status, expected_counts, started_at)
-       VALUES ($1, $2, $3, 'running', $4, NOW()) RETURNING id`,
-      [company.guid, company.id, syncType, expectedCounts ? JSON.stringify(expectedCounts) : null]
-    );
-    const syncRunId = rows[0].id;
+    const syncRunId = await startSyncRun(query, {
+      companyGuid: company.guid,
+      companyId: company.id,
+      deviceId: req.deviceId || req.headers['device-id'],
+      syncType,
+      expectedCounts,
+    });
     console.log(`[SYNC_RUN] started ${syncRunId} | company: ${companyGuid} | type: ${syncType}`);
     res.json({ status: true, data: { syncRunId } });
   } catch (err) {
@@ -422,18 +439,55 @@ router.post('/ingest/sync-run/start', requireDeviceCredential, async (req, res) 
   }
 });
 
-// POST /ingest/sync-run/complete — V2: mark sync_run as completed with record counts
+const SYNC_RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// POST /ingest/sync-run/heartbeat — extends the run lease while the desktop is still extracting
+router.post('/ingest/sync-run/heartbeat', requireDeviceCredential, async (req, res) => {
+  let body = req.body;
+  if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
+  const { syncRunId } = body || {};
+  if (!SYNC_RUN_ID_RE.test(String(syncRunId || ''))) {
+    return res.status(400).json({ status: false, code: 'SYNC_RUN_ID_INVALID', message: 'valid syncRunId required' });
+  }
+  try {
+    const alive = await heartbeatSyncRun(query, { syncRunId, deviceId: req.deviceId || req.headers['device-id'] });
+    if (!alive) {
+      return res.status(409).json({ status: false, code: 'SYNC_RUN_NOT_RUNNING', message: 'sync run is not running for this device' });
+    }
+    res.json({ status: true, data: { syncRunId } });
+  } catch (err) {
+    console.error('[SYNC_RUN] heartbeat error:', err.message);
+    res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+// POST /ingest/sync-run/complete — fenced terminal transition by the device that owns the run
 router.post('/ingest/sync-run/complete', requireDeviceCredential, async (req, res) => {
   let body = req.body;
   if (Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { body = {}; } }
-  const { syncRunId, uploadId, recordCounts, status = 'completed', errorMessage } = body || {};
-  if (!syncRunId) return res.status(400).json({ status: false, message: 'syncRunId required' });
+  const { syncRunId, uploadId, recordCounts, errorMessage } = body || {};
+  if (!SYNC_RUN_ID_RE.test(String(syncRunId || ''))) {
+    return res.status(400).json({ status: false, code: 'SYNC_RUN_ID_INVALID', message: 'valid syncRunId required' });
+  }
+  const status = normalizeTerminalStatus(body?.status);
+  if (!status) {
+    return res.status(400).json({ status: false, code: 'SYNC_RUN_STATUS_INVALID', message: 'status must be completed, partial or failed' });
+  }
   try {
-    await query(
-      `UPDATE sync_runs SET status=$1, record_counts=$2, upload_id=$3, error_message=$4, completed_at=NOW()
-       WHERE id=$5`,
-      [status, recordCounts ? JSON.stringify(recordCounts) : null, uploadId || null, errorMessage || null, syncRunId]
-    );
+    const result = await finishSyncRun(query, {
+      syncRunId,
+      deviceId: req.deviceId || req.headers['device-id'],
+      status,
+      recordCounts,
+      uploadId,
+      errorMessage,
+    });
+    if (!result.ok) {
+      const httpStatus = result.reason === 'not_found' ? 404 : result.reason === 'not_owner' ? 403 : 409;
+      const code = result.reason === 'not_found' ? 'SYNC_RUN_NOT_FOUND'
+        : result.reason === 'not_owner' ? 'SYNC_RUN_OWNERSHIP_DENIED' : 'SYNC_RUN_NOT_RUNNING';
+      return res.status(httpStatus).json({ status: false, code, message: code, currentStatus: result.status || null });
+    }
     console.log(`[SYNC_RUN] ${status} ${syncRunId}`);
     res.json({ status: true, data: { syncRunId, status } });
   } catch (err) {
@@ -465,16 +519,15 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
     const userId = device.user_id || null;
 
     let data;
-    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body;
-    if (typeof raw === 'string') {
-      const lines = raw.trim().split('\n').filter(Boolean);
-      data = lines.length > 1
-        ? lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
-        : JSON.parse(raw);
-    } else {
-      data = raw;
+    try {
+      data = parseChunkBody(req.body);
+    } catch (err) {
+      if (err instanceof ChunkBodyError) {
+        console.error(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} rejected: ${err.code}${err.line ? ` at line ${err.line}` : ''}`);
+        return res.status(400).json({ status: false, code: err.code, line: err.line, message: err.message });
+      }
+      throw err;
     }
-    if (!Array.isArray(data)) data = data ? [data] : [];
 
     // Ownership: uploadId must belong to this authenticated device
     const { rows: owned } = await query(
@@ -525,28 +578,69 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
       throw err;
     }
 
-    for (const { company, records } of resolved) {
-      await query(
-        `UPDATE ingest_uploads SET company_id = $1, company_guid = $2
-         WHERE id = $3 AND device_id = $4`,
-        [company.id, company.guid, uploadId, deviceId]
-      );
-      console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${company.guid} | companyId: ${company.id} | records: ${records.length}${resolved.length > 1 ? ` (1 of ${resolved.length} companies in chunk)` : ''}`);
-      if (records.length > 0) {
-        await processIngestedData(streamName, records, company.guid, userId, deviceId, {
-          companyId: company.id,
-          uploadId,
-          billSnapshotMode: req.headers['bill-snapshot-mode'] || null,
-          chunkKey: `${streamName}:${chunkIndex}`,
-        });
-      }
+    const receiptKey = { uploadId, stream: streamName, chunkIndex };
+    const claim = await claimChunk(query, {
+      ...receiptKey,
+      hash: chunkContentHash(req.body),
+      recordCount: data.length,
+    });
+    if (claim.outcome === 'duplicate') {
+      console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} already applied — acknowledged without re-applying`);
+      return res.json({ status: true, data: { received: true, chunkIndex, duplicate: true } });
+    }
+    if (claim.outcome === 'conflict') {
+      return res.status(409).json({
+        status: false,
+        code: 'CHUNK_CONTENT_CONFLICT',
+        message: 'This chunk index was already applied with different content. Start a new sync.',
+      });
+    }
+    if (claim.outcome === 'in_progress') {
+      return res.status(409).json({
+        status: false,
+        code: 'CHUNK_IN_PROGRESS',
+        message: 'This chunk is still being applied. Retry shortly.',
+      });
     }
 
+    try {
+      for (const { company, records } of resolved) {
+        await query(
+          `UPDATE ingest_uploads SET company_id = $1, company_guid = $2
+           WHERE id = $3 AND device_id = $4`,
+          [company.id, company.guid, uploadId, deviceId]
+        );
+        console.log(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} | company: ${company.guid} | companyId: ${company.id} | records: ${records.length}${resolved.length > 1 ? ` (1 of ${resolved.length} companies in chunk)` : ''}`);
+        if (records.length > 0) {
+          await processIngestedData(streamName, records, company.guid, userId, deviceId, {
+            companyId: company.id,
+            uploadId,
+            billSnapshotMode: req.headers['bill-snapshot-mode'] || null,
+            chunkKey: `${streamName}:${chunkIndex}`,
+          });
+        }
+      }
+    } catch (err) {
+      await releaseChunkClaim(query, receiptKey).catch(() => {});
+      throw err;
+    }
+
+    await markChunkApplied(query, receiptKey);
     await query('UPDATE ingest_uploads SET chunks = chunks + 1 WHERE id = $1', [uploadId]);
     res.json({ status: true, data: { received: true, chunkIndex } });
   } catch (err) {
+    if (err instanceof IngestBatchError) {
+      console.error(`[INGEST] chunk ${chunkIndex} | stream: ${streamName} rolled back:`, err.failures.map((f) => f.message).join(' | '));
+      return res.status(500).json({
+        status: false,
+        code: err.code,
+        failedUnits: err.failures.length,
+        pgCodes: [...new Set(err.failures.map((f) => f.pgCode).filter(Boolean))],
+        message: 'Part of this chunk could not be saved and was rolled back. The sync will need to retry.',
+      });
+    }
     console.error('[INGEST] chunk error:', err.message);
-    res.status(500).json({ status: false, message: 'Chunk processing failed' });
+    res.status(500).json({ status: false, code: 'CHUNK_FAILED', message: 'Chunk processing failed' });
   }
 });
 
@@ -706,12 +800,16 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     );
     await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
 
+    const verifiedSuccess = isVerifiedSyncSuccess(ingestWarnings);
     for (const { guid: companyGuid, id: resolvedCompanyId } of companies) {
-      await query('UPDATE companies SET synced_at = $1 WHERE guid = $2 AND workspace_id = $3', [
-        now(),
-        companyGuid,
-        device?.workspace_id || null,
-      ]);
+      await query(
+        `UPDATE companies
+            SET last_sync_attempt_at = $1,
+                last_sync_outcome    = $4,
+                synced_at            = CASE WHEN $5::boolean THEN $1 ELSE synced_at END
+          WHERE guid = $2 AND workspace_id = $3`,
+        [now(), companyGuid, device?.workspace_id || null, ingestOutcome, verifiedSuccess]
+      );
 
       // Log the sync operation
       await query(
