@@ -654,7 +654,6 @@ export async function initSchema() {
       ALTER TABLE voucher_ledger_entries ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE stock_transactions    ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE stock_transactions    ADD COLUMN IF NOT EXISTS warehouse_guid TEXT;
-      ALTER TABLE batch_allocations     ADD COLUMN IF NOT EXISTS godown_guid TEXT;
       ALTER TABLE voucher_inventory_items ADD COLUMN IF NOT EXISTS financial_year TEXT;
       ALTER TABLE gst_voucher_details   ADD COLUMN IF NOT EXISTS financial_year TEXT;
 
@@ -755,6 +754,7 @@ export async function initSchema() {
         synced_at      TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(voucher_guid, company_guid, stock_item_name, batch_name, godown_name)
       );
+      ALTER TABLE batch_allocations     ADD COLUMN IF NOT EXISTS godown_guid TEXT;
       CREATE INDEX IF NOT EXISTS idx_ba_company ON batch_allocations(company_guid);
       CREATE INDEX IF NOT EXISTS idx_ba_stock   ON batch_allocations(company_guid, stock_item_name);
       CREATE INDEX IF NOT EXISTS idx_ba_batch   ON batch_allocations(batch_name);
@@ -834,15 +834,6 @@ export async function initSchema() {
       ALTER TABLE stocks ADD COLUMN IF NOT EXISTS type_of_supply    TEXT;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS reorder_level     DECIMAL(15,4) DEFAULT 0;
       ALTER TABLE groups ADD COLUMN IF NOT EXISTS minimum_order_qty DECIMAL(15,4) DEFAULT 0;
-
-      -- Phase A+B+C: app_vouchers new columns (invoice_uuid, numbering_policy, tally_voucher_no)
-      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS invoice_uuid     UUID DEFAULT gen_random_uuid() UNIQUE;
-      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS numbering_policy TEXT NOT NULL DEFAULT 'tally_prime_series';
-
-      -- Invoice+Receipt split (2026-06-30): links a Receipt app_voucher to its parent Sales Invoice
-      -- via Sales Invoice's invoice_uuid. NULL for all standalone vouchers (invoices, regular receipts).
-      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS parent_invoice_uuid UUID;
-      CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent ON app_vouchers(parent_invoice_uuid);
 
       -- Bill-wise allocation (Phase B+C, 2026-06-30): cached from Tally's BILLALLOCATIONS.LIST so
       -- the reconciler can match Receipts (where Tally drops top-level <REFERENCE>) by Agst Ref linkage.
@@ -1091,6 +1082,15 @@ export async function initSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_company ON app_vouchers(company_guid);
       CREATE INDEX IF NOT EXISTS idx_app_vouchers_wqid    ON app_vouchers(write_queue_id);
+
+      -- Phase A+B+C: app_vouchers new columns (invoice_uuid, numbering_policy, tally_voucher_no)
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS invoice_uuid     UUID DEFAULT gen_random_uuid() UNIQUE;
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS numbering_policy TEXT NOT NULL DEFAULT 'tally_prime_series';
+
+      -- Invoice+Receipt split (2026-06-30): links a Receipt app_voucher to its parent Sales Invoice
+      -- via Sales Invoice's invoice_uuid. NULL for all standalone vouchers (invoices, regular receipts).
+      ALTER TABLE app_vouchers ADD COLUMN IF NOT EXISTS parent_invoice_uuid UUID;
+      CREATE INDEX IF NOT EXISTS idx_app_vouchers_parent ON app_vouchers(parent_invoice_uuid);
 
       -- ── Invoice PDF Versions (Phase C) ──────────────────────────────────────
       CREATE TABLE IF NOT EXISTS invoice_pdf_versions (
