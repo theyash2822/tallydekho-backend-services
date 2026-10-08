@@ -16,6 +16,8 @@ export { ingestCompanyCtx };
 import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
 import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
 import { aggregateInventoryLines } from '../utils/inventoryLineAggregate.js';
+import { isTallyTrue } from '../utils/tallyFields.js';
+import { classifyStockFyBalanceRows } from '../utils/stockFyBalance.js';
 
 // Rows created by an immediate app-side insert (gen_random_uuid) before Tally's own GUID arrives.
 const PLACEHOLDER_LEDGER_GUID_RE = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
@@ -987,13 +989,13 @@ async function processVouchers(data, companyGuid) {
       // VoucherType is the field name in AllVoucher.xml; VoucherTypeName in SimplifiedVoucher / Voucher.xml
       const voucherType   = r.VoucherTypeName || r.VOUCHERTYPENAME || r.VoucherType || r.voucherType || 'Voucher';
       const date          = normalizeDate(r.Date || r.DATE || r.date);
-      const isCancelled   = (r.ISCANCELLED === 'Yes' || r.IsCancelled === 'Yes' || r.ISCANCELLED === true);
+      const isCancelled   = isTallyTrue(r.ISCANCELLED) || isTallyTrue(r.IsCancelled);
       const cancelFlagPresent = [r.ISCANCELLED, r.IsCancelled, r.isCancelled].some((v) => v !== undefined && v !== null && v !== '');
       // Optional flag may arrive under several casings from Simplified / All / Single voucher XML.
       // Track presence separately from value — a missing/empty flag must NOT mean "became regular".
       const optionalRaw   = r.ISOPTIONAL ?? r.isOptional ?? r.IsOptional;
       const optionalFlagPresent = optionalRaw !== undefined && optionalRaw !== null && optionalRaw !== '';
-      const isOptional    = !!(optionalRaw === 1 || optionalRaw === '1' || optionalRaw === 'Yes' || optionalRaw === true);
+      const isOptional    = isTallyTrue(optionalRaw);
       const partyGuid     = r.PARTYLEDGERGUID || r.PARTYGUIDS || r.PartyGuid || r.partyGuid || null;
       // Thin Simplified stubs historically exported isOptional=0 without FETCHing IsOptional.
       // Never treat those as proof of Optional→Regular conversion.
@@ -3034,20 +3036,13 @@ async function applyCurrentFyClosingQty(companyGuid) {
 async function processStockFyBalance(data, companyGuid) {
   if (!data || data.length === 0) return;
 
-  const financialYear = data[0]?._FINANCIAL_YEAR;
-  if (!financialYear) {
-    console.warn('[DB] StockFyBalance: no financial_year on records — skipping');
-    return;
+  const { groups, rejected } = classifyStockFyBalanceRows(data);
+  if (rejected.length) {
+    const reasons = [...new Set(rejected.map((r) => r.reason))].join(',');
+    console.warn(`[DB] StockFyBalance: ${rejected.length} row(s) not stored for ${companyGuid} (${reasons})`);
+    await recordIngestWarning('stock_fy_balance_rejected', `${rejected.length} row(s): ${reasons}`);
   }
-
-  // Determine if this is an OPENING query (date = FY_start - 1) or CLOSING query (date = FY_end)
-  // We detect by comparing FROM_DATE to FY boundaries
-  const fromDate = data[0]?.FROM_DATE || data[0]?.from_date || '';
-  const fyYear   = financialYear; // e.g. '2025-2026'
-  const fyStart  = fyYear.split('-')[0] + '0401'; // e.g. '20250401'
-  const fyEnd    = (parseInt(fyYear.split('-')[0]) + 1) + '0331'; // e.g. '20260331'
-  const isClosingQuery = (fromDate === fyEnd);
-  const isOpeningQuery = (fromDate !== fyEnd); // any date before FY start
+  if (!groups.length) return;
 
   const now = Math.floor(Date.now() / 1000);
   const client = wrapIngestClient(await getClient());
@@ -3055,53 +3050,46 @@ async function processStockFyBalance(data, companyGuid) {
     await client.query('BEGIN');
     let saved = 0;
 
-    for (const r of data) {
-      const name = r.Name || r.NAME || '';
-      if (!name) continue;
-
-      const closeQty = parseFloat(String(r.ClosingQty  || r.CLOSINGQTY  || 0).replace(/[^0-9.-]/g, '')) || 0;
-      const closeRate= parseFloat(String(r.ClosingRate || r.CLOSINGRATE || 0).replace(/[^0-9.-]/g, '')) || 0;
-      const rawVal   = String(r.ClosingValue || r.CLOSINGVALUE || 0).replace('(-)', '-');
-      const closeVal = parseFloat(rawVal.replace(/[^0-9.-]/g, '')) * (rawVal.includes('-') ? -1 : 1) || 0;
-      const guid     = r.Guid || r.GUID || null;
-
-      try {
-        if (isClosingQuery) {
-          // Update or insert closing_value for this FY
-          await client.query(`
-            INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, closing_qty, closing_rate, closing_value, synced_at, company_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
-            ON CONFLICT (company_id, financial_year, stock_name)
-            DO UPDATE SET
-              company_id = COALESCE(EXCLUDED.company_id, stock_fy_valuation.company_id), closing_qty   = EXCLUDED.closing_qty,
-              closing_rate  = EXCLUDED.closing_rate,
-              closing_value = EXCLUDED.closing_value,
-              synced_at     = EXCLUDED.synced_at`,
-            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
-          );
-        } else {
-          // Opening query: store as NEXT FY's opening
-          // date = FY_start - 1 day → this is the opening of financialYear
-          await client.query(`
-            INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, opening_qty, opening_rate, opening_value, synced_at, company_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
-            ON CONFLICT (company_id, financial_year, stock_name)
-            DO UPDATE SET
-              opening_qty   = EXCLUDED.opening_qty,
-              opening_rate  = EXCLUDED.opening_rate,
-              opening_value = EXCLUDED.opening_value,
-              synced_at     = EXCLUDED.synced_at`,
-            [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
-          );
+    for (const { financialYear, role, items } of groups) {
+      const isClosingQuery = role === 'closing';
+      for (const { name, guid, qty: closeQty, rate: closeRate, value: closeVal } of items) {
+        try {
+          if (isClosingQuery) {
+            // Update or insert closing_value for this FY
+            await client.query(`
+              INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, closing_qty, closing_rate, closing_value, synced_at, company_id)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+              ON CONFLICT (company_id, financial_year, stock_name)
+              DO UPDATE SET
+                company_id = COALESCE(EXCLUDED.company_id, stock_fy_valuation.company_id), closing_qty   = EXCLUDED.closing_qty,
+                closing_rate  = EXCLUDED.closing_rate,
+                closing_value = EXCLUDED.closing_value,
+                synced_at     = EXCLUDED.synced_at`,
+              [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
+            );
+          } else {
+            // date = FY_start - 1 day → this is the opening of financialYear
+            await client.query(`
+              INSERT INTO stock_fy_valuation (company_guid, financial_year, stock_name, stock_guid, opening_qty, opening_rate, opening_value, synced_at, company_id)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8, $9)
+              ON CONFLICT (company_id, financial_year, stock_name)
+              DO UPDATE SET
+                opening_qty   = EXCLUDED.opening_qty,
+                opening_rate  = EXCLUDED.opening_rate,
+                opening_value = EXCLUDED.opening_value,
+                synced_at     = EXCLUDED.synced_at`,
+              [companyGuid, financialYear, name, guid, closeQty, closeRate, closeVal, now, currentCompanyId()]
+            );
+          }
+          saved++;
+        } catch (e) {
+          console.warn('[DB] StockFyBalance upsert failed:', e.message, name);
         }
-        saved++;
-      } catch (e) {
-        console.warn('[DB] StockFyBalance upsert failed:', e.message, name);
       }
     }
 
     await client.query('COMMIT');
-    console.log(`[DB] StockFyBalance: saved ${saved}/${data.length} for ${companyGuid} FY ${financialYear} type=${isClosingQuery?'closing':'opening'}`);
+    console.log(`[DB] StockFyBalance: saved ${saved}/${data.length} for ${companyGuid} scopes=${groups.map((g) => `${g.financialYear}:${g.role}`).join(',')}`);
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockFyBalance failed:', e.message);
@@ -3630,7 +3618,7 @@ async function processUnits(data, companyGuid) {
         `, [
           r.Guid || null, companyGuid, name,
           r.FORMAL_NAME || r.FormalName || name,
-          !!(r.IS_SIMPLE_UNIT === '1' || r.IS_SIMPLE_UNIT === true),
+          isTallyTrue(r.IS_SIMPLE_UNIT),
           r.BASE_UNITS || r.BaseUnits || null,
           r.ADDITIONAL_UNITS || null,
           r.CONVERSION || null,

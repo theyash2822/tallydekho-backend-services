@@ -1,5 +1,13 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P3 text-typed Tally fields and per-row stock FY balances (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **Flags (01):** `utils/tallyFields.js` `isTallyTrue` accepts `Yes`/`true`/`1` text and legacy coerced values; used for cancelled, optional and simple-unit flags (new desktops send exact text).
+- **Stock FY balances (S6):** `utils/stockFyBalance.js` classifies every StockFYBalance row by its own `_FINANCIAL_YEAR`/`FY_BEGIN`/`FY_END`/`BALANCE_DATE`/`BALANCE_ROLE` (no `data[0]`, no March-31 rule); a role that contradicts its date or missing metadata is rejected with an ingest warning; identical replays collapse, contradictory duplicates are not written. Older desktops are classified per row with the legacy rule. Value sign handling unchanged.
+- Verified (03): `0b9df2f` is on this branch.
+- Tested: `p3-fiscal-lossless.unit.test.js` 8/8; isolated PG `p3-fiscal` 2/2 + `p2-integrity` 10/10; DB-free regression 46/46 + bind count 3/3. Not run: real DB, Windows/Tally.
+- Risks: closing columns of `stock_fy_valuation` now fill from StockFYBalance; historical rows written under the old label stay until a re-sync / P7 repair.
+
 ## 2026-10-08 — P2 ingest integrity, chunk receipts, sync runs, write-back safety (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **Truthful batches (X3):** `wrapIngestClient` refuses COMMIT of an aborted transaction and records it; `processIngestedData` throws `IngestBatchError`; `/ingest/chunk` → 500 `INGEST_BATCH_FAILED` instead of 200.
