@@ -40,6 +40,18 @@ async function resolveCompanyWorkspaceId(companyId, workspaceId) {
   return rows[0]?.workspace_id ?? null;
 }
 
+/** Emits run after COMMIT without await; a lookup failure must not become an unhandled rejection. */
+async function resolveEmitScope(companyGuid, opts) {
+  try {
+    const companyId = await resolveCompanyRoomId(companyGuid, opts);
+    const workspaceId = await resolveCompanyWorkspaceId(companyId, opts.workspaceId);
+    return { companyId, workspaceId };
+  } catch (err) {
+    console.error('[socket] company scope lookup failed:', err.message);
+    return { companyId: null, workspaceId: null };
+  }
+}
+
 function emitCompanyEvent(companyId, companyGuid, event, payload, workspaceId = null) {
   if (!_io || companyId == null) return;
   _io.to(`company:${companyId}`).emit(event, {
@@ -52,8 +64,7 @@ function emitCompanyEvent(companyId, companyGuid, event, payload, workspaceId = 
 
 export async function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
   if (!_io) return;
-  const companyId = await resolveCompanyRoomId(companyGuid, opts);
-  const workspaceId = await resolveCompanyWorkspaceId(companyId, opts.workspaceId);
+  const { companyId, workspaceId } = await resolveEmitScope(companyGuid, opts);
   emitCompanyEvent(companyId, companyGuid, 'voucher:regularized', {
     tdkReferenceNo: tdkRef,
     tdkRef,
@@ -68,8 +79,7 @@ export async function emitVoucherRegularized(companyGuid, tdkRef, tallyVoucherNo
 
 export async function emitVoucherSynced(companyGuid, tdkRef, tallyVoucherNo, opts = {}) {
   if (!_io) return;
-  const companyId = await resolveCompanyRoomId(companyGuid, opts);
-  const workspaceId = await resolveCompanyWorkspaceId(companyId, opts.workspaceId);
+  const { companyId, workspaceId } = await resolveEmitScope(companyGuid, opts);
   emitCompanyEvent(companyId, companyGuid, 'voucher:tallySynced', {
     tdkReferenceNo: tdkRef,
     tdkRef,

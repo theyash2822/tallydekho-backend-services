@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P8 QA follow-up (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **Restore completion** is one transaction (claim, device activation, old-device revoke, binding, watermark reset, COMPLETED). A failure part-way rolls back and the desktop's pending acknowledgement can complete it later; no session stuck in COMPLETING.
+- **Socket emits:** company/workspace lookup for post-commit events is caught (`resolveEmitScope`); a DB error skips the event instead of an unhandled rejection.
+- **Repair CLI** accepts `TD_REPAIR_DATABASE_URL` (keeps credentials out of shell history/`ps`).
+- **Tests:** isolated 33/33 (new rollback test in `p5-backup-restore`), DB-free 40/40.
+
 ## 2026-10-08 — P7 historical-damage repair tooling (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **New:** `src/services/repairTools.js` and operator CLI `scripts/td-repair.mjs` for audit items I.1–I.8. Preview (default) is read-only and scoped to one workspace + company; it classifies findings as confirmed/suspected/unverifiable and prints counts and ids only.

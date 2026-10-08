@@ -1,5 +1,5 @@
 import { v4 as uuid } from 'uuid';
-import { query } from '../db/schema.js';
+import { query, getClient } from '../db/schema.js';
 import { audit } from './auditService.js';
 import { generateShortCode, hashSecret, verifySecret, hashToken, generateDeviceSecret } from './deviceCredential.js';
 import { listAvailableBackups, getBackup, downloadAuthFor } from './backupService.js';
@@ -256,54 +256,63 @@ export async function completeRestore({ deviceId, restoreToken, ok, lineageGuids
     throw err;
   }
 
-  const { rows: old } = await query(
-    `SELECT device_id FROM devices WHERE workspace_id = $1 AND paired = TRUE AND device_id <> $2`,
-    [session.workspace_id, deviceId]
-  );
-
-  const { rowCount: claimed } = await query(
-    `UPDATE restore_sessions SET status = 'COMPLETING' WHERE id = $1 AND status IN ('APPROVED','DOWNLOADING')`,
-    [session.id]
-  );
-  if (!claimed) throw restoreError('RESTORE_SESSION_EXPIRED', 'Restore completion already in progress', 409);
-
   const secret = generateDeviceSecret();
   const secretHash = await hashSecret(secret);
 
-  await query(
-    `UPDATE devices SET
-       paired = TRUE, binding_status = 'ACTIVE', workspace_id = $2,
-       device_secret_hash = $3, credential_claimed_at = NULL
-     WHERE device_id = $1`,
-    [deviceId, session.workspace_id, secretHash]
-  );
-
-  for (const row of old) {
-    await query(
-      `UPDATE devices SET paired = FALSE, binding_status = 'REVOKED', device_secret_hash = NULL, workspace_id = NULL
-       WHERE device_id = $1`,
-      [row.device_id]
+  // One transaction: a failure part-way leaves the session APPROVED/DOWNLOADING so the
+  // Desktop's pending acknowledgement can complete it, instead of a stuck COMPLETING row.
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const { rowCount: claimed } = await client.query(
+      `UPDATE restore_sessions SET status = 'COMPLETING' WHERE id = $1 AND status IN ('APPROVED','DOWNLOADING')`,
+      [session.id]
     );
-  }
+    if (!claimed) throw restoreError('RESTORE_SESSION_EXPIRED', 'Restore completion already in progress', 409);
 
-  await query(
-    `UPDATE workspace_tally_bindings SET active_device_id = $2, connection_status = 'CONNECTED', last_verified_at = $3, updated_at = $3
-     WHERE workspace_id = $1`,
-    [session.workspace_id, deviceId, now()]
-  );
-  await query(
-    `UPDATE workspaces SET tally_connection = 'CONNECTED', updated_at = $2 WHERE id = $1`,
-    [session.workspace_id, now()]
-  );
-  // Restored Tally data carries older AlterIds than the voucher watermarks: re-fetch every FY.
-  await query(
-    `DELETE FROM voucher_sync_watermarks WHERE company_id IN (SELECT id FROM companies WHERE workspace_id = $1)`,
-    [session.workspace_id]
-  ).catch((e) => console.warn('[RESTORE] voucher watermark reset failed:', e.message));
-  await query(
-    `UPDATE restore_sessions SET status = 'COMPLETED', completed_at = $2 WHERE id = $1`,
-    [session.id, now()]
-  );
+    const { rows: old } = await client.query(
+      `SELECT device_id FROM devices WHERE workspace_id = $1 AND paired = TRUE AND device_id <> $2`,
+      [session.workspace_id, deviceId]
+    );
+    await client.query(
+      `UPDATE devices SET
+         paired = TRUE, binding_status = 'ACTIVE', workspace_id = $2,
+         device_secret_hash = $3, credential_claimed_at = NULL
+       WHERE device_id = $1`,
+      [deviceId, session.workspace_id, secretHash]
+    );
+    for (const row of old) {
+      await client.query(
+        `UPDATE devices SET paired = FALSE, binding_status = 'REVOKED', device_secret_hash = NULL, workspace_id = NULL
+         WHERE device_id = $1`,
+        [row.device_id]
+      );
+    }
+    await client.query(
+      `UPDATE workspace_tally_bindings SET active_device_id = $2, connection_status = 'CONNECTED', last_verified_at = $3, updated_at = $3
+       WHERE workspace_id = $1`,
+      [session.workspace_id, deviceId, now()]
+    );
+    await client.query(
+      `UPDATE workspaces SET tally_connection = 'CONNECTED', updated_at = $2 WHERE id = $1`,
+      [session.workspace_id, now()]
+    );
+    // Restored Tally data carries older AlterIds than the voucher watermarks: re-fetch every FY.
+    await client.query(
+      `DELETE FROM voucher_sync_watermarks WHERE company_id IN (SELECT id FROM companies WHERE workspace_id = $1)`,
+      [session.workspace_id]
+    );
+    await client.query(
+      `UPDATE restore_sessions SET status = 'COMPLETED', completed_at = $2 WHERE id = $1`,
+      [session.id, now()]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
   await audit(session.workspace_id, session.approved_by_user_id, 'restore.completed', { deviceId, lineageGuids });
   return { activated: true, deviceSecret: secret, workspaceId: session.workspace_id };
 }

@@ -2,14 +2,15 @@
 /**
  * Historical-damage preview / scoped repair (TD-FIX-2026-10-08 P7, I.1–I.8).
  *
- * Deliberately does NOT load .env: the database URL must be passed explicitly.
+ * Deliberately does NOT load .env: the database URL must be given explicitly, preferably as
+ * TD_REPAIR_DATABASE_URL (a --database-url argument is visible in shell history and `ps`).
  * Output is counts and identifiers only (no customer text).
  *
  * Preview (read-only, default):
- *   node scripts/td-repair.mjs --database-url <url> --workspace <id> --company <id> [--items I.1,I.7]
+ *   TD_REPAIR_DATABASE_URL=<url> node scripts/td-repair.mjs --workspace <id> --company <id> [--items I.1,I.7]
  *
  * Apply (owner-approved runbook only; see audits/implementation/P7_repair_tooling.md):
- *   TD_REPAIR_OWNER_APPROVED=1 node scripts/td-repair.mjs --database-url <url> --workspace <id> --company <id> \
+ *   TD_REPAIR_OWNER_APPROVED=1 TD_REPAIR_DATABASE_URL=<url> node scripts/td-repair.mjs --workspace <id> --company <id> \
  *     --apply --approve <hash from preview> [--reactivate-years 12,13]
  */
 import pg from 'pg';
@@ -29,13 +30,14 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (!args['database-url'] || !args.workspace || !args.company) {
-    throw new Error('--database-url, --workspace and --company are required');
+  const databaseUrl = args['database-url'] || process.env.TD_REPAIR_DATABASE_URL;
+  if (!databaseUrl || !args.workspace || !args.company) {
+    throw new Error('TD_REPAIR_DATABASE_URL (or --database-url), --workspace and --company are required');
   }
   const items = args.items ? args.items.split(',').map((s) => s.trim()) : REPAIR_ITEMS;
   const selectYearIds = args['reactivate-years'] ? args['reactivate-years'].split(',').map(Number) : [];
   const scope = { workspaceId: args.workspace, companyId: Number(args.company), items };
-  const pool = new pg.Pool({ connectionString: args['database-url'], max: 1 });
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     if (!args.apply) {
       const q = (text, params) => pool.query(text, params);

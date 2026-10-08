@@ -129,6 +129,36 @@ test('N1: completion with the folder mapping activates; a lost acknowledgement c
   assert.deepEqual(rows[0], { binding_status: 'ACTIVE', workspace_id: ws.id });
 });
 
+test('N1: a failure part-way through completion rolls back and the acknowledgement can be retried', async () => {
+  const ws = await makeWorkspace();
+  const bytes = Buffer.from('PK\u0003\u0004 restore rollback');
+  const { backupId } = await uploadSession(ws, bytes);
+  await backups.completeBackup(ws.id, backupId, {}, { deviceId: ws.deviceId });
+  const newDevice = uniq('newdev');
+  await q(`INSERT INTO devices (device_id) VALUES ($1)`, [newDevice]);
+  const req = await restore.createRestoreRequest(newDevice);
+  await restore.approveRestore({ userId: ws.userId, workspaceId: ws.id, code: req.code, backupId });
+
+  const fn = `p5_fail_${ws.id.replace(/[^a-z0-9]/gi, '_')}`;
+  await q(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN IF NEW.id = '${ws.id}' THEN RAISE EXCEPTION 'synthetic failure'; END IF; RETURN NEW; END $$`);
+  await q(`CREATE TRIGGER ${fn} BEFORE UPDATE ON workspaces FOR EACH ROW EXECUTE FUNCTION ${fn}()`);
+  const args = { deviceId: newDevice, restoreToken: req.restoreToken, ok: true, restoredFolders: ['10000'], lineageGuids: ['g1'] };
+  try {
+    await assert.rejects(restore.completeRestore(args), /synthetic failure/);
+  } finally {
+    await q(`DROP TRIGGER ${fn} ON workspaces`);
+    await q(`DROP FUNCTION ${fn}()`);
+  }
+  const s = await q(`SELECT status FROM restore_sessions WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 1`, [ws.id]);
+  assert.notEqual(s.rows[0].status, 'COMPLETING');
+  const d = await q('SELECT binding_status FROM devices WHERE device_id = $1', [newDevice]);
+  assert.notEqual(d.rows[0].binding_status, 'ACTIVE', 'device activation rolled back');
+
+  const done = await restore.completeRestore(args);
+  assert.equal(done.activated, true);
+});
+
 test('N5: wrong restore codes are rate limited per user', async () => {
   const ws = await makeWorkspace();
   for (let i = 0; i < restore.CODE_ATTEMPT_MAX; i++) {
