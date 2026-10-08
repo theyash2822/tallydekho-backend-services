@@ -10,19 +10,35 @@ import { lineageMatchesBackupManifest, lineageMatchesRestoredFolders } from '../
 const now = () => Math.floor(Date.now() / 1000);
 const REQUEST_TTL = 30 * 60;
 const SESSION_TTL = 2 * 60 * 60;
+// A lost completion acknowledgement may be retried for this long after COMPLETED.
+const ACK_RETRY_TTL = 24 * 60 * 60;
+export const CODE_ATTEMPT_WINDOW = 15 * 60;
+export const CODE_ATTEMPT_MAX = 10;
 
+const restoreError = (code, message, httpStatus) => Object.assign(new Error(message), { code, httpStatus });
+
+/**
+ * The short code is shown to the Owner/Admin; the restore token stays on the requesting Desktop
+ * and is required for status, download and completion (N5). Device ids are public identifiers.
+ */
 export async function createRestoreRequest(newDeviceId) {
+  if (!newDeviceId) throw restoreError('DEVICE_ID_REQUIRED', 'Device id required', 400);
   const code = generateShortCode(6);
+  const restoreToken = generateDeviceSecret();
   const id = uuid();
   const ts = now();
   const codeHash = hashToken(code);
   await query(
-    `INSERT INTO restore_sessions
-       (id, new_device_id, status, request_code_hash, request_code_hint, expires_at, created_at)
-     VALUES ($1,$2,'PENDING',$3,$4,$5,$6)`,
-    [id, newDeviceId, codeHash, code.slice(-2), ts + REQUEST_TTL, ts]
+    `UPDATE restore_sessions SET status = 'SUPERSEDED' WHERE new_device_id = $1 AND status = 'PENDING'`,
+    [newDeviceId]
   );
-  return { restoreRequestId: id, code, expiresAt: ts + REQUEST_TTL };
+  await query(
+    `INSERT INTO restore_sessions
+       (id, new_device_id, status, request_code_hash, request_code_hint, request_secret_hash, expires_at, created_at)
+     VALUES ($1,$2,'PENDING',$3,$4,$5,$6,$7)`,
+    [id, newDeviceId, codeHash, code.slice(-2), hashToken(restoreToken), ts + REQUEST_TTL, ts]
+  );
+  return { restoreRequestId: id, code, restoreToken, expiresAt: ts + REQUEST_TTL };
 }
 
 export async function getRestoreRequestForDevice(deviceId) {
@@ -31,6 +47,16 @@ export async function getRestoreRequestForDevice(deviceId) {
     [deviceId]
   );
   return rows[0] || null;
+}
+
+/** The device's latest session, only when the caller holds that session's restore token. */
+async function sessionForToken(deviceId, restoreToken) {
+  const session = await getRestoreRequestForDevice(deviceId);
+  if (!session) return { session: null };
+  if (!session.request_secret_hash || !restoreToken || hashToken(String(restoreToken)) !== session.request_secret_hash) {
+    return { session: null, denied: true };
+  }
+  return { session };
 }
 
 export async function approveRestore({ userId, workspaceId, code, backupId }) {
@@ -60,30 +86,37 @@ export async function approveRestore({ userId, workspaceId, code, backupId }) {
     err.httpStatus = 404;
     throw err;
   }
+  const ts = now();
+  const { rows: attempts } = await query(
+    `SELECT COUNT(*)::int AS n FROM restore_code_attempts WHERE user_id = $1 AND attempted_at > $2`,
+    [userId, ts - CODE_ATTEMPT_WINDOW]
+  );
+  if (attempts[0].n >= CODE_ATTEMPT_MAX) {
+    throw restoreError('RESTORE_CODE_RATE_LIMITED', 'Too many restore code attempts. Try again in 15 minutes.', 429);
+  }
   const codeHash = hashToken(String(code || '').toUpperCase());
   const { rows } = await query(
     `SELECT * FROM restore_sessions
      WHERE request_code_hash = $1 AND status = 'PENDING' AND expires_at > $2
      ORDER BY created_at DESC LIMIT 1`,
-    [codeHash, now()]
+    [codeHash, ts]
   );
   const session = rows[0];
   if (!session) {
-    const err = new Error('Restore request not found or expired');
-    err.code = 'RESTORE_SESSION_EXPIRED';
-    err.httpStatus = 404;
-    throw err;
+    await query(`INSERT INTO restore_code_attempts (user_id, attempted_at) VALUES ($1, $2)`, [userId, ts]);
+    throw restoreError('RESTORE_SESSION_EXPIRED', 'Restore request not found or expired', 404);
   }
 
   const token = generateDeviceSecret();
   const tokenHash = hashToken(token);
-  await query(
+  const { rowCount } = await query(
     `UPDATE restore_sessions SET
        workspace_id = $2, backup_id = $3, approved_by_user_id = $4, status = 'APPROVED',
        token_hash = $5, expires_at = $6
-     WHERE id = $1`,
-    [session.id, workspaceId, backupId, userId, tokenHash, now() + SESSION_TTL]
+     WHERE id = $1 AND status = 'PENDING'`,
+    [session.id, workspaceId, backupId, userId, tokenHash, ts + SESSION_TTL]
   );
+  if (!rowCount) throw restoreError('RESTORE_SESSION_EXPIRED', 'Restore request was already decided', 409);
   await query(
     `UPDATE devices SET binding_status = 'RESTORE_PENDING', workspace_id = $2 WHERE device_id = $1`,
     [session.new_device_id, workspaceId]
@@ -128,8 +161,9 @@ export async function rejectRestore({ userId, workspaceId, sessionId }) {
   return { sessionId, status: 'REJECTED' };
 }
 
-export async function restoreStatusForDevice(deviceId) {
-  const session = await getRestoreRequestForDevice(deviceId);
+export async function restoreStatusForDevice(deviceId, restoreToken) {
+  const { session, denied } = await sessionForToken(deviceId, restoreToken);
+  if (denied) return { status: 'RESTORE_TOKEN_REQUIRED' };
   if (!session) return { status: 'NONE' };
   if (session.status === 'PENDING') {
     return {
@@ -140,6 +174,10 @@ export async function restoreStatusForDevice(deviceId) {
   }
   if (session.status === 'REJECTED') {
     return { status: 'RESTORE_REJECTED', restoreRequestId: session.id };
+  }
+  if ((session.status === 'APPROVED' || session.status === 'DOWNLOADING') && Number(session.expires_at) <= now()) {
+    await query(`UPDATE restore_sessions SET status = 'EXPIRED' WHERE id = $1 AND status IN ('APPROVED','DOWNLOADING')`, [session.id]);
+    return { status: 'EXPIRED', restoreRequestId: session.id };
   }
   if (session.status === 'APPROVED' || session.status === 'DOWNLOADING') {
     const backup = session.backup_id && session.workspace_id
@@ -166,16 +204,35 @@ export async function restoreStatusForDevice(deviceId) {
   return { status: session.status, restoreRequestId: session.id };
 }
 
-export async function completeRestore({ deviceId, ok, lineageGuids = [], restoredFolders = [] }) {
-  const session = await getRestoreRequestForDevice(deviceId);
-  if (!session || !['APPROVED', 'DOWNLOADING'].includes(session.status)) {
-    const err = new Error('No approved restore session');
-    err.code = 'RESTORE_SESSION_EXPIRED';
-    err.httpStatus = 409;
-    throw err;
+async function rotateRestoredDeviceSecret(deviceId, workspaceId) {
+  const secret = generateDeviceSecret();
+  const secretHash = await hashSecret(secret);
+  await query(
+    `UPDATE devices SET device_secret_hash = $3, credential_claimed_at = NULL
+      WHERE device_id = $1 AND workspace_id = $2 AND binding_status = 'ACTIVE'`,
+    [deviceId, workspaceId, secretHash]
+  );
+  return secret;
+}
+
+/**
+ * Restore completion (N1/N5). Requires the restore token. A repeated completion after COMPLETED
+ * (the first acknowledgement was lost) re-issues the device credential instead of failing, so the
+ * Desktop that already restored its files can finish; nothing else is re-run.
+ */
+export async function completeRestore({ deviceId, restoreToken, ok, lineageGuids = [], restoredFolders = [] }) {
+  const { session, denied } = await sessionForToken(deviceId, restoreToken);
+  if (denied) throw restoreError('RESTORE_TOKEN_REQUIRED', 'Restore token required', 403);
+  if (session?.status === 'COMPLETED' && ok && Number(session.completed_at) + ACK_RETRY_TTL > now()) {
+    const secret = await rotateRestoredDeviceSecret(deviceId, session.workspace_id);
+    await audit(session.workspace_id, session.approved_by_user_id, 'restore.ack_retried', { deviceId });
+    return { activated: true, deviceSecret: secret, workspaceId: session.workspace_id, repeated: true };
+  }
+  if (!session || !['APPROVED', 'DOWNLOADING'].includes(session.status) || Number(session.expires_at) <= now()) {
+    throw restoreError('RESTORE_SESSION_EXPIRED', 'No approved restore session', 409);
   }
   if (!ok) {
-    await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1`, [session.id]);
+    await query(`UPDATE restore_sessions SET status = 'FAILED' WHERE id = $1 AND status IN ('APPROVED','DOWNLOADING')`, [session.id]);
     return { activated: false };
   }
 
@@ -204,14 +261,18 @@ export async function completeRestore({ deviceId, ok, lineageGuids = [], restore
     [session.workspace_id, deviceId]
   );
 
+  const { rowCount: claimed } = await query(
+    `UPDATE restore_sessions SET status = 'COMPLETING' WHERE id = $1 AND status IN ('APPROVED','DOWNLOADING')`,
+    [session.id]
+  );
+  if (!claimed) throw restoreError('RESTORE_SESSION_EXPIRED', 'Restore completion already in progress', 409);
+
   const secret = generateDeviceSecret();
-  const { hashSecret: hash } = await import('./deviceCredential.js');
-  const secretHash = await hash(secret);
+  const secretHash = await hashSecret(secret);
 
   await query(
     `UPDATE devices SET
        paired = TRUE, binding_status = 'ACTIVE', workspace_id = $2,
-       user_id = (SELECT owner_user_id FROM workspaces WHERE id = $2),
        device_secret_hash = $3, credential_claimed_at = NULL
      WHERE device_id = $1`,
     [deviceId, session.workspace_id, secretHash]

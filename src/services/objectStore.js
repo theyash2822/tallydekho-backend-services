@@ -117,4 +117,49 @@ export async function deleteObject(objectKey) {
   await fsp.unlink(path.join(ROOT, objectKey)).catch(() => {});
 }
 
+/**
+ * Hash the bytes actually stored for an object (finding N6): the client's reported checksum is
+ * never trusted on its own. Returns null when the object does not exist.
+ * @returns {Promise<{ size: number, sha256: string } | null>}
+ */
+export async function inspectStoredObject(objectKey) {
+  if (!objectKey) return null;
+  const hash = crypto.createHash('sha256');
+  let size = 0;
+  if (s3Configured()) {
+    const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+    const client = new S3Client({
+      region: process.env.AWS_S3_REGION || process.env.AWS_SES_REGION || 'ap-south-1',
+      credentials: {
+        accessKeyId: process.env.AWS_S3_ACCESS_KEY || process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_S3_SECRET_KEY || process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+    let res;
+    try {
+      res = await client.send(new GetObjectCommand({ Bucket: process.env.AWS_S3_BACKUP_BUCKET, Key: objectKey }));
+    } catch (err) {
+      if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return null;
+      throw err;
+    }
+    for await (const chunk of res.Body) {
+      size += chunk.length;
+      hash.update(chunk);
+    }
+    return { size, sha256: hash.digest('hex') };
+  }
+  const file = path.join(ROOT, objectKey);
+  if (!path.resolve(file).startsWith(path.resolve(ROOT) + path.sep)) return null;
+  try {
+    for await (const chunk of fs.createReadStream(file)) {
+      size += chunk.length;
+      hash.update(chunk);
+    }
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  return { size, sha256: hash.digest('hex') };
+}
+
 export { hashToken };

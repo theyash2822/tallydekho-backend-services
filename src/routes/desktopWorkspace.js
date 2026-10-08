@@ -212,7 +212,7 @@ router.post('/backup/sessions', requireDeviceCredential, async (req, res) => {
 
 router.post('/backup/sessions/:id/complete', requireDeviceCredential, async (req, res) => {
   try {
-    const backup = await completeBackup(req.workspaceId, req.params.id, req.body || {});
+    const backup = await completeBackup(req.workspaceId, req.params.id, req.body || {}, { deviceId: req.deviceId });
     res.json({ status: true, data: { backupId: backup.id, status: backup.status } });
   } catch (err) {
     res.status(err.httpStatus || 500).json({ status: false, code: err.code, message: err.message });
@@ -220,8 +220,12 @@ router.post('/backup/sessions/:id/complete', requireDeviceCredential, async (req
 });
 
 router.post('/backup/sessions/:id/fail', requireDeviceCredential, async (req, res) => {
-  await failBackup(req.workspaceId, req.params.id);
-  res.json({ status: true });
+  try {
+    const result = await failBackup(req.workspaceId, req.params.id, req.deviceId);
+    res.json({ status: true, data: result });
+  } catch (err) {
+    res.status(500).json({ status: false, message: 'Backup fail report failed' });
+  }
 });
 
 router.get('/backup/list', requireDeviceCredential, async (req, res) => {
@@ -238,13 +242,13 @@ router.post('/restore/request', optionalDeviceCredential, async (req, res) => {
     const result = await createRestoreRequest(req.deviceId || req.headers['device-id']);
     res.json({ status: true, data: result });
   } catch (err) {
-    res.status(500).json({ status: false, message: err.message });
+    res.status(err.httpStatus || 500).json({ status: false, code: err.code, message: err.httpStatus ? err.message : 'Restore request failed' });
   }
 });
 
 router.get('/restore/status', optionalDeviceCredential, async (req, res) => {
   try {
-    const data = await restoreStatusForDevice(req.deviceId || req.headers['device-id']);
+    const data = await restoreStatusForDevice(req.deviceId || req.headers['device-id'], req.headers['x-restore-token']);
     res.json({ status: true, data });
   } catch (err) {
     res.status(500).json({ status: false, message: err.message });
@@ -255,6 +259,7 @@ router.post('/restore/complete', optionalDeviceCredential, async (req, res) => {
   try {
     const result = await completeRestore({
       deviceId: req.deviceId || req.headers['device-id'],
+      restoreToken: req.headers['x-restore-token'],
       ok: req.body?.ok !== false,
       lineageGuids: req.body?.lineageGuids || [],
       restoredFolders: req.body?.restoredFolders || [],

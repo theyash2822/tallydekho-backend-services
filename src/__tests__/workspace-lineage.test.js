@@ -45,15 +45,13 @@ test('restore: backup manifest must overlap restored GUIDs', () => {
   assert.equal(skip.ok, true);
 });
 
-test('restore: restored folders must overlap backup company names', () => {
-  const miss = lineageMatchesRestoredFolders([{ name: 'Acme' }, { name: 'Beta' }], ['OtherCo']);
-  assert.equal(miss.ok, false);
-  const hit = lineageMatchesRestoredFolders([{ name: 'Acme' }, { name: 'Beta' }], ['Beta']);
-  assert.equal(hit.ok, true);
-  const empty = lineageMatchesRestoredFolders([{ name: 'Acme' }], []);
-  assert.equal(empty.ok, false);
-  const byFolder = lineageMatchesRestoredFolders([{ name: 'Acme Ltd', folder: 'AcmeLtd' }], ['AcmeLtd']);
-  assert.equal(byFolder.ok, true);
+test('restore: restored folders must overlap the folders the backup recorded', () => {
+  const manifest = [{ name: 'Acme', folder: '10000' }, { name: 'Beta', folder: '10001' }];
+  assert.equal(lineageMatchesRestoredFolders(manifest, ['10005']).ok, false);
+  assert.equal(lineageMatchesRestoredFolders(manifest, ['10001']).ok, true);
+  assert.equal(lineageMatchesRestoredFolders(manifest, []).ok, false);
+  // Names are not folder numbers: an older manifest without folders is left to the GUID check.
+  assert.equal(lineageMatchesRestoredFolders([{ name: 'Acme' }], ['10000']).reason, 'skipped');
 });
 
 test('retention: failed backups are not in the successful list; keep latest 3', () => {

@@ -263,6 +263,13 @@ export async function applyWorkspaceSchema(client) {
       completed_at        BIGINT
     );
     CREATE INDEX IF NOT EXISTS idx_restore_sessions_device ON restore_sessions(new_device_id, status);
+    -- N5: the requesting Desktop proves itself with a per-request secret, not its public device id.
+    ALTER TABLE restore_sessions ADD COLUMN IF NOT EXISTS request_secret_hash TEXT;
+    CREATE TABLE IF NOT EXISTS restore_code_attempts (
+      user_id      INTEGER NOT NULL,
+      attempted_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_restore_code_attempts ON restore_code_attempts(user_id, attempted_at);
 
     CREATE TABLE IF NOT EXISTS hard_sync_requests (
       id                  TEXT PRIMARY KEY,

@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P5 verified backups, restore token, restore completion (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **N6:** backup sessions need a 64-hex SHA-256 and positive size. `completeBackup` re-hashes the stored object (`objectStore.inspectStoredObject`, local or S3) and compares with the declared values: missing object stays UPLOADING (409 `BACKUP_OBJECT_MISSING`), mismatch → FAILED and the object is deleted. Completion is device-scoped and idempotent. `failBackup` is ownership-checked and removes the object. Sessions left UPLOADING for 6 h become ABANDONED.
+- **N5:** a restore request returns a one-time `restoreToken` (stored hashed). Status and completion need it (`x-restore-token`); the device id alone gets `RESTORE_TOKEN_REQUIRED`. New requests supersede the device's pending ones. Wrong codes are rate limited (10 per 15 min per user, `RESTORE_CODE_RATE_LIMITED`); approval is a conditional PENDING→APPROVED.
+- **N1:** completion compares `restoredFolders` with the folder numbers in the backup manifest (legacy name-only manifests skip this; GUID lineage still applies). A repeated acknowledgement within 24 h re-issues the device credential instead of failing. Completion claims the session (COMPLETING) before activation.
+- **Bug fixed:** restore activation wrote `devices.user_id`, a column the schema no longer has, so every restore completion failed.
+- **Tests:** isolated `p5-backup-restore` 5/5; full isolated suite 30/30; DB-free 40/40 (incl. `workspace-lineage` 12/12). Not run: real S3, real DB, Windows.
+- **Known gaps:** mismatch paths set FAILED unconditionally; a crash mid-completion leaves the session COMPLETING (needs an operator/P7 tool).
+
 ## 2026-10-08 — P4 hard sync without delete-first, durable first-chunk resets (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **Hard sync (06):** init-sync no longer purges. It consumes one approval (device/workspace/company-set bound, 30-min expiry, single use, idempotent while jobs are open) and opens `hard_sync_jobs`. `services/hardSyncPublication.js` publishes at `/ingest/complete` in one transaction, only for a verified upload with a complete voucher list. Scoped sweep: stale unlisted Tally vouchers and their children, per-FY balances, Tally masters. Placeholders, cancelled and out-of-scope rows are kept; a table with no fresh rows is kept whole. `purgeCompaniesForHardSync` removed.

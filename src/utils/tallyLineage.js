@@ -71,9 +71,11 @@ export function lineageMatchesRestoredFolders(backupManifest = [], restoredFolde
   if (typeof manifest === 'string') {
     try { manifest = JSON.parse(manifest); } catch { manifest = []; }
   }
+  // Tally company folders are numbers (10000…); only a manifest that recorded its folders can be
+  // compared. Older manifests carried names only — the GUID lineage check covers those.
   const names = [...new Set(
     (Array.isArray(manifest) ? manifest : [])
-      .flatMap((c) => [c?.name, c.company_name, c.folder, c.folder_name])
+      .flatMap((c) => [c?.folder, c?.folder_name])
       .map((n) => String(n || '').trim())
       .filter(Boolean)
   )];
