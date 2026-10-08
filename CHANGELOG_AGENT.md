@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P7 historical-damage repair tooling (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **New:** `src/services/repairTools.js` and operator CLI `scripts/td-repair.mjs` for audit items I.1–I.8. Preview (default) is read-only and scoped to one workspace + company; it classifies findings as confirmed/suspected/unverifiable and prints counts and ids only.
+- **Apply** needs an explicit `--database-url` (no `.env`), `TD_REPAIR_OWNER_APPROVED=1` and the hash of the previewed manifest. It re-diagnoses in a transaction and refuses on any change (`REPAIR_STATE_CHANGED`). Actions: reset voucher watermarks of FYs with I.1–I.3 evidence (re-fetch on next sync), mark `running` sync runs with no heartbeat for 24 h `abandoned`, reactivate owner-selected inactive years. I.4/I.5/I.6 are reported as owner operations (hard sync); IRN/EWB is not reconstructed and no tax-service calls are made.
+- Not wired to startup or any route. Not run on the real database (OWNER_OPERATION_PENDING).
+- **Tests:** isolated `p7-repair` 2/2; full isolated suite 32/32; DB-free 40/40.
+
 ## 2026-10-08 — P5 verified backups, restore token, restore completion (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **N6:** backup sessions need a 64-hex SHA-256 and positive size. `completeBackup` re-hashes the stored object (`objectStore.inspectStoredObject`, local or S3) and compares with the declared values: missing object stays UPLOADING (409 `BACKUP_OBJECT_MISSING`), mismatch → FAILED and the object is deleted. Completion is device-scoped and idempotent. `failBackup` is ownership-checked and removes the object. Sessions left UPLOADING for 6 h become ABANDONED.
