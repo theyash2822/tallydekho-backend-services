@@ -152,6 +152,15 @@ export async function reconcileDeletedVouchers(client, { uploadId, syncRunId, co
   );
   result.deleted = del.rowCount || 0;
   result.action = 'deleted';
+  // Cached insights were computed from the removed vouchers; drop them in the same transaction.
+  await client.query('SAVEPOINT voucher_cache');
+  try {
+    await client.query('DELETE FROM ai_insights_cache WHERE company_id = $1', [companyId]);
+    await client.query('RELEASE SAVEPOINT voucher_cache');
+  } catch (err) {
+    if (err.code !== '42P01' && err.code !== '42703') throw err;
+    await client.query('ROLLBACK TO SAVEPOINT voucher_cache');
+  }
   return result;
 }
 

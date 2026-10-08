@@ -1,14 +1,21 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import {
+
+// Under `npm run test:isolated` the SQL cases run on the disposable cluster; the app modules must
+// load after the harness has pointed DATABASE_URL at it.
+if (process.env.TD_ISOLATED_TEST === '1') {
+  const { setupIsolatedDb } = await import('./isolated/isolatedDb.js');
+  await setupIsolatedDb();
+}
+const {
   parseVoucherLists,
   reconcileDeletedVouchers,
   VOUCHER_CHILD_TABLES,
   MASS_MIN,
   voucherDeletionMode,
-} from '../services/voucherDeletion.js';
-import { purgeTablesFor } from '../services/companyPurge.js';
+} = await import('../services/voucherDeletion.js');
+const { purgeTablesFor } = await import('../services/companyPurge.js');
 
 const CO_ID = 13114; // Laveena (real company row); every case runs in a rolled-back transaction
 const CO = '2d96a00f-9865-4be5-b8c6-7b9ced59d5df';
@@ -61,6 +68,15 @@ describe('reconcileDeletedVouchers (real SQL, rolled back)', () => {
     const client = await schema.getClient();
     try {
       await client.query('BEGIN');
+      // A disposable database has no Laveena row; create a synthetic one inside the rolled-back transaction.
+      const { rows: present } = await client.query('SELECT 1 FROM companies WHERE id = $1', [CO_ID]);
+      if (!present.length) {
+        await client.query(`INSERT INTO workspaces (id, name) VALUES ('tdk-test-vd-ws', 'Synthetic')`);
+        await client.query(
+          `INSERT INTO companies (id, guid, name, is_active, workspace_id) VALUES ($1, $2, 'Synthetic', TRUE, 'tdk-test-vd-ws')`,
+          [CO_ID, CO]
+        );
+      }
       await client.query('INSERT INTO ingest_uploads (id, device_id, created_at) VALUES ($1, $2, $3)', [UPLOAD, 'tdk-test', UPLOAD_START]);
       await client.query(
         `INSERT INTO sync_runs (id, company_guid, company_id, sync_type, status, started_at) VALUES ($1, $2, $3, 'normal', 'running', to_timestamp($4))`,

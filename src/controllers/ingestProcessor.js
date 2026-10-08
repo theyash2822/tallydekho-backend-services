@@ -10,7 +10,7 @@ import {
   wrapIngestClient,
   assertNoIngestFailures,
 } from '../utils/ingestCompanyDualWrite.js';
-import { claimBillOutstandingPurge } from '../utils/ingestCompanyGroups.js';
+import { claimResets } from '../services/ingestResetClaims.js';
 import { isStagedMode, stageBillRows } from '../services/billSnapshot.js';
 export { ingestCompanyCtx };
 import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
@@ -1849,11 +1849,16 @@ async function processStockTransactions(data, companyGuid) {
 
     // Clear existing entries for all vouchers in this batch (idempotent re-sync)
     // Prevents duplicate rows from batch allocations / multiple sync runs
+    // A voucher's lines can span chunks; only the first chunk of the upload resets them (X8).
     const uniqueVoucherGuids = [...new Set(data.map(r => r.GUID || r.Guid).filter(Boolean))];
-    if (uniqueVoucherGuids.length > 0) {
+    const resetGuids = await claimResets(client, {
+      uploadId: currentUploadId(), companyId: currentCompanyId(), kind: 'stock_transactions',
+      keys: uniqueVoucherGuids, chunkKey: currentChunkKey(),
+    });
+    if (resetGuids.length > 0) {
       await client.query(
         `DELETE FROM stock_transactions WHERE company_id=$1 AND voucher_guid = ANY($2::text[])`,
-        [currentCompanyId(), uniqueVoucherGuids]
+        [currentCompanyId(), resetGuids]
       );
     }
 
@@ -2833,7 +2838,10 @@ async function processBillOutstanding(data, companyGuid) {
   const parseAmt = parseBillAmt;
   try {
     await client.query('BEGIN');
-    if (claimBillOutstandingPurge(currentUploadId(), currentCompanyId())) {
+    const purge = await claimResets(client, {
+      uploadId: currentUploadId(), companyId: currentCompanyId(), kind: 'bill_outstanding', keys: [''], chunkKey: currentChunkKey(),
+    });
+    if (purge.length) {
       await client.query('DELETE FROM bill_outstanding WHERE company_id=$1', [currentCompanyId()]);
     }
     let saved = 0;
@@ -3224,7 +3232,11 @@ async function processLedgerTransactions(data, companyGuid) {
     await client.query('BEGIN');
 
     // Clear existing items for all vouchers in this batch (idempotent re-sync)
-    const uniqueGuids = [...new Set(data.map(r => r.Guid || r.GUID).filter(Boolean))];
+    // A voucher's lines can span chunks; only the first chunk of the upload resets them (X8).
+    const uniqueGuids = await claimResets(client, {
+      uploadId: currentUploadId(), companyId: currentCompanyId(), kind: 'ledger_transactions',
+      keys: data.map(r => r.Guid || r.GUID).filter(Boolean), chunkKey: currentChunkKey(),
+    });
     if (uniqueGuids.length > 0) {
       await client.query(
         `DELETE FROM voucher_items WHERE company_id=$1 AND voucher_guid = ANY($2::text[])`,

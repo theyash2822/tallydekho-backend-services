@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {
   groupRecordsByCompany,
   completeCompanyGuids,
-  claimBillOutstandingPurge,
 } from '../utils/ingestCompanyGroups.js';
 
 test('a chunk that straddles two companies is split by each record\'s own COMPANY_GUID', () => {
@@ -36,14 +35,4 @@ test('/ingest/complete covers every company in the upload', () => {
   assert.deepEqual(completeCompanyGuids({ companyGuid: 'X', companies: [{ guid: 'A' }] }, 'Z'), ['X']);
   assert.deepEqual(completeCompanyGuids({}, 'Z'), ['Z']);
   assert.deepEqual(completeCompanyGuids({}, null), []);
-});
-
-test('bill outstanding is purged once per upload and company, not on every chunk', () => {
-  const t = 1_000;
-  assert.equal(claimBillOutstandingPurge('u1', 7, t), true);
-  assert.equal(claimBillOutstandingPurge('u1', 7, t + 1), false);
-  assert.equal(claimBillOutstandingPurge('u1', 8, t + 2), true);
-  assert.equal(claimBillOutstandingPurge('u2', 7, t + 3), true);
-  assert.equal(claimBillOutstandingPurge(null, 7, t + 4), true);
-  assert.equal(claimBillOutstandingPurge(null, 7, t + 5), true);
 });

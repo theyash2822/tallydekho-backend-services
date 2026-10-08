@@ -16,26 +16,6 @@ export function groupRecordsByCompany(records, fallbackGuid = null) {
   return { groups, missing };
 }
 
-const BILL_PURGE_TTL_MS = 6 * 60 * 60 * 1000;
-const billPurges = new Map();
-
-/**
- * Bill outstanding is a full snapshot per company, but one company's rows can span
- * several chunks of the same upload. Returns true only for the first chunk of an
- * (upload, company) pair, so later chunks append instead of wiping earlier rows.
- * Without an uploadId every call purges (the previous behaviour).
- */
-export function claimBillOutstandingPurge(uploadId, companyId, nowMs = Date.now()) {
-  if (!uploadId || companyId == null) return true;
-  for (const [key, at] of billPurges) {
-    if (nowMs - at > BILL_PURGE_TTL_MS) billPurges.delete(key);
-  }
-  const key = `${uploadId}:${companyId}`;
-  if (billPurges.has(key)) return false;
-  billPurges.set(key, nowMs);
-  return true;
-}
-
 /** Distinct company GUIDs named by `/ingest/complete` (explicit guid first, then the companies list). */
 export function completeCompanyGuids(body, uploadCompanyGuid = null) {
   const out = [];

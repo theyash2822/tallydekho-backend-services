@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-08 — P4 hard sync without delete-first, durable first-chunk resets (branch `8-10-2026`, TD-FIX-2026-10-08)
+
+- **Hard sync (06):** init-sync no longer purges. It consumes one approval (device/workspace/company-set bound, 30-min expiry, single use, idempotent while jobs are open) and opens `hard_sync_jobs`. `services/hardSyncPublication.js` publishes at `/ingest/complete` in one transaction, only for a verified upload with a complete voucher list. Scoped sweep: stale unlisted Tally vouchers and their children, per-FY balances, Tally masters. Placeholders, cancelled and out-of-scope rows are kept; a table with no fresh rows is kept whole. `purgeCompaniesForHardSync` removed.
+- **Approval lifecycle:** an open request is reused only for the same manifest and operation and only while unexpired. Approval sets `expires_at`. `consumeApprovedHardSync` replaced by the non-destructive `remapGuidForReplacement`.
+- **X8/X12:** new `ingest_reset_claims` and `services/ingestResetClaims.js`. Flat stock/ledger lines and legacy bill purges reset only on the first chunk of an upload (durable, transactional). The in-memory `claimBillOutstandingPurge` was removed.
+- **07 (partial):** voucher deletion clears `ai_insights_cache` in the same transaction.
+- **Tests:** isolated `p4-hard-sync` 6/6, `p4-reset-claims` 2/2, `voucher-deletion` 13/13 (now runs on the disposable PG with a synthetic company); full isolated suite 25/25; DB-free 28/28. Not run: real DB, Windows/Tally.
+- **Risks:** mark-and-sweep, so readers can see old and new rows mixed during a hard sync. Publication needs a complete voucher list (verified TDL context); without it the old data stays and the job is marked failed.
+
 ## 2026-10-08 — P3 text-typed Tally fields and per-row stock FY balances (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **Flags (01):** `utils/tallyFields.js` `isTallyTrue` accepts `Yes`/`true`/`1` text and legacy coerced values; used for cancelled, optional and simple-unit flags (new desktops send exact text).

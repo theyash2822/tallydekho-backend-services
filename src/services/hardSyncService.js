@@ -3,10 +3,15 @@ import { query } from '../db/schema.js';
 import { audit } from './auditService.js';
 import { membershipCount } from './workspaceService.js';
 import { assertCapability } from './authorizationService.js';
-import { purgeCompaniesForHardSync } from './companyPurge.js';
+import { APPROVAL_TTL_SECONDS, manifestGuids } from './hardSyncPublication.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const TTL = 24 * 60 * 60;
+const sameManifest = (a, b) => {
+  const x = manifestGuids(a);
+  const y = manifestGuids(b);
+  return x.length === y.length && x.every((g, i) => g === y[i]);
+};
 
 export async function createHardSyncRequest({
   workspaceId,
@@ -22,17 +27,28 @@ export async function createHardSyncRequest({
      ORDER BY created_at DESC LIMIT 1`,
     [workspaceId, deviceId]
   );
-  if (open[0]?.status === 'APPROVED') {
+  const ts = now();
+  // An open request is reused only for the same companies and while it can still be used.
+  const reusable = open[0]
+    && sameManifest(open[0].company_manifest_json, companyManifest)
+    && open[0].operation === operation
+    && (open[0].expires_at == null || Number(open[0].expires_at) > ts);
+  if (reusable && open[0].status === 'APPROVED') {
     return { request: open[0], autoApproved: true, alreadyApproved: true };
   }
-  if (open[0]?.status === 'PENDING') {
+  if (reusable && open[0].status === 'PENDING') {
     return { request: open[0], autoApproved: false };
+  }
+  if (open[0]) {
+    await query(
+      `UPDATE hard_sync_requests SET status = 'SUPERSEDED', decided_at = $2 WHERE id = $1 AND status IN ('PENDING','APPROVED')`,
+      [open[0].id, ts]
+    );
   }
 
   const members = await membershipCount(workspaceId);
   const auto = members <= 1;
   const id = uuid();
-  const ts = now();
   const status = auto ? 'APPROVED' : 'PENDING';
   await query(
     `INSERT INTO hard_sync_requests
@@ -41,7 +57,7 @@ export async function createHardSyncRequest({
     [
       id, workspaceId, deviceId, operation, status,
       oldGuid, newGuid, JSON.stringify(companyManifest || []),
-      ts, auto ? ts : null, ts + TTL,
+      ts, auto ? ts : null, ts + (auto ? APPROVAL_TTL_SECONDS : TTL),
     ]
   );
   await audit(workspaceId, null, 'hard_sync.request', { id, operation, auto });
@@ -82,10 +98,25 @@ export async function approveHardSync({ requestId, userId, workspaceId }) {
     err.httpStatus = 409;
     throw err;
   }
-  await query(
-    `UPDATE hard_sync_requests SET status = 'APPROVED', approved_by_user_id = $2, decided_at = $3 WHERE id = $1`,
-    [requestId, userId, now()]
+  if (reqRow.expires_at != null && Number(reqRow.expires_at) <= now()) {
+    await query(`UPDATE hard_sync_requests SET status = 'EXPIRED', decided_at = $2 WHERE id = $1 AND status = 'PENDING'`, [requestId, now()]);
+    const err = new Error('Request expired');
+    err.code = 'HARD_SYNC_EXPIRED';
+    err.httpStatus = 409;
+    throw err;
+  }
+  const ts = now();
+  const { rowCount } = await query(
+    `UPDATE hard_sync_requests SET status = 'APPROVED', approved_by_user_id = $2, decided_at = $3, expires_at = $4
+      WHERE id = $1 AND status = 'PENDING'`,
+    [requestId, userId, ts, ts + APPROVAL_TTL_SECONDS]
   );
+  if (!rowCount) {
+    const err = new Error('Request is not pending');
+    err.code = 'HARD_SYNC_REJECTED';
+    err.httpStatus = 409;
+    throw err;
+  }
   await audit(workspaceId, userId, 'hard_sync.approved', { requestId });
   const { rows: next } = await query('SELECT * FROM hard_sync_requests WHERE id = $1', [requestId]);
   return next[0];
@@ -123,59 +154,38 @@ export async function listPendingHardSync(workspaceId) {
 export async function getHardSyncRequest(id) {
   const { rows } = await query('SELECT * FROM hard_sync_requests WHERE id = $1', [id]);
   const row = rows[0];
-  if (row?.status === 'PENDING' && row.expires_at && Number(row.expires_at) < now()) {
-    await query(`UPDATE hard_sync_requests SET status = 'EXPIRED', decided_at = $2 WHERE id = $1 AND status = 'PENDING'`, [id, now()]);
+  if ((row?.status === 'PENDING' || row?.status === 'APPROVED') && row.expires_at && Number(row.expires_at) < now()) {
+    await query(`UPDATE hard_sync_requests SET status = 'EXPIRED', decided_at = $2 WHERE id = $1 AND status = $3`, [id, now(), row.status]);
     return { ...row, status: 'EXPIRED' };
   }
   return row || null;
 }
 
-export async function consumeApprovedHardSync(workspaceId, deviceId, companies, guidReplacement) {
-  const { rows } = await query(
-    `SELECT * FROM hard_sync_requests
-     WHERE workspace_id = $1 AND device_id = $2 AND status = 'APPROVED'
-     ORDER BY created_at DESC LIMIT 1`,
-    [workspaceId, deviceId]
-  );
-  const reqRow = rows[0];
-  const members = await membershipCount(workspaceId);
-  if (!reqRow && members > 1) {
-    const err = new Error('Owner/Admin approval is required before Hard Sync.');
-    err.code = 'HARD_SYNC_APPROVAL_REQUIRED';
-    err.httpStatus = 403;
-    throw err;
-  }
-
+/**
+ * GUID replacement keeps companies.id (CID-Q005) and only remaps the external guid. Nothing is
+ * deleted here: the old company's rows are removed when the new company's data is published
+ * (services/hardSyncPublication.js).
+ */
+export async function remapGuidForReplacement(reqRow, workspaceId, companies) {
+  if (reqRow?.operation !== 'GUID_REPLACEMENT' || !reqRow.old_guid) return;
   const guids = (companies || []).map((c) => c.guid).filter(Boolean);
-  if (reqRow?.operation === 'GUID_REPLACEMENT' && reqRow.old_guid) {
-    // CID-Q005: keep companies.id stable — remap external guid only within workspace
-    const { rows: before } = await query(
-      `SELECT id, guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
-      [reqRow.old_guid, workspaceId]
-    );
-    // A different Tally company takes over this record: its old bills must not survive.
-    await purgeCompaniesForHardSync([reqRow.old_guid, ...guids], workspaceId, { keepBillOutstanding: false });
-    const newGuid = reqRow.new_guid || guids[0];
-    await query(
-      `UPDATE companies SET guid = $2 WHERE guid = $1 AND workspace_id = $3`,
-      [reqRow.old_guid, newGuid, workspaceId]
-    ).catch(() => {});
-    await query(
-      `UPDATE workspace_tally_lineage_companies SET status = 'REPLACED'
-       WHERE workspace_id = $1 AND tally_company_guid = $2`,
-      [workspaceId, reqRow.old_guid]
-    );
-    await audit(workspaceId, null, 'COMPANY_GUID_REMAP', {
-      companyId: before[0]?.id ?? null,
-      oldGuid: reqRow.old_guid,
-      newGuid,
-    }).catch(() => {});
-  } else if (guids.length) {
-    await purgeCompaniesForHardSync(guids, workspaceId);
-  }
-
-  if (reqRow) {
-    await query(`UPDATE hard_sync_requests SET status = 'EXECUTED' WHERE id = $1`, [reqRow.id]);
-  }
-  return reqRow;
+  const { rows: before } = await query(
+    `SELECT id, guid FROM companies WHERE guid = $1 AND workspace_id = $2 LIMIT 1`,
+    [reqRow.old_guid, workspaceId]
+  );
+  const newGuid = reqRow.new_guid || guids[0];
+  await query(
+    `UPDATE companies SET guid = $2 WHERE guid = $1 AND workspace_id = $3`,
+    [reqRow.old_guid, newGuid, workspaceId]
+  ).catch(() => {});
+  await query(
+    `UPDATE workspace_tally_lineage_companies SET status = 'REPLACED'
+     WHERE workspace_id = $1 AND tally_company_guid = $2`,
+    [workspaceId, reqRow.old_guid]
+  );
+  await audit(workspaceId, null, 'COMPANY_GUID_REMAP', {
+    companyId: before[0]?.id ?? null,
+    oldGuid: reqRow.old_guid,
+    newGuid,
+  }).catch(() => {});
 }

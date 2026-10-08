@@ -23,8 +23,16 @@ import {
   reconcileStockOpeningsFromTransactions,
   backfillStockMovementVoucherTypes,
 } from '../utils/ingestPostReconcile.js';
-import { purgeCompaniesForHardSync } from '../services/companyPurge.js';
-import { consumeApprovedHardSync } from '../services/hardSyncService.js';
+import { remapGuidForReplacement } from '../services/hardSyncService.js';
+import { membershipCount } from '../services/workspaceService.js';
+import {
+  consumeHardSyncApproval,
+  openHardSyncJob,
+  publishHardSyncTx,
+  sweepExpiredHardSyncJobs,
+} from '../services/hardSyncPublication.js';
+import { getClient } from '../db/schema.js';
+import { sweepOldResetClaims } from '../services/ingestResetClaims.js';
 import { markFirstSyncConnected, getKnownLineageGuids } from '../services/deviceBinding.js';
 import { evaluateLineage } from '../utils/tallyLineage.js';
 import { groupRecordsByCompany, completeCompanyGuids } from '../utils/ingestCompanyGroups.js';
@@ -35,7 +43,6 @@ import { parseVoucherLists, reconcileDeletedVouchersTx } from '../services/vouch
 import {
   readVoucherWatermarks,
   effectiveWatermark,
-  clearVoucherWatermarks,
   parseVoucherWatermarks,
   applyVoucherWatermarks,
 } from '../services/voucherWatermarks.js';
@@ -146,16 +153,25 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
       }
     }
 
+    // Hard sync never deletes here: it consumes one approval and opens per-company jobs; the
+    // replacement is published at /ingest/complete (services/hardSyncPublication.js).
+    await sweepOldResetClaims(query).catch((e) => console.warn('[SYNC] reset-claim cleanup skipped:', e.message));
+
+    let hardSyncRequest = null;
+    const hardSyncJobs = [];
     if (isHardSync === true && companies?.length > 0) {
       try {
-        await consumeApprovedHardSync(workspaceId, deviceId, companies, req.body?.guidReplacement);
-      } catch (purgeErr) {
-        console.error('[SYNC] Hard sync purge failed:', purgeErr.message);
-        return res.status(purgeErr.httpStatus || 500).json({
-          status: false,
-          code: purgeErr.code,
-          message: purgeErr.message || `Hard sync rebuild failed: ${purgeErr.message}`,
-        });
+        const nowSec = now();
+        await sweepExpiredHardSyncJobs(query, nowSec);
+        const consumed = await consumeHardSyncApproval(query, { workspaceId, deviceId, companies, membershipCount, nowSec });
+        hardSyncRequest = consumed.request;
+        if (!consumed.reused) await remapGuidForReplacement(hardSyncRequest, workspaceId, companies);
+      } catch (hsErr) {
+        console.error('[SYNC] Hard sync start refused:', hsErr.code || hsErr.message);
+        if (!hsErr.httpStatus) {
+          return res.status(500).json({ status: false, code: 'HARD_SYNC_START_FAILED', message: 'Hard Sync could not start. Nothing was deleted.' });
+        }
+        return res.status(hsErr.httpStatus).json({ status: false, code: hsErr.code, message: hsErr.message });
       }
     }
 
@@ -241,8 +257,18 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
           const companyId = savedCo[0]?.id;
           console.log(`[DB] Company saved: ${c.name || c.guid} id=${companyId}`);
 
+          if (hardSyncRequest) {
+            try {
+              const job = await openHardSyncJob(query, {
+                request: hardSyncRequest, workspaceId, deviceId, companyId, companyGuid: c.guid, years: c.years, nowSec: now(),
+              });
+              hardSyncJobs.push({ companyGuid: c.guid, jobId: job.id, scope: job.scope_json });
+            } catch (jobErr) {
+              hardSyncJobs.push({ companyGuid: c.guid, error: jobErr.code || jobErr.message });
+            }
+          }
+
           const { rows: lRows } = await query('SELECT MAX(alter_id) as max FROM ledgers WHERE company_id = $1', [companyId]);
-          if (isHardSync === true) await clearVoucherWatermarks({ query }, companyId);
           const watermarks = await readVoucherWatermarks({ query }, companyId).catch(() => new Map());
           const voucherByYear = {};
           const allYearsForAlter = c.allYears || c.years || [];
@@ -267,6 +293,13 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
             voucherByYear[finYear] = legacyRows[0]?.max || 0;
           }
           alterIds[c.guid] = { master: lRows[0]?.max || 0, voucher: voucherByYear };
+          // Hard sync re-reads everything in scope: publication removes only rows this run did not see.
+          if (hardSyncRequest) {
+            alterIds[c.guid] = {
+              master: 0,
+              voucher: Object.fromEntries(Object.keys(voucherByYear).map((fy) => [fy, 0])),
+            };
+          }
 
           // Store all financial years for this company
           const allYears = c.allYears || c.years || [];
@@ -349,7 +382,30 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
       }
     }
 
-    res.json({ status: true, data: { alterIds, yearIds, uploadId: uuid() } });
+    if (hardSyncRequest) {
+      const failed = hardSyncJobs.filter((j) => j.error);
+      const opened = new Set(hardSyncJobs.filter((j) => j.jobId).map((j) => j.companyGuid));
+      const missing = (companies || []).map((c) => c.guid).filter((g) => g && !opened.has(g));
+      if (failed.length || missing.length) {
+        return res.status(400).json({
+          status: false,
+          code: failed[0]?.error || 'HARD_SYNC_SCOPE_INVALID',
+          message: 'Hard Sync could not start for every selected company. Nothing was deleted.',
+          data: { failed, missing },
+        });
+      }
+      console.log(`[SYNC] hard sync jobs opened request=${hardSyncRequest.id} companies=${hardSyncJobs.length}`);
+    }
+
+    res.json({
+      status: true,
+      data: {
+        alterIds,
+        yearIds,
+        uploadId: uuid(),
+        ...(hardSyncRequest ? { hardSync: { requestId: hardSyncRequest.id, jobs: hardSyncJobs } } : {}),
+      },
+    });
   } catch (err) {
     console.error('[SYNC] init-sync error:', err.message);
     res.status(500).json({ status: false, message: 'Sync init failed' });
@@ -801,6 +857,24 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     await query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [now(), deviceId]);
 
     const verifiedSuccess = isVerifiedSyncSuccess(ingestWarnings);
+
+    const hardSyncResults = [];
+    if (isHardSync && uploadId) {
+      const lists = Array.isArray(body?.voucherLists) ? parseVoucherLists(body) : new Map();
+      for (const company of companies) {
+        const result = await publishHardSyncTx(getClient, {
+          deviceId,
+          companyId: company.id,
+          companyGuid: company.guid,
+          verified: verifiedSuccess,
+          voucherList: lists.get(company.guid) || null,
+          nowSec: now(),
+        });
+        hardSyncResults.push({ companyGuid: company.guid, ...result });
+        console.log('[INGEST] hard_sync_publication', JSON.stringify({ uploadId, companyId: company.id, ...result }));
+      }
+    }
+
     for (const { guid: companyGuid, id: resolvedCompanyId } of companies) {
       await query(
         `UPDATE companies
@@ -996,6 +1070,7 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
         billSnapshots: billSnapshotResults,
         voucherDeletions: voucherDeletionResults,
         voucherWatermarks: voucherWatermarkResults,
+        ...(isHardSync ? { hardSync: hardSyncResults } : {}),
       },
     });
   } catch (err) {

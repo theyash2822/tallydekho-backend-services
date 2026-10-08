@@ -130,23 +130,3 @@ export async function purgeCompanyTallyData(companyGuid, opts = {}) {
   }
   return purgeCompanyTallyDataById(rows[0].id, { companyGuid: rows[0].guid, keepBillOutstanding });
 }
-
-/**
- * Purge multiple selected companies (hard sync only). Bills are kept by default:
- * the desktop replaces them per company only after a successful bill fetch.
- * @param {string[]} companyGuids
- * @param {string} workspaceId
- * @param {{ keepBillOutstanding?: boolean }} [opts]
- */
-export async function purgeCompaniesForHardSync(companyGuids, workspaceId, opts = {}) {
-  if (!workspaceId) {
-    throw new Error('workspaceId required for hard-sync purge');
-  }
-  const keepBillOutstanding = opts.keepBillOutstanding !== false;
-  const guids = [...new Set((companyGuids || []).filter(Boolean))];
-  const results = [];
-  for (const guid of guids) {
-    results.push(await purgeCompanyTallyData(guid, { workspaceId, keepBillOutstanding }));
-  }
-  return results;
-}

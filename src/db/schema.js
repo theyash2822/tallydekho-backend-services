@@ -329,6 +329,18 @@ export async function initSchema() {
         PRIMARY KEY (upload_id, stream, chunk_index)
       );
 
+      -- First-chunk-only resets within one upload (services/ingestResetClaims.js).
+      CREATE TABLE IF NOT EXISTS ingest_reset_claims (
+        upload_id   TEXT NOT NULL,
+        company_id  BIGINT NOT NULL,
+        kind        TEXT NOT NULL,
+        item_key    TEXT NOT NULL DEFAULT '',
+        chunk_key   TEXT,
+        claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (upload_id, company_id, kind, item_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ingest_reset_claims_at ON ingest_reset_claims(claimed_at);
+
       -- Company financial years (multi-year support)
       CREATE TABLE IF NOT EXISTS company_years (
         id            SERIAL PRIMARY KEY,

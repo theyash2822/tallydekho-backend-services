@@ -279,6 +279,25 @@ export async function applyWorkspaceSchema(client) {
       expires_at          BIGINT
     );
     CREATE INDEX IF NOT EXISTS idx_hard_sync_ws ON hard_sync_requests(workspace_id, status);
+    ALTER TABLE hard_sync_requests ADD COLUMN IF NOT EXISTS consumed_at BIGINT;
+
+    CREATE TABLE IF NOT EXISTS hard_sync_jobs (
+      id            TEXT PRIMARY KEY,
+      request_id    TEXT NOT NULL,
+      workspace_id  TEXT NOT NULL,
+      device_id     TEXT NOT NULL,
+      company_id    INTEGER NOT NULL,
+      company_guid  TEXT NOT NULL,
+      scope_json    JSONB NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'preparing'
+                    CHECK (status IN ('preparing','published','failed','abandoned','cancelled')),
+      started_at    BIGINT NOT NULL,
+      finished_at   BIGINT,
+      reason        TEXT,
+      result_json   JSONB,
+      UNIQUE (request_id, company_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_hard_sync_jobs_company ON hard_sync_jobs(company_id, device_id, status);
 
     CREATE TABLE IF NOT EXISTS workspace_audit_log (
       id            TEXT PRIMARY KEY,
