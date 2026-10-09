@@ -1904,7 +1904,10 @@ async function processStockTransactions(data, companyGuid) {
       const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
       if (!stockName) {
         // A row with no item and no quantity/amount carries nothing to store (e.g. an accounting-only voucher).
-        if (!(parseFloat(r.ACTUALQTY || r.ActualQty || r.qty || 0) || parseFloat(r.AMOUNT ?? r.Amount ?? r.value ?? 0))) emptyRows += 1;
+        // Tally quantities look like '(-)20 Nos'; parseFloat reads those as NaN and would hide a real line.
+        const q = parseTallyQty(String(r.ACTUALQTY || r.ActualQty || r.qty || '0').replace(/,/g, ''));
+        const a = parseTallyQty(String(r.AMOUNT ?? r.Amount ?? r.value ?? '0').replace(/,/g, ''));
+        if (!(q || a)) emptyRows += 1;
         continue;
       }
       // parseTallyQty handles '(-)20', '-20', '20 nos' formats
@@ -3438,7 +3441,10 @@ async function processAllVoucher(data, companyGuid) {
       const date = normalizeDate(r.DATE || r.Date || r.date);
       // Skip junk records: no date + no meaningful type + no number = header/metadata rows
       if (!date && voucherType === 'Voucher' && !(r.VOUCHERNUMBER || r.VoucherNumber)) continue;
-      const isCancelled = r.ISCANCELLED === 'Yes' || r.CANCELLED === 'Yes' || false;
+      const cancelRaw = [r.ISCANCELLED, r.IsCancelled, r.CANCELLED];
+      const isCancelled = cancelRaw.some((v) => isTallyTrue(v));
+      // An absent flag is not "not cancelled": keep the stored state unless Tally sent the flag.
+      const cancelFlagPresent = cancelRaw.some((v) => v !== undefined && v !== null && v !== '');
       const partyGuid = r._VOUCHERTYPE || r._PartyName || r.PartyGuid || null;
       let amount = parseFloat(r.AMOUNT || r.Amount || 0);
       // Compute from ledger entries if amount is 0
@@ -3464,7 +3470,7 @@ async function processAllVoucher(data, companyGuid) {
             amount              = CASE WHEN EXCLUDED.amount = 0 AND vouchers.amount != 0 THEN vouchers.amount ELSE EXCLUDED.amount END,
             narration           = COALESCE(EXCLUDED.narration, vouchers.narration),
             reference           = COALESCE(EXCLUDED.reference, vouchers.reference),
-            is_cancelled        = EXCLUDED.is_cancelled,
+            is_cancelled        = CASE WHEN $19::boolean THEN EXCLUDED.is_cancelled ELSE vouchers.is_cancelled END,
             alter_id            = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
             raw_data            = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year      = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
@@ -3486,6 +3492,7 @@ async function processAllVoucher(data, companyGuid) {
           r._FINANCIAL_YEAR || null,
           dispatchDetails2 ? JSON.stringify(dispatchDetails2) : null,
           currentCompanyId(),
+          cancelFlagPresent,
         ]);
         saved++;
         // Save AllLedgerEntries to voucher_ledger_entries (proper Dr/Cr from amount sign)
