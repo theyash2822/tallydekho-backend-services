@@ -12,6 +12,8 @@ export async function applyLegacyShapeSchema(client) {
     ALTER TABLE companies ADD COLUMN IF NOT EXISTS gst_taxpayer_type VARCHAR(50) DEFAULT 'Regular';
 
     ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS financial_year         TEXT;
+    -- R2 / X2: newest version seen in any feed; alter_id is the version actually applied.
+    ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS observed_alter_id      BIGINT DEFAULT 0;
     ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS voucher_type_parent    VARCHAR(100);
     ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS gst_section            VARCHAR(50);
     ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS is_export              BOOLEAN DEFAULT FALSE;

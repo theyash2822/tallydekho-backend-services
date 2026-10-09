@@ -1048,8 +1048,8 @@ async function processVouchers(data, companyGuid) {
         billAlloc = extractFirstBillAllocation(r);
 
         await client.query(`
-          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, $22)
+          INSERT INTO vouchers (guid, company_guid, voucher_number, voucher_type, voucher_type_parent, date, party_name, party_guid, amount, narration, reference, is_cancelled, is_optional, alter_id, raw_data, synced_at, financial_year, dispatch_details, bill_ref_name, bill_type, bill_allocated_amount, company_id, observed_alter_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $23::boolean THEN 0 ELSE $14::bigint END,$15,$16,$17,$18,$19,$20,$21, $22, $14::bigint)
           ON CONFLICT (company_id, guid) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, vouchers.company_id), -- COALESCE: never overwrite real data with null (prevents SimplifiedVoucher stubs from wiping AllVoucher.xml data)
             -- A thin stub's number (parsed from F02) only fills a gap; the full row's number wins.
@@ -1077,8 +1077,13 @@ async function processVouchers(data, companyGuid) {
                                         THEN vouchers.is_optional
                                       ELSE EXCLUDED.is_optional
                                     END,
-            alter_id              = GREATEST(EXCLUDED.alter_id, vouchers.alter_id),
-            raw_data              = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null' THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
+            -- R2 / X2: a thin index row records that Tally has a newer version (observed) but
+            -- never claims it was applied, so watermarks keep asking for the full voucher.
+            alter_id              = CASE WHEN $23::boolean THEN vouchers.alter_id ELSE GREATEST(EXCLUDED.alter_id, vouchers.alter_id) END,
+            observed_alter_id     = GREATEST(EXCLUDED.observed_alter_id, vouchers.observed_alter_id),
+            raw_data              = CASE WHEN EXCLUDED.raw_data IS NULL OR EXCLUDED.raw_data = 'null'
+                                           OR ($23::boolean AND vouchers.raw_data IS NOT NULL)
+                                      THEN vouchers.raw_data ELSE EXCLUDED.raw_data END,
             financial_year        = COALESCE(EXCLUDED.financial_year, vouchers.financial_year),
             dispatch_details      = COALESCE(EXCLUDED.dispatch_details, vouchers.dispatch_details),
             bill_ref_name         = COALESCE(EXCLUDED.bill_ref_name, vouchers.bill_ref_name),
@@ -1207,7 +1212,7 @@ async function processVouchers(data, companyGuid) {
         if (ref.startsWith('TDK-OPT-') || ref.startsWith('TDK-PRF-')) {
           // Always attach Tally voucher number / synced status without changing entry type.
           if (voucherNumber) {
-            const { rows: optSyncRows } = await dbQuery(
+            const { rows: optSyncRows } = await client.query(
               `UPDATE app_vouchers
                SET tally_voucher_no    = COALESCE($1, tally_voucher_no),
                    tally_sync_status   = 'synced',
@@ -1235,14 +1240,14 @@ async function processVouchers(data, companyGuid) {
             && !isThinSimplified
             && voucherNumber
           ) {
-            const { rows: avRows } = await dbQuery(
+            const { rows: avRows } = await client.query(
               `SELECT id, current_entry_type FROM app_vouchers
                WHERE tdk_reference_no = $1
                  AND (company_id::text = $2::text OR company_guid = $2::text)`,
               [ref, currentCompanyId()]
             );
             if (avRows.length > 0 && avRows[0].current_entry_type === 'optional') {
-              await dbQuery(`
+              await client.query(`
                 UPDATE app_vouchers
                 SET current_entry_type  = 'regular',
                     books_impact_status = 'posted',
@@ -1275,7 +1280,7 @@ async function processVouchers(data, companyGuid) {
         // String-safe: Tally/XML parsers can emit Reference as number (same class as OPT path bug).
         const ref2 = String(r.Reference || r.REFERENCE || r.reference || '');
         if (voucherNumber && ref2 && ref2.startsWith('TDK-') && !ref2.startsWith('TDK-OPT-') && !ref2.startsWith('TDK-PRF-')) {
-          const { rows: avRegRows } = await dbQuery(
+          const { rows: avRegRows } = await client.query(
             `UPDATE app_vouchers
              SET tally_voucher_no    = $1,
                  tally_sync_status   = 'synced',
@@ -1315,7 +1320,7 @@ async function processVouchers(data, companyGuid) {
 
           // Strategy A — paired payment: parent SAL ref comes from BILLALLOCATIONS
           if (billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name) {
-            const { rows: candidateRows } = await dbQuery(
+            const { rows: candidateRows } = await client.query(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
@@ -1338,7 +1343,7 @@ async function processVouchers(data, companyGuid) {
 
           // Strategy B — direct payment: unique (party + date + amount)
           if (!payRef) {
-            const { rows: candidateRows2 } = await dbQuery(
+            const { rows: candidateRows2 } = await client.query(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                 WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
@@ -1359,7 +1364,7 @@ async function processVouchers(data, companyGuid) {
           }
 
           if (payRef) {
-            const { rows: payRows } = await dbQuery(
+            const { rows: payRows } = await client.query(
               `UPDATE app_vouchers
                   SET tally_voucher_no    = $1,
                       tally_sync_status   = 'synced',
@@ -1378,7 +1383,7 @@ async function processVouchers(data, companyGuid) {
             }
           } else if (ambiguousRefs && ambiguousRefs.length > 1) {
             // Prevent repeated re-attempts for ambiguous matches.
-            await dbQuery(
+            await client.query(
               `UPDATE app_vouchers
                   SET tally_sync_status = 'needs_manual_reconciliation',
                       sync_error        = $1,
@@ -1401,7 +1406,7 @@ async function processVouchers(data, companyGuid) {
           const narration = r.Narration || r.NARRATION || r.narration || '';
           const m = narration.match(/TDK Journal:\s*(TDK-(?:OPT-)?JOR-\d{4}-\d+)/i);
           if (m?.[1]) {
-            const { rows: jorRows } = await dbQuery(
+            const { rows: jorRows } = await client.query(
               `UPDATE app_vouchers
                   SET tally_voucher_no    = $1,
                       tally_sync_status   = 'synced',
@@ -1431,7 +1436,7 @@ async function processVouchers(data, companyGuid) {
           const narration = r.Narration || r.NARRATION || r.narration || '';
           const m = narration.match(/TDK Contra:\s*(TDK-(?:OPT-)?CON-\d{4}-\d+)/i);
           if (m?.[1]) {
-            const { rows: conRows } = await dbQuery(
+            const { rows: conRows } = await client.query(
               `UPDATE app_vouchers
                   SET tally_voucher_no    = $1,
                       tally_sync_status   = 'synced',
@@ -1478,7 +1483,7 @@ async function processVouchers(data, companyGuid) {
 
           // Fallback: use bill allocation Agst Ref → lookup the unique queued receipt
           if (!rcpRef && billAlloc && billAlloc.bill_type === 'Agst Ref' && billAlloc.bill_ref_name) {
-            const { rows: candidateRows } = await dbQuery(
+            const { rows: candidateRows } = await client.query(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                  JOIN app_vouchers parent ON parent.invoice_uuid = av.parent_invoice_uuid
@@ -1497,7 +1502,7 @@ async function processVouchers(data, companyGuid) {
               console.warn(`[reconcile] Receipt ambiguous match for parent ${billAlloc.bill_ref_name}: ${candidateRows.length} candidates — needs_manual_reconciliation`);
               // Phase E: mark all ambiguous candidates so they don't get silently re-matched.
               try {
-                await dbQuery(
+                await client.query(
                   `UPDATE app_vouchers
                       SET tally_sync_status = 'needs_manual_reconciliation',
                           sync_error        = $1,
@@ -1517,7 +1522,7 @@ async function processVouchers(data, companyGuid) {
           // Fallback: SimplifiedVoucher.xml has no REFERENCE/bill_ref — match unique Receipt
           // by party + date + amount (must filter voucher_type=Receipt to avoid Sales collision).
           if (!rcpRef && partyName && recAmt > 0 && date) {
-            const { rows: candidateRows2 } = await dbQuery(
+            const { rows: candidateRows2 } = await client.query(
               `SELECT av.tdk_reference_no
                  FROM app_vouchers av
                 WHERE (av.company_id::text = $1::text OR av.company_guid = $1::text)
@@ -1536,7 +1541,7 @@ async function processVouchers(data, companyGuid) {
           }
 
           if (rcpRef) {
-            const { rows: recRows } = await dbQuery(
+            const { rows: recRows } = await client.query(
               `UPDATE app_vouchers
                   SET tally_voucher_no    = $1,
                       tally_sync_status   = 'synced',
@@ -1560,16 +1565,16 @@ async function processVouchers(data, companyGuid) {
       }
     }
 
+    // Gap 1: batch allocations nested in AllVoucher.xml inventory entries belong to the same
+    // accounting unit as their vouchers: written in this transaction, before COMMIT (R2 / X4).
+    if (allBatchFlatRecords.length > 0) {
+      await writeBatchAllocationRows(client, allBatchFlatRecords, companyGuid);
+    }
+
     await client.query('COMMIT');
     committed = true;
     for (const fire of pendingEmits.splice(0)) fire();
     console.log(`[DB] Vouchers: saved ${saved}/${data.length} for ${companyGuid}`);
-
-    // Gap 1: Persist batch allocations extracted from nested AllVoucher.xml → Batchallocations
-    // Runs post-commit with its own transaction; never blocks or rolls back voucher ingestion
-    if (allBatchFlatRecords.length > 0) {
-      await processBatchAllocations(allBatchFlatRecords, companyGuid);
-    }
 
     // Batch JOIN reconciliation — handles SimplifiedVoucher.xml which omits REFERENCE field.
     // When Tally sends incremental sync data without REFERENCE, the per-record reconciliation
@@ -3784,50 +3789,56 @@ async function processStockCategories(data, companyGuid) {
   finally { client.release(); }
 }
 
-// CTO Spec: batch_allocations table — batch/expiry tracking per voucher line item
+// CTO Spec: batch_allocations table — batch/expiry tracking per voucher line item.
+// Writes on the caller's client: inside processVouchers they are part of the voucher's
+// transaction, so a failure rolls the voucher back with them (R2 / X4).
+async function writeBatchAllocationRows(client, data, companyGuid) {
+  let saved = 0;
+  for (const r of data) {
+    const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
+    const itemName    = r.STOCKITEMNAME || r.StockItemName || r.ItemName || '';
+    // Gap 1 fix: add Batchname (AllVoucher.xml lowercase field name) to lookup chain
+    const batchName   = r.BATCHNAME || r.BatchName || r.Batchname || r.BATCHALLOCNAME || '';
+    if (!voucherGuid || !batchName) continue;
+    // Gap 2 fix: prefer ActualQty, fallback to BilledQty
+    const qty         = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.BILLEDQTY || r.BilledQty || r.QTY || 0);
+    const rate        = parseTallyRate(r.RATE || r.Rate || 0);
+    const fy          = r._FINANCIAL_YEAR || null;
+    // Gap 1 fix: add Godownname (AllVoucher.xml lowercase field name) to lookup chain
+    const godownName  = r.GODOWNNAME || r.GodownName || r.Godownname || null;
+    // Gap 3: resolve expiry — formatted date first, ExpiryPeriod text as fallback
+    const rawExpiry   = r.EXPIRYDATE || r.ExpiryDate || '';
+    const rawPeriod   = r.EXPIRYPERIOD || r.ExpiryPeriod || '';
+    const expiryDate  = rawExpiry || parseExpiryPeriod(rawPeriod) || null;
+    await client.query(`
+      INSERT INTO batch_allocations (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
+         expiry_date, mfg_date, qty, rate, godown_name, financial_year, synced_at, company_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(), $12)
+      ON CONFLICT (company_id, voucher_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
+        company_id = COALESCE(EXCLUDED.company_id, batch_allocations.company_id), qty=EXCLUDED.qty, rate=EXCLUDED.rate, expiry_date=EXCLUDED.expiry_date,
+        mfg_date=EXCLUDED.mfg_date, financial_year=EXCLUDED.financial_year, synced_at=NOW()
+    `, [
+      voucherGuid, companyGuid, itemName,
+      r.STOCKITEMGUID || r.StockItemGuid || null,
+      batchName,
+      expiryDate,
+      r.MANUFACTURINGDATE || r.ManufacturingDate || r.MFGDATE || r.MfgDate || null,
+      qty, rate,
+      godownName,
+      fy,
+      currentCompanyId()]);
+    saved++;
+  }
+  return saved;
+}
+
+/** The standalone batch stream (VoucherInventoryDetail.xml rows with batches). */
 async function processBatchAllocations(data, companyGuid) {
   if (!data?.length) return;
   const client = wrapIngestClient(await getClient());
   try {
     await client.query('BEGIN');
-    let saved = 0;
-    for (const r of data) {
-      const voucherGuid = r.VOUCHERGUID || r.VoucherGuid || r.GUID || '';
-      const itemName    = r.STOCKITEMNAME || r.StockItemName || r.ItemName || '';
-      // Gap 1 fix: add Batchname (AllVoucher.xml lowercase field name) to lookup chain
-      const batchName   = r.BATCHNAME || r.BatchName || r.Batchname || r.BATCHALLOCNAME || '';
-      if (!voucherGuid || !batchName) continue;
-      // Gap 2 fix: prefer ActualQty, fallback to BilledQty
-      const qty         = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.BILLEDQTY || r.BilledQty || r.QTY || 0);
-      const rate        = parseTallyRate(r.RATE || r.Rate || 0);
-      const fy          = r._FINANCIAL_YEAR || null;
-      // Gap 1 fix: add Godownname (AllVoucher.xml lowercase field name) to lookup chain
-      const godownName  = r.GODOWNNAME || r.GodownName || r.Godownname || null;
-      // Gap 3: resolve expiry — formatted date first, ExpiryPeriod text as fallback
-      const rawExpiry   = r.EXPIRYDATE || r.ExpiryDate || '';
-      const rawPeriod   = r.EXPIRYPERIOD || r.ExpiryPeriod || '';
-      const expiryDate  = rawExpiry || parseExpiryPeriod(rawPeriod) || null;
-      try {
-        await client.query(`
-          INSERT INTO batch_allocations (voucher_guid, company_guid, stock_item_name, stock_item_guid, batch_name,
-             expiry_date, mfg_date, qty, rate, godown_name, financial_year, synced_at, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(), $12)
-          ON CONFLICT (company_id, voucher_guid, stock_item_name, batch_name, godown_name) DO UPDATE SET
-            company_id = COALESCE(EXCLUDED.company_id, batch_allocations.company_id), qty=EXCLUDED.qty, rate=EXCLUDED.rate, expiry_date=EXCLUDED.expiry_date,
-            mfg_date=EXCLUDED.mfg_date, financial_year=EXCLUDED.financial_year, synced_at=NOW()
-        `, [
-          voucherGuid, companyGuid, itemName,
-          r.STOCKITEMGUID || r.StockItemGuid || null,
-          batchName,
-          expiryDate,
-          r.MANUFACTURINGDATE || r.ManufacturingDate || r.MFGDATE || r.MfgDate || null,
-          qty, rate,
-          godownName,
-          fy,
-          currentCompanyId()]);
-        saved++;
-      } catch (e) { console.warn('[DB] BatchAllocation insert failed:', e.message, batchName); }
-    }
+    const saved = await writeBatchAllocationRows(client, data, companyGuid);
     await client.query('COMMIT');
     console.log(`[DB] BatchAllocations: saved ${saved}/${data.length} for ${companyGuid}`);
   } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BatchAllocations failed:', e.message); }
