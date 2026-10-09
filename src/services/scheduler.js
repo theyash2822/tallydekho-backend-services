@@ -5,6 +5,7 @@ import cron from 'node-cron';
 import { query } from '../db/schema.js';
 import { sendCompliancePush } from './push.js';
 import { runPaymentReminderJob, istNow } from './paymentReminderJob.js';
+import { sweepStaleSyncRuns } from '../utils/syncRuns.js';
 
 const IST_CRON = { timezone: 'Asia/Kolkata' };
 
@@ -15,6 +16,17 @@ export function startScheduler() {
   schedulerStarted = true;
 
   console.log('[Scheduler] Starting TallyDekho job scheduler...');
+
+  // Sync runs whose desktop stopped sending heartbeats are closed even when no new sync
+  // starts for that company (R2 / S7).
+  cron.schedule('* * * * *', async () => {
+    try {
+      const swept = await sweepStaleSyncRuns(query);
+      if (swept) console.log(`[Scheduler] sync runs abandoned after lease expiry: ${swept}`);
+    } catch (err) {
+      console.warn('[Scheduler] sync-run sweep failed:', err.message);
+    }
+  });
 
   // ─── Payment Reminders — runs every hour, checks per-user configured time ───
   // Checks all users, finds invoices due soon, sends reminders if time matches

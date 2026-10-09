@@ -1009,17 +1009,21 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
       } catch (e) { console.warn('[INGEST] Tax backfill failed (non-fatal):', e.message); }
     }
 
-    if (userId && companies.length) {
+    // The audience is the device's workspace; a legacy device.user_id is not required (R2 / S7).
+    // Only a verified completion is announced as "synced".
+    if (verifiedSuccess && companies.length) {
       try {
-        let wsId = null;
-        try {
-          const { rows: wr } = await query(
-            `SELECT workspace_id FROM workspace_devices WHERE device_id = $1 AND status = 'active' LIMIT 1`,
-            [deviceId]
-          );
-          wsId = wr[0]?.workspace_id || null;
-        } catch (_) {}
-        companies.forEach((c) => socketService.notifySynced(userId, c.guid, wsId));
+        let wsId = device?.workspace_id || null;
+        if (!wsId) {
+          try {
+            const { rows: wr } = await query(
+              `SELECT workspace_id FROM workspace_devices WHERE device_id = $1 AND status = 'active' LIMIT 1`,
+              [deviceId]
+            );
+            wsId = wr[0]?.workspace_id || null;
+          } catch (_) {}
+        }
+        if (wsId) companies.forEach((c) => socketService.notifySynced(userId || null, c.guid, wsId));
       } catch (e) { console.warn('[WS] emit failed:', e.message); }
     }
 
