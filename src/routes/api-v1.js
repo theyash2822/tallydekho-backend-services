@@ -9179,11 +9179,6 @@ function validateBarcode(barcode, type) {
   if (type === 'EAN8' && !/^\d{8}$/.test(b)) return 'EAN8 must be exactly 8 digits';
   return null;
 }
-function buildStockItemAlterXML(stockName, barcode, existingAliases = []) {
-  const all = [...new Set([stockName, ...existingAliases, barcode])];
-  const nameList = all.map(a => `<NAME>${a.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</NAME>`).join('\n              ');
-  return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>All Masters</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><STOCKITEM NAME="${stockName}" ACTION="Alter"><NAME>${stockName}</NAME><NAME.LIST TYPE="String">${nameList}</NAME.LIST></STOCKITEM></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
-}
 
 /** Shared barcode list filters — mutates params[], returns AND-clauses (empty string if none). */
 function applyBarcodeListFilters({ period, group, status, search, lowThreshold = 20 }, params) {

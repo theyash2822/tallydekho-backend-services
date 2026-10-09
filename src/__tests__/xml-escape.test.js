@@ -168,3 +168,28 @@ test('source: no raw companyName / user text in write-back templates', () => {
   assert.doesNotMatch(tw, /STOCKITEM ACTION="Alter" NAME="\$\{existingName\}"/);
   assert.doesNotMatch(tw, /<BASICFINALDESTINATION>\$\{dd\.ship_to\}</);
 });
+
+// R2 / W3: parse the real builder output and get the original values back — no loss,
+// no double escaping — for &, <, >, quotes, Hindi, ₹, multiline and literal entity text.
+test('buildSalesLikeVoucherXml round-trips through an XML parser', async () => {
+  const { XMLParser } = await import('fast-xml-parser');
+  const party = 'Shah & Sons <Ltd> "HQ" शाह ₹';
+  const narration = 'Line 1 & <2>\nदूसरी पंक्ति ₹ 1,180\nliteral &amp; stays literal';
+  const xml = buildSalesLikeVoucherXml({ ...nastyVoucher, partyLedger: party, narration });
+  const parsed = new XMLParser({ ignoreAttributes: false, processEntities: true, htmlEntities: false, trimValues: false }).parse(xml);
+  const find = (node, key) => {
+    if (!node || typeof node !== 'object') return undefined;
+    if (key in node) return node[key];
+    for (const v of Object.values(node)) {
+      const hit = find(v, key);
+      if (hit !== undefined) return hit;
+    }
+    return undefined;
+  };
+  assert.equal(find(parsed, 'PARTYLEDGERNAME'), party);
+  assert.equal(find(parsed, 'NARRATION'), narration);
+});
+
+test('the dead unescaped stock-item alter builder is gone', () => {
+  assert.doesNotMatch(read('../routes/api-v1.js'), /function buildStockItemAlterXML/);
+});
