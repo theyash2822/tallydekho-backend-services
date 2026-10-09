@@ -581,6 +581,9 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_wq_lock      ON write_queue(status, lock_expires_at) WHERE status IN ('desktop_offline','pending');
       -- The desktop never answered: Tally may or may not have the entry, so it must not be re-pushed.
       ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS outcome_unknown BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS unknown_resolution  TEXT;
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS unknown_resolved_at BIGINT;
+      ALTER TABLE write_queue ADD COLUMN IF NOT EXISTS unknown_resolved_by INTEGER;
 
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);

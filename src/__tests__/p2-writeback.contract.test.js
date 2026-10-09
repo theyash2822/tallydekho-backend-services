@@ -47,9 +47,12 @@ describe('X9: an unanswered write is never auto-re-pushed', () => {
     assert.match(claim, /outcome_unknown IS NOT TRUE/);
   });
 
-  it('manual retry of an outcome-unknown row needs explicit confirmation', () => {
+  // Behaviour is proven in isolated/r1-writeback-unknown.test.js; this guards the
+  // removed user-confirmation override from coming back.
+  it('manual retry never re-posts an outcome-unknown row, even on confirmation', () => {
     const body = sliceFn(tallyWrite, 'export async function retrySingleEntry(');
-    assert.match(body, /outcome_unknown IS NOT TRUE OR \$3::boolean/);
+    assert.match(body, /AND outcome_unknown IS NOT TRUE\n/);
+    assert.doesNotMatch(body, /confirmOutcomeUnknown|\$3::boolean/);
     assert.match(body, /code: 'OUTCOME_UNKNOWN'/);
   });
 });

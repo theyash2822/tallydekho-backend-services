@@ -216,9 +216,11 @@ const outcomeUnknownError = () => {
 
 /** A desktop answer that arrives after the timeout settles the queued row it belongs to. */
 const settleLateTallyAck = async (xmlBody, result, attempt = 0) => {
+  // A late reply that is itself uncertain proves nothing; the entry stays unknown.
+  if (!result || (!result.status && result.outcomeUnknown)) return;
   const { rows } = await query(
     `SELECT id FROM write_queue
-      WHERE xml = $1 AND outcome_unknown = TRUE
+      WHERE xml = $1 AND outcome_unknown = TRUE AND unknown_resolution IS NULL
       ORDER BY updated_at DESC LIMIT 1`,
     [xmlBody]
   );
@@ -289,6 +291,7 @@ const forwardToTally = async (companyGuid, userId, xmlBody, opts = {}) => {
           }
           clearTimeout(timeout);
           if (result && result.status) resolve(result);
+          else if (result && result.outcomeUnknown) reject(outcomeUnknownError());
           else reject(new Error((result && result.message) || 'Tally write failed'));
         });
       });
@@ -5944,11 +5947,9 @@ router.get('/audit-trail', authMiddleware, async (req, res) => {
 router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await retrySingleEntry(id, req.user.userId, {
-      confirmOutcomeUnknown: req.body?.confirmOutcomeUnknown === true,
-    });
+    const result = await retrySingleEntry(id, req.user.userId);
     if (result.outcomeUnknown) {
-      return res.status(409).json({ status: false, code: result.code, outcomeUnknown: true, message: result.message });
+      return res.status(409).json({ status: false, code: result.code, outcomeUnknown: true, resolution: result.resolution, message: result.message });
     }
     if (result.alreadySuccess) {
       return res.json({ status: true, message: result.message, alreadySuccess: true, voucherNumber: result.voucherNumber || null });
@@ -5980,24 +5981,36 @@ router.post('/audit-trail/:id/retry', authMiddleware, async (req, res) => {
 // Atomic claim: only desktop_offline / failed rows can be claimed. Concurrent
 // Audit Trail taps on a queued row used to re-forward the same XML and create
 // duplicate vouchers in Tally — the WHERE clause prevents that race.
-export async function retrySingleEntry(entryId, userId, { confirmOutcomeUnknown = false } = {}) {
+// The caller must still be an active member of the entry's workspace: a removed
+// member or a stale owner id must not re-post into that workspace's Tally.
+const ACTIVE_QUEUE_MEMBER_SQL = `(write_queue.workspace_id IS NULL OR EXISTS (
+  SELECT 1 FROM workspace_memberships m
+   WHERE m.workspace_id = write_queue.workspace_id AND m.user_id = $2 AND m.status = 'ACTIVE'))`;
+
+// An entry whose Tally outcome is unknown is never re-posted from here, even on
+// user confirmation: Tally may hold it. resolveOutcomeUnknown settles it without posting.
+export async function retrySingleEntry(entryId, userId) {
   try {
     const { rows: claimed } = await query(
       `UPDATE write_queue
           SET status='processing',
               error_message=NULL,
-              outcome_unknown=FALSE,
               updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
         WHERE id=$1 AND user_id=$2
           AND status IN ('desktop_offline', 'failed', 'pending')
           AND xml IS NOT NULL
-          AND (outcome_unknown IS NOT TRUE OR $3::boolean)
+          AND outcome_unknown IS NOT TRUE
+          AND ${ACTIVE_QUEUE_MEMBER_SQL}
         RETURNING *`,
-      [entryId, userId, confirmOutcomeUnknown === true]
+      [entryId, userId]
     );
     const entry = claimed[0];
     if (!entry) {
-      const { rows } = await query(`SELECT id, status, xml, tally_voucher_number, outcome_unknown FROM write_queue WHERE id=$1 AND user_id=$2`, [entryId, userId]);
+      const { rows } = await query(
+        `SELECT id, status, xml, tally_voucher_number, outcome_unknown, unknown_resolution FROM write_queue
+          WHERE id=$1 AND user_id=$2 AND ${ACTIVE_QUEUE_MEMBER_SQL}`,
+        [entryId, userId]
+      );
       const existing = rows[0];
       if (!existing) return { success: false, message: 'Entry not found' };
       if (existing.outcome_unknown) {
@@ -6005,7 +6018,8 @@ export async function retrySingleEntry(entryId, userId, { confirmOutcomeUnknown 
           success: false,
           outcomeUnknown: true,
           code: 'OUTCOME_UNKNOWN',
-          message: 'Tally may already have this entry. Check Tally first; retry only if it is missing.',
+          resolution: existing.unknown_resolution || null,
+          message: 'Tally may already have this entry, so it will not be sent again. Check the Day Book in Tally, then mark it as found or discard this attempt.',
         };
       }
       if (existing.status === 'success') {
@@ -6044,6 +6058,47 @@ export async function retrySingleEntry(entryId, userId, { confirmOutcomeUnknown 
     await updateWriteQueue(entryId, null, err.message).catch(() => {});
     return { success: false, message: err.message };
   }
+}
+
+/**
+ * Settle an outcome-unknown entry by user review. Nothing is posted to Tally.
+ *   found_in_tally — the user found it in Tally: mark posted (optionally with its number).
+ *   discard        — close this attempt for good; it stays outcome_unknown so no
+ *                    retry path can pick it up. The user re-enters it if needed.
+ */
+export async function resolveOutcomeUnknown(entryId, userId, { resolution, tallyVoucherNumber = null } = {}) {
+  if (resolution !== 'found_in_tally' && resolution !== 'discard') {
+    return { success: false, code: 'INVALID_RESOLUTION', message: 'resolution must be found_in_tally or discard' };
+  }
+  const number = tallyVoucherNumber == null ? null : String(tallyVoucherNumber).trim().slice(0, 100) || null;
+  const found = resolution === 'found_in_tally';
+  const { rows } = await query(
+    `UPDATE write_queue
+        SET status = CASE WHEN $3 THEN 'success' ELSE status END,
+            outcome_unknown = CASE WHEN $3 THEN FALSE ELSE TRUE END,
+            tally_voucher_number = CASE WHEN $3 THEN COALESCE($4, tally_voucher_number) ELSE tally_voucher_number END,
+            unknown_resolution = $5,
+            unknown_resolved_at = EXTRACT(EPOCH FROM NOW())::BIGINT,
+            unknown_resolved_by = $2,
+            updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+      WHERE id=$1 AND user_id=$2 AND outcome_unknown = TRUE AND unknown_resolution IS NULL
+        AND ${ACTIVE_QUEUE_MEMBER_SQL}
+      RETURNING id, status, tally_voucher_number`,
+    [entryId, userId, found, number, found ? 'found_in_tally' : 'discarded']
+  );
+  if (!rows[0]) {
+    return { success: false, code: 'NOT_RESOLVABLE', message: 'Entry not found or not awaiting review' };
+  }
+  await query(
+    found
+      ? `UPDATE app_vouchers SET sync_error = NULL,
+           tally_voucher_no = COALESCE($2, tally_voucher_no),
+           updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE write_queue_id = $1`
+      : `UPDATE app_vouchers SET sync_error = $2, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+          WHERE write_queue_id = $1`,
+    [entryId, found ? number : 'Discarded after an unconfirmed Tally post. Not sent again.']
+  ).catch(() => {});
+  return { success: true, resolution: found ? 'found_in_tally' : 'discarded', status: rows[0].status };
 }
 
 // Phase C: per-workspace debounce map — prevents hammering Tally with retries
@@ -6728,7 +6783,7 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
     const desktop = await resolveDesktopWorkspace(req, res);
     if (!desktop) return;
     const { outboxId } = req.params;
-    const { success, tallyVoucherNumber, tallyVoucherGuid, tallyAlterId, errorCode, errorMessage } = req.body;
+    const { success, outcomeUnknown, tallyVoucherNumber, tallyVoucherGuid, tallyAlterId, errorCode, errorMessage } = req.body;
 
     // Verify this device owns the lock
     const { rows: lockRows } = await query(
@@ -6775,6 +6830,20 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
         });
       }
       res.json({ status: true, message: 'Result recorded. Invoice posted.' });
+    } else if (outcomeUnknown === true) {
+      // Tally may hold the entry. Keep it out of every claim/retry path until reviewed.
+      await query(
+        `UPDATE write_queue SET status='failed', outcome_unknown=TRUE, error_message=$1,
+         locked_by_device_id=NULL, locked_at=NULL, lock_expires_at=NULL,
+         attempt_count=attempt_count+1, updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id=$2`,
+        [`${OUTCOME_UNKNOWN_PREFIX}: ${errorMessage || 'Tally did not confirm this entry'}`, outboxId]
+      );
+      await query(
+        `UPDATE app_vouchers SET sync_error = $2, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+          WHERE write_queue_id = $1`,
+        [outboxId, 'Tally did not confirm this entry. Check Tally before entering it again.']
+      ).catch(() => {});
+      res.json({ status: true, message: 'Outcome unknown recorded.' });
     } else {
       await query(
         `UPDATE write_queue SET status='failed', error_message=$1,
