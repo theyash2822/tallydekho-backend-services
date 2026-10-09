@@ -390,6 +390,22 @@ function tallyName(r) {
 // LIST structures rather than as direct fields.  These helpers check both
 // the flat (old COLLECTION) path and the nested NATIVEMETHOD path.
 
+/**
+ * R2 / X6: which Tally-owned ledger fields this record actually carries. A carried but empty
+ * field is an explicit clear in Tally; a field the record does not carry keeps its stored value.
+ */
+function ledgerFieldPresence(r) {
+  const carries = (...keys) => keys.some((k) => Object.prototype.hasOwnProperty.call(r, k));
+  return {
+    gstin: carries('GSTIN', 'GSTREGISTRATIONNO', 'GSTREGNO', 'GSTREGNUMBER', 'GSTRegNo', 'PARTYGSTIN', 'PartyGSTIN',
+      'GSTREGISTRATIONDETAILS.LIST', 'GSTRegistrationDetails.LIST', 'GSTREGISTRATIONDETAILS'),
+    pan: carries('PAN', 'ITPAN', 'INCOMETAXNUMBER', 'IncomeTaxNumber'),
+    phone: carries('LEDGERMOBILE', 'LedgerMobile', 'LEDPHONE', 'LedPhone', 'LedgerPhone', 'PHONE', 'Phone'),
+    email: carries('LEDGEREMAIL', 'LedgerEmail', 'EMAIL', 'Email'),
+    address: carries('ADDRESS.LIST', 'MAILINGADDRESS.LIST', 'Address', 'MAILINGADDRESS'),
+  };
+}
+
 function extractNativeGstin(r) {
   // Flat path (COLLECTION format / direct field)
   if (r.GSTIN && typeof r.GSTIN === 'string') return r.GSTIN;
@@ -749,17 +765,31 @@ async function processMasters(data, companyGuid) {
           [currentCompanyId(), name, guid, PLACEHOLDER_LEDGER_GUID_RE, `${companyGuid}%`]
         );
         const bank = extractBankFields(r);
+        const clears = ledgerFieldPresence(r);
+        // A rename keeps the GUID: per-year balances keyed by the old name move with it.
+        const { rows: prevName } = await client.query(
+          'SELECT name FROM ledgers WHERE company_id = $1 AND guid = $2', [currentCompanyId(), guid]
+        );
+        if (prevName[0] && prevName[0].name !== name) {
+          await client.query(
+            `UPDATE ledger_fy_balances b SET ledger_name = $3
+              WHERE b.company_id = $1 AND b.ledger_name = $2
+                AND NOT EXISTS (SELECT 1 FROM ledger_fy_balances n
+                                 WHERE n.company_id = $1 AND n.ledger_name = $3 AND n.financial_year = b.financial_year)`,
+            [currentCompanyId(), prevName[0].name, name]
+          );
+        }
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address, opening_balance, closing_balance, balance_type, alter_id, synced_at, gst_registration_type, state_name, pincode, tax_rate,
             bank_account_no, bank_ifsc, bank_name, bank_branch, bank_holder, credit_limit, company_id)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25, $26)
           ON CONFLICT (company_id, guid) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, ledgers.company_id), name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
-            gstin=COALESCE(NULLIF(EXCLUDED.gstin,''), ledgers.gstin),
-            pan=COALESCE(NULLIF(EXCLUDED.pan,''), ledgers.pan),
-            phone=COALESCE(NULLIF(EXCLUDED.phone,''), ledgers.phone),
-            email=COALESCE(NULLIF(EXCLUDED.email,''), ledgers.email),
-            address=COALESCE(NULLIF(EXCLUDED.address,''), ledgers.address),
+            gstin=CASE WHEN $27::boolean THEN NULLIF(EXCLUDED.gstin,'') ELSE COALESCE(NULLIF(EXCLUDED.gstin,''), ledgers.gstin) END,
+            pan=CASE WHEN $28::boolean THEN NULLIF(EXCLUDED.pan,'') ELSE COALESCE(NULLIF(EXCLUDED.pan,''), ledgers.pan) END,
+            phone=CASE WHEN $29::boolean THEN NULLIF(EXCLUDED.phone,'') ELSE COALESCE(NULLIF(EXCLUDED.phone,''), ledgers.phone) END,
+            email=CASE WHEN $30::boolean THEN NULLIF(EXCLUDED.email,'') ELSE COALESCE(NULLIF(EXCLUDED.email,''), ledgers.email) END,
+            address=CASE WHEN $31::boolean THEN NULLIF(EXCLUDED.address,'') ELSE COALESCE(NULLIF(EXCLUDED.address,''), ledgers.address) END,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, alter_id=EXCLUDED.alter_id,
             synced_at=EXCLUDED.synced_at,
@@ -791,6 +821,7 @@ async function processMasters(data, companyGuid) {
           bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
           bank.credit_limit,
           currentCompanyId(),
+          clears.gstin, clears.pan, clears.phone, clears.email, clears.address,
         ]);
         saved++;
       } catch (e) {
@@ -2241,6 +2272,19 @@ async function processFullLedger(data, companyGuid) {
               AND guid ~* $4 AND guid NOT LIKE $5`,
           [currentCompanyId(), name, guid, PLACEHOLDER_LEDGER_GUID_RE, `${companyGuid}%`]
         );
+        const fullClears = ledgerFieldPresence(r);
+        const { rows: prevFullName } = await client.query(
+          'SELECT name FROM ledgers WHERE company_id = $1 AND guid = $2', [currentCompanyId(), guid]
+        );
+        if (prevFullName[0] && prevFullName[0].name !== name) {
+          await client.query(
+            `UPDATE ledger_fy_balances b SET ledger_name = $3
+              WHERE b.company_id = $1 AND b.ledger_name = $2
+                AND NOT EXISTS (SELECT 1 FROM ledger_fy_balances n
+                                 WHERE n.company_id = $1 AND n.ledger_name = $3 AND n.financial_year = b.financial_year)`,
+            [currentCompanyId(), prevFullName[0].name, name]
+          );
+        }
         const bank = extractBankFields(r);
         await client.query(`
           INSERT INTO ledgers (guid, company_guid, name, parent, alias, gstin, pan, phone, email, address,
@@ -2249,11 +2293,11 @@ async function processFullLedger(data, companyGuid) {
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26, $27)
           ON CONFLICT (company_id, guid) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, ledgers.company_id), name=EXCLUDED.name, parent=EXCLUDED.parent, alias=EXCLUDED.alias,
-            gstin=COALESCE(NULLIF(EXCLUDED.gstin,''), ledgers.gstin),
-            pan=COALESCE(NULLIF(EXCLUDED.pan,''), ledgers.pan),
-            phone=COALESCE(NULLIF(EXCLUDED.phone,''), ledgers.phone),
-            email=COALESCE(NULLIF(EXCLUDED.email,''), ledgers.email),
-            address=COALESCE(NULLIF(EXCLUDED.address,''), ledgers.address),
+            gstin=CASE WHEN $28::boolean THEN NULLIF(EXCLUDED.gstin,'') ELSE COALESCE(NULLIF(EXCLUDED.gstin,''), ledgers.gstin) END,
+            pan=CASE WHEN $29::boolean THEN NULLIF(EXCLUDED.pan,'') ELSE COALESCE(NULLIF(EXCLUDED.pan,''), ledgers.pan) END,
+            phone=CASE WHEN $30::boolean THEN NULLIF(EXCLUDED.phone,'') ELSE COALESCE(NULLIF(EXCLUDED.phone,''), ledgers.phone) END,
+            email=CASE WHEN $31::boolean THEN NULLIF(EXCLUDED.email,'') ELSE COALESCE(NULLIF(EXCLUDED.email,''), ledgers.email) END,
+            address=CASE WHEN $32::boolean THEN NULLIF(EXCLUDED.address,'') ELSE COALESCE(NULLIF(EXCLUDED.address,''), ledgers.address) END,
             opening_balance=EXCLUDED.opening_balance, closing_balance=EXCLUDED.closing_balance,
             balance_type=EXCLUDED.balance_type, is_revenue=EXCLUDED.is_revenue,
             alter_id=EXCLUDED.alter_id, synced_at=EXCLUDED.synced_at,
@@ -2286,6 +2330,7 @@ async function processFullLedger(data, companyGuid) {
           bank.bank_account_no, bank.bank_ifsc, bank.bank_name, bank.bank_branch, bank.bank_holder,
           bank.credit_limit,
           currentCompanyId(),
+          fullClears.gstin, fullClears.pan, fullClears.phone, fullClears.email, fullClears.address,
         ]);
         saved++;
         // DEBUG: log raw GST-related fields for ledgers that still have no GSTIN after extraction
