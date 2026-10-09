@@ -18,6 +18,7 @@ import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
 import { aggregateInventoryLines } from '../utils/inventoryLineAggregate.js';
 import { lineOrdinalCutoverComplete } from '../db/lineOrdinalSchema.js';
 import { isTallyTrue } from '../utils/tallyFields.js';
+import { tallyCounter } from '../utils/tallyCounters.js';
 import { classifyStockFyBalanceRows } from '../utils/stockFyBalance.js';
 
 // Rows created by an immediate app-side insert (gen_random_uuid) before Tally's own GUID arrives.
@@ -812,7 +813,7 @@ async function processMasters(data, companyGuid) {
           extractNativeAddress(r),
           parseFloat(String(r.OPENINGBALANCE || '0').replace(/[^0-9.-]/g, '')) || 0,
           Math.abs(balNum), balType,
-          parseInt(r.AlterId || r.ALTERID || 0),
+          tallyCounter(r.AlterId ?? r.ALTERID),
           now(),
           extractNativeGstRegType(r),
           r.LEDSTATENAME || r.LedStateName || r.STATENAME || r.MAILINGSTATE || null,
@@ -967,7 +968,7 @@ async function processStocks(data, companyGuid) {
           0, // closing_value
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
-          parseInt(r.ALTERID || r.AlterId || 0),
+          tallyCounter(r.ALTERID ?? r.AlterId),
           // Gap 4: batch & expiry flags from StockItem.xml (IsBatchWise / IsExpDtMaint)
           (r.MAINTAININBATCHES === 'Yes' || r.MaintainInBatches === 'Yes'),
           (r.USEEXPIRYDATES    === 'Yes' || r.UseExpirydates    === 'Yes'),
@@ -1149,7 +1150,7 @@ async function processVouchers(data, companyGuid) {
           r.Reference || r.REFERENCE || r.reference || null,
           isCancelled,
           isOptional,
-          parseInt(r.AlterId || r.ALTERID || 0),
+          tallyCounter(r.AlterId ?? r.ALTERID),
           JSON.stringify(r).slice(0, 10000),
           now(),
           r._FINANCIAL_YEAR || null,
@@ -2165,7 +2166,7 @@ async function processGroupMasters(data, companyGuid) {
           !!(r.IsPrimary === 1 || r.IsPrimary === '1'),
           parseTallyQty(r.REORDERLEVEL || r.ReorderLevel || r.reorderlevel || 0),
           parseTallyQty(r.MINIMUMORDERQTY || r.MinimumOrderQty || r.MINIMUMORDERQUANTITY || r.MinimumOrderQuantity || 0),
-          parseInt(r.AlterId || r.ALTERID || 0), now(),
+          tallyCounter(r.AlterId ?? r.ALTERID), now(),
           currentCompanyId()]);
         saved++;
       } catch (e) {
@@ -2322,7 +2323,7 @@ async function processFullLedger(data, companyGuid) {
           Math.abs(parseFloat(String(r.OPENINGBALANCE ?? r.OpeningBalance ?? '0').replace(/[^0-9.-]/g, '')) || 0),
           Math.abs(balNum), balType,
           !!(r.ISREVENUE === 'Yes' || r.IsRevenue === 1 || r.IsRevenue === '1' || r.ISREVENUE === 1 || r.ISREVENUE === '1'),
-          parseInt(r.ALTERID || r.AlterId || 0), now(),
+          tallyCounter(r.ALTERID ?? r.AlterId), now(),
           extractNativeGstRegType(r),
           extractNativeStateName(r),
           extractNativePincode(r),
@@ -2622,7 +2623,7 @@ async function processVoucherInventoryItems(data, companyGuid) {
           batchName,
           r.UNIT       || r.Unit       || null,
           r.HSN        || null,
-          parseInt(r.ALTERID ?? r.AlterId ?? 0),
+          tallyCounter(r.ALTERID ?? r.AlterId),
           currentCompanyId(),
           ordinal]);
         saved++;
@@ -2692,7 +2693,7 @@ async function processGSTDetails(data, companyGuid) {
           n(r.SGSTAMOUNT    ?? r.SGSTAmount    ?? r.SGST_AMOUNT),
           n(r.IGSTAMOUNT    ?? r.IGSTAmount    ?? r.IGST_AMOUNT),
           r.IRN || null,
-          parseInt(r.ALTERID ?? r.AlterId ?? 0), now(),
+          tallyCounter(r.ALTERID ?? r.AlterId), now(),
           isInterstate, isRcm, exportType, isSez,
           partyGstin, isNilRated, isExempt,
           itcEligibility, cessAmount, isNonGst,
@@ -2911,7 +2912,7 @@ function billOutstandingRow(r, companyGuid) {
     amount: parseBillAmt(r.Amount ?? r.AMOUNT),
     pending_amount: pending,
     bill_type: billSide(r),
-    alter_id: parseInt(r.AlterId || 0) || 0,
+    alter_id: tallyCounter(r.AlterId),
     synced_at: now(),
   };
 }
@@ -2979,7 +2980,7 @@ async function processBillOutstanding(data, companyGuid) {
           r.VoucherGuid || null, companyGuid, ledgerName, billName,
           billDate, dueDate,
           amount, pending,
-          drCr, parseInt(r.AlterId || 0) || 0, now(),
+          drCr, tallyCounter(r.AlterId), now(),
           currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
@@ -3587,7 +3588,7 @@ async function processAllVoucher(data, companyGuid) {
           r.NARRATION || r.Narration || null,
           r.REFERENCE || r.Reference || null,
           isCancelled,
-          parseInt(r.ALTERID || r.AlterId || 0),
+          tallyCounter(r.ALTERID ?? r.AlterId),
           JSON.stringify(r).slice(0, 5000),
           now(),
           r._FINANCIAL_YEAR || null,
@@ -3707,7 +3708,7 @@ async function processWarehouses(data, companyGuid) {
           r.Address || null,
           alias,
           JSON.stringify(aliases),
-          parseInt(r.AlterId || r.ALTERID || 0), now(),
+          tallyCounter(r.AlterId ?? r.ALTERID), now(),
           currentCompanyId()]);
         saved++;
         const whGuid = r.Guid || r.GUID || null;
@@ -3751,7 +3752,7 @@ async function processUnits(data, companyGuid) {
           r.BASE_UNITS || r.BaseUnits || null,
           r.ADDITIONAL_UNITS || null,
           r.CONVERSION || null,
-          parseInt(r.ALTERID || r.AlterId || 0), now(),
+          tallyCounter(r.ALTERID ?? r.AlterId), now(),
           currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] Unit insert failed:', e.message); }
@@ -3786,7 +3787,7 @@ async function processVoucherTypes(data, companyGuid) {
           r.NUMBERINGMETHOD || null,
           !!(r.ISDEEMEDPOSITIVE === 'Yes' || r.ISDEEMEDPOSITIVE === '1'),
           !!(r.AFFECTSSTOCK === 'Yes' || r.AFFECTSSTOCK === '1'),
-          parseInt(r.ALTERID || r.AlterId || 0), now(),
+          tallyCounter(r.ALTERID ?? r.AlterId), now(),
           currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] VoucherType insert failed:', e.message); }
@@ -3824,7 +3825,7 @@ async function processStockCategories(data, companyGuid) {
           ON CONFLICT (company_id, name) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, stock_categories.company_id), guid=COALESCE(EXCLUDED.guid, stock_categories.guid),
             parent=EXCLUDED.parent, alter_id=EXCLUDED.alter_id, synced_at=NOW()
-        `, [guid, companyGuid, name, parent, parseInt(r.ALTERID || r.AlterId || 0), currentCompanyId()]);
+        `, [guid, companyGuid, name, parent, tallyCounter(r.ALTERID ?? r.AlterId), currentCompanyId()]);
         saved++;
       } catch (e) { console.warn('[DB] StockCategory insert failed:', e.message, name); }
     }
@@ -3903,7 +3904,7 @@ async function processCurrencies(data, companyGuid) {
           INSERT INTO currencies (guid, company_guid, name, alter_id, synced_at, company_id)
           VALUES ($1,$2,$3,$4,$5, $6)
           ON CONFLICT (company_id, name) DO UPDATE SET company_id = COALESCE(EXCLUDED.company_id, currencies.company_id), guid=EXCLUDED.guid, synced_at=EXCLUDED.synced_at
-        `, [r.Guid || null, companyGuid, name, parseInt(r.ALTERID || 0), now(), currentCompanyId()]);
+        `, [r.Guid || null, companyGuid, name, tallyCounter(r.ALTERID), now(), currentCompanyId()]);
         saved++;
       } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
     }

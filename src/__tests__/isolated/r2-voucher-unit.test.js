@@ -119,3 +119,15 @@ test('X2: a stub that arrives first is stored as observed only; old full data af
   const after = await versions(co, v);
   assert.deepEqual([after.applied, after.observed], [11, 12]);
 });
+
+// R3 / 01: counters through the real voucher processor.
+test('01: AlterId "0012" is stored as 12; "2E5" fails the unit instead of becoming 2', async () => {
+  const co = await makeCompany();
+  const ok = `${co.guid}-c1`;
+  await ingest(co, [{ ...full(ok, 1, 'n'), AlterId: '0012' }]);
+  assert.equal((await versions(co, ok)).applied, 12);
+  const bad = `${co.guid}-c2`;
+  await assert.rejects(ingest(co, [{ ...full(bad, 1, 'n'), AlterId: '2E5' }]), (err) => err instanceof IngestBatchError);
+  const { rows } = await q('SELECT COUNT(*)::int AS n FROM vouchers WHERE company_id = $1 AND guid = $2', [co.id, bad]);
+  assert.equal(rows[0].n, 0);
+});
