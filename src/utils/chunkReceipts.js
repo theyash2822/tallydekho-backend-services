@@ -50,11 +50,23 @@ export function parseChunkBody(body) {
   } else {
     data = raw;
   }
-  if (data == null) data = [];
+  // Valid JSON is not enough: a chunk is one or more record objects. `null`, primitives,
+  // nested arrays or a body with nothing in it never become a successful receipt.
+  if (data == null) throw new ChunkBodyError('CHUNK_EMPTY', 'Chunk has no records');
   if (!Array.isArray(data)) data = [data];
+  if (!data.length) throw new ChunkBodyError('CHUNK_EMPTY', 'Chunk has no records');
   if (data.length > MAX_CHUNK_RECORDS) {
     throw new ChunkBodyError('CHUNK_TOO_LARGE', `Chunk has more than ${MAX_CHUNK_RECORDS} records`);
   }
+  data.forEach((record, i) => {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+      throw new ChunkBodyError('RECORD_INVALID', 'Chunk record is not a JSON object', i + 1);
+    }
+    const xml = record.XML ?? record.xml;
+    if (typeof xml !== 'string' || !xml.trim()) {
+      throw new ChunkBodyError('RECORD_INVALID', 'Chunk record has no XML collection name', i + 1);
+    }
+  });
   return data;
 }
 
@@ -100,10 +112,25 @@ export async function claimChunk(q, { uploadId, stream, chunkIndex, hash, record
   return taken.rows.length ? { outcome: 'claimed' } : { outcome: 'in_progress' };
 }
 
+/**
+ * Receipt and the upload's chunk counter change in one statement, and the counter is
+ * derived from applied receipts, so a replayed or re-applied chunk never counts twice.
+ */
 export async function markChunkApplied(q, { uploadId, stream, chunkIndex }) {
   await q(
-    `UPDATE ingest_chunk_receipts SET status = 'applied', applied_at = NOW()
-      WHERE upload_id = $1 AND stream = $2 AND chunk_index = $3`,
+    `WITH applied AS (
+       UPDATE ingest_chunk_receipts SET status = 'applied', applied_at = NOW()
+        WHERE upload_id = $1 AND stream = $2 AND chunk_index = $3
+       RETURNING upload_id
+     )
+     UPDATE ingest_uploads u
+        SET chunks = (SELECT COUNT(*) FROM ingest_chunk_receipts r
+                       WHERE r.upload_id = $1 AND r.status = 'applied')
+                     + (SELECT COUNT(*) FROM applied a
+                         WHERE NOT EXISTS (SELECT 1 FROM ingest_chunk_receipts r2
+                                            WHERE r2.upload_id = $1 AND r2.stream = $2
+                                              AND r2.chunk_index = $3 AND r2.status = 'applied'))
+      WHERE u.id = $1`,
     [uploadId, stream, chunkIndex]
   );
 }

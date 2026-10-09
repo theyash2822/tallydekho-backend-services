@@ -160,7 +160,7 @@ test('thin Simplified stub does not wipe voucher number or inventory lines', asy
   assert.equal(after.rows[0].n, before.rows[0].n);
 });
 
-test('repeated item/godown lines are merged, not dropped', async () => {
+test('older desktop rows (no line ordinals): repeated item/godown lines are merged, not dropped', async () => {
   const co = await makeCompany();
   const vGuid = `${co.guid}-00000002`;
   const line = { VOUCHERGUID: vGuid, STOCKITEMNAME: 'Synthetic Nut', GODOWNNAME: 'Main', RATE: '10/nos' };
@@ -178,29 +178,32 @@ test('repeated item/godown lines are merged, not dropped', async () => {
   assert.equal(rows[0].amount, 50);
 });
 
-test('a rolled-back batch is reported as a failure, not success', async () => {
+// R2 / X3: a deterministic fault in a required child insert (not "either outcome is fine").
+test('a required child-row failure rolls the voucher back and reports the batch as failed', async () => {
   const co = await makeCompany();
   const vGuid = `${co.guid}-00000003`;
-  // Force a statement error inside the voucher transaction: an over-long numeric value.
-  const bad = {
-    GUID: vGuid,
-    VoucherNumber: 'S-3',
-    VoucherTypeName: 'Sales',
-    Date: '20250401',
-    PartyLedgerName: 'Synthetic Customer',
-    ALLLEDGERENTRIES: [{ LEDGERNAME: 'Synthetic Customer', AMOUNT: '-1e400' }],
-  };
-  let thrown = null;
+  await q(`ALTER TABLE voucher_ledger_entries ADD CONSTRAINT x3_fault_ledger CHECK (ledger_name <> 'X3 Fault Ledger') NOT VALID`);
   try {
-    await processIngestedData('vouchers', [bad], co.guid, null, null, { companyId: co.id });
-  } catch (err) {
-    thrown = err;
-  }
-  const { rows } = await q(`SELECT COUNT(*)::int AS n FROM vouchers WHERE company_id = $1 AND guid = $2`, [co.id, vGuid]);
-  if (rows[0].n === 0) {
-    assert.ok(thrown instanceof IngestBatchError, 'a voucher batch that did not persist must throw IngestBatchError');
-    assert.equal(thrown.code, 'INGEST_BATCH_FAILED');
-  } else {
-    assert.equal(thrown, null, 'a persisted batch must not report failure');
+    const voucher = {
+      GUID: vGuid,
+      VoucherNumber: 'S-3',
+      VoucherTypeName: 'Sales',
+      Date: '20250401',
+      PartyLedgerName: 'Synthetic Customer',
+      ALLLEDGERENTRIES: [
+        { LEDGERNAME: 'Synthetic Customer', AMOUNT: '-100' },
+        { LEDGERNAME: 'X3 Fault Ledger', AMOUNT: '100' },
+      ],
+    };
+    await assert.rejects(
+      processIngestedData('vouchers', [voucher], co.guid, null, null, { companyId: co.id }),
+      (err) => err instanceof IngestBatchError && err.code === 'INGEST_BATCH_FAILED',
+    );
+    const { rows } = await q(`SELECT COUNT(*)::int AS n FROM vouchers WHERE company_id = $1 AND guid = $2`, [co.id, vGuid]);
+    assert.equal(rows[0].n, 0, 'no header without its ledger lines');
+    const { rows: lines } = await q(`SELECT COUNT(*)::int AS n FROM voucher_ledger_entries WHERE company_id = $1 AND voucher_guid = $2`, [co.id, vGuid]);
+    assert.equal(lines[0].n, 0);
+  } finally {
+    await q('ALTER TABLE voucher_ledger_entries DROP CONSTRAINT IF EXISTS x3_fault_ledger');
   }
 });

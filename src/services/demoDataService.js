@@ -218,7 +218,7 @@ async function insertInvLine(companyId, companyGuid, voucherGuid, line, fy) {
        (voucher_guid, company_guid, company_id, stock_item_name, stock_item_guid, actual_qty, billed_qty,
         rate, amount, godown_name, batch_name, unit, hsn, tax_rate, financial_year)
      VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-     ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
+     ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name, line_ordinal) DO UPDATE SET
        actual_qty = EXCLUDED.actual_qty, billed_qty = EXCLUDED.billed_qty,
        rate = EXCLUDED.rate, amount = EXCLUDED.amount, financial_year = EXCLUDED.financial_year`,
     [
@@ -233,7 +233,7 @@ async function insertStockTxn(companyId, companyGuid, row, ts, fy) {
     `INSERT INTO stock_transactions
        (stock_guid, company_guid, company_id, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, financial_year)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-     ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
+     ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type, line_ordinal) DO UPDATE SET
        qty = EXCLUDED.qty, rate = EXCLUDED.rate, value = EXCLUDED.value, date = EXCLUDED.date,
        financial_year = EXCLUDED.financial_year, synced_at = EXCLUDED.synced_at`,
     [

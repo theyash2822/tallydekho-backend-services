@@ -16,6 +16,7 @@ export { ingestCompanyCtx };
 import { extractBillAllocations, firstBillAllocation } from '../utils/billAllocations.js';
 import { billSide, creditDays, dueDateOf } from '../utils/billOutstanding.js';
 import { aggregateInventoryLines } from '../utils/inventoryLineAggregate.js';
+import { lineOrdinalCutoverComplete } from '../db/lineOrdinalSchema.js';
 import { isTallyTrue } from '../utils/tallyFields.js';
 import { classifyStockFyBalanceRows } from '../utils/stockFyBalance.js';
 
@@ -554,6 +555,23 @@ async function maybeStoreRaw(records, companyGuid, streamName) {
     client.release();
   }
 }
+
+// R2 / X5: once the ordinal keys are in place (boot on an empty DB, or the supervised
+// cutover script), each source line is stored under its own ordinal. Restart after the cutover.
+let lineOrdinalModeCache = null;
+async function lineOrdinalMode() {
+  if (lineOrdinalModeCache === null) {
+    lineOrdinalModeCache = await lineOrdinalCutoverComplete((t, p) => rawDbQuery(t, p)).catch(() => false);
+  }
+  return lineOrdinalModeCache;
+}
+export function resetLineOrdinalModeForTests() {
+  lineOrdinalModeCache = null;
+}
+const lineOrdinalOf = (r) => {
+  const n = Number(r?._LINE_ORDINAL);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+};
 
 export async function processIngestedData(streamName, data, companyGuid, userId, deviceId, opts = {}) {
   if (!data?.length || !companyGuid) return;
@@ -1940,19 +1958,32 @@ async function processStockTransactions(data, companyGuid) {
       stockLines.push({ r, stockName, qty: Math.abs(qty), rate, value, type, warehouse });
     }
 
-    const { lines: mergedStockLines, merged: stockMerged, sources: stockSources } = aggregateInventoryLines(
-      stockLines,
-      (l) => JSON.stringify([l.stockName, l.r.GUID || l.r.Guid || null, l.warehouse, l.type]),
-      { sum: ['qty', 'value'], qty: 'qty', value: 'value', rate: 'rate' }
-    );
-    if (stockMerged) console.log(`[DB] StockTransactions: merged ${stockMerged} repeated item/godown line(s) for ${companyGuid}`);
+    // Each source line is its own row when the desktop sent line ordinals and the ordinal key
+    // exists; otherwise (older desktop or database before the X5 cutover) identical lines merge.
+    const stOrdinalKey = await lineOrdinalMode();
+    const stUseOrdinals = stOrdinalKey && stockLines.every((l) => lineOrdinalOf(l.r) !== null);
+    let mergedStockLines;
+    let stockSources;
+    if (stUseOrdinals) {
+      mergedStockLines = stockLines.map((l) => ({ ...l, ordinal: lineOrdinalOf(l.r) }));
+      stockSources = mergedStockLines.map(() => 1);
+    } else {
+      const agg = aggregateInventoryLines(
+        stockLines,
+        (l) => JSON.stringify([l.stockName, l.r.GUID || l.r.Guid || null, l.warehouse, l.type]),
+        { sum: ['qty', 'value'], qty: 'qty', value: 'value', rate: 'rate' }
+      );
+      mergedStockLines = agg.lines.map((l) => ({ ...l, ordinal: 0 }));
+      stockSources = agg.sources;
+      if (agg.merged) console.log(`[DB] StockTransactions: merged ${agg.merged} repeated item/godown line(s) for ${companyGuid}`);
+    }
 
-    for (const [lineIdx, { r, stockName, qty, rate, value, type, warehouse }] of mergedStockLines.entries()) {
+    for (const [lineIdx, { r, stockName, qty, rate, value, type, warehouse, ordinal }] of mergedStockLines.entries()) {
       try {
         await client.query(`
-          INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
-          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
+          INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, company_id, line_ordinal)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12, $13)
+          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type, line_ordinal) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, stock_transactions.company_id), qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at
         `, [
           stockName,
@@ -1966,7 +1997,8 @@ async function processStockTransactions(data, companyGuid) {
           type,
           warehouse,
           now(),
-          currentCompanyId()]);
+          currentCompanyId(),
+          ordinal]);
         saved += stockSources[lineIdx];
       } catch (e) {
         console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200));
@@ -2337,29 +2369,39 @@ function parseLedgerEntries(r) {
 // V2: includes financial_year from record metadata
 // Every bill allocation line → voucher_bill_allocations (multi-bill receipts, AR/AP linking).
 // Only called for rich payloads so a SimplifiedVoucher stub never wipes stored rows.
+// Allocations are required children of the voucher: a failure here fails the voucher's
+// unit (and the chunk) instead of committing the voucher without its bills.
 async function saveBillAllocations(client, voucherGuid, r) {
   const cid = currentCompanyId();
   if (cid == null) return;
-  const allocs = extractBillAllocations(r);
-  await client.query('SAVEPOINT bill_alloc');
-  try {
-    await writeBillAllocations(client, cid, voucherGuid, r, allocs);
-    await client.query('RELEASE SAVEPOINT bill_alloc');
-  } catch (err) {
-    await client.query('ROLLBACK TO SAVEPOINT bill_alloc');
-    console.warn('[DB] Bill allocation save failed:', err.message, voucherGuid);
+  await writeBillAllocations(client, cid, voucherGuid, r, extractBillAllocations(r));
+}
+
+/** One row per (ledger, bill): Tally may allocate the same bill more than once in a voucher. */
+function mergeBillAllocations(allocs) {
+  const byKey = new Map();
+  for (const a of allocs) {
+    if (!a.ledger) continue;
+    const ledger = a.ledger.slice(0, 500);
+    const name = a.name.slice(0, 500);
+    const key = `${ledger}\u0000${name}`;
+    const prev = byKey.get(key);
+    if (prev) {
+      prev.amount = prev.amount == null && a.amount == null ? null : Number(prev.amount || 0) + Number(a.amount || 0);
+    } else {
+      byKey.set(key, { ...a, ledger, name });
+    }
   }
+  return [...byKey.values()];
 }
 
 async function writeBillAllocations(client, cid, voucherGuid, r, allocs) {
   await client.query('DELETE FROM voucher_bill_allocations WHERE company_id=$1 AND voucher_guid=$2', [cid, voucherGuid]);
-  for (const a of allocs) {
-    if (!a.ledger) continue;
+  for (const a of mergeBillAllocations(allocs)) {
     await client.query(
       `INSERT INTO voucher_bill_allocations (company_id, voucher_guid, ledger_name, bill_name, bill_type, amount, bill_date)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT DO NOTHING`,
-      [cid, voucherGuid, a.ledger.slice(0, 500), a.name.slice(0, 500), a.type, a.amount, a.date ? String(a.date) : null]
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [cid, voucherGuid, a.ledger, a.name, a.type, a.amount, a.date ? String(a.date) : null]
     );
   }
   const first = firstBillAllocation(r);
@@ -2498,18 +2540,26 @@ async function processVoucherInventoryItems(data, companyGuid) {
         batchName: r.BATCHNAME || r.BatchName || '',
       });
     }
-    const { lines, merged } = aggregateInventoryLines(
-      parsed,
-      (l) => JSON.stringify([l.voucherGuid, l.itemName, l.godownName, l.batchName]),
-      { sum: ['qty', 'billedQty', 'amount', 'discount'], qty: 'qty', value: 'amount', rate: 'rate' }
-    );
-    if (merged) console.log(`[DB] VoucherInventoryItems: merged ${merged} repeated item/godown/batch line(s) for ${companyGuid}`);
-    for (const { r, voucherGuid, itemName, qty, billedQty, rate, amount, discount, godownName, batchName } of lines) {
+    const viiOrdinalKey = await lineOrdinalMode();
+    const viiUseOrdinals = viiOrdinalKey && parsed.every((l) => lineOrdinalOf(l.r) !== null);
+    let lines;
+    if (viiUseOrdinals) {
+      lines = parsed.map((l) => ({ ...l, ordinal: lineOrdinalOf(l.r) }));
+    } else {
+      const agg = aggregateInventoryLines(
+        parsed,
+        (l) => JSON.stringify([l.voucherGuid, l.itemName, l.godownName, l.batchName]),
+        { sum: ['qty', 'billedQty', 'amount', 'discount'], qty: 'qty', value: 'amount', rate: 'rate' }
+      );
+      lines = agg.lines.map((l) => ({ ...l, ordinal: 0 }));
+      if (agg.merged) console.log(`[DB] VoucherInventoryItems: merged ${agg.merged} repeated item/godown/batch line(s) for ${companyGuid}`);
+    }
+    for (const { r, voucherGuid, itemName, qty, billedQty, rate, amount, discount, godownName, batchName, ordinal } of lines) {
       try {
         await client.query(`
-          INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, $15)
-          ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name) DO UPDATE SET
+          INSERT INTO voucher_inventory_items (voucher_guid, company_guid, stock_item_name, stock_item_guid, actual_qty, billed_qty, rate, amount, discount, godown_name, batch_name, unit, hsn, alter_id, company_id, line_ordinal)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, $15, $16)
+          ON CONFLICT (company_id, voucher_guid, stock_item_name, godown_name, batch_name, line_ordinal) DO UPDATE SET
             company_id = COALESCE(EXCLUDED.company_id, voucher_inventory_items.company_id), actual_qty=EXCLUDED.actual_qty, billed_qty=EXCLUDED.billed_qty,
             rate=EXCLUDED.rate, amount=EXCLUDED.amount,
             discount=EXCLUDED.discount, alter_id=EXCLUDED.alter_id
@@ -2523,7 +2573,8 @@ async function processVoucherInventoryItems(data, companyGuid) {
           r.UNIT       || r.Unit       || null,
           r.HSN        || null,
           parseInt(r.ALTERID ?? r.AlterId ?? 0),
-          currentCompanyId()]);
+          currentCompanyId(),
+          ordinal]);
         saved++;
       } catch (e) {
         console.warn('[DB] VoucherInvItem insert failed:', e.message);
@@ -2944,7 +2995,7 @@ async function processStockOpeningBalance(data, companyGuid) {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, financial_year, synced_at, company_id)
           VALUES ($1,$2,$3,'Opening Balance','2000-01-01',$4,$5,$6,'inward',$7,NULL,${now()},$8)
-          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type) DO UPDATE SET
+          ON CONFLICT (company_id, stock_guid, voucher_guid, warehouse, type, line_ordinal) DO UPDATE SET
             qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value, synced_at=EXCLUDED.synced_at,
             company_id=COALESCE(EXCLUDED.company_id, stock_transactions.company_id)
         `, [name, companyGuid, syntheticGuid, Math.abs(qty), Number.isFinite(rate) ? rate : 0, Number.isFinite(value) ? Math.abs(value) : 0, warehouse, currentCompanyId()]);

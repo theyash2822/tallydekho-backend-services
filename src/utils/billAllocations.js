@@ -17,42 +17,47 @@ function parseAmount(raw) {
   return Number.isFinite(n) ? n : null;
 }
 
-function ledgerEntriesOf(r) {
-  if (!r || typeof r !== 'object') return [];
-  return [
-    ...asList(r.ALLLEDGERENTRIES),
-    ...asList(r.AllLedgerEntries),
-    ...asList(r.AllLedgerentries),
-    ...asList(r.LEDGERENTRIES),
-    ...asList(r.LedgerEntries),
-  ].filter((e) => e && typeof e === 'object');
-}
-
-/** Every allocation line: [{ ledger, name, type, amount, date, isParty }]. Duplicates removed. */
+/**
+ * Every allocation line: [{ ledger, name, type, amount, date, isParty }].
+ * Tally may export the same ledger lines under both ALLLEDGERENTRIES and LEDGERENTRIES,
+ * so each ledger is taken from the first list that has it (as parseLedgerEntries does).
+ * Within that list, repeated allocations to the same bill are summed — not dropped.
+ */
 export function extractBillAllocations(r) {
+  if (!r || typeof r !== 'object') return [];
+  const groups = [
+    [...asList(r.ALLLEDGERENTRIES), ...asList(r.AllLedgerEntries), ...asList(r.AllLedgerentries)],
+    [...asList(r.LEDGERENTRIES), ...asList(r.LedgerEntries)],
+  ].map((g) => g.filter((e) => e && typeof e === 'object'));
   const out = [];
-  const seen = new Set();
-  for (const e of ledgerEntriesOf(r)) {
-    const ledger = String(e.LEDGERNAME || e.Ledgername || e.LedgerName || e.ledgername || '').trim();
-    const isParty = e.ISPARTYLEDGER === 'Yes' || e.IsPartyLedger === 'Yes';
-    const allocs = asList(e.BILLALLOCATIONS || e.BillAllocations || e.Billallocations || e.billallocations);
-    for (const ba of allocs) {
-      if (!ba || typeof ba !== 'object') continue;
-      const name = String(ba.NAME ?? ba.Name ?? ba.name ?? ba.Billname ?? ba.BillName ?? '').trim();
-      if (!name) continue;
-      const type = String(ba.BILLTYPE ?? ba.BillType ?? ba.billType ?? ba.Billtype ?? '').trim() || null;
-      const key = `${ledger}\u0000${name}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({
-        ledger,
-        name,
-        type,
-        amount: parseAmount(ba.AMOUNT ?? ba.Amount ?? ba.amount ?? ba.BillAmount ?? ba.Billamount),
-        date: ba.BILLDATE ?? ba.BillDate ?? ba.Billdate ?? null,
-        isParty,
-      });
+  const byKey = new Map();
+  const coveredLedgers = new Set();
+  for (const entries of groups) {
+    const ledgersHere = new Set();
+    for (const e of entries) {
+      const ledger = String(e.LEDGERNAME || e.Ledgername || e.LedgerName || e.ledgername || '').trim();
+      if (coveredLedgers.has(ledger)) continue;
+      ledgersHere.add(ledger);
+      const isParty = e.ISPARTYLEDGER === 'Yes' || e.IsPartyLedger === 'Yes';
+      const allocs = asList(e.BILLALLOCATIONS || e.BillAllocations || e.Billallocations || e.billallocations);
+      for (const ba of allocs) {
+        if (!ba || typeof ba !== 'object') continue;
+        const name = String(ba.NAME ?? ba.Name ?? ba.name ?? ba.Billname ?? ba.BillName ?? '').trim();
+        if (!name) continue;
+        const type = String(ba.BILLTYPE ?? ba.BillType ?? ba.billType ?? ba.Billtype ?? '').trim() || null;
+        const amount = parseAmount(ba.AMOUNT ?? ba.Amount ?? ba.amount ?? ba.BillAmount ?? ba.Billamount);
+        const key = `${ledger}\u0000${name}`;
+        const prev = byKey.get(key);
+        if (prev) {
+          if (amount != null) prev.amount = (prev.amount ?? 0) + amount;
+          continue;
+        }
+        const row = { ledger, name, type, amount, date: ba.BILLDATE ?? ba.BillDate ?? ba.Billdate ?? null, isParty };
+        byKey.set(key, row);
+        out.push(row);
+      }
     }
+    for (const l of ledgersHere) coveredLedgers.add(l);
   }
   return out;
 }

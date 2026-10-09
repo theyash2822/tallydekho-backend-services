@@ -7,6 +7,8 @@ import { allowEndpoint } from './networkGuard.js';
 
 export async function startRouteHarness(mounts) {
   const app = express();
+  // Same body handling as server.js: chunk uploads arrive raw.
+  app.use('/ingest/chunk', express.raw({ type: '*/*', limit: '50mb' }));
   app.use(express.json({ limit: '5mb' }));
   for (const [prefix, router] of mounts) app.use(prefix, router);
   const server = await new Promise((resolve) => {
@@ -14,11 +16,11 @@ export async function startRouteHarness(mounts) {
   });
   const port = server.address().port;
   allowEndpoint('127.0.0.1', port);
-  const call = async (method, path, { body, headers = {} } = {}) => {
+  const call = async (method, path, { body, raw, headers = {} } = {}) => {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method,
-      headers: { 'content-type': 'application/json', ...headers },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { 'content-type': raw !== undefined ? 'application/x-ndjson' : 'application/json', ...headers },
+      body: raw !== undefined ? raw : body === undefined ? undefined : JSON.stringify(body),
     });
     let json = null;
     try { json = await res.json(); } catch { /* empty */ }

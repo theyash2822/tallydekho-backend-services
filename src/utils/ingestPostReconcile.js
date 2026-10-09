@@ -4,7 +4,7 @@
  * Parent vouchers are the source for stock_transactions.voucher_type.
  */
 import { query } from '../db/schema.js';
-import { currentUploadId } from './ingestCompanyDualWrite.js';
+import { currentUploadId, currentChunkKey, ingestCompanyCtx } from './ingestCompanyDualWrite.js';
 import { RESET_MARKER } from '../services/voucherWatermarks.js';
 
 export async function reconcileStockOpeningsFromTransactions(companyId) {
@@ -64,7 +64,47 @@ export async function backfillStockMovementVoucherTypes(companyId) {
 export async function addCollectionTotals(xml, { saved = 0, rejected = 0 }) {
   const uploadId = currentUploadId();
   if (!uploadId || !xml) return;
+  const chunkKey = currentChunkKey();
+  const store = ingestCompanyCtx.getStore();
   try {
+    if (chunkKey && store) {
+      // Replay-safe: this chunk's contribution is stored under its key (accumulated for
+      // this application only) and the totals are re-summed, so re-applying the same
+      // chunk after a crash overwrites its share instead of adding it again.
+      const acc = (store.chunkTotals ||= new Map());
+      const cur = acc.get(xml) || { saved: 0, rejected: 0 };
+      cur.saved += Math.max(0, Number(saved) || 0);
+      cur.rejected += Math.max(0, Number(rejected) || 0);
+      acc.set(xml, cur);
+      await query(
+        `WITH cur AS (
+           SELECT COALESCE(collection_counts, '{}'::jsonb) AS cc FROM ingest_uploads WHERE id = $1 FOR UPDATE
+         ), nxt AS (
+           SELECT jsonb_set(
+                    jsonb_set(cc, '{_chunks}', COALESCE(cc->'_chunks', '{}'::jsonb)),
+                    ARRAY['_chunks', $2::text],
+                    COALESCE(cc->'_chunks'->$2::text, '{}'::jsonb)
+                      || jsonb_build_object($5::text, jsonb_build_object('saved', $3::bigint, 'rejected', $4::bigint))
+                  ) AS cc
+             FROM cur
+         ), summed AS (
+           SELECT nxt.cc,
+                  (SELECT COALESCE(SUM((v->>'saved')::bigint), 0) FROM jsonb_each(nxt.cc->'_chunks'->$2::text) e(k, v)) AS s,
+                  (SELECT COALESCE(SUM((v->>'rejected')::bigint), 0) FROM jsonb_each(nxt.cc->'_chunks'->$2::text) e(k, v)) AS r
+             FROM nxt
+         )
+         UPDATE ingest_uploads u
+            SET collection_counts = jsonb_set(
+                  jsonb_set(summed.cc, '{_cumulative}', COALESCE(summed.cc->'_cumulative', '{}'::jsonb)),
+                  ARRAY['_cumulative', $2::text],
+                  jsonb_build_object('saved', summed.s, 'rejected', summed.r)
+                )
+           FROM summed
+          WHERE u.id = $1`,
+        [uploadId, String(xml), cur.saved, cur.rejected, chunkKey]
+      );
+      return;
+    }
     await query(
       `UPDATE ingest_uploads
           SET collection_counts = jsonb_set(

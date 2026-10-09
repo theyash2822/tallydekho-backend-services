@@ -650,7 +650,6 @@ router.post('/ingest/chunk', requireDeviceCredential, async (req, res) => {
     }
 
     await markChunkApplied(query, receiptKey);
-    await query('UPDATE ingest_uploads SET chunks = chunks + 1 WHERE id = $1', [uploadId]);
     res.json({ status: true, data: { received: true, chunkIndex } });
   } catch (err) {
     if (err instanceof IngestBatchError) {

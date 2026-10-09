@@ -3,6 +3,7 @@ import pg from 'pg';
 import { REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 import { applyWorkspaceSchema } from './workspaceSchema.js';
 import { applyLegacyShapeSchema } from './legacyShapeSchema.js';
+import { ensureLineOrdinalKeys, applyLineOrdinalCutover, lineOrdinalCutoverComplete, lineOrdinalTablesEmpty } from './lineOrdinalSchema.js';
 import { ensureDeploymentIdentity } from './deploymentIdentity.js';
 import { assertAppEnvConsistency } from '../config/appEnv.js';
 const { Pool } = pg;
@@ -77,6 +78,12 @@ const CID_CUTOVER_GUARDED_TABLES = [
 let cidCutoverOutcome = null;
 
 /** What the last initSchema did about the Company Identity cutover. */
+let lineOrdinalOutcome = null;
+/** 'already_applied' | 'applied_on_empty_database' | 'pending_operator_migration' (R2 / X5). */
+export function lastLineOrdinalOutcome() {
+  return lineOrdinalOutcome;
+}
+
 export function lastCidCutoverOutcome() {
   return cidCutoverOutcome;
 }
@@ -1532,6 +1539,21 @@ export async function initSchema() {
           'verified backup: scripts/cid-child-constraint-cutover.mjs, ' +
           'scripts/cid-config-master-cutover.mjs, scripts/cid-guid-unique-cutover.mjs — see ' +
           'COMPANY_IDENTITY_PRODUCTION_CUTOVER.md'
+      );
+    }
+
+    // R2 / X5: after the CID keys exist, so the ordinal keys can replace them.
+    await ensureLineOrdinalKeys(client);
+    if (await lineOrdinalCutoverComplete((t, p) => client.query(t, p))) {
+      lineOrdinalOutcome = 'already_applied';
+    } else if (cidCutoverOutcome !== 'pending_operator_migration' && await lineOrdinalTablesEmpty((t, p) => client.query(t, p))) {
+      await applyLineOrdinalCutover(client);
+      lineOrdinalOutcome = 'applied_on_empty_database';
+    } else {
+      lineOrdinalOutcome = 'pending_operator_migration';
+      console.warn(
+        '[X5] Repeated stock lines are still merged on this database (it holds inventory rows). ' +
+        'After a verified backup run scripts/x5-line-ordinal-cutover.mjs (preflight, then --apply).'
       );
     }
 

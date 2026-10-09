@@ -44,29 +44,42 @@ const inCtx = (fn) => {
 };
 
 describe('parseChunkBody', () => {
+  const r = (n) => ({ XML: 'LedgerFull.xml', n });
+  const line = (n) => JSON.stringify(r(n));
+
   it('parses NDJSON with blank lines and CRLF', () => {
-    assert.deepEqual(parseChunkBody('{"a":1}\r\n\n{"b":2}\n'), [{ a: 1 }, { b: 2 }]);
+    assert.deepEqual(parseChunkBody(`${line(1)}\r\n\n${line(2)}\n`), [r(1), r(2)]);
   });
 
-  it('accepts a single JSON array and a single object', () => {
-    assert.deepEqual(parseChunkBody('[{"a":1},{"a":2}]'), [{ a: 1 }, { a: 2 }]);
-    assert.deepEqual(parseChunkBody('{"a":1}'), [{ a: 1 }]);
-    assert.deepEqual(parseChunkBody(Buffer.from('{"a":1}\n{"a":2}')), [{ a: 1 }, { a: 2 }]);
+  it('accepts a single JSON array, a single object and no final newline', () => {
+    assert.deepEqual(parseChunkBody(`[${line(1)},${line(2)}]`), [r(1), r(2)]);
+    assert.deepEqual(parseChunkBody(line(1)), [r(1)]);
+    assert.deepEqual(parseChunkBody(Buffer.from(`${line(1)}\n${line(2)}`)), [r(1), r(2)]);
   });
 
   it('rejects a bad line with its line number and never echoes content', () => {
     assert.throws(
-      () => parseChunkBody('{"a":1}\n{"secret":"x"\n{"c":3}'),
+      () => parseChunkBody(`${line(1)}\n{"secret":"x"\n${line(3)}`),
       (e) => e instanceof ChunkBodyError && e.code === 'NDJSON_INVALID' && e.line === 2 && !e.message.includes('secret')
     );
   });
 
   it('rejects non-object NDJSON lines', () => {
-    assert.throws(() => parseChunkBody('{"a":1}\n[1,2]'), (e) => e.code === 'NDJSON_INVALID' && e.line === 2);
+    assert.throws(() => parseChunkBody(`${line(1)}\n[1,2]`), (e) => e.code === 'NDJSON_INVALID' && e.line === 2);
+  });
+
+  // R2 / X11: valid JSON that is not a record never becomes a successful receipt.
+  it('rejects null, primitives, arrays of non-objects, empty bodies and records without a collection', () => {
+    for (const body of ['null', '\n\n', '', '5', '"text"', '[]', '[null]', `[${line(1)},7]`, '[[{"XML":"a"}]]']) {
+      assert.throws(() => parseChunkBody(body), (e) => e instanceof ChunkBodyError && ['CHUNK_EMPTY', 'RECORD_INVALID', 'NDJSON_INVALID'].includes(e.code), `body ${JSON.stringify(body)}`);
+    }
+    assert.throws(() => parseChunkBody(`${line(1)}\n{"no":"xml"}\n${line(3)}`), (e) => e.code === 'RECORD_INVALID' && e.line === 2);
+    assert.throws(() => parseChunkBody(`${line(1)}\n${line(2)}\n{"XML":""}`), (e) => e.code === 'RECORD_INVALID' && e.line === 3);
+    assert.throws(() => parseChunkBody(`${line(1)}\n${line(2)}\n${line(3)}`.slice(0, -5)), (e) => e.code === 'NDJSON_INVALID' && e.line === 3, 'truncated last line');
   });
 
   it('rejects oversized chunks', () => {
-    const big = Array.from({ length: MAX_CHUNK_RECORDS + 1 }, () => ({}));
+    const big = Array.from({ length: MAX_CHUNK_RECORDS + 1 }, () => ({ XML: 'a' }));
     assert.throws(() => parseChunkBody(big), (e) => e.code === 'CHUNK_TOO_LARGE');
   });
 
