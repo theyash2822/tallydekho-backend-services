@@ -23,21 +23,35 @@ const stockValue = (raw) => {
   return parseFloat(s.replace(/[^0-9.-]/g, '')) * (s.includes('-') ? -1 : 1) || 0;
 };
 
-function classifyRow(r) {
+/**
+ * @param companyYears Map(finYear → { begin, end }) from company_years (YYYYMMDD). When the
+ *   company has recorded years, every row must name one of them with the same boundaries
+ *   (R3 / S6); a row that does not is rejected instead of being given a label.
+ */
+function classifyRow(r, companyYears) {
   const fyLabel = r._FINANCIAL_YEAR || r.FINANCIAL_YEAR || null;
   const role = String(r.BALANCE_ROLE || '').toLowerCase();
+  const known = companyYears && companyYears.size ? companyYears.get(fyLabel) : undefined;
+  if (companyYears && companyYears.size && fyLabel && !known) return { error: 'unknown_company_year' };
   if (role) {
     const fyBegin = ymd(r.FY_BEGIN);
     const fyEnd = ymd(r.FY_END);
     const date = ymd(r.BALANCE_DATE ?? r.FROM_DATE);
     if (!fyLabel || !fyBegin || !fyEnd || !date) return { error: 'missing_fiscal_metadata' };
+    if (known && (known.begin !== fyBegin || known.end !== fyEnd)) return { error: 'fiscal_scope_mismatch' };
     if (role === 'closing' && date === fyEnd) return { financialYear: fyLabel, role };
     if (role === 'opening' && date === dayBefore(fyBegin)) return { financialYear: fyLabel, role };
     return { error: 'role_date_mismatch' };
   }
-  // Legacy desktop: label is the calendar year of the query date, boundaries assumed April–March.
+  // Legacy desktop: only FROM_DATE and a label. With recorded company years the date must be
+  // that year's closing or the day before its start; otherwise the April–March rule applies.
   const date = ymd(r.FROM_DATE ?? r.from_date);
   if (!fyLabel || !date) return { error: 'missing_fiscal_metadata' };
+  if (known) {
+    if (date === known.end) return { financialYear: fyLabel, role: 'closing' };
+    if (date === dayBefore(known.begin)) return { financialYear: fyLabel, role: 'opening' };
+    return { error: 'role_date_mismatch' };
+  }
   const startYear = parseInt(String(fyLabel).split('-')[0], 10);
   if (!Number.isFinite(startYear)) return { error: 'missing_fiscal_metadata' };
   if (date === `${startYear + 1}0331`) return { financialYear: fyLabel, role: 'closing' };
@@ -48,13 +62,13 @@ function classifyRow(r) {
  * Groups rows by fiscal year and role. Identical duplicates collapse; the same item with different
  * values in one scope is contradictory and is reported instead of being written in arrival order.
  */
-export function classifyStockFyBalanceRows(data) {
+export function classifyStockFyBalanceRows(data, { companyYears = null } = {}) {
   const groups = new Map();
   const rejected = [];
   for (const r of data || []) {
     const name = r?.Name || r?.NAME || '';
     if (!name) continue;
-    const c = classifyRow(r);
+    const c = classifyRow(r, companyYears);
     if (c.error) { rejected.push({ name, reason: c.error }); continue; }
     const key = `${c.financialYear}|${c.role}`;
     if (!groups.has(key)) groups.set(key, { financialYear: c.financialYear, role: c.role, items: new Map() });

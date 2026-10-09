@@ -92,3 +92,24 @@ test('isTallyTrue accepts text and legacy coerced flags', () => {
   for (const v of ['Yes', 'yes', ' true ', '1', true, 1]) assert.equal(isTallyTrue(v), true, String(v));
   for (const v of ['No', 'false', '0', '', null, undefined, false, 0]) assert.equal(isTallyTrue(v), false, String(v));
 });
+
+// R3 / S6: rows are checked against the company's recorded years.
+test('S6: a row naming an unknown year or different boundaries is rejected, not labelled', () => {
+  const companyYears = new Map([['2024-2025', { begin: '20240401', end: '20250331' }], ['2025-2026', { begin: '20250401', end: '20260331' }]]);
+  const r = (fy, begin, end, role, date) => ({ Name: 'Widget', _FINANCIAL_YEAR: fy, FY_BEGIN: begin, FY_END: end, BALANCE_ROLE: role, BALANCE_DATE: date, ClosingQty: '5', ClosingValue: '-50' });
+  const { groups, rejected } = classifyStockFyBalanceRows([
+    r('2025-2026', '20250401', '20260331', 'closing', '20260331'),
+    r('2026-2027', '20260401', '20270331', 'closing', '20270331'),
+    r('2024-2025', '20240101', '20241231', 'closing', '20241231'),
+  ], { companyYears });
+  assert.deepEqual(groups.map((g) => [g.financialYear, g.role, g.items.length]), [['2025-2026', 'closing', 1]]);
+  assert.deepEqual(rejected.map((x) => x.reason).sort(), ['fiscal_scope_mismatch', 'unknown_company_year']);
+});
+
+test('S6: legacy rows of a January–December company use its recorded boundaries, not April–March', () => {
+  const companyYears = new Map([['2025-2026', { begin: '20250101', end: '20251231' }]]);
+  const legacy = (date) => ({ Name: 'Widget', _FINANCIAL_YEAR: '2025-2026', FROM_DATE: date, ClosingQty: '5', ClosingValue: '-50' });
+  const { groups, rejected } = classifyStockFyBalanceRows([legacy('20251231'), legacy('20241231'), legacy('20260331')], { companyYears });
+  assert.deepEqual(groups.map((g) => g.role).sort(), ['closing', 'opening']);
+  assert.deepEqual(rejected.map((x) => x.reason), ['role_date_mismatch'], 'the April–March date is not this company\'s year end');
+});

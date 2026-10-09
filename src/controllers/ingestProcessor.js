@@ -3158,7 +3158,17 @@ async function applyCurrentFyClosingQty(companyGuid) {
 async function processStockFyBalance(data, companyGuid) {
   if (!data || data.length === 0) return;
 
-  const { groups, rejected } = classifyStockFyBalanceRows(data);
+  // R3 / S6: rows are checked against the company's recorded years, not only their own tags.
+  const companyYears = new Map();
+  try {
+    const { rows: years } = await dbQuery(
+      `SELECT fin_year, REPLACE(begin_date::text, '-', '') AS b, REPLACE(end_date::text, '-', '') AS e
+         FROM company_years WHERE company_id = $1`,
+      [currentCompanyId()]
+    );
+    for (const y of years) companyYears.set(y.fin_year, { begin: String(y.b).slice(0, 8), end: String(y.e).slice(0, 8) });
+  } catch (_) { /* no recorded years: per-row tags only */ }
+  const { groups, rejected } = classifyStockFyBalanceRows(data, { companyYears });
   if (rejected.length) {
     const reasons = [...new Set(rejected.map((r) => r.reason))].join(',');
     console.warn(`[DB] StockFyBalance: ${rejected.length} row(s) not stored for ${companyGuid} (${reasons})`);
