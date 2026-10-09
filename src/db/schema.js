@@ -596,13 +596,15 @@ export async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_groups_company     ON groups(company_guid);
       CREATE INDEX IF NOT EXISTS idx_vii_voucher        ON voucher_inventory_items(voucher_guid);
       CREATE INDEX IF NOT EXISTS idx_vii_company        ON voucher_inventory_items(company_guid);
+      -- Pre-CID content keys: only until the company_id / line-ordinal keys replace them (re-adding
+      -- them afterwards would fail on repeated stock lines and stop boot — R2 / X5).
       DO $$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'voucher_inventory_items_unique') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname IN ('voucher_inventory_items_unique', 'uq_vii_company_id_compound', 'uq_vii_line')) THEN
           ALTER TABLE voucher_inventory_items ADD CONSTRAINT voucher_inventory_items_unique UNIQUE (voucher_guid, company_guid, stock_item_name, godown_name, batch_name);
         END IF;
       END $$;
       DO $$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_transactions_unique') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname IN ('stock_transactions_unique', 'uq_stock_tx_company_id_compound', 'uq_stock_tx_line')) THEN
           ALTER TABLE stock_transactions ADD CONSTRAINT stock_transactions_unique UNIQUE (stock_guid, company_guid, voucher_guid, warehouse, type);
         END IF;
       END $$;
