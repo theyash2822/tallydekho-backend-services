@@ -2943,52 +2943,17 @@ async function stageBillOutstanding(data, companyGuid) {
   }
 }
 
+// R4 / X12: outstanding bills are replaced only through the staged protocol (rows staged per
+// upload, published at /ingest/complete when the device-owned upload's counts match). The old
+// header-less path deleted every bill on its first chunk and is refused: such rows are not
+// applied and the last confirmed bills stay.
 async function processBillOutstanding(data, companyGuid) {
   if (isStagedMode(currentBillSnapshotMode())) {
     return stageBillOutstanding(data, companyGuid);
   }
-  const client = wrapIngestClient(await getClient());
-  const parseAmt = parseBillAmt;
-  try {
-    await client.query('BEGIN');
-    const purge = await claimResets(client, {
-      uploadId: currentUploadId(), companyId: currentCompanyId(), kind: 'bill_outstanding', keys: [''], chunkKey: currentChunkKey(),
-    });
-    if (purge.length) {
-      await client.query('DELETE FROM bill_outstanding WHERE company_id=$1', [currentCompanyId()]);
-    }
-    let saved = 0;
-    let skipped = 0;
-    for (const r of data) {
-      const ledgerName = String(r.LedgerName || r.LEDGERNAME || '').trim();
-      const billName = String(r.BillName || r.BILLNAME || '').trim();
-      if (!ledgerName || !billName) { skipped++; continue; }
-      const pending = parseAmt(r.PendingAmount ?? r.PENDINGAMOUNT);
-      if (Math.abs(pending) < 0.005) { skipped++; continue; }
-      const amount = parseAmt(r.Amount ?? r.AMOUNT);
-      const drCr = billSide(r);
-      const billDate = normalizeDate(r.BillDate);
-      const creditPeriod = r.CreditPeriod ?? r.CREDITPERIOD ?? null;
-      // Tally can express the credit period as days or as a fixed due date.
-      const dueDate = dueDateOf(billDate, normalizeDate(r.DueDate), creditPeriod)
-        || (creditDays(creditPeriod) == null ? normalizeDate(creditPeriod) : null);
-      try {
-        await client.query(`
-          INSERT INTO bill_outstanding (voucher_guid, company_guid, ledger_name, bill_name, bill_date, due_date, amount, pending_amount, bill_type, alter_id, synced_at, company_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, $12)
-        `, [
-          r.VoucherGuid || null, companyGuid, ledgerName, billName,
-          billDate, dueDate,
-          amount, pending,
-          drCr, tallyCounter(r.AlterId), now(),
-          currentCompanyId()]);
-        saved++;
-      } catch (e) { console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200)); }
-    }
-    await client.query('COMMIT');
-    console.log(`[DB] BillOutstanding: saved ${saved}/${data.length} (skipped ${skipped}) for ${companyGuid}`);
-  } catch (e) { await client.query('ROLLBACK'); console.error('[DB] BillOutstanding failed:', e.message); }
-  finally { client.release(); }
+  console.warn(`[DB] BillOutstanding: ${data.length} row(s) without the staged protocol refused for ${companyGuid}; last confirmed bills kept`);
+  await recordIngestWarning('bill_legacy_refused', 'Outstanding bills were sent without the staged protocol; the last confirmed bills are kept.');
+  await recordCollectionStat('BillOutstanding.xml', { received: data.length, saved: 0, refused: data.length });
 }
 
 async function processStockOpeningBalance(data, companyGuid) {
