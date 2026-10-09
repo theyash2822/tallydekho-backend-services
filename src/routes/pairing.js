@@ -1,4 +1,5 @@
 // Pairing routes
+import { lastSuccessfulSyncSecs, secsToIso } from '../services/deviceSyncTime.js';
 import { Router } from 'express';
 import { query } from '../db/schema.js';
 import { authMiddleware, requireDeviceCredential } from '../middleware/auth.js';
@@ -27,7 +28,7 @@ router.get('/pairing-device', async (req, res) => {
     // Desktop path: device-id header present
     if (deviceId) {
       const { rows } = await query(
-        `SELECT d.device_id, d.name, d.last_seen, u.mobile, u.name AS user_name
+        `SELECT d.device_id, d.name, d.last_seen, d.workspace_id, u.mobile, u.name AS user_name
            FROM devices d
            LEFT JOIN workspaces w ON w.id = d.workspace_id
            LEFT JOIN users u ON u.id = w.owner_user_id
@@ -43,7 +44,8 @@ router.get('/pairing-device', async (req, res) => {
             NAME: d.name || d.device_id.slice(0,8),
             MOBILE: d.mobile || '',
             USER_NAME: d.user_name || '',
-            LAST_SYNC_AT: d.last_seen,
+            LAST_SYNC_AT: await lastSuccessfulSyncSecs(query, d.device_id, d.workspace_id),
+            LAST_SEEN_AT: d.last_seen,
             IS_PAIRED: true,
           }
         }
@@ -79,7 +81,15 @@ router.get('/pairing-device', async (req, res) => {
     if (!device) return res.json({ status: true, data: null });
     return res.json({
       status: true,
-      data: { device: { code: device.device_id.slice(0, 8), deviceId: device.device_id, lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null, paired: true } },
+      data: {
+        device: {
+          code: device.device_id.slice(0, 8),
+          deviceId: device.device_id,
+          lastSync: secsToIso(await lastSuccessfulSyncSecs(query, device.device_id, workspaceId)),
+          lastSeen: secsToIso(device.last_seen),
+          paired: true,
+        },
+      },
     });
   } catch (err) {
     res.status(500).json({ status: false, message: 'Failed' });
@@ -204,7 +214,8 @@ router.get('/paired-device', authMiddleware, async (req, res) => {
         ? {
             device: {
               code: device.device_id.slice(0, 8),
-              lastSync: device.last_seen ? new Date(device.last_seen * 1000).toISOString() : null,
+              lastSync: secsToIso(await lastSuccessfulSyncSecs(query, device.device_id, workspaceId)),
+              lastSeen: secsToIso(device.last_seen),
             },
           }
         : null,
@@ -319,7 +330,9 @@ router.post('/register', async (req, res) => {
 
     const { rows } = await query('SELECT * FROM devices WHERE device_id = $1', [resolvedId]);
     const device = rows[0];
-    const lastSync = device?.last_seen ? new Date(device.last_seen * 1000).toISOString() : null;
+    // Registration is not a sync: report the last verified sync, or nothing.
+    const lastSync = secsToIso(await lastSuccessfulSyncSecs(query, resolvedId, device?.workspace_id));
+    const lastSeen = secsToIso(device?.last_seen);
     const isPaired = device?.paired === true;
 
     let issuedSecret = null;
@@ -353,6 +366,7 @@ router.post('/register', async (req, res) => {
       message: 'Registered',
       data: {
         lastSync,
+        lastSeen,
         forceUpdate: false,
         isPaired,
         pairingCode: device?.pairing_code || null,

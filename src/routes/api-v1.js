@@ -4,6 +4,7 @@
 // translating response shapes to match the new API spec.
 // ============================================================
 
+import { lastSuccessfulSyncSecs } from '../services/deviceSyncTime.js';
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -804,6 +805,7 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
               id: device.device_id,
               name: device.name || 'Desktop',
               last_seen: Number.isFinite(lastSeenSecs) ? lastSeenSecs : null,
+              last_sync_at: await lastSuccessfulSyncSecs(query, device.device_id, workspaceId),
             } : null,
             company,
           },
@@ -828,7 +830,12 @@ router.get('/tally-sync/status', authMiddleware, async (req, res) => {
             desktop_online: !!payload.desktopOnline,
             workspace_status: status,
             device: payload.activeDeviceId
-              ? { id: payload.activeDeviceId, name: 'Desktop', last_seen: payload.lastHeartbeatAt || null }
+              ? {
+                  id: payload.activeDeviceId,
+                  name: 'Desktop',
+                  last_seen: payload.lastHeartbeatAt || null,
+                  last_sync_at: await lastSuccessfulSyncSecs(query, payload.activeDeviceId, personal.id),
+                }
               : null,
             company,
             canPair: payload.canPair,

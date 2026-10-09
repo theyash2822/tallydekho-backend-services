@@ -175,42 +175,10 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
       }
     }
 
+    // A company or year missing from this sync keeps its visibility: a sync of one
+    // company says nothing about the others. Removal is its own route
+    // (/desktop/companies/remove); the upsert below activates what this sync sends.
     const alterIds = {};
-    if (companies && companies.length > 0) {
-      // Mark companies not in current sync as inactive (workspace + device — never user_id)
-      const activeGuids = companies.map(c => c.guid).filter(Boolean);
-      if (workspaceId) {
-        const ph = activeGuids.map((_, i) => `$${i + 3}`).join(',');
-        await query(
-          `UPDATE companies SET is_active = FALSE
-           WHERE workspace_id = $1 AND device_id = $2 AND guid NOT IN (${ph})`,
-          [workspaceId, deviceId, ...activeGuids]
-        ).catch(() => {});
-        const phActivate = activeGuids.map((_, i) => `$${i + 2}`).join(',');
-        await query(
-          `UPDATE companies SET is_active = TRUE
-           WHERE workspace_id = $1 AND guid IN (${phActivate})`,
-          [workspaceId, ...activeGuids]
-        ).catch(() => {});
-      } else {
-        const ph = activeGuids.map((_, i) => `$${i + 2}`).join(',');
-        await query(
-          `UPDATE companies SET is_active = FALSE
-           WHERE device_id = $1 AND guid NOT IN (${ph})`,
-          [deviceId, ...activeGuids]
-        ).catch(() => {});
-        // Constrained to this device. Without it, a device that has no
-        // workspace_id yet would reactivate companies with the same Tally GUID
-        // in every other workspace — the deactivate above was already scoped by
-        // device_id, so only this half was open.
-        const phActivate = activeGuids.map((_, i) => `$${i + 2}`).join(',');
-        await query(
-          `UPDATE companies SET is_active = TRUE
-           WHERE device_id = $1 AND guid IN (${phActivate})`,
-          [deviceId, ...activeGuids]
-        ).catch(() => {});
-      }
-    }
     if (companies) {
       for (const c of companies) {
         try {
@@ -307,7 +275,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
           const selectedFYNames = new Set(selectedYears.map(y => y.finYear || y.fin_year || y.name).filter(Boolean));
           console.log(`[DB] Years for ${c.name}: total=${allYears.length} selected=${selectedFYNames.size}`);
 
-          await query('UPDATE company_years SET is_active = FALSE, is_current = FALSE WHERE company_id = $1', [companyId]).catch(() => {});
+          await query('UPDATE company_years SET is_current = FALSE WHERE company_id = $1', [companyId]).catch(() => {});
 
           const norm = d => d && d.length === 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
           for (const y of allYears) {
@@ -325,7 +293,7 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
                 VALUES ($1, $2, $3, $4, $5, $6, FALSE)
                 ON CONFLICT (company_id, fin_year) DO UPDATE SET
                   begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date,
-                  is_active = EXCLUDED.is_active
+                  is_active = company_years.is_active OR EXCLUDED.is_active
               `, [c.guid, companyId, finYear, norm(beginDate), norm(endDate), isActive]);
             } catch (ye) { console.warn('[DB] Year insert failed:', ye.message, y); }
           }
