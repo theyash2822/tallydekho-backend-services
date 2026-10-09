@@ -130,8 +130,9 @@ describe('voucher watermarks — database', () => {
 });
 
 describe('voucher watermarks — wiring', () => {
-  it('init-sync uses the watermark when present, legacy value otherwise, and hard sync clears', () => {
-    assert.match(ROUTE, /if \(isHardSync === true\) await clearVoucherWatermarks\(\{ query \}, companyId\);/);
+  it('init-sync uses the watermark when present, legacy value otherwise; hard sync keeps it until publication', () => {
+    // P4: a hard sync fetches from alterId 0 on the desktop; watermarks only move when the upload is verified.
+    assert.doesNotMatch(ROUTE, /clearVoucherWatermarks\(/);
     assert.match(ROUTE, /const watermarkSync = req\.body\?\.watermarkSync === true;/);
     assert.match(ROUTE, /if \(watermarkSync\) \{\s*voucherByYear\[finYear\] = effectiveWatermark\(watermarks\.get\(finYear\), yvRows\[0\]\?\.max\);\s*continue;\s*\}/);
     assert.match(ROUTE, /\[companyId, y\.begin \|\| y\.beginDate \|\| '2000-01-01', y\.end \|\| y\.endDate \|\| '2099-12-31'\]/);

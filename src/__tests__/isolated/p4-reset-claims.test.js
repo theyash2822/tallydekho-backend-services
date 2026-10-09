@@ -81,3 +81,30 @@ test('a voucher whose flat lines span two chunks keeps every line', async () => 
   const vi = await q('SELECT ledger_name FROM voucher_items WHERE company_id = $1 AND voucher_guid = $2 ORDER BY ledger_name', [co.id, v]);
   assert.deepEqual(vi.rows.map((r) => r.ledger_name), ['Cash', 'Sales'], 'both ledger lines survive the second chunk');
 });
+
+test('counts: merged repeated lines, empty rows and zero-qty openings are not rejections (watermark can advance)', async () => {
+  const co = await makeCompany();
+  const uploadId = uniq('up');
+  await q(`INSERT INTO ingest_uploads (id, device_id) VALUES ($1, 'synthetic-dev')`, [uploadId]);
+  const v = `${co.guid}-v2`;
+  const opts = { companyId: co.id, uploadId, chunkKey: 'st:0' };
+  const empty = { GUID: `${co.guid}-v3`, COMPANY_GUID: co.guid, XML: 'StockTransaction.xml', _FINANCIAL_YEAR: '2025-2026' };
+  await processIngestedData('records', [
+    stockLine(co, v, 'Widget A', 1), stockLine(co, v, 'Widget A', 2), stockLine(co, v, 'Widget B', 3), empty,
+  ], co.guid, null, null, opts);
+  await q(`INSERT INTO stocks (guid, company_guid, company_id, name) VALUES ($1,$2,$3,'Widget A')`, [`${co.guid}-s1`, co.guid, co.id]);
+  await processIngestedData('records', [
+    { Name: 'Widget A', COMPANY_GUID: co.guid, XML: 'StockOpeningBalance.xml', OpeningBalance: '0', OpeningRate: '0', OpeningValue: '0' },
+    { Name: 'Widget A', COMPANY_GUID: co.guid, XML: 'StockOpeningBalance.xml', OpeningBalance: '5', OpeningRate: '10', OpeningValue: '50', GodownName: 'Main' },
+  ], co.guid, null, null, { ...opts, chunkKey: 'ob:0' });
+
+  const { rows } = await q(`SELECT collection_counts AS c FROM ingest_uploads WHERE id = $1`, [uploadId]);
+  const c = rows[0].c;
+  assert.deepEqual(c._cumulative['StockTransaction.xml'], { saved: 4, rejected: 0 });
+  assert.equal(c['StockTransaction.xml'].saved, 3);
+  assert.equal(c['StockTransaction.xml'].empty, 1);
+  assert.equal(c['StockOpeningBalance.xml'].rejected, 0);
+  assert.equal(c['StockOpeningBalance.xml'].warehouseRows, 1);
+  const st = await q(`SELECT value FROM stock_transactions WHERE company_id = $1 AND voucher_guid = $2 AND stock_guid = 'Widget A'`, [co.id, v]);
+  assert.equal(Number(st.rows[0].value), 30, 'repeated lines merged, not dropped');
+});

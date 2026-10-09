@@ -1,5 +1,13 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-09 — Fix: false "rejected" counts held voucher watermarks back (branch `8-10-2026`)
+
+- Seen in the Windows sync log: Laveena `StockTransaction.xml rejected 1`, `StockOpeningBalance.xml rejected 4/4`, Yash Ki Company `StockOpeningBalance.xml rejected 1` → `voucher_watermarks kept (rejected:StockTransaction.xml)`, so that company re-fetched the same year on every sync.
+- **StockTransaction:** `saved` counted merged lines, not input rows, so the P2 merge of repeated item/godown lines (X5) looked like rejections. `aggregateInventoryLines` now returns `sources` per merged line and `saved` adds them. Rows with no item and no quantity/amount (accounting-only vouchers) are reported as `empty`, not rejected, and count as accounted for the watermark. Rows with a quantity but no item are still rejections.
+- **StockOpeningBalance:** zero-quantity rows (stocks updated, no warehouse row needed) were reported as rejected. Now only unusable rows (no name, bad number, failed insert) are rejected; `warehouseRows` reports the warehouse inserts.
+- **Stale source-text tests updated to the P4 design** (never run in earlier phases): `voucher-watermarks` wiring (hard sync no longer clears watermarks at init-sync) and `bill-snapshot` (no up-front purge; publication removes only stale bills).
+- **Tests:** full backend sweep on the disposable PG 409/411 pass (2 skipped; `critical` and `pairing-stabilization` excluded — live HTTP); isolated 34/34 (new counting test in `p4-reset-claims`).
+
 ## 2026-10-08 — P8 QA follow-up (branch `8-10-2026`, TD-FIX-2026-10-08)
 
 - **Restore completion** is one transaction (claim, device activation, old-device revoke, binding, watermark reset, COMPLETED). A failure part-way rolls back and the desktop's pending acknowledgement can complete it later; no session stuck in COMPLETING.

@@ -1896,10 +1896,15 @@ async function processStockTransactions(data, companyGuid) {
     }
 
     const stockLines = [];
+    let emptyRows = 0;
     for (const r of data) {
       // StockTransaction.xml: Tally sends ALL keys uppercase
       const stockName = r.STOCKITEMNAME || r.StockItemName || r.stockGuid || '';
-      if (!stockName) continue;
+      if (!stockName) {
+        // A row with no item and no quantity/amount carries nothing to store (e.g. an accounting-only voucher).
+        if (!(parseFloat(r.ACTUALQTY || r.ActualQty || r.qty || 0) || parseFloat(r.AMOUNT ?? r.Amount ?? r.value ?? 0))) emptyRows += 1;
+        continue;
+      }
       // parseTallyQty handles '(-)20', '-20', '20 nos' formats
       const rawQty = parseTallyQty(r.ACTUALQTY || r.ActualQty || r.qty || '0');
       const qty    = isNaN(rawQty) ? 0 : rawQty;
@@ -1930,14 +1935,14 @@ async function processStockTransactions(data, companyGuid) {
       stockLines.push({ r, stockName, qty: Math.abs(qty), rate, value, type, warehouse });
     }
 
-    const { lines: mergedStockLines, merged: stockMerged } = aggregateInventoryLines(
+    const { lines: mergedStockLines, merged: stockMerged, sources: stockSources } = aggregateInventoryLines(
       stockLines,
       (l) => JSON.stringify([l.stockName, l.r.GUID || l.r.Guid || null, l.warehouse, l.type]),
       { sum: ['qty', 'value'], qty: 'qty', value: 'value', rate: 'rate' }
     );
     if (stockMerged) console.log(`[DB] StockTransactions: merged ${stockMerged} repeated item/godown line(s) for ${companyGuid}`);
 
-    for (const { r, stockName, qty, rate, value, type, warehouse } of mergedStockLines) {
+    for (const [lineIdx, { r, stockName, qty, rate, value, type, warehouse }] of mergedStockLines.entries()) {
       try {
         await client.query(`
           INSERT INTO stock_transactions (stock_guid, company_guid, voucher_guid, voucher_type, date, qty, rate, value, type, warehouse, synced_at, company_id)
@@ -1957,7 +1962,7 @@ async function processStockTransactions(data, companyGuid) {
           warehouse,
           now(),
           currentCompanyId()]);
-        saved++;
+        saved += stockSources[lineIdx];
       } catch (e) {
         console.warn("[DB] Insert failed:", e.message, JSON.stringify(r).slice(0,200));
         await recordIngestWarning('stock_transaction_insert', e.message);
@@ -2009,9 +2014,10 @@ async function processStockTransactions(data, companyGuid) {
 
     await client.query('COMMIT');
     console.log(`[DB] StockTx: saved ${saved}/${data.length} for ${companyGuid}${stCommitted ? '' : ' — ROLLED BACK'}`);
-    await recordCollectionStat('StockTransaction.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved) });
+    await recordCollectionStat('StockTransaction.xml', { received: data.length, saved, rejected: Math.max(0, data.length - saved - emptyRows), empty: emptyRows });
+    // Empty rows are accounted for (nothing to store), so they count toward the watermark's saved >= sent.
     await addCollectionTotals('StockTransaction.xml', stCommitted
-      ? { saved, rejected: Math.max(0, data.length - saved) }
+      ? { saved: saved + emptyRows, rejected: Math.max(0, data.length - saved - emptyRows) }
       : { saved: 0, rejected: data.length });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -2890,14 +2896,14 @@ async function processStockOpeningBalance(data, companyGuid) {
     await client.query('BEGIN');
     let updated = 0;
     let txInserted = 0;
+    let unusable = 0;
 
     // Aggregate: total opening per stock (sum across all warehouses)
     const totals = {}; // name → { qty, rate, val }
     for (const r of data) {
       const name = tallyName(r);  // use tallyName() to handle array values from xml2js
-      if (!name) continue;
       const qty = parseFloat(r.OpeningBalance || r.OPENINGBALANCE || 0);
-      if (isNaN(qty)) continue;
+      if (!name || isNaN(qty)) { unusable += 1; continue; }
       if (!totals[name]) totals[name] = { qty: 0, rate: 0, val: 0 };
       totals[name].qty += qty;
       totals[name].rate = parseFloat(r.OpeningRate || r.OPENINGRATE || 0);
@@ -2938,12 +2944,13 @@ async function processStockOpeningBalance(data, companyGuid) {
             company_id=COALESCE(EXCLUDED.company_id, stock_transactions.company_id)
         `, [name, companyGuid, syntheticGuid, Math.abs(qty), Number.isFinite(rate) ? rate : 0, Number.isFinite(value) ? Math.abs(value) : 0, warehouse, currentCompanyId()]);
         txInserted++;
-      } catch (e) { console.warn('[DB] StockOpening tx insert failed:', e.message, name, warehouse); }
+      } catch (e) { unusable += 1; console.warn('[DB] StockOpening tx insert failed:', e.message, name, warehouse); }
     }
 
     await client.query('COMMIT');
     console.log(`[DB] StockOpening: updated ${updated} stocks, ${txInserted} warehouse tx rows for ${companyGuid}`);
-    await recordCollectionStat('StockOpeningBalance.xml', { received: data.length, saved: txInserted, rejected: Math.max(0, data.length - txInserted) });
+    // Zero-quantity rows update stocks.opening_* but need no warehouse row; they are not rejections.
+    await recordCollectionStat('StockOpeningBalance.xml', { received: data.length, saved: data.length - unusable, rejected: unusable, warehouseRows: txInserted });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('[DB] StockOpening failed:', e.message);

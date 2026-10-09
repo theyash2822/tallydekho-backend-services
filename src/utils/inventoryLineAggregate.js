@@ -10,7 +10,7 @@ const round6 = (n) => Math.round((Number(n) || 0) * 1e6) / 1e6;
  * @param {object[]} lines
  * @param {(line: object) => string} keyOf
  * @param {{ sum: string[], qty: string, value: string, rate: string }} fields
- * @returns {{ lines: object[], merged: number }}
+ * @returns {{ lines: object[], merged: number, sources: number[] }} `sources[i]` = input lines merged into `lines[i]`
  */
 export function aggregateInventoryLines(lines, keyOf, { sum, qty, value, rate }) {
   const byKey = new Map();
@@ -19,17 +19,20 @@ export function aggregateInventoryLines(lines, keyOf, { sum, qty, value, rate })
     const key = keyOf(line);
     const prev = byKey.get(key);
     if (!prev) {
-      byKey.set(key, { line: { ...line }, mixedRate: false });
+      byKey.set(key, { line: { ...line }, mixedRate: false, sources: 1 });
       continue;
     }
     merged += 1;
+    prev.sources += 1;
     for (const f of sum) prev.line[f] = round6((prev.line[f] || 0) + (line[f] || 0));
     if (prev.line[rate] !== line[rate]) prev.mixedRate = true;
   }
   const out = [];
-  for (const { line, mixedRate } of byKey.values()) {
+  const sources = [];
+  for (const { line, mixedRate, sources: n } of byKey.values()) {
     if (mixedRate && line[qty]) line[rate] = round6(line[value] / line[qty]);
     out.push(line);
+    sources.push(n);
   }
-  return { lines: out, merged };
+  return { lines: out, merged, sources };
 }

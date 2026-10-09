@@ -139,13 +139,14 @@ describe('aggregateInventoryLines', () => {
   const key = (l) => `${l.v}|${l.item}|${l.godown}`;
 
   it('merges repeated item/godown lines instead of dropping them', () => {
-    const { lines, merged } = aggregateInventoryLines([
+    const { lines, merged, sources } = aggregateInventoryLines([
       { v: 'V1', item: 'Bolt', godown: 'Main', qty: 2, rate: 10, amount: 20 },
       { v: 'V1', item: 'Bolt', godown: 'Main', qty: 3, rate: 10, amount: 30 },
       { v: 'V1', item: 'Nut', godown: 'Main', qty: 1, rate: 5, amount: 5 },
     ], key, fields);
     assert.equal(merged, 1);
     assert.equal(lines.length, 2);
+    assert.deepEqual(sources, [2, 1], 'source rows per merged line, so saved counts stay per input row');
     const bolt = lines.find((l) => l.item === 'Bolt');
     assert.deepEqual([bolt.qty, bolt.amount, bolt.rate], [5, 50, 10]);
   });

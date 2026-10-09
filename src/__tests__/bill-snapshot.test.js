@@ -170,10 +170,11 @@ test('hard sync keeps bills; reset/delete and GUID replacement still wipe them',
   assert.ok(!purgeTablesFor({ keepBillOutstanding: true }).includes('bill_outstanding_staging'));
   assert.ok(purgeTablesFor().includes('bill_outstanding'));
   assert.ok(purgeTablesFor().includes('vouchers'));
-  const purge = readFileSync(new URL('../services/companyPurge.js', import.meta.url), 'utf8');
-  assert.match(purge, /keepBillOutstanding = opts\.keepBillOutstanding !== false/);
+  // P4: hard sync never purges up front; publication removes only bills older than the verified upload.
   const hard = readFileSync(new URL('../services/hardSyncService.js', import.meta.url), 'utf8');
-  assert.match(hard, /old_guid, \.\.\.guids\], workspaceId, \{ keepBillOutstanding: false \}/);
+  assert.doesNotMatch(hard, /purgeCompan/);
+  const publish = readFileSync(new URL('../services/hardSyncPublication.js', import.meta.url), 'utf8');
+  assert.match(publish, /DELETE FROM bill_outstanding WHERE company_id = \$1 AND COALESCE\(synced_at, 0\) < \$2/);
 });
 
 test('ingest routes wire the staged header into chunks and summaries into complete', () => {
