@@ -1,5 +1,12 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-09 — Fix: stock masters skipped when StockItemFull arrives in 6+ envelopes (branch `8-10-2026`)
+
+- Seen after the Windows hard sync: Radhe Ram (6 FYs selected) logged `Stocks: saved 0/6` and publication reported `stocks: kept:no_rows_this_run(9)`; its stock masters had not been refreshed since the 4-FY run. `processStocks` only unwrapped the envelope rows when there were ≤ 5 of them, so 6+ envelopes were read as items with no name and skipped. Pre-existing since the initial commit.
+- It now also unwraps whenever no row is itself a named stock item. Behaviour for ≤ 5 envelopes and for flat item rows is unchanged.
+- The hard-sync guard behaved correctly (kept the 9 stocks instead of deleting them).
+- **Tests:** new isolated test (6 envelopes → 6 stocks; fails on the old code with 0/6); isolated 35/35; `p2-ingest-integrity` unit 16/16.
+
 ## 2026-10-09 — Fix: false "rejected" counts held voucher watermarks back (branch `8-10-2026`)
 
 - Seen in the Windows sync log: Laveena `StockTransaction.xml rejected 1`, `StockOpeningBalance.xml rejected 4/4`, Yash Ki Company `StockOpeningBalance.xml rejected 1` → `voucher_watermarks kept (rejected:StockTransaction.xml)`, so that company re-fetched the same year on every sync.

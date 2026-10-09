@@ -108,3 +108,17 @@ test('counts: merged repeated lines, empty rows and zero-qty openings are not re
   const st = await q(`SELECT value FROM stock_transactions WHERE company_id = $1 AND voucher_guid = $2 AND stock_guid = 'Widget A'`, [co.id, v]);
   assert.equal(Number(st.rows[0].value), 30, 'repeated lines merged, not dropped');
 });
+
+test('stock masters wrapped in more than five envelopes are still saved', async () => {
+  const co = await makeCompany();
+  const envelope = (i) => ({
+    XML: 'StockItemFull.xml', COMPANY_GUID: co.guid,
+    BODY: JSON.stringify({ DATA: { TALLYMESSAGE: { STOCKITEM: [
+      { NAME: `Item ${i}`, GUID: `${co.guid}-s${i}`, BASEUNITS: 'Nos', ALTERID: String(i) },
+    ] } } }),
+  });
+  const rows = Array.from({ length: 6 }, (_, i) => envelope(i));
+  await processIngestedData('master', rows, co.guid, null, null, { companyId: co.id });
+  const { rows: saved } = await q('SELECT name FROM stocks WHERE company_id = $1 ORDER BY name', [co.id]);
+  assert.deepEqual(saved.map((r) => r.name), rows.map((_, i) => `Item ${i}`));
+});

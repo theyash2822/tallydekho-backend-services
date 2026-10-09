@@ -851,8 +851,10 @@ async function processStocks(data, companyGuid) {
 
     // StockItemFull.xml — Tally Collection format wraps items in BODY.DATA.TALLYMESSAGE.STOCKITEM[]
     // CMPINFO also has STOCKITEM as a numeric count — we must skip primitives and find the real array of objects.
+    // The envelope count varies per company/selection (6+ is real), so size alone can't decide.
     let expandedStockData = data;
-    if (data.length <= 5) {
+    const rowsAreItems = data.some((raw) => tallyName(unwrapMaster(raw, ['STOCKITEM', 'StockItem']) || {}));
+    if (data.length <= 5 || !rowsAreItems) {
       const found = findNestedArrayOfObjects(data, ['STOCKITEM', 'StockItem', 'STOCKITEMREPORT']);
       if (found.length > 0) {
         expandedStockData = found;
