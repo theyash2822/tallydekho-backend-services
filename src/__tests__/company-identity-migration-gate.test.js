@@ -11,51 +11,24 @@ import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cidDestructiveMigrationsAllowed } from '../db/schema.js';
-
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-function withEnv(env, fn) {
-  const prev = {};
-  for (const k of Object.keys(env)) {
-    prev[k] = process.env[k];
-    if (env[k] === undefined) delete process.env[k];
-    else process.env[k] = env[k];
-  }
-  try {
-    return fn();
-  } finally {
-    for (const k of Object.keys(prev)) {
-      if (prev[k] === undefined) delete process.env[k];
-      else process.env[k] = prev[k];
-    }
-  }
-}
-
 describe('Company Identity destructive migration gate', () => {
-  it('production boot does not auto-apply the cutover', () => {
-    withEnv({ NODE_ENV: 'production', CID_ALLOW_DESTRUCTIVE_MIGRATION: undefined }, () => {
-      assert.equal(cidDestructiveMigrationsAllowed(), false);
-    });
-  });
-
-  it('production requires explicit CID_ALLOW_DESTRUCTIVE_MIGRATION opt-in', () => {
-    withEnv({ NODE_ENV: 'production', CID_ALLOW_DESTRUCTIVE_MIGRATION: '1' }, () => {
-      assert.equal(cidDestructiveMigrationsAllowed(), true);
-    });
-  });
-
-  it('dev/test still converge automatically', () => {
-    for (const env of ['development', 'test', undefined]) {
-      withEnv({ NODE_ENV: env, CID_ALLOW_DESTRUCTIVE_MIGRATION: undefined }, () => {
-        assert.equal(cidDestructiveMigrationsAllowed(), true);
-      });
-    }
-  });
-
-  it('the cutover is isolated behind the gate, not inlined in initSchema', () => {
+  // Behaviour (clean install / previous shape with data / already upgraded,
+  // under every NODE_ENV and the opt-in flag) is proven against a disposable
+  // database in isolated/x10-schema-scenarios.test.js.
+  it('no environment variable can authorise the boot cutover', () => {
     const src = fs.readFileSync(path.join(root, 'db/schema.js'), 'utf8');
-    assert.ok(src.includes('if (cidDestructiveMigrationsAllowed()) {'));
+    assert.ok(!src.includes('cidDestructiveMigrationsAllowed'));
+    assert.ok(!/process\.env\.CID_ALLOW_DESTRUCTIVE_MIGRATION/.test(src));
+    const gate = src.slice(src.indexOf('if (await cidCutoverComplete(client))'));
+    assert.ok(gate.startsWith('if (await cidCutoverComplete(client))'));
+    assert.ok(!/process\.env/.test(gate.slice(0, gate.indexOf('pending_operator_migration'))));
+  });
+
+  it('the cutover is isolated behind the empty-database gate, not inlined in initSchema', () => {
+    const src = fs.readFileSync(path.join(root, 'db/schema.js'), 'utf8');
+    assert.ok(src.includes('} else if (await cidGuardedTablesEmpty(client)) {'));
     assert.ok(src.includes('await applyCidConstraintCutover(client)'));
     // The destructive statements must live inside the gated function only.
     const gated = src.slice(src.indexOf('async function applyCidConstraintCutover'));

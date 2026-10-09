@@ -2,6 +2,7 @@
 import pg from 'pg';
 import { REPAIR_VOUCHER_TYPE_PARENT_SQL } from '../utils/voucherTypeParent.js';
 import { applyWorkspaceSchema } from './workspaceSchema.js';
+import { applyLegacyShapeSchema } from './legacyShapeSchema.js';
 import { ensureDeploymentIdentity } from './deploymentIdentity.js';
 import { assertAppEnvConsistency } from '../config/appEnv.js';
 const { Pool } = pg;
@@ -60,15 +61,50 @@ export function getDb() {
 }
 
 /**
- * Destructive Company Identity constraint migrations must never run as an
- * implicit side effect of a production deploy/restart. Outside production they
- * run on boot so dev/CI schemas track the code.
+ * Tables whose rows, key columns or uniqueness the Company Identity cutover can
+ * delete, drop or merge. Boot may only run the cutover when all are empty —
+ * a clean install — because then it cannot destroy business data. Any other
+ * database gets the supervised operator scripts. No environment variable
+ * (NODE_ENV, CID_ALLOW_DESTRUCTIVE_MIGRATION, …) changes this.
  */
-export function cidDestructiveMigrationsAllowed() {
-  return (
-    process.env.NODE_ENV !== 'production' ||
-    process.env.CID_ALLOW_DESTRUCTIVE_MIGRATION === '1'
-  );
+const CID_CUTOVER_GUARDED_TABLES = [
+  'companies', 'member_company_access', 'tdk_reference_counters', 'vouchers', 'ledgers',
+  'stocks', 'groups', 'company_years', 'app_vouchers', 'write_queue', 'cost_centres',
+  'company_print_profile', 'company_compliance_config', 'inventory_barcode_settings',
+  'tally_country_master', 'tally_state_master',
+];
+
+let cidCutoverOutcome = null;
+
+/** What the last initSchema did about the Company Identity cutover. */
+export function lastCidCutoverOutcome() {
+  return cidCutoverOutcome;
+}
+
+async function cidCutoverComplete(client) {
+  const { rows } = await client.query(`
+    SELECT
+      EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+              WHERE n.nspname = current_schema() AND c.conname = 'companies_workspace_guid_key') AS ws_guid,
+      EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+              WHERE n.nspname = current_schema() AND c.conname = 'uq_vouchers_company_id_guid') AS vouchers_cid,
+      EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'member_company_access'
+                AND column_name = 'company_guid') AS mca_guid_col`);
+  const r = rows[0];
+  return r.ws_guid && r.vouchers_cid && !r.mca_guid_col;
+}
+
+async function cidGuardedTablesEmpty(client) {
+  for (const table of CID_CUTOVER_GUARDED_TABLES) {
+    const exists = await client.query(`SELECT to_regclass($1) IS NOT NULL AS ok`, [table]);
+    if (!exists.rows[0].ok) continue;
+    const { rows } = await client.query(`SELECT EXISTS (SELECT 1 FROM ${table}) AS has_rows`);
+    if (rows[0].has_rows) return false;
+  }
+  return true;
 }
 
 /**
@@ -1318,14 +1354,7 @@ export async function initSchema() {
     // workspace resolution create the row on demand; environments that want it
     // done up front run scripts/backfill-personal-workspaces.mjs.
 
-    // Backfill historical master writes into app_masters + mark posted when synced.
-    try {
-      const { backfillAppMasters } = await import('../utils/appMasters.js');
-      await backfillAppMasters(client);
-      console.log('✅ app_masters backfill complete');
-    } catch (e) {
-      console.warn('[app_masters] backfill skipped:', e.message);
-    }
+    await applyLegacyShapeSchema(client);
 
     // Data repair: thin SimplifiedVoucher syncs used to overwrite every
     // voucher_type_parent with the 'Voucher' placeholder, emptying the GST
@@ -1363,6 +1392,17 @@ export async function initSchema() {
       ).catch(() => {});
     }
     console.log('✅ Company Identity Phase 2 additive company_id columns ensured');
+
+    // Backfill historical master writes into app_masters + mark posted when synced.
+    // Reads company_id on write_queue/ledgers/warehouses/stocks, so it runs after
+    // those columns exist.
+    try {
+      const { backfillAppMasters } = await import('../utils/appMasters.js');
+      await backfillAppMasters(client);
+      console.log('✅ app_masters backfill complete');
+    } catch (e) {
+      console.warn('[app_masters] backfill skipped:', e.message);
+    }
 
     // Bill rows of a staged desktop upload wait here until /ingest/complete confirms
     // the company's snapshot is complete; only then do they replace bill_outstanding.
@@ -1476,13 +1516,18 @@ export async function initSchema() {
     `).catch((e) => console.warn('[CID3C] MCA unique:', e.message));
     console.log('✅ MCA (membership_id, company_id) unique index ensured (drop-ready for legacy PK)');
 
-    if (cidDestructiveMigrationsAllowed()) {
+    if (await cidCutoverComplete(client)) {
+      cidCutoverOutcome = 'already_applied';
+    } else if (await cidGuardedTablesEmpty(client)) {
       await applyCidConstraintCutover(client);
+      cidCutoverOutcome = 'applied_on_empty_database';
     } else {
-      console.warn(
-        '[CID] destructive Company Identity constraint cutover SKIPPED on boot ' +
-          '(NODE_ENV=production without CID_ALLOW_DESTRUCTIVE_MIGRATION=1). ' +
-          'Run it as a supervised step: scripts/cid-guid-unique-cutover.mjs — see ' +
+      cidCutoverOutcome = 'pending_operator_migration';
+      console.error(
+        '[CID] SCHEMA MISMATCH: Company Identity constraint cutover is not applied and this ' +
+          'database holds data, so boot will not run it. Run the supervised steps after a ' +
+          'verified backup: scripts/cid-child-constraint-cutover.mjs, ' +
+          'scripts/cid-config-master-cutover.mjs, scripts/cid-guid-unique-cutover.mjs — see ' +
           'COMPANY_IDENTITY_PRODUCTION_CUTOVER.md'
       );
     }
@@ -1505,9 +1550,9 @@ export async function initSchema() {
  * an internal owner, and replaces global UNIQUE(companies.guid) with
  * UNIQUE(workspace_id, guid).
  *
- * Runs automatically outside production so local/CI databases converge with the
- * code. In production it must be an operator-supervised step with a verified
- * backup — never an implicit side effect of a deploy/restart.
+ * Boot runs it only on a clean install (CID_CUTOVER_GUARDED_TABLES all empty).
+ * Every database holding data must use the operator-supervised scripts with a
+ * verified backup — never an implicit side effect of a deploy/restart.
  */
 async function applyCidConstraintCutover(client) {
     // ── Company Identity Phase 3D (local constraint cutover) ─────────────
@@ -1577,6 +1622,8 @@ async function applyCidConstraintCutover(client) {
       ['stock_transactions', 'uq_stock_tx_company_id_compound', '(company_id, stock_guid, voucher_guid, warehouse, type)'],
       ['voucher_inventory_items', 'uq_vii_company_id_compound', '(company_id, voucher_guid, stock_item_name, godown_name, batch_name)'],
       ['batch_allocations', 'uq_ba_company_id_compound', '(company_id, voucher_guid, stock_item_name, batch_name, godown_name)'],
+      ['currencies', 'uq_currencies_company_id_name', '(company_id, name)'],
+      ['voucher_ledger_entries', 'uq_vle_company_id_compound', '(company_id, voucher_guid, ledger_name, line_index)'],
     ];
     for (const [table, cname, cols] of cidUniqueConstraints) {
       await client.query(`
@@ -1674,8 +1721,13 @@ async function applyCidConstraintCutover(client) {
         END;
         -- drop legacy GUID uniques superseded by company_id
         ALTER TABLE company_years DROP CONSTRAINT IF EXISTS company_years_company_guid_fin_year_key;
-        ALTER TABLE ai_insights_cache DROP CONSTRAINT IF EXISTS ai_insights_cache_company_guid_month_key_key;
-        ALTER TABLE financial_year_summaries DROP CONSTRAINT IF EXISTS financial_year_summaries_company_guid_financial_year_key;
+        -- Created lazily by services/aiInsights.js, so absent on a clean install.
+        IF to_regclass('ai_insights_cache') IS NOT NULL THEN
+          ALTER TABLE ai_insights_cache DROP CONSTRAINT IF EXISTS ai_insights_cache_company_guid_month_key_key;
+        END IF;
+        IF to_regclass('financial_year_summaries') IS NOT NULL THEN
+          ALTER TABLE financial_year_summaries DROP CONSTRAINT IF EXISTS financial_year_summaries_company_guid_financial_year_key;
+        END IF;
         ALTER TABLE kpi_ar_ap_snapshots DROP CONSTRAINT IF EXISTS kpi_ar_ap_snapshots_company_guid_side_as_of_key;
         ALTER TABLE kpi_loans_snapshots DROP CONSTRAINT IF EXISTS kpi_loans_snapshots_company_guid_as_of_key;
         ALTER TABLE company_inventory_settings DROP CONSTRAINT IF EXISTS company_inventory_settings_company_guid_key;

@@ -35,6 +35,45 @@ test('guard rejects a different DATABASE_URL already loaded (e.g. from .env)', (
   );
 });
 
+test('network guard rejects non-owned endpoints before dispatch, allows owned ones', async () => {
+  const net = await import('node:net');
+  const { installNetworkGuard, allowEndpoint, blockedAttempts } = await import('./networkGuard.js');
+  installNetworkGuard();
+
+  let decoyConnections = 0;
+  const decoy = net.createServer((s) => { decoyConnections += 1; s.destroy(); });
+  await new Promise((r) => decoy.listen(0, '127.0.0.1', r));
+  const decoyPort = decoy.address().port;
+
+  const owned = net.createServer((s) => s.end('ok'));
+  await new Promise((r) => owned.listen(0, '127.0.0.1', r));
+  const ownedPort = owned.address().port;
+  allowEndpoint('127.0.0.1', ownedPort);
+
+  // Same loopback host as the owner's real backend: loopback is not a blanket allow.
+  assert.throws(() => net.connect(3001, '127.0.0.1'), (e) => e.code === 'NETWORK_GUARD');
+  assert.throws(() => net.connect(decoyPort, '127.0.0.1'), (e) => e.code === 'NETWORK_GUARD');
+  // OTP/cloud-style host: rejected before DNS lookup. No request is ever sent.
+  await assert.rejects(
+    fetch('https://otp-provider.invalid/api/v5/otp?mobile=0000000000', { method: 'POST' }),
+    (e) => e.code === 'NETWORK_GUARD' || e.cause?.code === 'NETWORK_GUARD'
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(decoyConnections, 0);
+  assert.ok(blockedAttempts().some((t) => t.startsWith('otp-provider.invalid')));
+
+  const reply = await new Promise((resolve, reject) => {
+    const c = net.connect(ownedPort, '127.0.0.1');
+    let buf = '';
+    c.on('data', (d) => { buf += d; });
+    c.on('end', () => resolve(buf));
+    c.on('error', reject);
+  });
+  assert.equal(reply, 'ok');
+  decoy.close();
+  owned.close();
+});
+
 test('isolated schema initialises on the disposable cluster only', async () => {
   const schema = await setupIsolatedDb();
   const { rows } = await schema.getPool().query(

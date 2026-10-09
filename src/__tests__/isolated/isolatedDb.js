@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import pg from 'pg';
+import { installNetworkGuard } from './networkGuard.js';
 
 export class IsolationError extends Error {
   constructor(message) {
@@ -68,6 +69,8 @@ export function setupIsolatedDb() {
   if (!ready) {
     ready = (async () => {
       const { url, token } = validateIsolatedEnv();
+      const u = new URL(url);
+      installNetworkGuard({ allow: [[u.hostname, Number(u.port)]] });
       await verifyMarker(url, token);
       process.env.DATABASE_URL = url;
       process.env.NODE_ENV = 'test';
