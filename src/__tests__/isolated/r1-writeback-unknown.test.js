@@ -163,3 +163,34 @@ test('X1: another user cannot retry a foreign entry', async () => {
   assert.notEqual(r.status, 200);
   assert.equal(posts.length, 0);
 });
+
+// R6 / W1: the outbox-result path delivers the posting event once, scoped to the company room.
+test('W1: a successful outbox result announces the posting once to its company room', async () => {
+  const ws = await seedWorkspace(q, uniq);
+  const { setupSocket } = await import('../../socket/socketHandler.js');
+  const emitted = [];
+  const svc = setupSocket({ on: () => {}, to: (room) => ({ emit: (event, payload) => emitted.push({ room, event, payload }) }) });
+  tallyWrite.setTallyWriteSocket({ ...svc, connectedClients: new Map() });
+  const id = await queueEntry(ws, 'processing');
+  await q('UPDATE write_queue SET locked_by_device_id = $1, lock_expires_at = EXTRACT(EPOCH FROM NOW())::BIGINT + 600 WHERE id = $2', [ws.deviceId, id]);
+  const ref = `TDK-SAL-${uniq('w1')}`;
+  await q(
+    `INSERT INTO app_vouchers (company_guid, company_id, voucher_type, tdk_reference_no, write_queue_id, created_at, updated_at)
+     VALUES ($1, $2, 'sales_invoice', $3, $4, EXTRACT(EPOCH FROM NOW())::BIGINT, EXTRACT(EPOCH FROM NOW())::BIGINT)`,
+    [ws.companyGuid, ws.companyId, ref, id],
+  );
+  const post = () => harness.call('POST', `/tally/desktop/writeback/${id}/result`, { headers: ws.deviceHeaders, body: { success: true, tallyVoucherNumber: 'S-77', tallyVoucherGuid: 'g-77' } });
+  const first = await post();
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  await new Promise((r) => setTimeout(r, 50));
+  const synced = emitted.filter((e) => e.event === 'voucher:tallySynced');
+  assert.equal(synced.length, 1);
+  assert.equal(synced[0].room, `company:${ws.companyId}`);
+  assert.equal(synced[0].payload.tdkReferenceNo, ref);
+  assert.equal(synced[0].payload.workspaceId, ws.workspaceId);
+
+  const again = await post();
+  assert.equal(again.status, 403, 'a repeated result no longer owns the lock');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(emitted.filter((e) => e.event === 'voucher:tallySynced').length, 1, 'announced once');
+});

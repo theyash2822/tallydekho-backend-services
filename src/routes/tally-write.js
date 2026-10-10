@@ -6787,12 +6787,12 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
 
     // Verify this device owns the lock
     const { rows: lockRows } = await query(
-      `SELECT id, company_guid FROM write_queue
+      `SELECT id, company_guid, company_id FROM write_queue
        WHERE id=$1 AND locked_by_device_id=$2 AND workspace_id=$3`,
       [outboxId, desktop.deviceId, desktop.workspaceId]
     );
     if (!lockRows[0]) return res.status(403).json({ status: false, message: 'Not the lock owner or not found' });
-    const { company_guid } = lockRows[0];
+    const { company_guid, company_id: queueCompanyId } = lockRows[0];
 
     if (success) {
       await query(
@@ -6808,11 +6808,16 @@ router.post('/desktop/writeback/:outboxId/result', requireDeviceCredential, asyn
            tally_sync_status='synced', books_impact_status='posted',
            updated_at=EXTRACT(EPOCH FROM NOW())::BIGINT
            WHERE write_queue_id=$3 AND tally_sync_status!='synced'
-           RETURNING tdk_reference_no`,
+           RETURNING tdk_reference_no, company_id`,
           [tallyVoucherNumber, tallyVoucherGuid || null, outboxId]
         ).catch(() => ({ rows: [] }));
         if (avRows[0]?.tdk_reference_no) {
-          _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber, { companyId: avRows[0].company_id });
+          // R6 / W1: scoped by the queue row's company and the desktop's workspace — never a
+          // GUID-only lookup that could reach another workspace's company with the same GUID.
+          _socketService?.emitVoucherSynced?.(company_guid, avRows[0].tdk_reference_no, tallyVoucherNumber, {
+            companyId: avRows[0].company_id ?? queueCompanyId ?? null,
+            workspaceId: desktop.workspaceId,
+          });
         }
       }
       // Desktop completed a deferred push without going through the Sales/Purchase
