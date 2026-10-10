@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { hardSyncEnabled, HARD_SYNC_UNAVAILABLE } from '../services/hardSyncGate.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { resolveWorkspaceMiddleware, bindWorkspaceParam, requireCapability } from '../middleware/workspaceContext.js';
 import {
@@ -1376,6 +1377,7 @@ router.get('/workspaces/:id/approvals', authMiddleware, bindWorkspaceParam, requ
 });
 
 router.post('/hard-sync-requests/:id/approve', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
+  if (!hardSyncEnabled()) return res.status(409).json({ success: false, status: false, ...HARD_SYNC_UNAVAILABLE });
   try {
     const row = await approveHardSync({
       requestId: req.params.id,

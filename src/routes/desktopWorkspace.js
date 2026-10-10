@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { hardSyncEnabled, HARD_SYNC_UNAVAILABLE } from '../services/hardSyncGate.js';
 import { query } from '../db/schema.js';
 import { requireDeviceCredential, optionalDeviceCredential } from '../middleware/auth.js';
 import { getWorkspaceById, workspacePublicView, requestWorkspaceReset } from '../services/workspaceService.js';
@@ -81,6 +82,7 @@ router.post('/claim-credential', requireDeviceCredential, async (req, res) => {
 });
 
 router.post('/hard-sync/request', requireDeviceCredential, async (req, res) => {
+  if (!hardSyncEnabled()) return res.status(409).json({ status: false, ...HARD_SYNC_UNAVAILABLE });
   try {
     const { operation, oldGuid, newGuid, companies } = req.body || {};
     const result = await createHardSyncRequest({

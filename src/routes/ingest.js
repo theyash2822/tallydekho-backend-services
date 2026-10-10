@@ -1,5 +1,6 @@
 // Ingest pipeline — receives chunked data from Desktop
 import { Router } from 'express';
+import { hardSyncEnabled, HARD_SYNC_UNAVAILABLE } from '../services/hardSyncGate.js';
 import { query } from '../db/schema.js';
 import { v4 as uuid } from 'uuid';
 import { processIngestedData, backfillTaxTransactions } from '../controllers/ingestProcessor.js';
@@ -157,6 +158,9 @@ router.post('/desktop/init-sync', requireDeviceCredential, async (req, res) => {
     // replacement is published at /ingest/complete (services/hardSyncPublication.js).
     await sweepOldResetClaims(query).catch((e) => console.warn('[SYNC] reset-claim cleanup skipped:', e.message));
 
+    if (isHardSync === true && !hardSyncEnabled()) {
+      return res.status(409).json({ status: false, ...HARD_SYNC_UNAVAILABLE });
+    }
     let hardSyncRequest = null;
     const hardSyncJobs = [];
     if (isHardSync === true && companies?.length > 0) {
@@ -826,7 +830,8 @@ router.post('/ingest/complete', requireDeviceCredential, async (req, res) => {
     const verifiedSuccess = isVerifiedSyncSuccess(ingestWarnings);
 
     const hardSyncResults = [];
-    if (isHardSync && uploadId) {
+    // A job opened before the gate never publishes its live replacement.
+    if (isHardSync && uploadId && hardSyncEnabled()) {
       const lists = Array.isArray(body?.voucherLists) ? parseVoucherLists(body) : new Map();
       for (const company of companies) {
         const result = await publishHardSyncTx(getClient, {

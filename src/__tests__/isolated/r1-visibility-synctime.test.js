@@ -78,3 +78,19 @@ test('S4: registration reports the last verified sync, never the registration or
   const pairing = await harness.call('GET', '/desktop/pairing-device', { headers: { 'device-id': ws.deviceId } });
   assert.equal(pairing.body.data.pairing.LAST_SYNC_AT, syncedAt);
 });
+
+test('Hard Sync is off: request and start are refused and nothing is changed', async () => {
+  const ws = await seedWorkspace(q, uniq);
+  const { default: desktopWorkspace } = await import('../../routes/desktopWorkspace.js');
+  const h = await startRouteHarness([['/desktop', desktopWorkspace]]);
+  try {
+    const req = await h.call('POST', '/desktop/hard-sync/request', { headers: ws.deviceHeaders, body: { operation: 'REBUILD', companies: [{ guid: ws.companyGuid }] } });
+    assert.equal(req.status, 409);
+    assert.equal(req.body.code, 'HARD_SYNC_UNAVAILABLE');
+  } finally {
+    await h.close();
+  }
+  const start = await harness.call('POST', '/desktop/init-sync', { headers: ws.deviceHeaders, body: { isHardSync: true, companies: [{ guid: ws.companyGuid, name: 'Synthetic Co', years: [] }] } });
+  assert.equal(start.status, 409);
+  assert.equal(start.body.code, 'HARD_SYNC_UNAVAILABLE');
+});
