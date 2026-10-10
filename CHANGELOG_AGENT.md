@@ -1,5 +1,14 @@
 # CHANGELOG_AGENT.md — td-backend
 
+## 2026-10-09 — TDV01 remediation RM01 (branch `tdv01-remediation`)
+
+- R0: clean install works; boot never runs the destructive company-identity cutover on a database with data (no env flag can authorise it); isolated tests cannot reach real services.
+- Write-back: an entry whose Tally outcome is unknown is never re-sent (the `confirmOutcomeUnknown` override is gone); users review it via `POST /api/vouchers/my-entries/:id/resolve-unknown` (`found_in_tally` | `discard`); retries need an active membership; stuck "processing" entries go to review; outbox-result postings announce one scoped event.
+- Sync: a sync no longer hides other companies or years; `lastSync` everywhere is the last verified sync (`last_seen` reported separately); `synced` reaches the workspace without a legacy user_id; stale sync runs swept every minute.
+- Ingest: chunk records validated by shape (`CHUNK_EMPTY`, `RECORD_INVALID`); receipts and counters replay-safe; bill allocations can no longer be dropped silently (and repeated allocations to one bill are summed); one transaction per voucher unit incl. batch allocations and app links; thin rows never claim an applied version (`observed_alter_id`); repeated stock lines kept via `line_ordinal` (operator: `scripts/x5-line-ordinal-cutover.mjs` on existing data); explicit ledger clears; exact Tally counters; stock FY balances checked against company years; header-less bill purge refused; AllVoucher cancel flag only changes when sent.
+- **Hard Sync is off** on this branch (`HARD_SYNC_UNAVAILABLE`, 409) until the staged design ships (owner decision 9 Oct).
+- Tests: isolated 76/76, DB-free 80/80. Evidence: `audits/tdv01_remediation/2026-10-09-RM01/`.
+
 ## 2026-10-09 — Fix: stock masters skipped when StockItemFull arrives in 6+ envelopes (branch `8-10-2026`)
 
 - Seen after the Windows hard sync: Radhe Ram (6 FYs selected) logged `Stocks: saved 0/6` and publication reported `stocks: kept:no_rows_this_run(9)`; its stock masters had not been refreshed since the 4-FY run. `processStocks` only unwrapped the envelope rows when there were ≤ 5 of them, so 6+ envelopes were read as items with no name and skipped. Pre-existing since the initial commit.
