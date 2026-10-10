@@ -2853,6 +2853,8 @@ router.get('/vouchers/my-entries', authMiddleware, async (req, res) => {
         wq.entry_label as party_name,
         wq.status as _queue_status,
         wq.error_message as _queue_error,
+        wq.outcome_unknown as _outcome_unknown,
+        wq.unknown_resolution as _unknown_resolution,
         wq.attempt_count,
         TO_CHAR(TO_TIMESTAMP(wq.created_at), 'YYYY-MM-DD') as date,
         wq.created_at,

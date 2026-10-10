@@ -1077,6 +1077,7 @@ router.get('/workspace/approvals', authMiddleware, resolveWorkspaceMiddleware, r
 });
 
 router.post('/workspace/hard-sync/:id/approve', authMiddleware, resolveWorkspaceMiddleware, requireCapability('tally.restore_replace'), async (req, res) => {
+  if (!hardSyncEnabled()) return res.status(409).json({ success: false, status: false, ...HARD_SYNC_UNAVAILABLE });
   try {
     const row = await approveHardSync({
       requestId: req.params.id,

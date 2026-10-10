@@ -6,6 +6,7 @@ import { query } from '../db/schema.js';
 import { sendCompliancePush } from './push.js';
 import { runPaymentReminderJob, istNow } from './paymentReminderJob.js';
 import { sweepStaleSyncRuns } from '../utils/syncRuns.js';
+import { sweepStuckWriteback } from '../routes/tally-write.js';
 
 const IST_CRON = { timezone: 'Asia/Kolkata' };
 
@@ -23,6 +24,8 @@ export function startScheduler() {
     try {
       const swept = await sweepStaleSyncRuns(query);
       if (swept) console.log(`[Scheduler] sync runs abandoned after lease expiry: ${swept}`);
+      const stuck = await sweepStuckWriteback(query);
+      if (stuck) console.log(`[Scheduler] write-backs moved to review (no desktop result): ${stuck}`);
     } catch (err) {
       console.warn('[Scheduler] sync-run sweep failed:', err.message);
     }

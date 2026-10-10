@@ -194,3 +194,20 @@ test('W1: a successful outbox result announces the posting once to its company r
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(emitted.filter((e) => e.event === 'voucher:tallySynced').length, 1, 'announced once');
 });
+
+// QA follow-up: a write-back the desktop never reported goes to review, never back to the queue.
+test('a processing entry whose desktop lock expired moves to review and is never re-sent', async () => {
+  const ws = await seedWorkspace(q, uniq);
+  const posts = fakeDesktop(ws, () => ({ status: true }));
+  const id = await queueEntry(ws, 'processing');
+  await q('UPDATE write_queue SET locked_by_device_id = $1, lock_expires_at = EXTRACT(EPOCH FROM NOW())::BIGINT - 5 WHERE id = $2', [ws.deviceId, id]);
+  const fresh = await queueEntry(ws, 'processing');
+  await q('UPDATE write_queue SET locked_by_device_id = $1, lock_expires_at = EXTRACT(EPOCH FROM NOW())::BIGINT + 600 WHERE id = $2', [ws.deviceId, fresh]);
+  assert.ok((await tallyWrite.sweepStuckWriteback()) >= 1);
+  const r = await row(id);
+  assert.deepEqual([r.status, r.outcome_unknown, r.locked_by_device_id], ['failed', true, null]);
+  assert.equal((await row(fresh)).status, 'processing', 'a live lock is left alone');
+  const retry = await harness.call('POST', `/tally/audit-trail/${id}/retry`, { headers: ws.userHeaders });
+  assert.notEqual(retry.status, 200);
+  assert.equal(posts.length, 0, 'nothing was posted');
+});

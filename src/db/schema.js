@@ -1555,7 +1555,7 @@ export async function initSchema() {
       lineOrdinalOutcome = 'pending_operator_migration';
       console.warn(
         '[X5] Repeated stock lines are still merged on this database (it holds inventory rows). ' +
-        'After a verified backup run scripts/x5-line-ordinal-cutover.mjs (preflight, then --apply).'
+        'After a verified backup run node scripts/x5-line-ordinal-cutover.mjs (preflight), then CONFIRM=1 node scripts/x5-line-ordinal-cutover.mjs, then restart.'
       );
     }
 

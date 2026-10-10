@@ -5987,6 +5987,26 @@ const ACTIVE_QUEUE_MEMBER_SQL = `(write_queue.workspace_id IS NULL OR EXISTS (
   SELECT 1 FROM workspace_memberships m
    WHERE m.workspace_id = write_queue.workspace_id AND m.user_id = $2 AND m.status = 'ACTIVE'))`;
 
+/**
+ * A write-back still "processing" after its desktop lock expired (or, without a lock, untouched
+ * for 30 minutes) may already be in Tally: it goes to review as an unknown outcome and is never
+ * re-sent by any path. Run by the scheduler.
+ */
+export async function sweepStuckWriteback(q = query) {
+  const { rowCount } = await q(
+    `UPDATE write_queue
+        SET status = 'failed', outcome_unknown = TRUE,
+            error_message = $1,
+            locked_by_device_id = NULL, locked_at = NULL, lock_expires_at = NULL,
+            updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+      WHERE status = 'processing'
+        AND ((lock_expires_at IS NOT NULL AND lock_expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT)
+          OR (locked_by_device_id IS NULL AND updated_at < EXTRACT(EPOCH FROM NOW())::BIGINT - 1800))`,
+    [`${OUTCOME_UNKNOWN_PREFIX} The desktop never reported the result. Check Tally's Day Book, then mark it found or discard it.`]
+  );
+  return rowCount || 0;
+}
+
 // An entry whose Tally outcome is unknown is never re-posted from here, even on
 // user confirmation: Tally may hold it. resolveOutcomeUnknown settles it without posting.
 export async function retrySingleEntry(entryId, userId) {
